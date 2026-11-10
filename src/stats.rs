@@ -148,7 +148,6 @@ impl crate::logs::LogStore {
         Ok(())
     }
 
-    /// Persist one per-attempt LLM failure row to the `llm_failures` table.
     pub(crate) async fn record_llm_failure_row(&self, rec: &LlmFailureRow) -> Result<()> {
         self.conn
             .execute(
@@ -180,8 +179,6 @@ impl crate::logs::LogStore {
     }
 }
 
-/// One per-operation LLM request stat row (the `llm_requests` table).
-///
 /// One row per completed LLM operation (agent iteration, extraction,
 /// summarization, consolidation) — retry attempts are aggregated into
 /// [`LlmRequestRecord::retry_attempts`]. Metadata only: no request inputs or outputs.
@@ -218,8 +215,6 @@ pub(crate) struct LlmRequestRecord {
     pub recorded_at: String,
 }
 
-/// One per-attempt LLM failure row (the `llm_failures` table).
-///
 /// One row per FAILED attempt of an LLM operation — including intermediate
 /// failures of operations that later succeeded and the terminal exhausted
 /// attempt. Grouped per operation via [`LlmFailureRow::operation_id`].
@@ -459,7 +454,6 @@ fn elapsed_ms(started: Option<std::time::Instant>) -> Option<u64> {
     started.and_then(|t| u64::try_from(t.elapsed().as_millis()).ok())
 }
 
-/// Emit a success LLM request stat for a completed operation.
 #[expect(clippy::cast_possible_truncation)]
 pub(crate) fn record_llm_success(
     request: &crate::ChatRequest,
@@ -477,7 +471,6 @@ pub(crate) fn record_llm_success(
     );
 }
 
-/// Emit a failure LLM request stat for an exhausted operation.
 #[expect(clippy::cast_possible_truncation)]
 pub(crate) fn record_llm_failure(
     request: &crate::ChatRequest,

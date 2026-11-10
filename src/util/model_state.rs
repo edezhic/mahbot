@@ -6,7 +6,6 @@
 //! Memory ordering: `Acquire` loads, `Release` stores, `AcqRel`/`Acquire` compare-exchange.
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Model loading state with type-safe atomic access.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd)]
 pub(crate) enum ModelState {
@@ -34,7 +33,6 @@ impl ModelState {
     }
 }
 
-/// Atomic wrapper around [`ModelState`] that provides lock-free access.
 pub(crate) struct AtomicModelState(AtomicU8);
 
 impl AtomicModelState {
@@ -50,7 +48,6 @@ impl AtomicModelState {
         self.0.store(state as u8, order);
     }
 
-    /// Returns `true` if the state is [`ModelState::Ready`].
     #[must_use]
     pub(crate) fn is_ready(&self) -> bool {
         self.load(Ordering::Acquire) == ModelState::Ready

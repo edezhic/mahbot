@@ -74,7 +74,6 @@ pub(crate) const WATCHDOG_GRACE_SECS: u64 = 1;
 /// other failures exit with.
 pub(crate) const WATCHDOG_EXIT_CODE: i32 = 1;
 
-/// The command's read limit.
 fn limit() -> Duration {
     crate::util::env_duration_secs(ENV, DEFAULT_SECS).min(Duration::from_secs(MAX_SECS))
 }
@@ -161,7 +160,6 @@ impl<'a> Read<'a> {
         self.budget.remaining()
     }
 
-    /// The limit's failure for this read.
     #[must_use]
     pub(crate) fn timeout(&self) -> anyhow::Error {
         anyhow!(self.message())
@@ -258,8 +256,6 @@ mod tests {
         limit()
     }
 
-    /// Unset means the default, an override is taken as given, an absurd one is
-    /// clamped — and the smallest value is an immediate failure, never an engine-style "no limit".
     #[test]
     #[serial_test::serial(read_limit)]
     fn limit_reads_the_knob_within_its_bounds() {

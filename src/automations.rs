@@ -302,8 +302,6 @@ pub(crate) fn format_fire_time(timestamp: &str) -> Result<String> {
     Ok(format!("{local} local time ({utc} UTC)"))
 }
 
-// Automation CRUD
-
 /// Validate an automation's optional custom-role target before it is stored: only the
 /// administrator may address an automation to a custom role, the role must exist, the branch
 /// identifier and folder must resolve to what will be stored, and a role-addressed automation's
@@ -327,7 +325,6 @@ async fn validate_automation_target(
         "no custom role named '{}'",
         target.role
     );
-    // An explicit empty/whitespace identifier counts as absent.
     let identifier = target
         .identifier
         .map(|id| id.trim().to_string())
@@ -335,7 +332,6 @@ async fn validate_automation_target(
     if let Some(id) = &identifier {
         crate::custom_role::validate_identifier(id)?;
     }
-    // Same for the workspace, resolved to the address actually stored.
     let workspace = match target
         .workspace
         .map(|w| w.trim().to_string())
@@ -375,8 +371,6 @@ pub(crate) fn owner_automation_session(agent_id: &str, user_name: &str) -> Strin
     }
 }
 
-/// Create a new automation for a session.
-///
 /// Exactly one of `fire_at` (one-shot) or `interval_seconds` (periodic) must be provided.
 /// One-shot fire times are normalized to RFC3339 UTC and must be in the future; periodic
 /// intervals must be at least 5 seconds. At most [`MAX_ACTIVE_AUTOMATIONS`] active automations
@@ -415,7 +409,6 @@ pub(crate) async fn add_automation(
         );
     }
 
-    // Normalize the one-shot fire time to RFC3339 UTC.
     let normalized_fire_at = fire_at
         .map(|f| {
             db::parse_utc_timestamp(f)
@@ -424,7 +417,6 @@ pub(crate) async fn add_automation(
         })
         .transpose()?;
 
-    // Exactly one of fire_at / interval_seconds; a one-shot must be in the future.
     let (kind, interval_secs, next_fire_at) = match (&normalized_fire_at, interval_seconds) {
         (Some(fire), None) => {
             anyhow::ensure!(
@@ -631,8 +623,6 @@ async fn due_automations(now: &str) -> Result<Vec<Automation>> {
         .collect::<Result<_, _>>()?)
 }
 
-/// Route a due automation into the Assistant's own session and settle it.
-///
 /// A role-addressed automation wakes that custom role instead; the Assistant wakes otherwise — a
 /// triggered automation takes its attempt slot and runs its custom tool (see
 /// [`fire_trigger_automation`]); a plain one delivers its text as the notice. The notice is a
@@ -1669,7 +1659,6 @@ mod tests {
             .expect("an active automation row")
     }
 
-    /// Whether the sweep would pick the automation up right now.
     async fn is_due(id: &str) -> bool {
         due_automations(&db::now())
             .await
@@ -1678,7 +1667,6 @@ mod tests {
             .any(|automation| automation.id == id)
     }
 
-    /// How far `timestamp` is from now, in seconds.
     fn seconds_from_now(timestamp: &str) -> i64 {
         db::parse_utc_timestamp(timestamp)
             .unwrap()

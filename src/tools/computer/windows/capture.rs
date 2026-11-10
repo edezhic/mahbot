@@ -220,7 +220,6 @@ fn screen_graphics(
     Ok(canvas)
 }
 
-/// A frame from the capture facility, or the reason there was none.
 fn grab(
     gpu: &Gpu,
     item: &GraphicsCaptureItem,

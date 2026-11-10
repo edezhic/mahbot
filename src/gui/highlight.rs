@@ -53,7 +53,6 @@ fn cached_query(lang: HighlightLanguage) -> Option<&'static Query> {
     .as_ref()
 }
 
-/// A color-coded span within a single line of code.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HighlightSpan {
     pub start: usize,
@@ -79,7 +78,6 @@ impl FileHighlights {
     }
 }
 
-/// Categories of highlighted tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HighlightClass {
     Keyword,
@@ -93,7 +91,6 @@ pub enum HighlightClass {
 }
 
 impl HighlightClass {
-    /// Map to a theme color.
     #[must_use]
     pub const fn color(self) -> Color {
         match self {
@@ -119,7 +116,6 @@ pub(crate) fn parse_highlights(content: &str, lang: HighlightLanguage) -> Option
     Some(parse_file_highlights(&mut parser, content, lang))
 }
 
-/// Parse an entire source file and return per-line highlight spans.
 #[must_use]
 pub(crate) fn parse_file_highlights(
     parser: &mut Parser,
@@ -156,7 +152,6 @@ fn parse_markdown_highlights(source: &str) -> FileHighlights {
     build_markdown_highlights_from_tree(&markdown_tree, source)
 }
 
-/// Build per-line highlight spans from an already-parsed [`MarkdownTree`].
 #[must_use]
 fn build_markdown_highlights_from_tree(
     markdown_tree: &MarkdownTree,
@@ -221,7 +216,6 @@ fn distribute_byte_spans(
     source: &str,
     byte_spans: &[(usize, usize, HighlightClass)],
 ) -> FileHighlights {
-    // Compute byte offsets of each line start (and the past-end sentinel).
     let mut line_starts: Vec<usize> = Vec::new();
     let mut pos = 0;
     line_starts.push(0);
@@ -322,7 +316,6 @@ const fn span_paint_priority(class: HighlightClass) -> u8 {
     }
 }
 
-/// Build per-line highlight spans from an already-parsed tree-sitter tree.
 #[must_use]
 fn build_highlights_from_tree(
     tree: &tree_sitter::Tree,
@@ -332,7 +325,6 @@ fn build_highlights_from_tree(
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query_obj, tree.root_node(), source.as_bytes());
 
-    // Collect all highlight spans as (byte_start, byte_end, class) tuples.
     let mut byte_spans: Vec<(usize, usize, HighlightClass)> = Vec::new();
     matches.advance();
     while let Some(m) = matches.get() {
@@ -363,15 +355,12 @@ fn capture_index_to_name(query: &Query, index: u32) -> &str {
 )]
 fn capture_class(capture_name: &str) -> HighlightClass {
     match capture_name {
-        // Keywords and keyword-like constructs
         "keyword" | "keyword.operator" | "constant" | "constant.builtin" | "boolean"
         | "conditional" | "storageclass" | "charset" | "import" | "keyframes" | "media"
         | "namespace" | "supports" | "label" => HighlightClass::Keyword,
-        // Types
         "type" | "type.builtin" | "type.qualifier" | "tag" | "tag.error" | "constructor" => {
             HighlightClass::Type
         }
-        // Functions, methods, properties, attributes
         "function"
         | "function.builtin"
         | "function.call"
@@ -382,7 +371,6 @@ fn capture_class(capture_name: &str) -> HighlightClass {
         | "attribute"
         | "property"
         | "field" => HighlightClass::Function,
-        // Strings (including escapes and special string variants)
         "string"
         | "string.special"
         | "string.special.key"
@@ -392,7 +380,6 @@ fn capture_class(capture_name: &str) -> HighlightClass {
         | "embedded" => HighlightClass::String,
         "comment" => HighlightClass::Comment,
         "number" | "float" => HighlightClass::Number,
-        // Operators, punctuation, and delimiters
         "operator"
         | "delimiter"
         | "punctuation.bracket"
@@ -402,7 +389,6 @@ fn capture_class(capture_name: &str) -> HighlightClass {
         "variable" | "variable.builtin" | "variable.parameter" | "parameter" | "spell" => {
             HighlightClass::Text
         }
-        // Markdown block captures
         // Headings — use Type for distinctive color
         "text.title" => HighlightClass::Type,
         // Code blocks / literal text — use String style
@@ -411,8 +397,6 @@ fn capture_class(capture_name: &str) -> HighlightClass {
         "text.uri" => HighlightClass::Function,
         // Link labels / references — plain text
         "text.reference" => HighlightClass::Text,
-        // Markdown inline captures
-        //
         // text.emphasis and text.strong only come from the inline query —
         // not the block query. The inline query is applied per-inline-tree
         // (paragraph, heading content, list item content, etc.).
@@ -426,9 +410,6 @@ fn capture_class(capture_name: &str) -> HighlightClass {
     }
 }
 
-// Language definitions
-
-/// Supported languages for syntax highlighting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, EnumCount, strum::VariantArray)]
 #[allow(clippy::upper_case_acronyms)]
 #[repr(usize)]
@@ -472,7 +453,6 @@ impl HighlightLanguage {
             .copied()
     }
 
-    /// Determine language from a file path.
     #[must_use]
     pub fn from_path(path: &str) -> Option<Self> {
         std::path::Path::new(path)
@@ -538,7 +518,6 @@ impl HighlightLanguage {
     }
 }
 
-// Highlight queries
 // These queries use tree-sitter's pattern syntax to capture tokens.
 // Each capture name maps to a HighlightClass via capture_class().
 
@@ -643,7 +622,6 @@ mod tests {
 
     #[test]
     fn test_all_queries_compile() {
-        // Test all standard HighlightLanguage variants via VARIANTS.
         for variant in HighlightLanguage::VARIANTS {
             let name = format!("{variant:?}");
             // Direct query compilation (doesn't go through the cache layer).

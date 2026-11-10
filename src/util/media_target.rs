@@ -101,7 +101,6 @@ pub(crate) enum MarkerTarget {
     NotAReference,
     /// An inline `data:` payload, or the placeholder left where one was stripped.
     Inline,
-    /// An http(s) address.
     Remote,
     /// A local path: an absolute target as written, a relative one joined to the workspace
     /// root that has it (the first root when none does).

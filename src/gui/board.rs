@@ -80,7 +80,6 @@ pub(crate) enum BoardMessage {
 
     CloseModal,
 
-    /// Dismiss modals/panels (Escape key).
     Escape,
 
     LinkClicked(String),
@@ -2031,7 +2030,6 @@ mod tests {
         comments: usize,
     }
 
-    /// A comment send needs a ticket, and a stale completion only drops the guard.
     #[test]
     fn test_comment_send_accepts_only_with_a_ticket_and_drops_stale_callbacks() {
         let cases = [
@@ -2260,7 +2258,6 @@ mod tests {
             "the first failure is gone"
         );
 
-        // Hash vanished (latent) → loading must not stay stuck.
         let mut state = make_board_state();
         state.selected_ticket.as_mut().unwrap().commit_hash = Some(HASH.into());
         state.commit_stats_loading = true;
@@ -2474,7 +2471,6 @@ mod tests {
         let ticket = make_ticket("T-1", TicketPhase::InDevelopment);
         state.apply_ticket_upsert(ticket.clone());
         assert_eq!(state.tickets.len(), 2);
-        // Idempotent upsert by id — no duplicate.
         state.apply_ticket_upsert(ticket);
         assert_eq!(state.tickets.len(), 2);
 
@@ -2597,7 +2593,6 @@ mod tests {
         },
     ];
 
-    /// Only a pipeline-occupied ticket asks before cancelling.
     #[test]
     fn cancel_confirmation_opens_only_for_a_pipeline_occupied_ticket() {
         for case in CANCEL_CONFIRM_CASES {

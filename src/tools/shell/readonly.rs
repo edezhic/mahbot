@@ -2984,12 +2984,10 @@ fn segment_with_word_replaced(words: &[&str], idx: usize, value: &str) -> String
     parts.join(" ")
 }
 
-/// The shared read-only rejection text.
 fn rejection_message(cmd: &str, why: &str, suggestion: &str) -> String {
     super::framed_refusal("⚠️ Read-only mode: ", cmd, why, suggestion)
 }
 
-/// Rejection template helper.
 fn reject<T>(cmd: &str, why: &str, suggestion: &str) -> Result<T, String> {
     Err(rejection_message(cmd, why, suggestion))
 }
@@ -3022,7 +3020,6 @@ struct MutatorCheck {
     suggestions: (Suggestion, Suggestion),
 }
 
-/// True when a scratch mutator writes outside temp.
 fn scratch_rejects(segment: &str, _verb: &str, state: &ValidationState) -> bool {
     !scratch_paths_under_temp(segment, state)
 }
@@ -3380,10 +3377,6 @@ fn echo_token_fold(body: &str, dashes: EchoDashes) -> Option<String> {
     Some(toks.join(" "))
 }
 
-/// Simple [`echo_token_fold`] with [`EchoDashes::Reject`]: fixed output of a
-/// substitution body that provably echoes plain tokens (`$(echo foo bar)`);
-/// `None` when unprovable (any other command, `-`-prefixed or quoted args,
-/// `$var`, nested spans, ...).
 fn simple_echo_output(body: &str) -> Option<String> {
     echo_token_fold(body, EchoDashes::Reject)
 }
@@ -4380,7 +4373,6 @@ fn check_git_subcommand_mutation(subcommand: &str, mutation_tokens: &[&str]) -> 
     Ok(())
 }
 
-/// True when `word` is a mutation token or the `token=value` form of one.
 fn matches_mutation_token(word: &str, tokens: &[&str]) -> bool {
     tokens.contains(&word)
         || tokens
@@ -4789,7 +4781,6 @@ fn check_git_segment(segment: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Return the value of a flag that takes a separate word as its argument.
 fn flag_value<'a>(parts: &'a [&'a str], flag: &str) -> Option<&'a str> {
     parts.windows(2).find_map(|w| {
         if w[0] == flag {
@@ -4805,7 +4796,6 @@ fn flag_value<'a>(parts: &'a [&'a str], flag: &str) -> Option<&'a str> {
     })
 }
 
-/// Return the value of a flag using `=` syntax (e.g., `--output=/tmp/file`, `of=/tmp/out`).
 fn flag_value_equals<'a>(parts: &'a [&'a str], prefix: &str) -> Option<&'a str> {
     parts.iter().find_map(|p| p.strip_prefix(prefix))
 }
@@ -5235,7 +5225,6 @@ mod tests {
             ("curl --output=out URL", false),
             ("curl --'output' out URL", false), // quoted long form
             ("curl --remote-name-all URL", false), // per-URL CWD writes
-            // tar
             ("tar -tf archive.tar.gz", true),
             ("tar -xzf archive.tar.gz", false),
             ("tar -czf archive.tar.gz dir/", false),
@@ -6309,7 +6298,6 @@ mod tests {
             // read-only — copying from anywhere into temp is allowed;
             // copying into the workspace stays blocked).
             ("cp /etc/passwd /tmp/out", true), // source outside temp, dest temp
-            // curl -o to temp → allowed
             ("curl -o /tmp/file URL", true),
             ("curl --output /tmp/file URL", true),
             ("curl -o /etc/passwd URL", false),
@@ -6317,7 +6305,6 @@ mod tests {
             ("curl -O URL", false),
             ("curl --remote-name URL", false),
             ("curl -o /tmp/file -O URL", false), // -O always blocks
-            // wget -O to temp → allowed
             ("wget -O /tmp/file URL", true),
             ("wget --output-document /tmp/file URL", true),
             ("wget -O /etc/passwd URL", false),
@@ -6373,7 +6360,6 @@ mod tests {
             // Quote-wrapped operands (normalized for the absolute check)
             ("sed -i 's/a/b/' '/tmp/file'", true),
             ("sed -i 's/a/b/' '/etc/passwd' /tmp/file", false), // mixed
-            // dd of= to temp → allowed
             ("dd if=/dev/zero of=/tmp/out bs=1024 count=1", true),
             ("dd of=/tmp/out", true),
             ("dd if=/dev/zero of=/etc/passwd bs=1024 count=1", false),
@@ -6385,7 +6371,6 @@ mod tests {
             ("base64 -d input.txt", true),
             ("base64 -o /tmp/out input.txt", true),
             // Multiple path arguments (security bypass).
-            // Multiple path args under temp → should be allowed
             ("tee /tmp/scratch.log /tmp/out.txt", true),
             ("touch /tmp/a.txt /tmp/b.txt", true),
             ("tee /tmp/scratch.log /etc/passwd", false),

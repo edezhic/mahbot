@@ -64,7 +64,6 @@ fn add_model_to_list(input: &mut SingleLineEditorState, list: &mut Option<String
     }
 }
 
-/// Shared body of the single-line editor arms: focus navigation out, else apply.
 fn apply_simple_editor_action(
     editor: &mut SingleLineEditorState,
     action: EditorAction,
@@ -227,7 +226,6 @@ fn telegram_escape(status: &telegram_local::Status) -> bool {
     status.target == Mode::Local && status.last_error.is_some()
 }
 
-/// Which model picker is being operated on.
 #[derive(Debug, Clone, Copy, Hash, Eq, PartialEq, EnumCount)]
 pub enum ModelPickerTarget {
     ImageGen,
@@ -243,7 +241,6 @@ impl ModelPickerTarget {
     }
 }
 
-/// Action performed on a model picker.
 #[derive(Debug, Clone)]
 pub enum ModelPickerAction {
     AddInput(EditorAction),
@@ -251,7 +248,6 @@ pub enum ModelPickerAction {
     RemoveModel(String),
 }
 
-/// The `ConfigData` model-list field a picker target edits.
 fn picker_list_field<'a>(
     t: &'a ModelPickerTarget,
     config: &'a mut ConfigData,
@@ -284,7 +280,6 @@ fn is_model_setting_field(field: &str) -> bool {
         )
 }
 
-/// Which password field the visibility toggle applies to.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum PasswordTarget {
     ProviderKey,
@@ -328,7 +323,6 @@ pub enum SettingsMessage {
     /// Toggle the custom chat-endpoint section: ON only reveals its fields (nothing is staged
     /// or persisted); OFF reverts to OpenRouter, settling the endpoint with `""` to clear both.
     CustomEndpointToggle(bool),
-    /// Per-model provider routing edits
     ModelRoutingOrder {
         model: String,
         action: EditorAction,
@@ -345,7 +339,6 @@ pub enum SettingsMessage {
         key: &'static str,
         action: EditorAction,
     },
-    /// Toggle password visibility for a specific field.
     TogglePasswordVisibility(PasswordTarget),
     /// The Autolaunch switch: apply the decision to the system's own registration.
     AutolaunchToggle(bool),
@@ -387,7 +380,6 @@ pub enum SettingsMessage {
     AddUserResult(Result<crate::users::AddUserOutcome, String>),
     CustomToolsMsg(custom_tools::CustomToolsMessage),
     CustomRolesMsg(custom_roles::CustomRolesMessage),
-    /// Escape key pressed (dismisses modal if open).
     Escape,
     OpenModelsPopup,
     /// Close the Models popup — not a cancel: text inside its settle window keeps saving.
@@ -409,7 +401,6 @@ pub enum SettingsMessage {
     /// (and the pipeline) back; `generation` drops results from a superseded toggle.
     TranscriptionToggleResult {
         generation: u64,
-        /// Whether this toggle cascaded Wake Word Detection off.
         cascade_wake_word: bool,
         result: Result<(), String>,
     },
@@ -508,7 +499,6 @@ pub struct SettingsState {
     field_editors: HashMap<String, SingleLineEditorState>,
     /// Never-panicking render fallback for [`Self::field_editor`]; every key is pre-populated.
     empty_field_editor: SingleLineEditorState,
-    /// Which password fields are currently visible.
     password_visible: HashSet<PasswordTarget>,
     /// Whether the user revealed the custom-endpoint section this session (UI-only). An active
     /// endpoint keeps it open without this flag; a failed save closes it, so the toggle never
@@ -886,7 +876,6 @@ impl SettingsState {
         }
     }
 
-    /// Bump the generation counter for a field and return the new value.
     fn bump_gen(&mut self, field: &str) -> u64 {
         let g = self.field_gen.entry(field.to_string()).or_insert(0);
         *g = g.wrapping_add(1);
@@ -3017,7 +3006,6 @@ impl SettingsState {
 
         rows_col = rows_col.push(Space::new().height(8));
 
-        // Action row: [Re-discover] [Save]
         rows_col = rows_col.push(
             row![
                 button(row![
@@ -3072,7 +3060,6 @@ impl SettingsState {
     }
     // Field ids are always `config:<key>`, derived from the `CONFIG_KEY_*` const.
 
-    /// A single inline-editable text config field row (with error placement).
     fn config_text_field<'a>(
         &'a self,
         label: &'static str,
@@ -3127,7 +3114,6 @@ impl SettingsState {
         col.into()
     }
 
-    /// A single maskable password config field row (with password highlighting).
     fn config_password_field<'a>(
         &'a self,
         label: &'static str,
@@ -3439,7 +3425,6 @@ impl SettingsState {
         )
     }
 
-    /// Wake Word Detection with its enrollment controls.
     #[expect(clippy::too_many_lines)]
     fn wake_word_rows(
         mut column: Column<'_, SettingsMessage>,
@@ -3971,7 +3956,6 @@ impl SettingsState {
     }
 }
 
-/// Section heading (secondary-colored monospace title above the content).
 fn section<'a>(
     title: &'static str,
     content: Column<'a, SettingsMessage>,
@@ -3979,7 +3963,6 @@ fn section<'a>(
     section_impl(title, None, content)
 }
 
-/// Section heading with an action button inline in the header row.
 fn section_with_header_action<'a>(
     title: &'static str,
     action: Element<'a, SettingsMessage>,
@@ -3988,8 +3971,6 @@ fn section_with_header_action<'a>(
     section_impl(title, Some(action), content)
 }
 
-/// Renders a section header (plain text, or text with a right-aligned action), a spacer
-/// and the content column.
 fn section_impl<'a>(
     title: &'static str,
     action: Option<Element<'a, SettingsMessage>>,
@@ -4016,7 +3997,6 @@ fn section_impl<'a>(
 /// Left pad aligning inline messages with a field row's input column (180px label + 8px).
 const FIELD_ROW_INLINE_PAD: f32 = 188.0;
 
-/// Label on the left, input on the right, optional hint inline after the input.
 fn field_row<'a>(
     label: &'static str,
     input: Element<'a, SettingsMessage>,
@@ -4037,7 +4017,6 @@ fn inline_label<'a>(
         .into()
 }
 
-/// Plain-text inline status cell at the default size: the audio-row status arms.
 fn status_label<'a>(msg: impl IntoFragment<'a>) -> Element<'a, SettingsMessage> {
     Text::new(msg).size(theme::TEXT_13).into()
 }
@@ -4053,7 +4032,6 @@ fn inline_warning(msg: &str, left_pad: f32) -> Element<'_, SettingsMessage> {
     inline_label(msg, left_pad, theme::STATUS_WARNING)
 }
 
-/// The gray "Disabled" inline status label shared by the audio rows.
 fn disabled_status() -> Element<'static, SettingsMessage> {
     text("Disabled")
         .size(theme::TEXT_13)
@@ -4070,7 +4048,6 @@ fn row_hint<'a>(
     widgets::tooltip_hint(container(row).width(Length::Fill), hint)
 }
 
-/// Toggle plus inline status side by side: the frame of the audio rows.
 fn toggle_status_row<'a>(
     toggler: impl Into<Element<'a, SettingsMessage>>,
     status: impl Into<Element<'a, SettingsMessage>>,
@@ -4084,7 +4061,6 @@ fn toggle_status_row<'a>(
     .into()
 }
 
-/// Inline "status label + Retry" row for a failed download / model load.
 fn retry_status_row(
     label: &'static str,
     on_retry: SettingsMessage,
@@ -4101,7 +4077,6 @@ fn retry_status_row(
     .into()
 }
 
-/// Accent "+" header button shared by the Workspaces and Users section headers.
 fn section_plus_button(
     tooltip_text: &'static str,
     on_press: SettingsMessage,
@@ -4118,7 +4093,6 @@ fn section_plus_button(
     )
 }
 
-/// The Cancel button closing each live-enrollment progress column.
 fn cancel_enrollment_button() -> Element<'static, SettingsMessage> {
     container(
         button(text("Cancel").size(theme::TEXT_13))
@@ -4129,7 +4103,6 @@ fn cancel_enrollment_button() -> Element<'static, SettingsMessage> {
     .into()
 }
 
-/// Status text framed by spacers above the Cancel button: the enrollment status columns.
 fn enrollment_status_column(status: String) -> Element<'static, SettingsMessage> {
     Column::new()
         .push(Space::new().height(8))
@@ -4169,7 +4142,6 @@ fn field_row_with_error<'a>(
     }
 }
 
-/// One api_id/api_hash dialog field: label/input row, hint, and the validator's message.
 fn credentials_dialog_field<'a>(
     label: &'static str,
     input: Element<'a, SettingsMessage>,
@@ -4278,12 +4250,10 @@ async fn save_credentials_and_switch_local(api_id: String, api_hash: String) -> 
         .map_err(|e| e.to_string())
 }
 
-/// The labels a dialog's submit button shows while its work is in flight.
 const BUSY_ADDING: &str = "Adding…";
 const BUSY_SAVING: &str = "Saving…";
 const BUSY_SWITCHING: &str = "Switching…";
 
-/// Configuration for a single text field in [`modal_dialog`].
 struct DialogField<'a> {
     label: &'static str,
     placeholder: &'static str,
@@ -4443,7 +4413,6 @@ mod tests {
         let mut state = SettingsState::new();
         setup(&mut state);
 
-        // Initial state
         assert_eq!(get_gen(&state), 0, "initial gen is 0");
         assert_eq!(
             get_enabled(&state.config).as_deref(),
@@ -4452,7 +4421,6 @@ mod tests {
         );
         assert!(state.error.is_none(), "no error initially");
 
-        // Toggle ON
         let _task = state.update(toggle_on(true));
         assert_eq!(get_gen(&state), 1, "gen incremented after toggle ON");
         assert_eq!(
@@ -4461,7 +4429,6 @@ mod tests {
             "enabled set to Some(\"true\") after toggle ON"
         );
 
-        // Stale result from previous generation must be ignored
         let _task = state.update(toggle_result(0, Err("stale result".into())));
         assert_eq!(
             get_enabled(&state.config).as_deref(),
@@ -4470,7 +4437,6 @@ mod tests {
         );
         assert_eq!(get_gen(&state), 1, "gen unchanged by stale result");
 
-        // Correct generation + DB error → rollback to disabled
         let _task = state.update(toggle_result(1, Err("db write failed".into())));
         assert!(
             get_enabled(&state.config).as_deref() != Some("true"),
@@ -4483,7 +4449,6 @@ mod tests {
         );
         assert_eq!(get_gen(&state), 1, "gen unchanged after rollback");
 
-        // Toggle ON again, succeed this time
         state.error = None; // clear previous error
         let _task = state.update(toggle_on(true));
         assert_eq!(get_gen(&state), 2, "gen incremented on second toggle");
@@ -4495,7 +4460,6 @@ mod tests {
         );
         assert!(state.error.is_none(), "no error after successful toggle");
 
-        // Stale result from old generation must also be ignored
         let _task = state.update(toggle_result(1, Err("stale from old gen".into())));
         assert_eq!(
             get_enabled(&state.config).as_deref(),
@@ -4504,7 +4468,6 @@ mod tests {
         );
         assert!(state.error.is_none(), "stale result must NOT set error");
 
-        // Toggle OFF with DB error → rollback back to enabled
         let _task = state.update(toggle_on(false));
         assert_eq!(get_gen(&state), 3, "gen incremented on toggle OFF");
         assert_eq!(
@@ -4621,7 +4584,6 @@ mod tests {
 
     // A dropped task never runs; no store is needed, so the state is the surface.
 
-    /// One per-field autosave case: the field, the steps on it, and what it must show.
     struct AutosaveCase {
         name: &'static str,
         key: &'static str,
@@ -4629,7 +4591,6 @@ mod tests {
         see: See,
     }
 
-    /// One step applied to the case's own field before it is inspected.
     enum Act {
         /// A value staged in the field: a keystroke, or an immediate control's pick.
         Typed(&'static str),
@@ -4647,7 +4608,6 @@ mod tests {
         Editor(EditorAction),
     }
 
-    /// What the case's field must show once its steps have run.
     enum See {
         /// Generation, staged value, in flight, pending value, surfaced error.
         Field(

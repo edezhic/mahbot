@@ -46,7 +46,6 @@ const GRAMMARS: &[Grammar] = &[
     ("markdown", || tree_sitter_md::LANGUAGE.into()),
 ];
 
-/// Every extension [`tree_sitter_language_for_extension`] recognizes, in declaration order.
 pub(crate) fn supported_extensions() -> impl Iterator<Item = &'static str> {
     GRAMMARS.iter().map(|(ext, _)| *ext)
 }

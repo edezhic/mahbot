@@ -35,7 +35,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
-/// Actions for navigating and extracting content from web pages.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ChromeAction {
@@ -308,7 +307,6 @@ pub struct ChromeTool {
     /// Session namespace prefix; empty for the shared non-agent instance, whose sessions are swept
     /// apart.
     session_prefix: String,
-    /// Chrome sessions this run's tooling used, handed to the run's release when the run ends.
     chrome_sessions: std::sync::Arc<ChromeRunSessions>,
 }
 
@@ -355,7 +353,6 @@ impl ChromeTool {
         )
     }
 
-    /// Acquire the per-tab lock; different tabs run fully concurrently.
     async fn acquire_tab_lock(&self, tab: &str) -> tokio::sync::OwnedMutexGuard<()> {
         let lock = {
             let mut locks = self.tab_locks.lock().unwrap_poison();
@@ -1569,7 +1566,6 @@ impl ChromeTool {
         output
     }
 
-    /// Normalize the raw arguments into the parsed action plus the tab and any normalization notes.
     fn normalize_call(args: &Value) -> anyhow::Result<(String, ChromeAction, Vec<String>)> {
         let mut normalized_notes: Vec<String> = Vec::new();
         let (tab, tab_note) = Self::normalize_tab(args);
@@ -2087,7 +2083,6 @@ const EXPECTED_ACTION_SHAPE: &str = "one of: {\"open\":{\"url\":\"https://...\"}
 const TAB_ARG: &str = "`tab` is optional — it names the page in this run's private session, and an \
                        empty or missing value means the default page";
 
-/// Corrective error for an unrecoverable shape, listing the exact expected form.
 fn corrective_action_error(received: &Value) -> String {
     format!(
         "Invalid chrome action arguments. Expected action to be {EXPECTED_ACTION_SHAPE}. {TAB_ARG}. \
@@ -2175,7 +2170,6 @@ fn require_find_action(name: &str, o: &serde_json::Map<String, Value>) -> Result
     Ok(())
 }
 
-/// Build a tagged action from a plain name plus sibling fields.
 fn build_action_from_siblings(name: &str, args: &Value) -> Result<(Value, Option<String>), String> {
     let Some(obj) = args.as_object() else {
         return Err(corrective_action_error(args));

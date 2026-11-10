@@ -82,9 +82,7 @@ struct ConvertedDocument {
     page_text: bool,
 }
 
-/// What one conversion attempt produced.
 enum Conversion {
-    /// A document the converter read.
     Reading(ConvertedDocument),
     /// A container it does not take (an Outlook `.msg`, say, or a file that
     /// changed between the sniff and the conversion): the ordinary read applies.
@@ -629,7 +627,6 @@ mod tests {
             .collect()
     }
 
-    /// The file names inside `folder`, sorted.
     fn folder_names(folder: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(folder)
             .expect("the reading's folder")
@@ -645,7 +642,6 @@ mod tests {
         names
     }
 
-    /// The names inside `folder` whose extension is `extension`, sorted.
     fn files_with_extension(folder: &Path, extension: &str) -> Vec<String> {
         folder_names(folder)
             .into_iter()
@@ -1063,7 +1059,6 @@ mod tests {
         fixture: Vec<u8>,
         /// Substrings the refusal must carry.
         message: &'static [&'static str],
-        /// The folder the reading would have written into.
         folder: &'static str,
     }
 

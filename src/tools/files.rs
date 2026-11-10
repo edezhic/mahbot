@@ -99,7 +99,6 @@ impl Tool for FilesTool {
     }
 }
 
-/// One resolved operand: its workspace-relative spelling and the absolute path it names.
 struct Item {
     relative: PathBuf,
     absolute: PathBuf,
@@ -258,7 +257,6 @@ fn bare_name(name: &str) -> Result<String> {
     }
 }
 
-/// The optional new name a `move` gives the item on arrival.
 fn optional_name(args: &serde_json::Value) -> Result<Option<String>> {
     let name = arg(args, "name");
     if name.is_empty() {
@@ -339,7 +337,6 @@ async fn move_item(root: &Path, source: &Item, args: &serde_json::Value) -> Resu
     ))
 }
 
-/// Rename one item in place.
 async fn rename_item(root: &Path, source: &Item, args: &serde_json::Value) -> Result<String> {
     refuse_source(source, "rename").await?;
     if first_area(&source.relative).is_some_and(is_swept) {

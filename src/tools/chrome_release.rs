@@ -61,7 +61,6 @@ const EVICTED_RUN_TTL: Duration = Duration::from_hours(1);
 /// ([`crate::chrome::SESSION_STOP_TIMEOUT`]), so a slow pass is cut off and left for the next boot.
 const SHUTDOWN_RELEASE_FLUSH_BUDGET: Duration = Duration::from_secs(10);
 
-/// One ended run's unreleased session names.
 #[derive(Clone)]
 struct PendingRunRelease {
     /// The identity records are merged by: a live run of the same agent id shares it.
@@ -70,7 +69,6 @@ struct PendingRunRelease {
     attempts: u32,
     next_attempt_at: Instant,
     held: bool,
-    /// The agent id the run ended under, so a report can name it.
     run: String,
     /// Passes the browser answered for and left standing, concluded at [`MAX_LEFT_OPEN_ATTEMPTS`].
     left_open: u32,
@@ -121,7 +119,6 @@ static RECLAIM: OnceLock<Mutex<ReclaimSchedule>> = OnceLock::new();
 static STUCK_NAMESPACES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 /// Sessions a pass closed but had no budget to let go of, with their failed attempts.
 static PENDING_FORGET: OnceLock<Mutex<Vec<(String, u32)>>> = OnceLock::new();
-/// The runs whose records the cap evicted, so a report of their tabs can still name them.
 static EVICTED_RUNS: OnceLock<Mutex<VecDeque<EvictedRun>>> = OnceLock::new();
 
 fn pending_releases() -> &'static Mutex<VecDeque<PendingRunRelease>> {
@@ -175,7 +172,6 @@ pub(crate) fn unregister_run_namespace(namespace: &str) {
     release_wake().notify_one();
 }
 
-/// Whether some live run owns `namespace` right now.
 fn run_namespace_is_live(namespace: &str) -> bool {
     !namespace.is_empty()
         && live_run_namespaces()
@@ -195,7 +191,6 @@ enum Eligibility {
 }
 
 impl Eligibility {
-    /// The pair a merge keeps.
     fn keep(self, queued: (Instant, bool), incoming: (Instant, bool)) -> (Instant, bool) {
         match self {
             Self::RunEnd => incoming,
@@ -477,7 +472,6 @@ fn persist_pending_releases() {
     }
 }
 
-/// Whole epoch seconds — the unit the record file stores deadlines in.
 fn epoch_secs() -> u64 {
     crate::util::unix_millis() / 1000
 }
@@ -583,7 +577,6 @@ fn take_releasable() -> Vec<PendingRunRelease> {
     taken
 }
 
-/// What one record's browser answers left.
 struct RecordDisposition {
     /// Names the browser did not settle (`Retry`) or the pass never asked about (no binary to ask):
     /// the record stays queued for exactly these.
@@ -1468,7 +1461,6 @@ struct ReclaimAsk {
 }
 
 impl ReclaimAsk {
-    /// An ask that was never put to the browser.
     fn unanswered() -> Self {
         Self {
             names: Vec::new(),
@@ -1698,7 +1690,6 @@ impl ProtectedNamespaces {
             .any(|record| within_hold(record, now) && names_a_namespace(&record.namespace, name))
     }
 
-    /// Add the live map and the held records as they are now to this set.
     fn refresh(&mut self) {
         self.namespaces.extend(Self::live_and_held().namespaces);
     }
@@ -1717,7 +1708,6 @@ fn names_a_namespace(prefix: &str, name: &str) -> bool {
     !prefix.is_empty() && name.starts_with(prefix)
 }
 
-/// The `target` every row of the chrome-tabs issue family carries.
 pub(crate) const ISSUE_TARGET: &str = "chrome-tabs";
 /// The one durable message every leftover report carries; stable, because the Issues view dedupes.
 const LEFTOVER_MESSAGE: &str = "agent-run browser tabs could not be closed automatically";
@@ -1750,7 +1740,6 @@ const UNCLOSABLE_DETAIL: &str = "the product could not close these tabs and keep
                                  the browser answered this run's close attempts and left the \
                                  tabs standing — the removal refused as not its own to make, or \
                                  answered while they still stood";
-/// The one detail a left-open report carries: the browser's answer that left the tabs standing.
 const LEFT_OPEN_DETAIL: &str = "the browser extension answered this run's close and the tabs \
                                 were left standing: it refused the removal as not its own to \
                                 make, or answered it while the tabs still stood";
@@ -1783,7 +1772,6 @@ enum IssueKind {
 }
 
 impl IssueKind {
-    /// The message the Issues view shows for this kind.
     fn message(self) -> &'static str {
         match self {
             Self::Unclosable => LEFTOVER_MESSAGE,
@@ -1915,10 +1903,8 @@ const ATTEMPT_TIMEOUT: Duration = crate::tools::chrome_tabs::READ_PHASE_RESERVE
 /// restore never probes for it.
 #[derive(Clone, Debug)]
 struct ReleaseSettings {
-    /// One pass's whole budget ([`ATTEMPT_TIMEOUT`]).
     attempt_timeout: Duration,
     retry_base: Duration,
-    /// Floor on a restored record's eligibility ([`RELEASE_BOOT_GRACE`]).
     boot_grace: Duration,
     /// The durable record file (`None` = nothing to write it to; see [`RELEASE_FILE_NAME`]).
     store: Option<PathBuf>,
@@ -1988,7 +1974,6 @@ fn release_backoff(attempts: u32) -> Duration {
         .min(RELEASE_RETRY_CAP)
 }
 
-/// Test-only: one entry per queued record — names, attempt count, and how long it must still wait.
 #[cfg(test)]
 fn pending_releases_snapshot() -> Vec<(Vec<String>, u32, Duration)> {
     let now = Instant::now();
@@ -2015,7 +2000,6 @@ pub(crate) fn pending_names_and_attempts() -> Vec<(Vec<String>, u32)> {
         .collect()
 }
 
-/// Test-only: how long each queued record must still wait.
 #[cfg(test)]
 pub(crate) fn pending_release_delays() -> Vec<Duration> {
     pending_releases_snapshot()
@@ -2079,7 +2063,6 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    // Ended-run session releases
     /// Re-arm the attempt bound of the settings a [`ReleaseGuard`] installed, so a later pass does
     /// not race a cold stub spawn.
     fn widen_attempt_bound(attempt_timeout: Duration) {
@@ -2096,7 +2079,6 @@ mod tests {
         swap_release_settings(settings);
     }
 
-    /// The names the record file describes, sorted.
     fn record_file_names(path: &Path) -> Vec<String> {
         let json = fs::read_to_string(path).expect("record file");
         let mut names: Vec<String> = serde_json::from_str::<Vec<PersistedRunRelease>>(&json)
@@ -2499,7 +2481,6 @@ exit 0
         .expect("write release record file");
     }
 
-    /// Only the browser's own answers settle a queued record.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn the_browsers_own_answers_settle_each_release_record() {
@@ -2841,7 +2822,6 @@ exit 0
         }
     }
 
-    /// Every leftover the release path cannot settle is told to the Issues view once.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn every_leftover_is_reported_to_the_issues_view_once() {
@@ -3352,7 +3332,6 @@ exit 0
         }
     }
 
-    /// The let-go queue retires the session a pass's reads ran in.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn the_let_go_queue_retires_each_scratch_session() {
@@ -3920,7 +3899,6 @@ exit 0
         }
     }
 
-    /// Each sweep that could not settle its leftovers climbs one rung of the retry ladder.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn silent_sweeps_climb_one_rung_per_pass() {
@@ -4094,7 +4072,6 @@ exit 0
         );
     }
 
-    /// The per-agent tab cap evicts only a record nothing holds.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn the_cap_evicts_only_an_unheld_record() {
@@ -4291,7 +4268,6 @@ exit 0
         }
     }
 
-    /// An attempt that never reached the browser counts as one failure and keeps the record queued.
     #[tokio::test]
     #[serial_test::serial(chrome_release)]
     async fn an_attempt_that_could_not_reach_the_browser_keeps_the_record_queued() {

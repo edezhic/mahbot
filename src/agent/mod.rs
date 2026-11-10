@@ -719,7 +719,6 @@ impl Agent {
     /// message. An empty unpersisted tail is logged: INFO after a drain cut (lossless),
     /// DEBUG after the `sleep` tool, INFO otherwise (genuine anomaly).
     pub async fn finalize_session(&mut self) -> anyhow::Result<()> {
-        // The batch leaves on the telemetry queue ([`crate::telemetry`]).
         let stats = {
             let mut guard = self.tool_stats.lock().unwrap_poison();
             std::mem::take(&mut *guard)
@@ -797,7 +796,6 @@ impl Agent {
         self.cancel_token.is_cancelled()
     }
 
-    /// Whether a workspace-pause (strict freeze) stop was requested.
     #[must_use]
     fn is_cancelled_by_pause(&self) -> bool {
         self.pause_stop.load(std::sync::atomic::Ordering::SeqCst)
@@ -872,7 +870,6 @@ impl Agent {
         self.run_turn(messages, resume).instrument(span).await
     }
 
-    /// [`Self::work`]'s body, inside the turn's span.
     async fn run_turn(&mut self, messages: &[&str], resume: bool) -> anyhow::Result<String> {
         // Whether the turn's message lands decides whether it may advance a personal
         // folder's change baseline; cleared first, so no early return carries the old one.
@@ -1049,7 +1046,6 @@ impl Agent {
             let mut terminalize: Vec<String> = Vec::new();
             // Fresh images of the resumed round, injected as ONE message after the loop.
             let mut fresh_images: Vec<ImagePayload> = Vec::new();
-            // Shared dedup key for fresh-image injection, lazily computed.
             let mut seen_data_uris: Option<std::collections::HashSet<String>> = None;
 
             for call in calls {
@@ -1135,7 +1131,6 @@ impl Agent {
                         .0
                         .output
                 } else {
-                    // Re-execute under the tool task-local context.
                     let outcome = self
                         .in_tool_context(async {
                             self.execute_tool(&call.name, call.arguments.clone()).await
@@ -1146,7 +1141,6 @@ impl Agent {
                         Self::log_drain_cut(&call.name);
                         return Ok(false);
                     }
-                    // Format through the tool and collect fresh image payloads.
                     let (formatted, fresh_payloads) = tool_result_content(
                         &self.tools,
                         &call.name,
@@ -1346,7 +1340,6 @@ impl Agent {
                 .map(|outcome| outcome.unwrap_or_else(interrupted_outcome))
                 .collect();
 
-            // Track media outcomes for the marker fallback.
             accumulated_media_paths.extend(extract_media_from_outcomes(
                 &self.tools,
                 &tool_calls,
@@ -1418,7 +1411,6 @@ impl Agent {
         self.in_tool_context(async {
             while i < tool_calls.len() {
                 if side_flags[i] {
-                    // Side-effecting: a single-call group.
                     let outcome = self
                         .race_interrupt(
                             self.execute_tool(&tool_calls[i].name, tool_calls[i].arguments.clone()),
@@ -1427,7 +1419,6 @@ impl Agent {
                     outcomes.push(outcome);
                     i += 1;
                 } else {
-                    // Read-only group: extend while the next call is read-only too.
                     let group_start = i;
                     while i < tool_calls.len() && !side_flags[i] {
                         i += 1;
@@ -1744,7 +1735,6 @@ impl Agent {
             }
         };
 
-        // One stats record per invocation: arguments, duration, outcome, error.
         let elapsed_ms = start.elapsed().as_millis();
         let duration_ms = i64::try_from(elapsed_ms).unwrap_or(0);
         self.push_tool_call_record(
@@ -1957,7 +1947,6 @@ impl Agent {
                     tail.push(ChatMessage::user(nudge.clone()));
                     tail_grew = true;
                 }
-                // Real answer or tool calls — the turn resolves normally.
                 Ok(resp) => {
                     crate::stats::record_llm_success(&request, operation_started, attempt, &resp);
                     return Ok(resp);
@@ -2060,7 +2049,6 @@ impl Agent {
     ) -> anyhow::Result<()> {
         let tools = &self.tools;
 
-        // Dedup key for attached images, lazily computed.
         let mut seen_data_uris: Option<std::collections::HashSet<String>> = None;
 
         // Image messages go AFTER the tool-result block, preserving OpenAI-compatible
@@ -2086,7 +2074,6 @@ impl Agent {
             db_messages.push(ChatMessage::tool_result(&call.id, &output));
         }
 
-        // Inject the round's fresh images as ONE tagged synthetic user message.
         if let Some(message) =
             injected_images_message(&self.agent_id, self.role, fresh_image_payloads)
         {
@@ -2098,7 +2085,6 @@ impl Agent {
             return Ok(());
         }
 
-        // Batch-persist (after any unpersisted tail) and push into memory.
         self.session
             .persist_messages(&self.agent_id, &db_messages)
             .await
@@ -2432,7 +2418,6 @@ struct ReasoningOnlyStopRecovery {
     exhausted_ctx: &'static str,
 }
 
-/// Result of preparing an assistant turn from the LLM response.
 struct PreparedAssistantTurn {
     display_text: String,
     tool_calls: Vec<ToolCall>,
@@ -2578,7 +2563,6 @@ where
     let followers: Vec<F> = members.collect();
     let round_ts = crate::session::render_timestamp();
     if resume || followers.is_empty() {
-        // Resumed or single-member: no stagger, spawn everything immediately.
         let opts = RoundOpts {
             round_ts,
             first_call_notify: None,
@@ -4156,7 +4140,6 @@ mod tests {
             })
         };
 
-        // Empty/absent content, no tools → in class for ANY finish reason.
         for finish in [None, Some("stop"), Some("length"), Some("tool_calls")] {
             let resp = crate::ChatResponse {
                 text: None,
@@ -4166,23 +4149,19 @@ mod tests {
             };
             assert!(is_reasoning_only_stop(&resp), "finish_reason={finish:?}");
         }
-        // Explicit empty-string content → in class.
         let resp = crate::ChatResponse {
             text: Some(String::new()),
             reasoning: reasoning(),
             ..crate::ChatResponse::default()
         };
         assert!(is_reasoning_only_stop(&resp));
-        // Whitespace-only content → in class.
         let resp = crate::ChatResponse {
             text: Some("   \n ".into()),
             ..crate::ChatResponse::default()
         };
         assert!(is_reasoning_only_stop(&resp));
-        // Fully-empty response (no reasoning attached) → in class.
         let resp = crate::ChatResponse::default();
         assert!(is_reasoning_only_stop(&resp));
-        // Tool calls with empty text → NOT in class (valid tool-call turn).
         let resp = crate::ChatResponse {
             text: None,
             tool_calls: vec![crate::ToolCall {
@@ -4193,7 +4172,6 @@ mod tests {
             ..crate::ChatResponse::default()
         };
         assert!(!is_reasoning_only_stop(&resp));
-        // Real visible text (even with reasoning present) → NOT in class.
         let resp = crate::ChatResponse {
             text: Some("real answer".into()),
             reasoning: reasoning(),
@@ -4597,13 +4575,11 @@ mod tests {
         let mut agent = make_agent(vec![]);
         agent.session.set_token_length(Some(7_000));
 
-        // No usage data at all → keep the last known value.
         agent
             .record_session_usage(&crate::ChatResponse::default())
             .await;
         assert_eq!(agent.session.token_length(), Some(7_000));
 
-        // Only one side present → keep the last known value.
         let partial_input = crate::ChatResponse {
             usage: Some(crate::ProviderUsage {
                 input_tokens: Some(1_000),
@@ -4624,8 +4600,6 @@ mod tests {
         agent.record_session_usage(&partial_output).await;
         assert_eq!(agent.session.token_length(), Some(7_000));
 
-        // Both present → input + output; a later usage-less response never
-        // resets the value to zero.
         let full = crate::ChatResponse {
             usage: Some(crate::ProviderUsage {
                 input_tokens: Some(12_000),
@@ -4654,11 +4628,9 @@ mod tests {
         crate::util::test::init_test_stores().await;
         let mut agent = make_agent(vec![]);
 
-        // None (new / pre-migration session): early exit, nothing fires.
         agent.maybe_summarize(agent.session.history().len()).await;
         assert_eq!(agent.session.token_length(), None);
 
-        // A real value below the fixed threshold is equally a no-op.
         agent
             .session
             .set_token_length(Some(crate::session::SUMMARIZATION_THRESHOLD / 2));
@@ -4911,7 +4883,6 @@ mod tests {
             "phrase embeds the provider reason"
         );
 
-        // Durable rewrite: the session DB no longer holds the rejected image.
         let history = crate::session::store().load(agent_id).await;
         let last_user = history
             .iter()
@@ -4961,7 +4932,6 @@ mod tests {
             "text-content rejection must fail the run normally"
         );
 
-        // No strip: the image marker survives in the session.
         let history = crate::session::store().load(agent_id).await;
         let last_user = history
             .iter()
@@ -5017,7 +4987,6 @@ mod tests {
             "retried user message is already stripped"
         );
 
-        // The message was stripped exactly once (phrase present, no marker).
         let history = crate::session::store().load(agent_id).await;
         let last_user = history
             .iter()

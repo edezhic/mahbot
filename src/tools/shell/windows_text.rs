@@ -191,7 +191,6 @@ mod tests {
                 fallback: bytewise,
                 expected: "ok: héllo\nnot utf-8: \u{80}\u{81}\nok: done\n",
             },
-            // The same input with the other reading on the line that is not UTF-8.
             DecodeCase {
                 name: "only the unreadable line takes the fallback's reading",
                 input: mixed,

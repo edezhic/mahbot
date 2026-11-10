@@ -27,7 +27,6 @@ use crate::{Tool, Workspace};
 /// The actions the schema declares and the dispatch serves.
 const ALL: [&str; 4] = ["instructions", "reference", "render", "inspect"];
 
-/// The topics `reference` returns a document for.
 const TOPICS: [&str; 3] = ["authoring", "rendering", "troubleshooting"];
 
 /// The resolutions the vendor captures at, each at a raised device pixel ratio.
@@ -160,7 +159,6 @@ impl Tool for HyperframesTool {
 }
 
 impl HyperframesTool {
-    /// The tool's answer for one action: a document, a check, or a render with its timeline.
     async fn answer(
         &self,
         ws: &Workspace,

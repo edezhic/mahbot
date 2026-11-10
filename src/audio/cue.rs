@@ -19,7 +19,6 @@ const START_WAV: &[u8] = include_bytes!("start.wav");
 /// over, but the microphone is still open.
 const END_WAV: &[u8] = include_bytes!("end.wav");
 
-/// Which cue to play.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cue {
     /// A wake-word recording just started.

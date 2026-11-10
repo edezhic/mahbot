@@ -14,7 +14,6 @@ const HTML_ENTITIES: &[(char, &str)] = &[
     ('"', "&quot;"),
 ];
 
-/// Escape `&`, `<`, `>`, `"` and `'` as their entities.
 #[must_use]
 pub fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());

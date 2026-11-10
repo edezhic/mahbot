@@ -39,19 +39,15 @@ use super::theme;
 /// ([`super::highlight::HighlightClass::Type`]).
 const HUNK_HEADER_COLOR: Color = super::highlight::HighlightClass::Type.color();
 
-/// Added line foreground color.
 const ADDED_COLOR: Color = theme::STATUS_SUCCESS;
 
-/// Removed line foreground color.
 const REMOVED_COLOR: Color = theme::STATUS_ERROR;
 
-/// Context line foreground color.
 const CONTEXT_COLOR: Color = theme::TEXT_SECONDARY;
 
 /// Approximate pixel width of one monospace digit at [`GUTTER_FONT_SIZE`].
 const GUTTER_DIGIT_WIDTH: f32 = GUTTER_FONT_SIZE * 0.62;
 
-/// Selection highlight fill color.
 const SELECTION_COLOR: Color = theme::ACCENT_DIM;
 
 /// Pre-built data for rendering one diff file via [`DiffBufferWidget`]: all string formatting and
@@ -88,7 +84,6 @@ struct ShapeCacheKey {
 }
 
 impl ShapeCacheKey {
-    /// Build the key for a buffer's data shaped at the given text-area width.
     fn new(data: &DiffFileBuffer, text_area_width: f32) -> Self {
         Self {
             content_fingerprint: data.content_fingerprint,
@@ -108,8 +103,6 @@ struct ShapeCacheEntry {
     total_height: f32,
 }
 
-// Widget state
-
 /// Persistent state stored in `widget::Tree::State`.
 #[derive(Default)]
 struct DiffBufferState {
@@ -121,13 +114,9 @@ struct DiffBufferState {
     gutter_width: f32,
     /// Selection anchor byte offset in buffer text (`None` = no selection).
     sel_anchor: Option<usize>,
-    /// Selection cursor/end byte offset in buffer text.
     sel_cursor: Option<usize>,
-    /// Whether the left mouse button is held for drag-selection.
     mouse_held: bool,
 }
-
-// Widget
 
 /// A custom Iced widget that renders a single diff file's content via
 /// [`cosmic_text::Buffer`], with gutter line numbers and per-line background
@@ -142,7 +131,6 @@ pub struct DiffBufferWidget<'a> {
 }
 
 impl<'a> DiffBufferWidget<'a> {
-    /// Create a new [`DiffBufferWidget`] from pre-computed buffer data.
     #[must_use]
     pub const fn new(data: &'a DiffFileBuffer) -> Self {
         Self {
@@ -153,7 +141,6 @@ impl<'a> DiffBufferWidget<'a> {
     }
 }
 
-/// Compute the number of digits needed for the widest old/new line number.
 #[must_use]
 fn compute_gutter_digits(line_numbers: &[(Option<usize>, Option<usize>)]) -> usize {
     line_numbers
@@ -165,7 +152,6 @@ fn compute_gutter_digits(line_numbers: &[(Option<usize>, Option<usize>)]) -> usi
         .unwrap_or(1)
 }
 
-/// Pixel width for a dual-column old/new line-number gutter.
 #[must_use]
 #[expect(clippy::cast_precision_loss)]
 const fn gutter_width_from_digits(digits: usize) -> f32 {
@@ -243,7 +229,6 @@ fn compute_content_fingerprint(
     hasher.finish()
 }
 
-/// Convert a shaped-buffer hit to a global byte offset in the source text.
 fn hit_to_global_byte(buffer: &cosmic_text::Buffer, line: usize, index: usize) -> usize {
     let mut global = 0usize;
     for i in 0..line {
@@ -254,7 +239,6 @@ fn hit_to_global_byte(buffer: &cosmic_text::Buffer, line: usize, index: usize) -
     global + index
 }
 
-/// Convert a global byte offset back to a cosmic_text cursor.
 fn global_byte_to_cursor(buffer: &cosmic_text::Buffer, global: usize) -> cosmic_text::Cursor {
     let mut pos = 0usize;
     for (i, line) in buffer.lines.iter().enumerate() {
@@ -306,7 +290,6 @@ fn selection_text(text: &str, anchor: usize, cursor: usize) -> Option<String> {
     Some(text[start..end].to_string())
 }
 
-/// Whether a non-empty selection is active.
 fn has_selection(anchor: Option<usize>, cursor: Option<usize>) -> bool {
     match (anchor, cursor) {
         (Some(a), Some(c)) => a != c,
@@ -543,7 +526,6 @@ where
             let (old_right_x, new_right_x) =
                 gutter_column_right_edges(bounds.x, self.h_padding, gutter_width);
 
-            // Draw old line number (right-aligned in left half)
             let old_str = old_num.map_or_else(String::new, |n| n.to_string());
             if !old_str.is_empty() {
                 let num_text = text::Text {
@@ -565,7 +547,6 @@ where
                 );
             }
 
-            // Draw new line number (right-aligned in right half)
             let new_str = new_num.map_or_else(String::new, |n| n.to_string());
             if !new_str.is_empty() {
                 let num_text = text::Text {
@@ -767,7 +748,6 @@ pub fn build_file_buffers(
     buffers
 }
 
-/// Build the [`DiffFileBuffer`] for a single file.
 fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
     let mut text = String::new();
     // Pre-allocate: rough estimate of 80 bytes per line
@@ -783,7 +763,6 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
     let mut line_numbers: Vec<(Option<usize>, Option<usize>)> = Vec::new();
 
     for hunk in &file.hunks {
-        // Hunk header line
         {
             let start = text.len();
             text.push_str(&hunk.header);
@@ -825,7 +804,6 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
                 }
             };
 
-            // Build spans for this line
             let line_hl_spans = hl_line_number
                 .and_then(|n| highlights.and_then(|h| h.spans.get(n.saturating_sub(1))));
 
@@ -840,7 +818,6 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
                         let abs_start = content_start + s.start.min(content_len);
                         let abs_end = content_start + s.end.min(content_len);
                         if abs_start > cursor {
-                            // Gap before this span — fill with fg color
                             span_data.push((cursor, abs_start, fg_color));
                         }
                         if abs_end > abs_start {
@@ -848,15 +825,12 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
                             cursor = abs_end;
                         }
                     }
-                    // Remaining content after last highlight
                     if cursor < end {
                         span_data.push((cursor, end, fg_color));
                     }
-                    // Also cover the prefix portion
                     span_data.push((line_start, content_start, fg_color));
                 }
                 _ => {
-                    // No highlights — entire line in fg color
                     span_data.push((line_start, end, fg_color));
                 }
             }
@@ -883,8 +857,6 @@ fn build_single_file_buffer(file: &super::diff::DiffFile) -> DiffFileBuffer {
         content_fingerprint,
     }
 }
-
-// Tests
 
 #[cfg(test)]
 mod tests {

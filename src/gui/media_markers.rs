@@ -802,7 +802,6 @@ mod tests {
     use iced::widget::markdown;
     use std::io::Cursor;
 
-    /// A picture attachment, drawn from `image`.
     fn picture(image: Option<&str>, label: &str) -> MediaAttachment {
         MediaAttachment {
             image: image.map(str::to_string),
@@ -825,22 +824,18 @@ mod tests {
         picture(Some(path), &format!("🖼️ {}", file_name_or_path(path)))
     }
 
-    /// The audio row for a path.
     fn snd(path: &str) -> MediaAttachment {
         named(&format!("🎵 {}", file_name_or_path(path)), None)
     }
 
-    /// The video clip row for a path.
     fn clip(path: &str) -> MediaAttachment {
         named(&format!("🎬 Video: {}", file_name_or_path(path)), None)
     }
 
-    /// The document row for a path, revealed at `reveal`.
     fn doc(path: &str, reveal: &str) -> MediaAttachment {
         named(&format!("📄 {}", file_name_or_path(path)), Some(reveal))
     }
 
-    /// All paragraph text a parsed body carries, flattened.
     fn paragraph_text(items: &[markdown::Item]) -> String {
         let style = crate::gui::theme::markdown_settings().style;
         items

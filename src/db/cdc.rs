@@ -40,7 +40,6 @@ use turso::core::types::{ImmutableRecordRef, ValueRef};
 use crate::db::{Connection, Row, params};
 use crate::util::UnwrapPoison;
 
-/// Capacity of each per-table change-event broadcast channel.
 const CHANNEL_CAPACITY: usize = 1024;
 
 /// Maximum `turso_cdc` rows processed per drain batch (bounds the per-cycle read for a large
@@ -51,14 +50,12 @@ const DRAIN_BATCH: i64 = 1000;
 /// whatever the idle/busy state, and an empty poll costs one cheap cached-prepare read.
 const DRAIN_POLL: Duration = Duration::from_millis(100);
 
-/// The engine-managed CDC table name (created when capture is enabled).
 pub(crate) const CDC_TABLE: &str = "turso_cdc";
 
 /// Tables that must never be broadcast (self-feed prevention): writes to these on the CDC-enabled
 /// connection would otherwise re-enter the drainer.
 const EXCLUDED_TABLES: &[&str] = &[CDC_TABLE, "turso_cdc_version", "ticket_chronicle"];
 
-/// Which mutation produced a CDC change row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChangeType {
     Insert,
@@ -66,14 +63,12 @@ pub enum ChangeType {
     Delete,
 }
 
-/// The resolved business key of a changed row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pk {
     Text(String),
     Integer(i64),
 }
 
-/// A decoded record value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum CdcValue {
     Null,
@@ -101,7 +96,6 @@ impl CdcValue {
     }
 }
 
-/// A decoded full row (`before`/`after`), addressed by column name.
 #[derive(Debug, Clone)]
 pub struct RowRecord {
     columns: Vec<String>,
@@ -155,7 +149,6 @@ pub struct ChangeEvent {
 }
 
 impl ChangeEvent {
-    /// The tickets-table business key as a string id, when applicable.
     #[must_use]
     pub fn ticket_id(&self) -> Option<&str> {
         if self.table == "tickets" {
@@ -204,7 +197,6 @@ impl TableInfo {
     }
 }
 
-/// Cache of per-table [`TableInfo`], keyed by table name.
 static TABLE_INFO: OnceLock<Mutex<HashMap<String, TableInfo>>> = OnceLock::new();
 
 /// Registry of generic per-table broadcast senders. The drainer derives `subscribed_tables` from
@@ -220,7 +212,6 @@ static TABLES: OnceLock<Mutex<HashMap<String, tokio::sync::broadcast::Sender<Cha
 /// on first access.
 static TICKET_SENDER: OnceLock<tokio::sync::broadcast::Sender<ChangeEvent>> = OnceLock::new();
 
-/// The shared tickets-table broadcast sender.
 #[must_use]
 pub(crate) fn ticket_sender() -> &'static tokio::sync::broadcast::Sender<ChangeEvent> {
     TICKET_SENDER.get_or_init(|| {
@@ -488,7 +479,6 @@ pub(crate) async fn drain_once(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Decode a single CDC row into a [`ChangeEvent`].
 async fn decode_row(
     conn: &Connection,
     infos: &mut HashMap<String, TableInfo>,
@@ -525,7 +515,6 @@ async fn decode_row(
     })
 }
 
-/// Publish an event to its table's subscriber channel(s).
 fn broadcast_event(event: &ChangeEvent) {
     if event.table == "tickets" {
         // Best-effort: a lagging receiver gets `Lagged` → the GUI forces a full refresh rather than
@@ -602,7 +591,6 @@ async fn cached_table_info(conn: &Connection, table: &str) -> anyhow::Result<Tab
     Ok(info)
 }
 
-/// Convert a Turso record value to our owned [`CdcValue`] via the public `ValueRef` accessors.
 fn value_ref_to_cdc(v: &ValueRef<'_>) -> CdcValue {
     if matches!(v, ValueRef::Null) {
         return CdcValue::Null;

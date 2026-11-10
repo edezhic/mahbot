@@ -39,8 +39,6 @@ const CONNECTION_TIMEOUT_MS: u32 = 3_000;
 /// Client-side bound on one transaction, which can span several provider calls.
 const TRANSACTION_TIMEOUT_MS: u32 = 10_000;
 
-// Calls and replies
-
 /// One unit of work for the apartment thread. Plain data only: no COM handle crosses the boundary.
 pub(super) enum Call {
     ListApps,
@@ -164,7 +162,6 @@ fn reply_mismatch() -> anyhow::Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum JobState {
-    /// Waiting in the channel.
     Queued = 0,
     /// Taken by the thread, which is running it now and may still complete.
     Running = 1,
@@ -173,7 +170,6 @@ enum JobState {
 }
 
 impl JobState {
-    /// Move `state` from `from` to `to`, answering whether this side won.
     fn settle(state: &AtomicU8, from: Self, to: Self) -> bool {
         state
             .compare_exchange(from as u8, to as u8, Ordering::SeqCst, Ordering::SeqCst)
@@ -194,8 +190,6 @@ struct Job {
 
 /// Where an actuating call placed its point, written by the thread as the call maps it.
 pub(super) type PlacementMemo = Mutex<Option<core::Placement>>;
-
-// The thread
 
 /// The live apartment thread. `alive` is cleared by a caller whose deadline expired (or whose
 /// reply channel died) and by the thread itself after a caught structured exception, so the next
@@ -296,7 +290,6 @@ fn leak(alive: &AtomicBool) {
     );
 }
 
-/// How many threads hangs left behind, in the words appended to the answer one of them produced.
 fn leaked_note() -> String {
     let count = LEAKED_THREADS.load(Ordering::SeqCst);
     let (threads, have) = if count == 1 {
@@ -367,7 +360,6 @@ pub(super) async fn submit_act(call: Call, timeout: Duration) -> anyhow::Result<
     }
 }
 
-/// The one failure mapping of an actuating call.
 fn actuation_failure(failure: JobFailure) -> anyhow::Result<Impact> {
     match failure {
         // Foreign code faulted while the job ran: where it stopped is unknown.
@@ -500,7 +492,6 @@ fn framework_failed(what: &str, code: u32) -> anyhow::Error {
     )
 }
 
-/// Everything the apartment thread owns: the UIA client and the capture device.
 struct Ctx {
     uia: IUIAutomation,
     capture: CaptureContext,

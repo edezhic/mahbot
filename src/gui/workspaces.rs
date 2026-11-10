@@ -53,11 +53,9 @@ pub enum WorkspacesMessage {
     RulesDiscard,
     /// Escape or a click outside the popup: close it only when nothing is unsaved.
     RulesDismiss,
-    /// Close the read-only contexts popup.
     ContextsClose,
 }
 
-/// Which context entry the read-only context panel is showing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ContextKind {
     Role(String),

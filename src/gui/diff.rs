@@ -230,7 +230,6 @@ pub struct DiffState {
     diff_loading: bool,
     diff_has_loaded: bool,
     status_message: Option<String>,
-    /// What the bounded worktree read left out, when it left out anything.
     omitted_note: Option<String>,
     file_tree: FileTree,
     selected_file: Option<String>,

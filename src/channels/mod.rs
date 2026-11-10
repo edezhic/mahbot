@@ -300,9 +300,7 @@ impl Channel for GuiChannel {
             .unwrap_poison()
             .take()
             .expect("GuiChannel::listen() called twice");
-        // Mutex guard is dropped here.
 
-        // Forward each GUI-originated message into the shared pipeline.
         while let Some(msg) = gui_rx.recv().await {
             if tx.send(msg).await.is_err() {
                 tracing::info!("GuiChannel: pipeline closed — shutting down listener");
@@ -322,7 +320,6 @@ impl Channel for GuiChannel {
         self
     }
 
-    /// GUI users are addressed by sender name.
     fn resolve_recipient(&self, user_name: &str, _reply_target: &str) -> Option<String> {
         Some(user_name.to_string())
     }
@@ -341,12 +338,10 @@ struct VoiceChannel;
 
 #[async_trait]
 impl Channel for VoiceChannel {
-    /// No-op — voice has no outbound transport.
     async fn send(&self, _message: &SendMessage) -> Result<SendOutcome, SendFailure> {
         Ok(SendOutcome::default())
     }
 
-    /// No-op — the voice pipeline manages its own mic-capture loop.
     async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         Ok(())
     }
@@ -372,7 +367,6 @@ mod tests {
     use super::*;
     use crate::{CHANNEL_REGISTRY, ChannelRegistry, channel_registry};
 
-    /// The bootstrap registration must leave the voice channel findable by its name.
     #[test]
     fn test_voice_channel_registration() {
         CHANNEL_REGISTRY.get_or_init(ChannelRegistry::default);
@@ -388,7 +382,6 @@ mod tests {
 mod urgent_tests {
     use super::take_urgent;
 
-    /// Only a `!` opening the typed text — after spaces, tabs and blank lines — is the mark.
     #[test]
     fn take_urgent_reads_only_the_leading_mark() {
         let bare_spaces = "   \t\n  !foo";

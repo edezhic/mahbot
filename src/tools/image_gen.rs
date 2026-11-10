@@ -128,7 +128,6 @@ impl Generated {
     }
 }
 
-/// What one generation of a call came to.
 enum Produced {
     /// The picture on disk.
     Picture(Generated),
@@ -584,7 +583,6 @@ struct RequestMaterial<'a> {
     references: &'a mut [crate::util::ReferenceImage],
 }
 
-/// One model's step in the walk.
 enum Step {
     /// Attempt it: the catalog declarations that shape its body — `None` only for the account's
     /// own fail-open attempt — and the size they accept.
@@ -592,22 +590,17 @@ enum Step {
         info: Option<ImageModelInfo>,
         size: Option<(&'static str, String)>,
     },
-    /// Never sent to, with the reason.
     Skip(String),
 }
 
-/// What one visited model came to.
 enum Visited {
-    /// Nothing was sent to it, with the reason.
     Skipped(String),
     /// Sent, and this is what came back. A failure that may have been produced and charged
     /// stops the walk, and the walk's stop reason says so.
     Attempted(Vec<AttemptFailure>),
 }
 
-/// What the walk came to.
 enum Walked {
-    /// The provider served `response`, produced by `model`.
     Served {
         model: String,
         response: serde_json::Value,
@@ -616,7 +609,6 @@ enum Walked {
     Unserved,
 }
 
-/// Why the walk ended before it could report on its models.
 #[derive(Debug)]
 enum WalkHalt {
     /// The request itself cannot be sent, with the reason: no other model changes that.
@@ -807,14 +799,12 @@ struct ImageWalk<'a> {
     auth: &'a str,
     /// The POST the walk makes — its only outward step, and the seam a test drives.
     sender: &'a dyn ImageSender,
-    /// What every visited model came to, in visit order.
     trail: Vec<(String, Visited)>,
     /// Why the walk stopped before exhausting the candidates, when it did.
     stopped: Option<String>,
 }
 
 impl ImageWalk<'_> {
-    /// Run the walk: `own_step` for the account's own model, then `candidates` in picker order.
     async fn run(&mut self, own_step: Step, candidates: Vec<String>) -> Result<Walked, WalkHalt> {
         let own_model = self.own_model;
         if let Some(walked) = self
@@ -1180,7 +1170,6 @@ impl AttemptFailure {
     }
 }
 
-/// How one model's attempt ended without a picture.
 enum AttemptOutcome {
     /// Walk on: another configured model may still serve the request.
     WalkOn(Vec<AttemptFailure>),
@@ -1834,7 +1823,6 @@ mod tests {
     }
 
     impl Refs {
-        /// No reference at all.
         fn none() -> Self {
             Self {
                 _dir: tempfile::TempDir::new().unwrap(),
@@ -2624,11 +2612,8 @@ mod tests {
 
     /// One walk driven by scripted answers: its outcome and the models POSTed to.
     struct WalkReport {
-        /// The serving model, when one served.
         walked_is_served: Option<String>,
-        /// The failure text, when none did.
         failure: Option<String>,
-        /// The note for the serving model.
         note: Option<String>,
         sent: Vec<String>,
     }
@@ -2696,7 +2681,6 @@ mod tests {
         name: &'static str,
         /// The picker models besides the account's own.
         candidates: &'static [&'static str],
-        /// Whether the account's own model refuses the request.
         own_refused: bool,
         /// The model that serves, and the models POSTed to in order.
         served: &'static str,

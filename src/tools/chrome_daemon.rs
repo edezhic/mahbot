@@ -85,9 +85,7 @@ use tracing::{debug, error, info, warn};
 /// healthy daemon answers in milliseconds, a wedged one hangs for the CLI's
 /// internal 45s read timeouts × 5 retries.
 const CLI_TIMEOUT: Duration = Duration::from_secs(8);
-/// Cache TTL for a healthy evaluation (fresh enough for per-call checks).
 const HEALTH_TTL: Duration = Duration::from_secs(10);
-/// Watchdog cadence between automatic health evaluations.
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 /// How often the watchdog re-verifies CLI presence where it was found — the
 /// binary can be uninstalled while the daemon runs, but spawning `--version`
@@ -107,7 +105,6 @@ const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 /// restart cannot reopen a cycle and keep a runaway loop from tripping the halt. That
 /// status cannot see wedges, so the halt engages only for service-level causes.
 const SUSTAINED_HEALTHY_WINDOW: Duration = Duration::from_mins(1);
-/// Backoff between restart attempts (30s → 2min → 10min).
 const RESTART_BACKOFF: [Duration; 3] = [
     Duration::from_secs(30),
     Duration::from_mins(2),
@@ -120,7 +117,6 @@ const LAUNCH_BACKOFF: [Duration; 3] = [
     Duration::from_mins(2),
     Duration::from_mins(10),
 ];
-/// Cooldown after the max restart attempts, before a fresh bounded cycle.
 const HALT_COOLDOWN: Duration = Duration::from_mins(30);
 /// How long recovery waits for the relay to republish after a relay-drop
 /// `daemon restart`: the MV3 service worker revives on its ~30 s keepalive and
@@ -163,7 +159,6 @@ enum ProbeFailure {
     /// the product closes the session's tabs at run end and on stop/recovery, and
     /// the session cannot drive that tab again.
     UnreachableTab,
-    /// The daemon socket hung or errored (daemon-side wedge).
     DaemonWedge,
 }
 
@@ -273,7 +268,6 @@ impl AttemptBudget {
             || self.next_at.is_some_and(|next| now < next)
     }
 
-    /// Reset to a fresh bounded cycle (sustained health / cooldown expiry).
     fn reset(&mut self) {
         self.attempts = 0;
         self.next_at = None;
@@ -316,7 +310,6 @@ enum RecoveryGate {
 }
 
 impl DaemonHealth {
-    /// Decide whether a daemon restart attempt is allowed.
     fn gate_restart(&mut self, now: Instant) -> RecoveryGate {
         self.restart_budget
             .gate(MAX_RESTART_ATTEMPTS, &RESTART_BACKOFF, HALT_COOLDOWN, now)
@@ -401,7 +394,6 @@ fn classify_failure_text(msg: &str) -> Option<ProbeFailure> {
     }
 }
 
-/// Get the platform-appropriate chrome-use binary name.
 pub(crate) const fn chrome_bin() -> &'static str {
     if cfg!(target_os = "windows") {
         "chrome-use.exe"
@@ -423,7 +415,6 @@ pub(crate) enum CliStatus {
     Transient(CliProbeFailure),
 }
 
-/// Why a CLI probe of a present binary failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CliProbeFailure {
     /// Spawn failed (EAGAIN/EMFILE/ENOMEM under process pressure, …) — retry
@@ -431,7 +422,6 @@ pub(crate) enum CliProbeFailure {
     Spawn(String),
     /// `--version` ran but exited non-zero — the install is broken.
     BadVersion(String),
-    /// The bounded probe timed out — the binary may be wedged.
     Timeout,
 }
 
@@ -445,13 +435,11 @@ impl std::fmt::Display for CliProbeFailure {
     }
 }
 
-/// GitHub repo whose releases host the chrome-use binary (single source of truth).
 const CHROME_USE_RELEASE_REPO: &str = "leeguooooo/chrome-use";
 
 /// Timeout for a chrome-use release download (archives are ~9 MB).
 const CHROME_USE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Timeout for resolving the latest chrome-use release tag.
 const CHROME_USE_RELEASE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Timeout for a chrome-use native-host registration subprocess (`extension
@@ -669,7 +657,6 @@ pub(crate) enum NoVerdict {
     /// chrome-use answered with a structured error — its own text, for a caller
     /// detecting a signature in it.
     Reported(String),
-    /// The child was killed at the product's own bound.
     TimedOut,
     /// Could not be spawned, or its exit could not be waited on (the two legs
     /// [`CliRun`] folds into `SpawnFailure`) — nothing was asked of the session.
@@ -680,7 +667,6 @@ pub(crate) enum NoVerdict {
 }
 
 impl NoVerdict {
-    /// The one-line cause for a log line.
     pub(crate) fn text(&self) -> &str {
         match self {
             Self::Reported(msg) => msg,
@@ -1240,7 +1226,6 @@ const CHROME_PROCESS_NAMES: [&str; 6] = [
     "chromium",
     "brave",
 ];
-/// Windows image names for the same browsers.
 #[cfg(target_os = "windows")]
 const WINDOWS_CHROME_PROCESS_NAMES: [&str; 3] = ["chrome.exe", "chromium.exe", "brave.exe"];
 
@@ -1628,7 +1613,6 @@ pub(crate) enum SessionRecovery {
 }
 
 impl SessionRecovery {
-    /// One plain sentence for the caller's error text.
     #[must_use]
     pub(crate) fn summary(self) -> &'static str {
         match self {
@@ -3231,7 +3215,6 @@ mod tests {
         }
     }
 
-    /// Readiness reports every fact it established and never defaults a missing one.
     #[tokio::test]
     #[expect(clippy::too_many_lines)]
     async fn readiness_reports_every_fact_and_never_defaults_a_missing_one() {

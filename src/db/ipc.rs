@@ -238,11 +238,9 @@ pub(crate) struct CallRequest {
     pub output_dir: Option<String>,
 }
 
-/// What became of an operation, as the caller reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CallOutcome {
-    /// The tool carried it out.
     Done,
     /// The tool carried it out in part; its own answer names what did not succeed. A failure for
     /// the caller, whose answer is printed all the same.
@@ -259,7 +257,6 @@ pub(crate) enum CallOutcome {
     Unavailable,
 }
 
-/// The instance's answer to one operation.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CallReply {
     pub outcome: CallOutcome,
@@ -267,7 +264,6 @@ pub(crate) struct CallReply {
 }
 
 impl CallReply {
-    /// The operation was carried out.
     pub(crate) fn done(answer: impl Into<String>) -> Self {
         Self {
             outcome: CallOutcome::Done,
@@ -283,7 +279,6 @@ impl CallReply {
         }
     }
 
-    /// The product refused the operation; nothing ran.
     pub(crate) fn refused(answer: impl Into<String>) -> Self {
         Self {
             outcome: CallOutcome::Refused,
@@ -591,7 +586,6 @@ pub async fn run_ipc_listener(
 /// one worth sending again — resending one the instance took would run a second copy of the same
 /// work.
 enum Attempt {
-    /// The instance answered.
     Answered(QueryResponse),
     /// The connection was never established: nothing reached the instance.
     NotDelivered(String),
@@ -680,7 +674,6 @@ fn not_attempted(undelivered: Option<&str>, spent: anyhow::Error, socket: &Path)
 /// What a finished attempt means to the retry loop: one classification for both clients, so they
 /// cannot drift on which failures are sent again or on what a failure says.
 enum Outcome {
-    /// The instance answered.
     Answer(QueryResponse),
     /// The instance never took it: send the next attempt after the backoff. The transport's error
     /// is carried along, for the case where the budget runs out before another attempt can be made.
@@ -831,7 +824,6 @@ fn ipc_query_sync_once(
     }
 }
 
-/// Connect to the running instance's endpoint.
 fn connect_sync(storage_root: &Path) -> Result<interprocess::local_socket::Stream, String> {
     let socket = socket_path(storage_root);
     let name = socket
@@ -918,7 +910,6 @@ pub fn request_window_show(storage_root: &Path) -> bool {
     answer.recv_timeout(WAIT).unwrap_or(false)
 }
 
-/// One exchange with the running instance: the request frame out, the answer in.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn ask_window_show(storage_root: &Path) -> bool {
     let Ok(mut stream) = connect_sync(storage_root) else {
@@ -936,7 +927,6 @@ fn ask_window_show(storage_root: &Path) -> bool {
     serde_json::from_slice::<QueryResponse>(&payload).is_ok_and(|response| response.error.is_none())
 }
 
-/// One attempt's outcome for a command-line operation (see `CallAttempt`).
 pub(crate) enum CallAttempt {
     /// The instance answered the operation; its own outcome is in the reply.
     Answered(CallReply),

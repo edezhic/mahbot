@@ -38,7 +38,6 @@ const DIR: &str = "transcripts";
 /// 2 dropped the words-only flag: every entry now carries the recogniser's words.
 const VERSION: u32 = 2;
 
-/// How much sound one piece carries.
 const PIECE: Duration = Duration::from_mins(5);
 
 /// How far short of a piece's own end a pass's progress may fall and still count as having read it:
@@ -266,7 +265,6 @@ async fn transcribe(
     }
 }
 
-/// What one batch read.
 struct Batch {
     /// The second the batch reaches, `None` when it read nothing.
     reached: Option<f64>,
@@ -343,7 +341,6 @@ fn piece_failure(error: &anyhow::Error) -> MediaError {
     MediaError::SoundTrack(error.root_cause().to_string())
 }
 
-/// One file's cache entry.
 #[derive(Serialize, Deserialize)]
 struct Entry {
     version: u32,

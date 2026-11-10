@@ -123,8 +123,6 @@ pub(crate) async fn release_run_folder(job_id: &str) {
     }
 }
 
-// Results archive (results.md)
-
 /// Shared results-archive location `<storage_root>/research/results/{job_id}.md` — the writer and
 /// the cancel sweep must agree on it, or a cancel deletes the wrong file (or nothing).
 pub(crate) fn results_archive_path(job_id: &str) -> Option<PathBuf> {
@@ -158,8 +156,6 @@ pub(crate) async fn write_results_md(job_id: &str, result: &str) {
         tracing::warn!(job = %job_id, error = %e, "Failed to write results.md — run result not archived");
     }
 }
-
-// Raw shell-command capture
 
 /// Extract every shell tool-call command from a session history. The canonical
 /// [`decoded_tool_calls`](crate::session::decoded_tool_calls) already un-nests provider-wrapped
@@ -279,8 +275,6 @@ pub(crate) async fn read_command_dump(run_root: &Path) -> Vec<String> {
         Err(_) => Vec::new(),
     }
 }
-
-// Sanitation cleanup dispatch
 
 /// Dedicated task prompt for the research-cleanup Sanitation agent.
 const CLEANUP_PROMPT_KEY: &str = "research/cleanup.md";
@@ -1023,8 +1017,6 @@ fn is_kept(
     MEDIA_VIDEO_EXTS.iter().any(|e| lower_base.ends_with(e)) && content_lower.contains(&lower_base)
 }
 
-// Tests
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1293,7 +1285,6 @@ mod tests {
         let cmds = vec!["a".to_string(), "b".to_string(), "a".to_string()];
         assert_eq!(dedup_newest_wins(&cmds), vec!["b", "a"]);
 
-        // Under the cap — untouched.
         let mut small = vec!["cat > /tmp/a".to_string(), "cat > /tmp/b".to_string()];
         cap_command_dump(&mut small, 50);
         assert_eq!(small.len(), 2, "under the cap — untouched");

@@ -8,7 +8,6 @@ use tracing::warn;
 
 use crate::util::unquote_c_style;
 
-/// Status of a file in the diff — what kind of change it represents.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffFileStatus {
     /// Exists on both sides (modified or unchanged).
@@ -26,7 +25,6 @@ pub enum DiffFileStatus {
 /// Whether the diff file has parseable content, or a placeholder reason.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffContent {
-    /// File has parseable text hunks.
     Parseable,
     /// Binary (detected by git).
     Binary,
@@ -34,16 +32,13 @@ pub enum DiffContent {
     TooLarge(u64),
 }
 
-/// A single changed file in the diff.
 #[derive(Debug, Clone)]
 pub struct DiffFile {
     pub path: String,
     /// Previous path when git detects a rename.
     pub old_path: Option<String>,
     pub hunks: Vec<DiffHunk>,
-    /// Change status (Added, Deleted, Renamed, Untracked, or Modified).
     pub status: DiffFileStatus,
-    /// Parseable hunks, binary, or too-large placeholder.
     pub content: DiffContent,
 }
 
@@ -78,7 +73,6 @@ impl DiffFile {
     }
 }
 
-/// One hunk within a file diff.
 #[derive(Debug, Clone)]
 pub struct DiffHunk {
     /// The hunk header line, e.g. "@@ -10,7 +10,9 @@ fn main() {
@@ -86,7 +80,6 @@ pub struct DiffHunk {
     pub lines: Vec<DiffLine>,
 }
 
-/// One line within a diff hunk or untracked file.
 #[derive(Debug, Clone)]
 pub struct DiffLine {
     pub kind: DiffLineKind,
@@ -125,7 +118,6 @@ struct DiffParser {
 }
 
 impl DiffParser {
-    /// Flush any pending hunk into the current file (if both exist).
     fn flush_hunk(&mut self) {
         if let Some(hunk) = self.current_hunk.take()
             && let Some(f) = &mut self.current_file
@@ -134,7 +126,6 @@ impl DiffParser {
         }
     }
 
-    /// Flush the current file (with optional pending hunk) into the files vec.
     fn flush(&mut self) {
         self.flush_hunk();
         if let Some(file) = self.current_file.take() {
@@ -238,7 +229,6 @@ impl DiffParser {
         });
     }
 
-    /// Process a single line from the diff output.
     fn process_line(&mut self, line: &str) {
         if line.starts_with("diff --git ") {
             self.handle_diff_git_header(line);
@@ -439,7 +429,6 @@ mod tests {
     #[expect(clippy::too_many_lines)] // the table is the whole point: one row per hunk shape
     #[test]
     fn file_status_and_line_kinds_follow_the_diff() {
-        /// Where the case's one file comes from.
         enum Source {
             Diff(&'static str),
             Untracked(&'static str),
@@ -757,8 +746,6 @@ index abc123..def456 100644
         assert_eq!(output[0].hunks[1].lines[0].old_line_number, Some(10));
         assert_eq!(output[0].hunks[1].lines[1].old_line_number, Some(11));
     }
-
-    // parse_hunk_header unit tests
 
     #[test]
     fn test_parse_hunk_header_cases() {

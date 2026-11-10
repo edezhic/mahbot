@@ -106,7 +106,6 @@ impl Profile {
 
     /// Set an output transform that replaces the pipeline output after line-level
     /// processing but before `combine_output` and `finish_shell_output`.
-    /// Receives the processed output and exit code, returns the transformed output.
     fn output_transform(mut self, transform: fn(&str, exit_code: i32) -> String) -> Self {
         self.output_transform = Some(transform);
         self
@@ -185,8 +184,6 @@ fn cargo_tool(
     p
 }
 
-/// Build a "lint tool" profile: strips blank lines, keeps stderr
-/// warning/error lines, caps at `max_lines`, signals clean success via `ok_msg`.
 fn lint_tool(matcher: &str, max_lines: usize, ok_msg: &'static str) -> Profile {
     Profile::new(matcher)
         .strip(&[BLANK_LINE])
@@ -347,7 +344,6 @@ pub(super) static PROFILES: LazyLock<Vec<Profile>> = LazyLock::new(|| {
         Profile::new(r"^yarn\b")
             .strip(&[r"^info\s", r"\[\d+/\d+\]"])
             .max(20),
-        // Python ecosystem
         // NOTE: Only `^pytest\b` is needed here — `python -m pytest` and
         // `poetry run pytest` intentionally fall through to GEN_FALLBACK
         // because canonical_command() strips intermediate flags (like `-m`)

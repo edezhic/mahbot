@@ -188,7 +188,6 @@ impl Connection {
         self.inner.set_busy_timeout(duration);
     }
 
-    /// Whether the connection is between transactions.
     #[must_use]
     pub(crate) fn is_autocommit(&self) -> bool {
         self.inner.get_auto_commit()
@@ -214,7 +213,6 @@ pub(crate) struct Statement {
 }
 
 impl Statement {
-    /// Bind `params` and hand back the statement's rows.
     pub(crate) fn query(&mut self, params: impl IntoParams) -> turso::Result<Rows> {
         self.bind(params)?;
         let columns = self.column_count();
@@ -224,7 +222,6 @@ impl Statement {
         })
     }
 
-    /// Execute this statement, returning how many rows it changed.
     pub(crate) async fn execute(&mut self, params: impl IntoParams) -> turso::Result<u64> {
         self.bind(params)?;
         match self.step().await? {
@@ -261,7 +258,6 @@ impl Statement {
         }
     }
 
-    /// Reset the statement and bind `params` to it.
     fn bind(&mut self, params: impl IntoParams) -> turso::Result<()> {
         let params = params.into_params()?;
         let mut inner = self.inner.lock().unwrap_poison();
@@ -313,20 +309,17 @@ impl Statement {
     }
 }
 
-/// The rows of one query.
 pub(crate) struct Rows {
     stmt: Statement,
     columns: usize,
 }
 
 impl Rows {
-    /// The result set's column names.
     #[must_use]
     pub(crate) fn column_names(&self) -> Vec<String> {
         self.stmt.column_names()
     }
 
-    /// Fetch the next row, or `None` once the statement has finished.
     pub(crate) async fn next(&mut self) -> turso::Result<Option<Row>> {
         match self.stmt.step().await? {
             TursoStatusCode::Done => Ok(None),
@@ -336,25 +329,21 @@ impl Rows {
     }
 }
 
-/// One row of a query's result.
 #[derive(Debug)]
 pub(crate) struct Row {
     values: Vec<CoreValue>,
 }
 
 impl Row {
-    /// The value at `index`, as the caller-facing [`Value`].
     pub(crate) fn get_value(&self, index: usize) -> turso::Result<Value> {
         Ok(self.value(index)?.clone().into())
     }
 
-    /// The value at `index`, converted to `T`.
     pub(crate) fn get<T: FromValue>(&self, index: usize) -> turso::Result<T> {
         T::from_sql(self.value(index)?.clone())
             .map_err(|err| turso::Error::ConversionFailure(err.to_string()))
     }
 
-    /// The number of columns in this row.
     #[must_use]
     pub(crate) fn column_count(&self) -> usize {
         self.values.len()

@@ -45,7 +45,6 @@ struct Flag {
     purpose: &'static str,
 }
 
-/// The two operations this command has.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Operation {
     /// An existing recording into text.
@@ -171,7 +170,6 @@ fn parse_flags(operation: Operation, tokens: &[String]) -> Result<Tail, String> 
     Ok(Tail::Values(values))
 }
 
-/// Read a whole `mahbot audio …` command line.
 fn parse(args: &[String]) -> Result<Invocation, String> {
     let Some(word) = args.first() else {
         return Err("no operation was given".to_string());
@@ -358,7 +356,6 @@ fn misuse(reason: &str) -> i32 {
     Exit::Usage.code()
 }
 
-// The operations themselves.
 mod engine {
     use super::{Speak, misuse};
     use crate::cli::Exit;

@@ -83,9 +83,7 @@ pub enum Addressee {
     Worker,
     /// A continuable worker conversation: continue (or create) a named branch.
     WorkerBranch,
-    /// The Manager of one managed workspace.
     Manager,
-    /// An administrator-defined custom role.
     Role,
     /// A guest account's own assistant, named by that account: the message runs as the guest
     /// and nothing comes back.
@@ -106,7 +104,6 @@ pub(crate) const ADDRESSEE_FLAG_HELP: &str = "Who receives it: 'assistant' (your
      ignored — `--branch` with 'worker', or `--place` with 'assistant', fails the call";
 
 impl Addressee {
-    /// The argument naming the choice.
     pub const ARG: &'static str = "addressee";
 
     /// Every addressee an agent's holder can have, narrowest first — the admin Assistant's
@@ -140,7 +137,6 @@ impl Addressee {
         Self::Role.as_str(),
     ];
 
-    /// The wire spelling of this addressee.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -342,7 +338,6 @@ impl SendTool {
         }
     }
 
-    /// The wire spellings of this holder's addressees.
     fn allowed(&self) -> Vec<&'static str> {
         self.kinds.iter().map(|kind| kind.as_str()).collect()
     }
@@ -830,7 +825,6 @@ mod tests {
     /// the rounds such a turn dispatches carry.
     const TURN_CHANNEL: &str = "gui";
 
-    /// A dispatch from an agent's own turn.
     async fn dispatch(
         tool: &dyn Tool,
         ws: &Workspace,
@@ -999,7 +993,6 @@ mod tests {
         }
     }
 
-    /// Count the deferred envelopes addressed to one agent.
     async fn pending_for(agent_id: &str) -> i64 {
         crate::session::store()
             .conn

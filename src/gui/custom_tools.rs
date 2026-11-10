@@ -13,13 +13,10 @@ use super::common::PolledList;
 
 #[derive(Debug, Clone)]
 pub(crate) enum CustomToolsMessage {
-    /// One refresh interval elapsed.
     Tick,
     /// A read finished. `Err` keeps the last loaded list on screen.
     Refreshed(Result<Vec<ToolListing>, String>),
-    /// Open the read-only details window for the named tool.
     OpenDetails(String),
-    /// Close the details window — the corner cross, Escape or a backdrop click.
     CloseDetails,
 }
 
@@ -71,7 +68,6 @@ impl CustomToolsState {
         }
     }
 
-    /// Close the details window (its corner cross, Escape or a backdrop click).
     pub(crate) fn close_details(&mut self) {
         self.details = None;
     }

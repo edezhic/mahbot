@@ -202,7 +202,6 @@ struct Tree {
     /// One element per node, in the same pre-order as `root` — the mapping
     /// [`core::pre_order_index`] lands in.
     handles: Vec<IUIAutomationElement>,
-    /// Where this walk stopped short of the whole tree.
     truncation: Truncation,
 }
 

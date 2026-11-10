@@ -17,8 +17,6 @@ use crate::util::UnwrapPoison;
 
 use super::theme;
 
-// Constants
-
 /// Font metrics used for text rendering (editor buffer, diff viewer).
 #[must_use]
 pub fn font_metrics() -> cosmic_text::Metrics {
@@ -40,8 +38,6 @@ pub(crate) const GUTTER_FONT_SIZE: f32 = theme::TEXT_11;
 /// Maximum visual lines per source line as a safety limit against
 /// pathological single lines (e.g. no-whitespace megabyte).
 pub(crate) const MAX_VISUAL_LINES_PER_SOURCE: usize = 10_000;
-
-// Font system access
 
 /// Acquire the global font system and invoke the closure with a mutable
 /// reference to it. The font system guard is released after the closure completes.
@@ -96,8 +92,6 @@ pub(crate) fn reshape_and_shape(
     // Ensure shaping runs even if set_size was a no-op (size unchanged)
     buffer.shape_until_scroll(font_sys, false);
 }
-
-// Geometry helpers
 
 /// Compute the total height of a cosmic_text buffer, accounting for wrapped
 /// lines. Each source line is capped at [`MAX_VISUAL_LINES_PER_SOURCE`]
@@ -189,7 +183,6 @@ pub(crate) fn cursor_to_buffer_coords(
     }
 }
 
-/// Compute the gutter clip rectangle for line numbers.
 pub(crate) fn gutter_clip_rect(
     bounds: Rectangle,
     h_padding: f32,
@@ -204,8 +197,6 @@ pub(crate) fn gutter_clip_rect(
         height: text_area_height,
     }
 }
-
-// Highlight background rendering
 
 /// Draw a highlighted background rectangle for a [`LayoutRun`] behind text,
 /// clipped to the text area.  Used by both the editor and diff widgets for
@@ -342,8 +333,6 @@ pub(crate) fn draw_run_highlights<Renderer, F>(
     }
 }
 
-// Colour conversion
-
 /// Convert an [`iced::Color`] (f32 RGBA components, 0.0–1.0) to
 /// [`cosmic_text::Color`] (u8 RGB).
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -353,8 +342,6 @@ pub(crate) fn iced_color_to_cosmic(c: Color) -> cosmic_text::Color {
     let b = (c.b * 255.0).round() as u8;
     cosmic_text::Color::rgb(r, g, b)
 }
-
-// Rich-span merging
 
 /// Push a `(text, attrs)` span to `result`, merging it with the last entry
 /// if both the attributes match and the slices are **contiguous** in the

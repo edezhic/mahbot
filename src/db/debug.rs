@@ -551,7 +551,6 @@ async fn run_debug_with_args(args: Vec<String>, home_override: Option<PathBuf>) 
     Ok(())
 }
 
-/// Run one read-only query through the instance's debug IPC endpoint.
 async fn ipc_query_readonly(
     read: Read<'_>,
     root: &Path,
@@ -938,7 +937,6 @@ fn collect_rows<T>(
     Ok(rows)
 }
 
-/// Double-quote a SQL identifier, escaping embedded double quotes.
 fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
@@ -1723,9 +1721,6 @@ mod tests {
         b
     }
 
-    /// The listing discovers families from base names and sidecar-only
-    /// members, classifies their file sets, ignores foreign files, and sorts
-    /// by (store, kind, stamp).
     #[test]
     fn list_families_classifies_file_sets() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -1927,9 +1922,6 @@ mod tests {
         .expect("legacy store family must be filterable by --db");
     }
 
-    /// End-to-end no-instance path: a row committed to the WAL (the store is
-    /// dropped without a checkpoint) is visible through the direct
-    /// single-process read-only open — no IPC, no running instance.
     #[serial_test::serial(read_limit)]
     #[tokio::test]
     async fn run_debug_without_an_instance_reads_committed_wal() {

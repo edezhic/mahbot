@@ -17,7 +17,6 @@ use std::time::Duration;
 use crate::util::http::install_ring_provider;
 use crate::util::truncate;
 
-/// HTTP client for the OpenRouter discovery endpoints.
 pub(crate) struct DiscoveryClient {
     client: reqwest::Client,
     key: String,
@@ -138,14 +137,12 @@ pub(crate) struct EndpointsResponse {
     pub data: EndpointsData,
 }
 
-/// `data` of the endpoints response.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct EndpointsData {
     #[serde(default)]
     pub endpoints: Vec<EndpointInfo>,
 }
 
-/// One provider endpoint serving the model.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct EndpointInfo {
     /// Provider-pinning slug used in `provider.order` (e.g. `streamlake/fp8`).
@@ -212,7 +209,6 @@ where
         }))
 }
 
-/// Parse the `data` array of the models response.
 fn parse_models(v: &serde_json::Value) -> anyhow::Result<Vec<ModelCatalogEntry>> {
     let data = v
         .get("data")
@@ -221,14 +217,12 @@ fn parse_models(v: &serde_json::Value) -> anyhow::Result<Vec<ModelCatalogEntry>>
         .with_context(|| "OpenRouter models response could not be parsed")
 }
 
-/// Parse the endpoints response body for `model_id`.
 fn parse_endpoints(v: &serde_json::Value, model_id: &str) -> anyhow::Result<EndpointsResponse> {
     serde_json::from_value(v.clone()).with_context(|| {
         format!("OpenRouter endpoints response for '{model_id}' could not be parsed")
     })
 }
 
-/// Parse the key response body.
 fn parse_key(v: &serde_json::Value) -> anyhow::Result<KeyInfo> {
     let data = v
         .get("data")

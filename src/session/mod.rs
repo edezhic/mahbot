@@ -123,7 +123,6 @@ pub(crate) fn user_msg_with_ts(content: &str, round_ts: Option<&str>) -> ChatMes
 }
 
 crate::define_store! {
-    /// Global session store.
     pub(crate) static SESSIONS: SessionStore,
     expect = "SESSIONS not initialized — call init_all_stores() first",
 }
@@ -1438,7 +1437,6 @@ impl SessionStore {
         .await
     }
 
-    /// Whether a branch session's launch was stopped before it produced anything.
     pub(crate) async fn get_launch_stopped(&self, agent_id: &str) -> bool {
         self.get_metadata_value(
             agent_id,
@@ -1569,7 +1567,6 @@ pub async fn cleanup_old_transient_sessions() -> Result<u64> {
     )
     .await?;
 
-    // Delete the metadata entries themselves
     let deleted = tx
         .execute(
             &format!("DELETE FROM session_metadata WHERE {safety_predicate}"),
@@ -1833,7 +1830,6 @@ pub(crate) fn worker_branch_agent_id(branch: &str) -> String {
     format!("{WORKER_BRANCH_AGENT_ID_PREFIX}{branch}")
 }
 
-/// Whether `agent_id` addresses a worker branch ([`WORKER_BRANCH_AGENT_ID_PREFIX`]).
 #[must_use]
 pub(crate) fn is_worker_branch_agent_id(agent_id: &str) -> bool {
     agent_id.starts_with(WORKER_BRANCH_AGENT_ID_PREFIX)
@@ -2107,10 +2103,8 @@ mod tests {
         crate::util::test::init_test_stores().await;
         let agent_id = unique_key();
 
-        // Empty session → None.
         assert!(store().get_last_message_tail(&agent_id).await.is_none());
 
-        // Append a user message → (User, "hello").
         store()
             .batch_append(&agent_id, &[ChatMessage::user("hello")])
             .await
@@ -2120,7 +2114,6 @@ mod tests {
             Some((ChatRole::User, "hello".into()))
         );
 
-        // Append an assistant message → (Assistant, "world").
         store()
             .batch_append(&agent_id, &[ChatMessage::assistant("world")])
             .await
@@ -2178,7 +2171,6 @@ mod tests {
         crate::util::test::init_test_stores().await;
         let k = unique_key();
 
-        // Append with context — creates the metadata row with a count of 1.
         store()
             .append_with_context(
                 &k,
@@ -2187,7 +2179,6 @@ mod tests {
             )
             .await
             .unwrap();
-        // Batch append 2 more (an assistant answer + a tool frame).
         store()
             .batch_append(
                 &k,
@@ -2211,11 +2202,8 @@ mod tests {
             "denormalized count must equal the session row count"
         );
         assert_eq!(mine.message_count, 3);
-        // No provider-reported length recorded yet → no token value.
         assert_eq!(mine.token_length, None);
 
-        // Once recorded, the real length flows through the list (the value
-        // the Sessions card renders next to the message count).
         store().set_token_length(&k, Some(12_300)).await.unwrap();
         let mine = store()
             .list_sessions_with_metadata()
@@ -2269,7 +2257,6 @@ mod tests {
         assert_eq!(count(&k).await, 2);
         assert_eq!(store().load(&k).await.len(), 2);
 
-        // A second compaction to a larger batch also SETs.
         store()
             .replace_messages(
                 &k,
@@ -2522,7 +2509,6 @@ mod tests {
         let agent_id = unique_key();
         let ws = crate::workspace::test_ws_named("/_test_empty_session_init", "empty_test");
 
-        // First turn: init with a real message creates the session.
         let session = session_with_init(&agent_id, "hello", &ws).await;
         let len_after_real = session.history().len();
         assert!(
@@ -2530,7 +2516,6 @@ mod tests {
             "real message should produce system prompt + user message (got {len_after_real})"
         );
 
-        // Second turn: init with empty message should NOT append.
         let session = session_with_init(&agent_id, "", &ws).await;
         assert_eq!(
             session.history().len(),
@@ -2538,8 +2523,6 @@ mod tests {
             "empty message must not append to session history",
         );
     }
-
-    // Retention-window selection
 
     fn tool_call_frame() -> ChatMessage {
         let tc = ToolCall {
@@ -2592,7 +2575,6 @@ mod tests {
             let contents: Vec<&str> = window.iter().map(|m| m.content.as_str()).collect();
             assert_eq!(contents, *expected, "unexpected retention window");
         }
-        // In-flight message appears exactly once — no duplicate re-append.
         assert_eq!(
             select_retention_window(&cases[0].0, cases[0].0.len())
                 .iter()
@@ -2619,13 +2601,10 @@ mod tests {
             .collect();
         assert_eq!(kept, ["a1", "turn-1", "turn-2", "turn-3", "turn-4"]);
 
-        // First turn: no assistant answers → users only.
         let window = select_retention_window(&[ChatMessage::user("u1")], 1);
         assert_eq!(window.len(), 1);
         assert_eq!(window[0].content, "u1");
 
-        // Reasoning-only JSON payloads and JSON-looking plain answers are
-        // answers, not tool traffic.
         let reasoning = Reasoning {
             reasoning: Some("thinking".into()),
             reasoning_content: None,
@@ -2644,7 +2623,6 @@ mod tests {
 
     #[test]
     fn decode_native_history_message_gates_on_native_shape() {
-        // Bare-JSON answer carries neither key → stays plain text (None).
         assert!(
             decode_native_history_message(&ChatMessage::assistant(r#"{"verdict": "bad"}"#))
                 .is_none()
@@ -2674,7 +2652,6 @@ mod tests {
             })
         ));
 
-        // Tool-call frame built by the producer decodes to Assistant with calls.
         let tc = ToolCall {
             id: "t1".into(),
             name: "read".into(),
@@ -2695,7 +2672,6 @@ mod tests {
             })
         ));
 
-        // Tool-result payloads decode to ToolResult.
         let decoded = decode_native_history_message(&ChatMessage::tool_result("t1", "r"));
         assert!(matches!(
             decoded,
@@ -2734,7 +2710,6 @@ mod tests {
         );
         assert_eq!(store().load(&k).await.len(), 3);
 
-        // A genuinely new answer IS appended.
         session.push_assistant("a2".to_string());
         assert_eq!(
             session.finalize(&k).await.unwrap(),
@@ -2767,7 +2742,6 @@ mod tests {
         let ws = crate::workspace::test_ws_named("/_test_gap_flush", "gap_flush");
         let mut session = session_with_init(&k, "", &ws).await;
 
-        // Failed drain: comment delivered to history only.
         session.push_messages_unpersisted(&[ChatMessage::user("C1")]);
 
         // Tool round: the gap must be flushed in the same transaction.
@@ -2782,7 +2756,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Final answer.
         session.push_assistant("final".into());
         session.finalize(&k).await.unwrap();
 
@@ -3071,8 +3044,6 @@ mod transient_prefix_tests {
     }
 }
 
-// Native history decoding
-
 #[derive(Debug)]
 pub(crate) enum DecodedNativeHistoryMessage {
     Assistant {
@@ -3104,7 +3075,6 @@ pub(crate) fn decode_native_history_message(
             .and_then(serde_json::Value::as_str)
             .map(ToString::to_string);
 
-        // Extract reasoning fields for the Assistant variant.
         let (r, rc, rd) =
             crate::providers::reasoning::json_lossless_assistant_reasoning_fields(value);
         let reasoning = Reasoning::from_optional_parts(r, rc, rd);

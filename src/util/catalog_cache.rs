@@ -87,7 +87,6 @@ pub(crate) struct Catalog<T> {
     path: &'static str,
     /// Human-readable label used in fetch error logs.
     label: &'static str,
-    /// Parses a fetched response body into the catalog type.
     parse: fn(&Value) -> anyhow::Result<T>,
     /// Injected fetch transport — [`fetch_from_provider`] in production, a scripted one in tests.
     fetch: FetchFn,

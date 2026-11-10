@@ -211,7 +211,6 @@ impl ResearchState {
     }
 }
 
-/// A sub-question from the round-0 decomposition plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SubQuestion {
     question: String,
@@ -259,7 +258,6 @@ struct MergedPlan {
     dropped: Vec<DroppedSubQuestion>,
 }
 
-/// One item in the interim gap list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Gap {
     /// "unanswered" | "partially_answered" | "contradictory" | "low_evidence".
@@ -271,7 +269,6 @@ struct Gap {
     traces_to: usize,
 }
 
-/// The interim gap list.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct GapList {
     gaps: Vec<Gap>,
@@ -641,7 +638,6 @@ fn build_async_research_message(job_id: &str, result: &anyhow::Result<String>) -
 struct EvidenceRound {
     /// Unique source URLs seen this round.
     urls: Vec<String>,
-    /// All claims reported this round.
     claims: Vec<Claim>,
     /// Analysts' self-reported uncovered aspects (from `AnalystFindings`).
     unanswered: Vec<String>,
@@ -653,7 +649,6 @@ struct EvidenceRound {
     raw_reports: Vec<String>,
 }
 
-/// All evidence accumulated across rounds.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct AccumulatedEvidence {
     urls: HashSet<String>,
@@ -713,7 +708,6 @@ struct ClaimAnnotation {
     contradiction: Option<String>,
 }
 
-/// The full annotation pass over one round's pending claims.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AnnotationPass {
@@ -733,7 +727,6 @@ struct ConfirmLink {
     verdict: String,
 }
 
-/// The confirm pass over one round's mutating annotation links.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConfirmPass {
@@ -893,7 +886,6 @@ impl QueryLedger {
     }
 }
 
-/// Running per-run telemetry for the summary.
 #[derive(Debug, Default)]
 struct RunStats {
     tool_calls: usize,
@@ -905,7 +897,6 @@ struct RunStats {
     failed_analysts: usize,
 }
 
-/// Outcome of the conditional gap-round phase.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct GapRoundsOutcome {
     abstention: Option<String>,
@@ -1217,7 +1208,6 @@ enum AnalystRun<T> {
     },
 }
 
-/// The successful result of one analyst run.
 struct AnalystRunOutcome<T> {
     value: T,
     tool_calls: usize,
@@ -2804,7 +2794,6 @@ fn partial_report(
     out
 }
 
-/// Exit of one `run_deep_research` invocation.
 enum ResearchExit {
     /// Real terminalization (success, partial, or error) — the caller writes results.md + the
     /// command dump and completes the durable job.
@@ -3497,7 +3486,6 @@ mod tests {
         }
     }
 
-    /// One structural validation gate.
     enum ValidationGate {
         GapTracesToPlan,
         MergedPlanCoverage,

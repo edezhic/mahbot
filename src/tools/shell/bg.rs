@@ -59,9 +59,7 @@ const WATCHER_SCRIPT: &str = "trap '' TERM; cat >/dev/null; kill -s KILL 0";
 /// failures. Every other early exit — a legitimate non-zero one included — is a successful
 /// launch surfaced via the exit-status annotation.
 const LAUNCH_PROBE: Duration = Duration::from_millis(250);
-/// Poll interval for the launch probe and the stop/teardown completion wait.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
-/// Waiter poll interval while waiting for the command child to exit.
 const WAITER_POLL: Duration = Duration::from_millis(50);
 /// Grace between SIGTERM and SIGKILL in the two-stage stop.
 #[cfg_attr(not(unix), expect(dead_code))] // only the Unix two-stage stop has a grace
@@ -73,7 +71,6 @@ const MAX_OUTPUT_NAME_ATTEMPTS: usize = 16;
 /// How many leading bytes of the output file the launch-failure tool error quotes.
 const FAILURE_OUTPUT_PREFIX_BYTES: usize = 400;
 
-/// Result of [`BackgroundSessions::stop`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StopResult {
     /// The stop ran (or the process was already dead).
@@ -402,13 +399,11 @@ impl BackgroundSessions {
         }
     }
 
-    /// Test/observability accessor: whether a session with this output-file path is registered.
     #[cfg(test)]
     pub(crate) fn contains(&self, path: &Path) -> bool {
         self.inner.lock().unwrap_poison().contains_key(path)
     }
 
-    /// Test/observability accessor: whether a registered session has finished.
     #[cfg(test)]
     pub(crate) fn is_finished(&self, path: &Path) -> bool {
         self.inner
@@ -441,7 +436,6 @@ impl BackgroundSessions {
         drop(guard);
 
         tokio::spawn(async move {
-            // Wait for the command to exit (or reuse the probe's early result).
             let mut status = early_status;
             if status.is_none() {
                 loop {
@@ -462,7 +456,6 @@ impl BackgroundSessions {
             append_exit_annotation(&output_path, status);
             finished.store(true, Ordering::SeqCst);
 
-            // Close the lifeline and reap the watcher.
             #[cfg(unix)]
             {
                 let (watcher, write_end) = {
@@ -703,7 +696,6 @@ fn read_output_prefix(path: &Path, max_bytes: usize) -> Option<String> {
     ))
 }
 
-/// Poll `finished` until it is set or the bound elapses.
 async fn wait_for_finished(finished: &AtomicBool, bound: Duration) {
     let deadline = Instant::now() + bound;
     while !finished.load(Ordering::SeqCst) && Instant::now() < deadline {
@@ -731,7 +723,6 @@ mod tests {
     #[cfg(not(unix))]
     const STOPPED_ANNOTATION: &str = "[exit status: 1]";
 
-    /// Wait for a session's finished flag with a generous bound.
     async fn wait_finished(sessions: &BackgroundSessions, path: &Path, bound: Duration) -> bool {
         let deadline = Instant::now() + bound;
         loop {
@@ -795,7 +786,6 @@ mod tests {
             .await
     }
 
-    /// A case for the finished-session annotation.
     struct LaunchExitCase {
         name: &'static str,
         command: &'static str,

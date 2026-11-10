@@ -57,7 +57,6 @@ fn decision() -> bool {
 #[cfg_attr(not(any(test, target_os = "macos")), expect(dead_code))]
 const LABEL: &str = "com.mahbot.autostart";
 
-/// `text` with the characters XML gives a meaning to escaped.
 #[cfg_attr(not(any(test, target_os = "macos")), expect(dead_code))]
 fn xml_escaped(text: &str) -> String {
     let mut out = String::with_capacity(text.len());

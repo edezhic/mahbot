@@ -33,7 +33,6 @@ const PREVIEW_RADIUS: f32 = 4.0;
 
 const MAX_CACHED_PREVIEWS: usize = 64;
 
-/// Why a candidate path did not become an [`Attachment`].
 #[derive(Debug)]
 pub(crate) enum Refusal {
     /// Not a file the user offered — a folder (dropping one is out of scope), a device, or a name
@@ -51,7 +50,6 @@ pub struct Attachment {
     pub kind: Kind,
 }
 
-/// What a staged attachment is delivered as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
     /// A raster the receive path routes on the `[IMAGE:…]` marker.
@@ -63,7 +61,6 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// The marker the staged message carries for this kind.
     fn marker(self) -> crate::util::MediaMarkerKind {
         match self {
             Self::Image => crate::util::MediaMarkerKind::Image,
@@ -208,8 +205,6 @@ async fn write_attachment(dir: &Path, attachment: &Attachment) -> Result<PathBuf
     }
 }
 
-/// Copy one attachment into `dir`, refusing anything over the product's file cap. The returned path
-/// is absolute — it is what the marker names.
 #[cfg(not(target_os = "macos"))]
 async fn write_attachment(dir: &Path, attachment: &Attachment) -> Result<PathBuf, String> {
     let Source::File(source) = &attachment.source;
@@ -381,8 +376,6 @@ fn picture_tile<'a, M: Clone + 'a>(
     .into()
 }
 
-/// The file chip of one attachment: the document glyph, the shortened name and the removal control
-/// after it.
 fn file_chip<'a, M: Clone + 'a>(name: &'a str, remove: M) -> Element<'a, M> {
     container(
         row![

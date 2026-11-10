@@ -5,10 +5,8 @@ use iced::{Alignment, Element, Length};
 
 use crate::gui::theme;
 
-/// Standard width of the small confirm/modal family.
 const CONFIRM_WIDTH: f32 = 400.0;
 
-/// Fixed width, padding, elevated dialog chrome.
 #[must_use]
 pub fn dialog_shell<'a, Message>(
     content: impl Into<Element<'a, Message>>,
@@ -21,7 +19,6 @@ pub fn dialog_shell<'a, Message>(
         .style(theme::dialog_container_style)
 }
 
-/// Bold 16px primary text.
 #[must_use]
 pub fn dialog_title<'a>(
     title: impl Into<String>,
@@ -56,7 +53,6 @@ pub fn dialog_title_row<'a, Message: Clone + 'a>(
     .align_y(Alignment::Start)
 }
 
-/// Separated by 8px gaps.
 #[must_use]
 pub fn dialog_body<'a, Message: 'a>(
     paragraphs: impl IntoIterator<Item = impl Into<String>>,
@@ -102,7 +98,6 @@ impl<'a, Message> DialogAction<'a, Message> {
     }
 }
 
-/// Fill spacer followed by the buttons, 8px apart, vertically centered.
 #[must_use]
 pub fn dialog_footer_row<'a, Message: 'a>(
     buttons: impl IntoIterator<Item = Element<'a, Message>>,
@@ -117,7 +112,6 @@ pub fn dialog_footer_row<'a, Message: 'a>(
     footer
 }
 
-/// Title, body, right-aligned action buttons (8px apart) in the standard 400px modal shell.
 #[must_use]
 pub fn confirm_dialog<'a, Message: Clone + 'a>(
     title: impl Into<Element<'a, Message>>,

@@ -123,8 +123,6 @@ use super::super::{REFUSAL_FRAME, framed_refusal};
 use super::scan;
 use super::{CheckContext, ShellPlatform, rejection_message};
 
-// Verdict
-
 /// Verdict of the Windows layer for one command segment.
 pub(super) enum WinVerdict {
     /// The layer models this verb and permits the invocation: the shared
@@ -136,9 +134,6 @@ pub(super) enum WinVerdict {
     Pass,
 }
 
-// Verb tables
-
-/// Executable extensions stripped from a verb word before matching.
 const VERB_EXTENSIONS: &[&str] = &["exe", "com", "bat", "cmd"];
 
 /// System-level commands refused outright: unlike the file-scoped mutators
@@ -343,8 +338,6 @@ fn verb_key_of(word: &str) -> Option<String> {
     Some(stem.to_ascii_lowercase())
 }
 
-// Lexical Windows path model
-
 /// Split a folded Windows path into its prefix (`c:` / `\\server\share` / `""`)
 /// and the remaining segment text. A `\\`-leading path with an empty server or
 /// share is degenerate and fails (fail-closed).
@@ -366,7 +359,6 @@ fn split_prefix(path: &str) -> Option<(String, &str)> {
     Some((String::new(), path))
 }
 
-/// The length of a leading drive-letter prefix (`c:`), if any.
 fn drive_letter(path: &str) -> Option<usize> {
     let bytes = path.as_bytes();
     (bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()).then_some(2)
@@ -932,8 +924,6 @@ fn check_set(args: &[&str], cmd: &str, ctx: &CheckContext) -> WinVerdict {
     }
     WinVerdict::Allow
 }
-
-// Argument helpers
 
 /// A verb word's glued switches ([`split_glued_switch`]) followed by the segment's own arguments,
 /// so a switch-consuming branch reads the glued spelling as the spaced one. Borrowed when there is

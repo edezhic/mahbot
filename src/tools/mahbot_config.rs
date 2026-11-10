@@ -60,7 +60,6 @@ fn format_tools(tools: &[String]) -> String {
     }
 }
 
-/// Dispatch a single configuration action for the admin.
 pub(crate) struct MahbotConfigTool;
 
 #[async_trait]
@@ -599,9 +598,7 @@ mod tests {
         );
     }
 
-    /// What an `add_user` call must refuse.
     enum AddUserExpect {
-        /// The reserved admin name.
         AdminName,
         /// A name an existing account matches, ignoring case.
         NameTaken,

@@ -10,12 +10,10 @@
 //! The browser-automation command ([`crate::chrome::cli`]) and the OpenRouter benchmark read
 //! their own flags and word their own refusals.
 
-/// Whether a token asks for help (`-h`/`--help`).
 pub(crate) fn is_help(token: &str) -> bool {
     token == "-h" || token == "--help"
 }
 
-/// One token of a flag tail, read.
 pub(crate) enum Token<'a> {
     /// `-h`/`--help`.
     Help,
@@ -47,17 +45,14 @@ pub(crate) fn read_token(token: &str) -> Result<Token<'_>, String> {
     })
 }
 
-/// A flag this operation does not take.
 pub(crate) fn unknown_flag(name: &str, operation: &str) -> String {
     format!("unknown flag '--{name}' for '{operation}'")
 }
 
-/// A flag that was given a second time.
 pub(crate) fn repeated_flag(name: &str) -> String {
     format!("flag '--{name}' was given more than once")
 }
 
-/// A flag standing without the value it takes — the form is spelled out for the caller.
 pub(crate) fn flag_value_missing(name: &str) -> String {
     format!("flag '--{name}' needs a value: '--{name} <value>'")
 }

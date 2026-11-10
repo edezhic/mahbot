@@ -31,14 +31,12 @@ use tracing::warn;
 pub(crate) enum StoreShape {
     /// No data file — a genuine first launch; the store is created.
     Absent,
-    /// The data file exists and passes the file-level shape check.
     Present,
     /// Exists but fails the file-level shape check. The service refuses to start; the file is left
     /// untouched.
     Unusable(ShapeDefect),
 }
 
-/// Why a store data file fails the file-level shape check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShapeDefect {
     /// 0 bytes — never usable, and never back-filled from a surviving journal.
@@ -47,7 +45,6 @@ pub(crate) enum ShapeDefect {
     TooShort(u64),
     /// The file could not be read (stat/read I/O failure other than NotFound).
     Unreadable,
-    /// The header does not carry the SQLite magic.
     BadMagic,
     /// The header's page-size field is not a power of two in [512, 65536].
     BadPageSize,
@@ -194,20 +191,16 @@ pub(crate) fn db_page_size_valid(header: &[u8; 18]) -> bool {
     (512..=65_536).contains(&page_size) && page_size.is_power_of_two()
 }
 
-/// True when the header carries the SQLite magic and a valid page size.
 #[must_use]
 pub(crate) fn db_header_valid(header: &[u8; 18]) -> bool {
     &header[..16] == DB_HEADER_MAGIC && db_page_size_valid(header)
 }
 
-/// One store whose data file exists but fails the file-level shape check.
 #[derive(Debug)]
 pub(crate) struct UnusableStore {
     /// Physical store name (`core` or `logs`).
     pub store: &'static str,
-    /// The store's data-file path.
     pub db_path: std::path::PathBuf,
-    /// The defect that made the file unusable.
     pub defect: ShapeDefect,
 }
 
@@ -241,7 +234,6 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    /// A minimal byte image with the SQLite magic and the given page size.
     fn valid_header(page_size: u16) -> Vec<u8> {
         let mut db = vec![0u8; 4096];
         db[..16].copy_from_slice(b"SQLite format 3\0");

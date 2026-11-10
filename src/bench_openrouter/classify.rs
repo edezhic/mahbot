@@ -11,7 +11,6 @@
 
 use super::discovery::EndpointInfo;
 
-/// One ladder round's cache outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CacheClassification {
     /// Cached tokens >= 90% of expected — cache held.

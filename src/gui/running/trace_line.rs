@@ -21,7 +21,6 @@ const MIN_SENTENCE_CHARS: usize = 20;
 /// Characters that may close a sentence behind its terminator.
 const CLOSERS: [char; 7] = ['"', '\'', '”', '’', '»', ')', ']'];
 
-/// One step's line and the hover text that explains it.
 pub(crate) struct Line<'a> {
     pub(crate) text: String,
     /// The step's reasoning, cut to [`MAX_SCAN_CHARS`]: the hover text. Blank reasoning is none.
@@ -78,7 +77,6 @@ fn pick_line(text: &str) -> Option<String> {
     (!line.is_empty() && line.chars().any(char::is_alphanumeric)).then_some(line)
 }
 
-/// The first [`MAX_SCAN_CHARS`] chars of a step's text.
 fn bounded_prefix(text: &str) -> &str {
     match text.char_indices().nth(MAX_SCAN_CHARS) {
         Some((cut, _)) => &text[..cut],

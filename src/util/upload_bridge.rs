@@ -224,7 +224,6 @@ async fn upload_uguu(req: &UploadRequest<'_>) -> anyhow::Result<String> {
 async fn upload_0807_st(req: &UploadRequest<'_>) -> anyhow::Result<String> {
     let client = crate::util::http::media_http_client();
 
-    // 1. Fetch the PoW challenge.
     let pow_resp = client
         .get("https://0807.st/pow")
         .send()
@@ -259,19 +258,18 @@ async fn upload_0807_st(req: &UploadRequest<'_>) -> anyhow::Result<String> {
         .context("0807.st PoW missing sig")?
         .to_string();
 
-    // 2. Solve hashcash: SHA-256(id + "." + nonce) with >= bits leading zeros.
     let id_for_solve = id.clone();
     let nonce = tokio::task::spawn_blocking(move || solve_pow(&id_for_solve, bits))
         .await
         .context("0807.st PoW solver panicked")?
         .with_context(|| format!("0807.st PoW unsolved at declared {declared_bits} bits"))?;
 
-    // 3. Upload with the solved proof. expiry=24 keeps the clip ephemeral.
     let part = Part::bytes(req.bytes.to_vec())
         .file_name(req.file_name.to_string())
         .mime_str(req.mime)?;
     let form = Form::new()
         .part("file", part)
+        // expiry=24 keeps the clip ephemeral.
         .text("expiry", "24")
         .text("pow_id", id)
         .text("pow_ts", ts)

@@ -113,11 +113,9 @@ pub struct AgentJob {
 pub struct Asker {
     /// The asking branch's launch, so the reply re-enters that conversation.
     pub launch: crate::Launch,
-    /// The folder the asking turn runs in.
     pub workspace: String,
 }
 
-/// Global router table: maps agent ID → that agent's consumer.
 static ROUTER: OnceLock<RwLock<HashMap<String, Consumer>>> = OnceLock::new();
 
 /// How long an announced urgent message has to reach the queue before the turn cut for
@@ -126,7 +124,6 @@ static ROUTER: OnceLock<RwLock<HashMap<String, Consumer>>> = OnceLock::new();
 /// stall the queue.
 const URGENT_ARRIVAL_SECS: u64 = 600;
 
-/// One agent's consumer: its job queue, plus urgent announcements on their way.
 struct Consumer {
     jobs: mpsc::UnboundedSender<AgentJob>,
     urgent: Arc<UrgentArrivals>,
@@ -732,7 +729,6 @@ async fn consumer_loop(
             break;
         }
 
-        // Nothing is waiting: block for the next job.
         if waiting.is_empty() {
             let job = tokio::select! {
                 job = rx.recv() => match job {
@@ -1176,7 +1172,6 @@ async fn report_unrunnable_branch(job: &AgentJob) {
     confirm_pending_delivery(job).await;
 }
 
-/// Set up Telegram typing indicators for the given users — one per unique Telegram chat.
 async fn setup_telegram_typing(
     users: &[UserRecord],
 ) -> Vec<(CancellationToken, tokio::task::JoinHandle<()>)> {
@@ -1215,7 +1210,6 @@ async fn setup_telegram_typing(
     typing_tasks
 }
 
-/// Broadcast typing indicators to the GUI for the given users.
 fn broadcast_typing(users: &[UserRecord], workspace: &str, is_typing: bool) {
     if let Some(tx) = crate::CHAT_BROADCAST.get() {
         for user in users {
@@ -1228,11 +1222,9 @@ fn broadcast_typing(users: &[UserRecord], workspace: &str, is_typing: bool) {
     }
 }
 
-/// Outcome of attempting to deliver a response on a single channel.
 enum DeliverOutcome {
     /// Sent; the markers this transport refused, if any.
     Sent(Vec<RefusedMarker>),
-    /// Recipient is not reachable on this channel.
     Unresolvable,
     /// Transport send failed, carrying the refusals collected before the failure.
     Failed(SendFailure),
@@ -1560,7 +1552,6 @@ async fn deliver_single_user_response(
     role: &Role,
     file_roots: &[std::path::PathBuf],
 ) {
-    // Broadcast + persist, tagged with the originating channel and a fresh dispatch tag.
     let channel = job.channel.as_str();
     broadcast_and_persist_agent_response(
         &user.name,
@@ -1606,8 +1597,6 @@ pub async fn deliver_unregistered_user_response(
     let user_name =
         crate::session::normalize_user_name(&job.user_name, "deliver_unregistered_user_response");
 
-    // Broadcast + persist (strings only, no UserRecord needed), tagged with the originating
-    // channel and a fresh dispatch tag on the row.
     broadcast_and_persist_agent_response(
         user_name,
         ch,
@@ -1914,7 +1903,6 @@ mod tests {
         assert!(!kept, "a drain stops the consumer, so nothing holds it");
     }
 
-    /// An announcement lands on the addressed agent's consumer only.
     #[tokio::test]
     async fn announce_urgent_reaches_the_addressed_consumer() {
         let _ = init_global();
@@ -2043,7 +2031,6 @@ mod tests {
             },
         );
 
-        // Poll until the consumer exits and the wrapper removes the dummy entry.
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
         let mut cleaned_up = false;
         while tokio::time::Instant::now() < deadline {
@@ -2095,7 +2082,6 @@ mod tests {
     /// channel a parallel test (e.g. telegram_tests) may have registered.
     const TEST_SPY_CHANNEL: &str = "__test_spy_channel";
 
-    /// Set up DB stores + channel registry for response-delivery tests.
     async fn setup_response_test_infra() {
         crate::util::test::init_management_test_stores().await;
         let _ = crate::CHANNEL_REGISTRY.set(crate::ChannelRegistry::default());

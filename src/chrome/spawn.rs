@@ -494,7 +494,6 @@ impl PipeDrain {
         }
     }
 
-    /// Bytes the reader has received so far.
     fn bytes(&self) -> u64 {
         self.progress.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -543,7 +542,6 @@ mod tests {
     use crate::util::test::set_env_var;
     use tokio::process::Command;
 
-    /// Read an env var explicitly set on the command.
     fn cmd_env(cmd: &Command, key: &str) -> Option<String> {
         cmd.as_std()
             .get_envs()

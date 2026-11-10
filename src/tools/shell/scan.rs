@@ -592,7 +592,6 @@ fn is_digit_suffix_redirect(w: &str, op: u8) -> bool {
     if bytes.len() < 2 || !bytes[0].is_ascii_digit() || bytes[bytes.len() - 1] != op {
         return false;
     }
-    // All bytes except the last must be decimal digits
     bytes[..bytes.len() - 1].iter().all(u8::is_ascii_digit)
 }
 
@@ -619,8 +618,6 @@ pub(super) enum TokenKind {
 /// checks below (the `w.starts_with('>')` arm would misclassify `>&` as a
 /// self-contained combined token and `&>`/`&>>` as regular words).
 pub(super) fn classify_shell_token(w: &str) -> TokenKind {
-    // NOTE: `>&` and `&>`/`&>>` are checked via exact `match` BEFORE the
-    // pattern-based checks below (see ordering invariants in doc comment).
     match w {
         ">" | ">&" | ">>" | ">|" | "<" | "<&" | "<>" | "&>" | "&>>" => {
             return TokenKind::Redirect { needs_target: true };

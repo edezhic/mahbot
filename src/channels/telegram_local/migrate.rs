@@ -33,7 +33,6 @@ pub(super) struct Journal {
     /// switch back starts on the local server with neither leave recorded.
     #[serde(default)]
     pub(super) from: String,
-    /// The mode being switched to.
     pub(super) target: String,
     /// The cloud `logOut` request was issued. Its answer may have been lost with the process,
     /// which is what tells a resumed attempt that `Unauthorized` means the bot has left.
@@ -43,7 +42,6 @@ pub(super) struct Journal {
     /// re-logs the bot in there and splits its updates.
     #[serde(default)]
     pub(super) cloud_logged_out: bool,
-    /// The bot has left the local server.
     #[serde(default)]
     pub(super) local_left: bool,
     /// The intake record was cleared for this switch. Recorded so a failed purge is retried
@@ -57,7 +55,6 @@ pub(super) struct Journal {
     /// cannot succeed, so it is not attempted.
     #[serde(default)]
     pub(super) blocked_credentials: Option<String>,
-    /// The single chat notice has been sent.
     #[serde(default)]
     pub(super) notice_sent: bool,
     /// The completion message, kept until it reaches the owner: a message that could not be
@@ -126,7 +123,6 @@ pub(super) fn current() -> Option<Journal> {
     serde_json::from_str(crate::config::CONFIG.telegram_local_migration()?.trim()).ok()
 }
 
-/// Whether a switch is in progress or waiting.
 pub(super) fn pending() -> bool {
     current().is_some()
 }
@@ -464,7 +460,6 @@ async fn release_cloud(journal: &mut Journal) -> Result<(), Step> {
     Ok(())
 }
 
-/// Switch the bot onto the local server.
 async fn to_local(journal: &mut Journal) -> Result<(), Step> {
     if crate::config::CONFIG.telegram_bot_token().is_none() {
         return Err(Step::Blocked(

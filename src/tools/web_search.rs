@@ -20,7 +20,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
-/// Backend provider for web search.
 pub enum WebSearchBackend {
     DeepSeek { key: String },
     Exa { key: String },
@@ -29,7 +28,6 @@ pub enum WebSearchBackend {
 /// DeepSeek's stand-alone search endpoint (fixed, not owner-editable).
 const DEEPSEEK_SEARCH_ENDPOINT: &str = "https://api.deepseek.com/v1/tools/search";
 
-/// Results asked of every backend.
 const RESULTS_PER_SEARCH: usize = 10;
 
 /// DeepSeek's documented query ceiling, in Unicode characters. A longer query is refused before
@@ -69,7 +67,6 @@ fn deepseek_request_body(query: &str) -> DeepSeekSearchRequest<'_> {
     }
 }
 
-/// DeepSeek's results as the shared row shape.
 fn deepseek_rows(results: Vec<DeepSeekResult>) -> Vec<SearchRow> {
     results
         .into_iter()
@@ -95,7 +92,6 @@ fn deepseek_query_limit(query: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Deserialize an absent-or-null field as the field's default.
 fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -174,7 +170,6 @@ struct ExaSearchResponse {
     results: Vec<ExaResult>,
 }
 
-/// A normalized search result shared by DeepSeek and Exa.
 struct SearchRow {
     title: Option<String>,
     url: String,
@@ -184,7 +179,6 @@ struct SearchRow {
     description: Option<String>,
 }
 
-/// One backend call's answer: the text rows, and what happened to the pictures.
 struct SearchAnswer {
     rows: Vec<SearchRow>,
     pictures: Pictures,
@@ -198,7 +192,6 @@ struct Picture {
     page: String,
 }
 
-/// What a search that may ask for pictures learned about them.
 enum Pictures {
     /// The call did not ask for pictures; output is exactly what it always was.
     NotRequested,
@@ -502,7 +495,6 @@ async fn verified_pictures(groups: Vec<Vec<Picture>>, cap: usize) -> Vec<Picture
         .collect()
 }
 
-/// A cached search result with full text content.
 #[derive(Debug, Clone)]
 pub(crate) struct CachedResult {
     pub(crate) title: String,
@@ -524,7 +516,6 @@ impl WebSearchCache {
         }
     }
 
-    /// Store a result and return its numeric expand ID.
     pub(crate) async fn cache_result(&self, title: String, url: String, text: String) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.cache
@@ -534,7 +525,6 @@ impl WebSearchCache {
         id
     }
 
-    /// Retrieve the full text for a cached result by expand ID.
     pub(crate) async fn expand_result(&self, id: u64) -> anyhow::Result<String> {
         let cache_guard = self.cache.read().await;
 
@@ -584,7 +574,6 @@ pub(crate) async fn check_search_error(
     anyhow::bail!("search failed with status {status}: {body}");
 }
 
-/// Extract a descriptive error message from a web-search error response body.
 #[must_use]
 fn search_error_detail(body: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(body)
@@ -593,7 +582,6 @@ fn search_error_detail(body: &str) -> Option<String> {
 }
 
 impl WebSearchCache {
-    /// Parse and validate `web_search` tool arguments.
     pub(crate) fn validate_execute_args<'a>(
         &self,
         args: &'a Value,
@@ -691,7 +679,6 @@ impl WebSearchTool {
         }
     }
 
-    /// A plain search: the text backend, and nothing else.
     async fn text_answer(&self, query: &str) -> anyhow::Result<SearchAnswer> {
         match &self.text {
             WebSearchBackend::DeepSeek { key } => self.deepseek_answer(key, query).await,

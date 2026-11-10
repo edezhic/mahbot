@@ -11,14 +11,12 @@ use super::attachment::Attachment;
 /// Shown when this platform cannot read attachment content from the clipboard at all.
 pub(crate) const UNSUPPORTED: &str = "Reading copied files or images from the clipboard is not available on this platform. Drag the file onto the chat instead.";
 
-/// Whether the clipboard's attachment content can be read at all here.
 #[cfg(target_os = "macos")]
 pub(crate) fn can_read() -> bool {
     // Read on the main thread only — the one place this app touches AppKit.
     objc2::MainThreadMarker::new().is_some()
 }
 
-/// Whether the clipboard's attachment content can be read at all here.
 #[cfg(not(target_os = "macos"))]
 pub(crate) const fn can_read() -> bool {
     false
@@ -33,7 +31,6 @@ pub(crate) fn read_files() -> (Vec<Attachment>, Vec<String>) {
     files(&objc2_app_kit::NSPasteboard::generalPasteboard())
 }
 
-/// The clipboard's copied files, in paste order.
 #[cfg(not(target_os = "macos"))]
 pub(crate) const fn read_files() -> (Vec<Attachment>, Vec<String>) {
     (Vec::new(), Vec::new())
@@ -49,7 +46,6 @@ pub(crate) fn read_image() -> Result<Option<Attachment>, String> {
     image(&objc2_app_kit::NSPasteboard::generalPasteboard())
 }
 
-/// The clipboard's image data.
 #[cfg(not(target_os = "macos"))]
 #[expect(clippy::unnecessary_wraps)] // one signature; only the macOS arm refuses
 pub(crate) const fn read_image() -> Result<Option<Attachment>, String> {
@@ -116,7 +112,6 @@ fn image(pasteboard: &objc2_app_kit::NSPasteboard) -> Result<Option<Attachment>,
         .map(Some)
 }
 
-/// Re-encode TIFF data as PNG through the bitmap representation.
 #[cfg(target_os = "macos")]
 fn png_from_tiff(data: &objc2_foundation::NSData) -> Option<Vec<u8>> {
     use objc2::AnyThread;

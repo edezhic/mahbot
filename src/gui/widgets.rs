@@ -24,7 +24,6 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// An option for [`fn@iced::widget::pick_list`] with separate value and display label.
 #[derive(Debug, Clone)]
 pub struct PickOption {
     pub value: String,
@@ -87,8 +86,6 @@ pub fn page_with_dialog<'a, Message: 'a>(
 pub fn no_dialog<'a, Message: 'a>() -> Element<'a, Message> {
     stack([empty_stack_placeholder()]).into()
 }
-
-// Shared single-line editor field
 
 /// A single shared-editor field frame matching the app's `text_input` visual language
 /// (`BG_ELEVATED` fill, radius 4, hairline border).
@@ -345,13 +342,11 @@ pub struct PillMetrics {
     pub padding: [f32; 2], // [vertical, horizontal]
 }
 
-/// Compact inline pill badge metrics.
 pub const PILL_COMPACT: PillMetrics = PillMetrics {
     text_size: theme::TEXT_10,
     padding: [theme::PAD_1, theme::PAD_6],
 };
 
-/// Modal header pill badge metrics.
 pub const PILL_MODAL: PillMetrics = PillMetrics {
     text_size: theme::TEXT_12,
     padding: [theme::PAD_2, theme::PAD_8],
@@ -388,7 +383,6 @@ pub fn section_heading<'a>(
         .color(theme::TEXT_SECONDARY)
 }
 
-/// Sub-heading inside a section (smaller sibling of [`section_heading`]).
 #[must_use]
 pub fn section_subheading<'a>(
     title: impl Into<String>,
@@ -507,8 +501,6 @@ pub fn ghost_icon_button<Message: 'static + Clone>() -> Element<'static, Message
     .into()
 }
 
-/// Create a selectable text widget with the given color; accepts borrowed (`&str`) and owned
-/// (`String`) content.
 pub fn selectable_text<'a, Message: 'a>(
     content: impl IntoFragment<'a>,
     color: Color,
@@ -602,7 +594,6 @@ pub fn vscroll_tracked<'a, Message: 'a>(
         .into()
 }
 
-/// The common vertical wrapper body: padded content inside a thin-rail [`scrollable`].
 fn vscroll_base<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     width: Length,
@@ -649,9 +640,7 @@ pub const CHAT_VERTICAL_RHYTHM: f32 = 8.0;
 /// Chat-bubble alignment polarity: user messages render **left**, agent/typing indicators **right**.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BubbleSide {
-    /// Bubble flush left, spacer right.
     Left,
-    /// Spacer left, bubble flush right.
     Right,
 }
 
@@ -673,7 +662,6 @@ pub(crate) fn align_bubble<'a, Msg: 'a>(
 /// Options for [`chat_composer`] that differ between the Home and Board pages — bundled so the
 /// shared signature does not grow with page-specific knobs.
 pub struct ChatComposerOptions<'a, M> {
-    /// A send is in flight — button disabled.
     pub sending: bool,
     /// Editor min/max heights in px.
     pub min_height: f32,
@@ -874,24 +862,16 @@ pub fn git_footer_stats<'a, Message: 'a>(
     )
 }
 
-// Debounce helpers
-
-/// Spawn a sleep task that returns `generation` after `ms` milliseconds.
 pub async fn debounce_sleep(ms: u64, generation: u64) -> u64 {
     tokio::time::sleep(Duration::from_millis(ms)).await;
     generation
 }
 
-// File tree
-
-/// A node in a shared file-tree sidebar.
 #[derive(Debug, Clone)]
 pub struct TreeNode {
-    /// Display name (directory or file name component).
     pub name: String,
     /// Full relative path from workspace/repo root.
     pub full_path: String,
-    /// Whether this is a directory node.
     pub is_dir: bool,
     /// Children (only populated for expanded directory nodes).
     pub children: Vec<TreeNode>,
@@ -902,7 +882,6 @@ pub struct TreeNode {
     pub ignored: bool,
 }
 
-/// Direction for navigating the file tree (arrow-key vertical movement).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TreeNavDirection {
     Up,
@@ -911,17 +890,12 @@ pub(crate) enum TreeNavDirection {
 
 /// Shared file-tree state used by both the editor and diff dashboard pages.
 pub struct FileTree {
-    /// The hierarchical tree nodes.
     pub nodes: Vec<TreeNode>,
     /// Which directories are expanded (by `full_path`).
     pub expanded_dirs: HashSet<String>,
-    /// Whether keyboard focus is in the file tree.
     pub tree_focused: bool,
-    /// Index into `visible_tree_nodes` of the focused entry.
     pub tree_focus_index: usize,
-    /// Flattened visible tree entries: (full_path, is_dir).
     pub visible_tree_nodes: Vec<(String, bool)>,
-    /// Scrollable ID for the tree panel (for scroll-into-view).
     pub tree_scroll_id: iced::widget::Id,
     /// Current vertical scroll offset of the tree panel viewport.
     /// Updated via `on_scroll` on the scrollable widget.
@@ -934,7 +908,6 @@ pub struct FileTree {
 }
 
 impl FileTree {
-    /// Create a new empty `FileTree` with the given scrollable ID.
     #[must_use]
     pub fn new(scroll_id: iced::widget::Id) -> Self {
         Self {
@@ -949,7 +922,6 @@ impl FileTree {
         }
     }
 
-    /// Rebuild the flattened list of visible tree nodes for keyboard navigation.
     pub fn rebuild_visible(&mut self) {
         self.visible_tree_nodes.clear();
         Self::flatten_tree_nodes(
@@ -990,7 +962,6 @@ impl FileTree {
         }
     }
 
-    /// Recursively flatten tree nodes, respecting expanded state.
     fn flatten_tree_nodes(
         nodes: &[TreeNode],
         expanded: &HashSet<String>,
@@ -1287,7 +1258,6 @@ fn tree_panel_width(file_tree: &FileTree, row_widths: &[f32]) -> f32 {
 /// scroll-into-view logic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScrollMode {
-    /// Scroll so that the focused row is at the top of the viewport.
     SnapToTop,
     /// Only scroll when the focused row is outside the visible viewport. Requires
     /// [`FileTree::viewport_h`] to be `Some`; falls back to
@@ -1362,7 +1332,6 @@ fn scroll_to_tree_focus<Message: 'static>(
     }
 }
 
-/// Helper: absolute scroll to `y` offset and update [`FileTree::scroll_y`].
 fn absolute_scroll_to<Message: 'static>(file_tree: &mut FileTree, y: f32) -> Task<Message> {
     // Best-guess update of the tracked scroll offset so that subsequent
     // ScrollIntoView checks within the same frame use a plausible value.
@@ -1491,7 +1460,6 @@ pub fn render_tree_node<'a, Message>(
     if is_dir { render_dir() } else { render_file() }
 }
 
-/// Whether the tree node at `node_path` is the focused one in keyboard navigation.
 #[must_use]
 pub fn tree_node_focused(tree: &FileTree, node_path: &str) -> bool {
     tree.tree_focused
@@ -1655,7 +1623,6 @@ pub fn click_to_toggle<'a, Message: Clone + 'a>(
     .into()
 }
 
-/// Outcome of a press+release pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClickKind {
     Click,
@@ -1689,7 +1656,6 @@ struct ClickToggleState {
     last_click: Option<Instant>,
     /// Completed (non-drag) clicks ending at this widget, reset by a drag.
     click_count: u32,
-    /// Whether the in-progress drag gesture already published a cancel.
     drag_canceled: bool,
 }
 

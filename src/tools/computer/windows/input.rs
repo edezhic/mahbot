@@ -372,8 +372,6 @@ fn round_i32(value: f64) -> i32 {
     value.round() as i32
 }
 
-// Event construction
-
 fn mouse_event(dx: i32, dy: i32, data: u32, flags: MOUSE_EVENT_FLAGS) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
@@ -544,8 +542,6 @@ fn vk_for(key: &str) -> anyhow::Result<VIRTUAL_KEY> {
         "unknown key name '{key}' — accepted keys: {KNOWN_KEYS}"
     ))
 }
-
-// Sending
 
 /// Send one batch. `SendInput` inserts fewer events than offered when UIPI blocks
 /// the input — it reports no error, only a short count. Delivering nothing is a

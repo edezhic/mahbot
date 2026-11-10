@@ -228,7 +228,6 @@ pub(crate) struct Toast {
     pub kind: ToastKind,
 }
 
-/// Message emitted by a page to request a toast from the dashboard.
 #[derive(Debug, Clone)]
 pub enum ToastMessage {
     Saved,
@@ -365,9 +364,7 @@ pub enum Message {
     OpenSessions,
     /// Keyboard shortcut: Escape — dismiss modal/panel/confirmation on the current page.
     EscapePressed,
-    /// Update button pressed — open the self-update confirmation modal.
     UpdateBot,
-    /// Self-update confirmed — start the background update.
     ConfirmUpdate,
     CancelUpdate,
     UpdateResult(Result<String, String>),
@@ -439,7 +436,6 @@ pub enum Message {
 /// Let [`Dashboard::update`] intercept Toast and LinkClicked messages before
 /// dispatching to page handlers, instead of repeating that in every page.
 impl Message {
-    /// The inner [`ToastMessage`], if this message wraps one.
     pub(crate) fn as_toast(&self) -> Option<&ToastMessage> {
         match self {
             Message::Home(home::HomeMessage::Toast(tm))
@@ -475,7 +471,6 @@ impl Message {
 /// Platform-aware keyboard modifier state from a [`keyboard::Modifiers`] value.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct KeyboardMods {
-    /// ⌘ is held.
     pub is_cmd: bool,
     /// The platform modifier: ⌘ on macOS, Ctrl elsewhere.
     pub is_platform_mod: bool,
@@ -516,7 +511,6 @@ impl KeyboardMods {
     }
 }
 
-/// [`KeyboardMods`] from an Iced [`keyboard::Modifiers`] value.
 pub(crate) fn detect_keyboard_mods(modifiers: keyboard::Modifiers) -> KeyboardMods {
     let is_cmd = modifiers.command();
     let is_platform_mod = modifiers.command() || modifiers.control();
@@ -534,7 +528,6 @@ pub(crate) fn detect_keyboard_mods(modifiers: keyboard::Modifiers) -> KeyboardMo
     }
 }
 
-/// Extract the key, modifiers, and physical key from a `KeyPressed` event.
 #[must_use]
 pub(crate) fn parse_key_press(
     event: keyboard::Event,
@@ -678,7 +671,6 @@ pub struct Dashboard {
     editor_state: editor::EditorState,
     settings_state: settings::SettingsState,
 
-    /// Whether the picked workspace's diff view is open.
     show_diff_modal: bool,
     /// The read-only view of another project's commit, from a sidebar ticket of another
     /// workspace: the project named in its header while open.
@@ -2465,7 +2457,6 @@ fn ticket_sidebar(board_state: &board::BoardState) -> Element<'_, Message> {
         .into()
 }
 
-/// Hint line for empty/loading ticket-list states.
 fn section_hint(label: &str) -> Element<'_, Message> {
     column![
         Space::new().height(8),
@@ -2514,7 +2505,6 @@ fn render_normal_ticket_list(board_state: &board::BoardState) -> Element<'_, Mes
     }
 }
 
-/// Render FTS search results as ticket cards in a scrollable list.
 fn render_search_results(board_state: &board::BoardState) -> Element<'_, Message> {
     // A failed search must not render as "No matching tickets".
     if let Some(err) = board_state.search_error.as_deref() {
@@ -2531,7 +2521,6 @@ fn render_search_results(board_state: &board::BoardState) -> Element<'_, Message
     }
 }
 
-/// Render a group of tickets with a header label.
 fn group_section<'a>(
     label: &'static str,
     tickets: &[&'a Ticket],
@@ -2920,7 +2909,6 @@ fn page_icon(page: Page) -> iced::widget::Text<'static, iced::Theme, iced::Rende
 #[derive(Clone, Copy)]
 enum RailEntry {
     Item,
-    /// The rail entry at the rail's bottom end.
     AtBottom,
     /// The window's own control: half-height, so it stays a narrow strip at the rail's top.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -3199,7 +3187,6 @@ impl Dashboard {
         )
     }
 
-    /// Footer per-workspace Maintainer toggle icon button.
     fn render_maintainer_toggle(&self) -> Element<'_, Message> {
         let enabled = self.maintenance_enabled();
         let icon: Element<'_, Message> = theme::role_icon(&Role::Maintainer)
@@ -3224,7 +3211,6 @@ impl Dashboard {
         )
     }
 
-    /// Footer per-workspace pipeline pause/unpause toggle icon button.
     fn render_pause_toggle(&self) -> Element<'_, Message> {
         let paused = self.paused();
         let icon: Element<'_, Message> = if paused {
@@ -3389,7 +3375,6 @@ impl Dashboard {
         ))
     }
 
-    /// Vertical divider between the footer activity chrome and git blocks.
     fn render_git_divider() -> Element<'static, Message> {
         rule::vertical(1)
             .style(|_: &iced::Theme| rule::Style {
@@ -3401,7 +3386,6 @@ impl Dashboard {
             .into()
     }
 
-    /// The current git branch button (clickable -> branch modal), `None` when no branch is known.
     fn render_git_branch(&self) -> Option<Element<'_, Message>> {
         let b = self.git_state.current_branch()?;
         let truncated = crate::util::truncate(b, 20);
@@ -3423,7 +3407,6 @@ impl Dashboard {
         ))
     }
 
-    /// One icon+count cell of the footer's sync control.
     fn sync_metric(
         icon: iced::widget::text::Text<'_, iced::Theme, iced::Renderer>,
         count: usize,
@@ -3664,7 +3647,6 @@ impl Dashboard {
         })
     }
 
-    /// The footer's active agent icons; `None` when no agents run.
     fn render_active_agents() -> Option<Element<'static, Message>> {
         let icons: Vec<Element<'static, Message>> = Self::running_roles()
             .into_iter()
@@ -3681,8 +3663,6 @@ impl Dashboard {
         )
     }
 
-    /// The in-flight non-agent call counter next to the agent icons; `None` when none are in
-    /// flight.
     fn render_non_agent_calls() -> Option<Element<'static, Message>> {
         Some(Self::non_agent_calls(theme::TEXT_14)?.footer())
     }
@@ -3785,7 +3765,6 @@ impl Dashboard {
     }
 }
 
-/// Muted 12px footer status label with side padding, optionally behind a glyph.
 fn footer_status_label(
     label: String,
     icon: Option<iced::widget::text::Text<'static, iced::Theme, iced::Renderer>>,
@@ -3808,7 +3787,6 @@ fn footer_status_label(
     container(content).padding([0.0, theme::PAD_12]).into()
 }
 
-/// Persisted window geometry: the last size and position the window reported.
 #[derive(serde::Deserialize)]
 pub struct WindowState {
     pub width: f32,
@@ -3895,7 +3873,6 @@ impl Default for WindowState {
 
 const WINDOW_STATE_FILE: &str = "window-state.json";
 
-/// Read persisted window state, falling back to defaults when it is missing or unreadable.
 #[must_use]
 pub fn read_window_state() -> WindowState {
     let Ok(dir) = crate::config::default_config_dir() else {
@@ -3956,7 +3933,6 @@ async fn load_workspace_map(generation: u64) -> Message {
     }
 }
 
-/// Read the full workspace map from the store (one row per name).
 async fn read_workspace_map() -> anyhow::Result<HashMap<String, Workspace>> {
     let list = crate::workspace::store().list().await?;
     Ok(list.into_iter().map(|ws| (ws.name.clone(), ws)).collect())
@@ -4702,7 +4678,6 @@ mod tests {
             Dash(Option<&'static str>),
             /// What the fallback resolves a stored name to while `personal:alice` exists.
             Fallback(Option<&'static str>),
-            /// What the picker is offered.
             Options,
         }
         use Probe::*;

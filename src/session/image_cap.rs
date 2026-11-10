@@ -180,7 +180,6 @@ mod tests {
         let mut messages = spread(total);
         apply(&mut messages, Some(total));
         assert_eq!(count(&messages), total - RETIRE_BATCH);
-        // The newest pictures survive verbatim; the oldest became the omission note.
         assert!(messages[total - 1].content.contains(&picture(total - 1)));
         assert!(!messages[0].content.contains("data:image/"));
         assert!(messages[0].content.contains("data-uri omitted"));

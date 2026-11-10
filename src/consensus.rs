@@ -48,7 +48,6 @@ impl GroupingMember {
     }
 }
 
-/// A group of related items plus the LLM's contradiction judgment.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct GroupingGroup {
@@ -137,7 +136,6 @@ impl<'a> ItemTable<'a> {
         }
     }
 
-    /// Total item count across all sources.
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.rows.len()
@@ -246,7 +244,6 @@ pub(crate) fn render_ungrouped_section(
     out
 }
 
-/// Mutable state of the repair protocol across rounds.
 struct RepairState<'a> {
     /// Global flat id table for this operation (id → agent, text).
     table: ItemTable<'a>,
@@ -299,7 +296,6 @@ struct RoundInput {
     pub references: Vec<GroupingReference>,
 }
 
-/// Per-round acceptance result.
 #[derive(Default)]
 struct RoundOutcome {
     /// Round-level rejection (incomplete coverage) — nothing froze this round.
@@ -307,11 +303,8 @@ struct RoundOutcome {
     /// Per-group/per-entry rejections fed to the next round, each with its typed cause (no
     /// substring classification of message wording).
     pub rejections: Vec<(FailureClass, String)>,
-    /// Newly frozen groups.
     pub froze: usize,
-    /// Newly accepted contradiction references.
     pub accepted_refs: usize,
-    /// A summary was accepted this round.
     pub accepted_summary: bool,
 }
 
@@ -321,7 +314,6 @@ fn member_range_error(member: &GroupingMember, table: &ItemTable<'_>) -> Option<
     (member.id >= table.len()).then(|| format!("unknown item id {}", member.id))
 }
 
-/// Push a typed rejection onto the outcome.
 fn reject(outcome: &mut RoundOutcome, cause: FailureClass, msg: String) {
     outcome.rejections.push((cause, msg));
 }

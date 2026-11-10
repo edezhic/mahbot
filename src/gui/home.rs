@@ -27,7 +27,6 @@ use super::widgets::{BubbleSide, align_bubble};
 /// [`DEDUP_RETAIN`].
 const DEDUP_PRUNE_THRESHOLD: usize = 500;
 
-/// Number of most-recent message IDs retained after a dedup-set prune.
 const DEDUP_RETAIN: usize = 200;
 
 /// Debounce window (ms) after a text/reply change before the draft is persisted to disk.
@@ -44,7 +43,6 @@ pub(super) const CHAT_SCROLL_ID: Id = Id::new("home_chat_scroll");
 /// the page opens or is navigated to.
 const CHAT_COMPOSER_ID: Id = Id::new("home_chat_composer");
 
-/// A displayed chat message in the scroll view.
 #[derive(Debug, Clone)]
 struct DisplayMessage {
     /// Row id in storage (`Some` for entries read from chat_history) or `None` for what is only on
@@ -57,9 +55,7 @@ struct DisplayMessage {
     /// Timestamp for the relative-time label and for load reconciliation: the stored row's own, or
     /// — for an on-screen-only message — the instant of the event that produced it.
     pub timestamp: Option<String>,
-    /// Reference to the message this one replies to, rendered as a quote header.
     pub reply_reference: Option<ReplyReference>,
-    /// Pre-parsed markdown items for rendering.
     pub md_items: Vec<iced::widget::markdown::Item>,
     /// The body's attachments (pictures, named files), in body order, drawn as one block above
     /// the text.
@@ -289,7 +285,6 @@ fn composer_controls(
     controls
 }
 
-/// Composer mic button: starts a voice recording for the Assistant.
 fn mic_control(voice_status: &crate::audio::voice::VoiceStatus) -> Element<'static, HomeMessage> {
     // The mic is busy while the pipeline owns it for a recording or any transcription — the button
     // must not look active when a new recording would be rejected. (A composer-owned recording
@@ -1110,7 +1105,6 @@ impl HomeState {
         let voice_status = crate::audio::voice::get_status();
         let recording = matches!(self.voice_message, Some(VoiceMessage::Recording));
 
-        // Input area
         // Controls for the composer action toolbar — inert while the composer is
         // (a drain).
         let controls: Vec<Element<'_, HomeMessage>> =
@@ -1176,7 +1170,6 @@ impl HomeState {
             .width(Length::Fill)
             .into();
 
-        // Reply preview
         // Shown between the message list and the composer while a reply target
         // is pending; the dismiss control cancels it.
         let reply_preview: Element<'_, HomeMessage> = match &self.pending_reply {
@@ -1184,7 +1177,6 @@ impl HomeState {
             None => Space::new().height(0).into(),
         };
 
-        // Full layout
         column![chat_area, reply_preview, input_area,]
             .align_x(Alignment::End)
             .width(Length::Fill)
@@ -1369,7 +1361,6 @@ impl HomeState {
                 // Capture synchronously (not from the ChatCleared callback): the
                 // reply is dropped but the draft text is kept.
                 let draft = self.capture_draft(DRAFT_SETTLE_MS);
-                // Build agent ID and schedule async cleanup.
                 let sender = crate::users::ADMIN_USER_NAME.to_string();
                 let clear_task = Task::perform(
                     async move {
@@ -1483,7 +1474,6 @@ impl HomeState {
                     reply_reference,
                     ..
                 } => {
-                    // 1. Replace optimistic placeholder if present.
                     if let Some(task) = self.replace_optimistic(
                         optimistic_id.as_deref(),
                         &message_id,
@@ -1496,18 +1486,15 @@ impl HomeState {
                         return task;
                     }
 
-                    // 2. Clear sending/typing state based on direction, sender, and workspace.
-                    //    Before the dedup: a confirmation whose row a load already
-                    //    brought in is dropped below, and it must still free the
-                    //    composer rather than leave the send guard holding it.
+                    // Sending/typing state is cleared before the dedup: a confirmation whose
+                    // row a load already brought in is dropped below, and it must still free
+                    // the composer rather than leave the send guard holding it.
                     self.update_sending_state(direction, &user_name, &workspace);
 
-                    // 3. Deduplicate against already-seen IDs.
                     if self.try_dedup(&message_id) {
                         return Task::none();
                     }
 
-                    // 4. Append the message (filtered by acting user + workspace).
                     self.append_message(
                         &user_name,
                         &workspace,
@@ -2001,7 +1988,6 @@ impl HomeState {
         Task::batch([restored, Task::done(why), lost])
     }
 
-    /// The toast for a send that could not reach the pipeline.
     fn send_refused_toast() -> HomeMessage {
         HomeMessage::Toast(ToastMessage::Error(
             "The message could not be sent. Try again.".to_string(),
@@ -2263,8 +2249,6 @@ mod tests {
         );
     }
 
-    // Helpers
-
     fn make_home_state(workspace: &str) -> HomeState {
         let mut state = HomeState::new();
         // Hermetic draft store bound to a throwaway temp dir so tests never
@@ -2311,7 +2295,6 @@ mod tests {
         ))
     }
 
-    /// The message a chat row of `text` renders to.
     fn said(text: &str, direction: ChatDirection) -> DisplayMessage {
         display_message(
             None,
@@ -2515,8 +2498,6 @@ mod tests {
         })
     }
 
-    // replace_optimistic
-
     /// An optimistic composer bubble waiting for its confirmation.
     fn bubble(id: &str, content: &str) -> DisplayMessage {
         make_msg(id, content, ChatDirection::User, None, true)
@@ -2689,8 +2670,6 @@ mod tests {
         }
     }
 
-    // try_dedup
-
     enum DedupSetup {
         Empty,
         Seen(&'static [&'static str]),
@@ -2761,8 +2740,6 @@ mod tests {
         }
     }
 
-    // update_sending_state
-
     struct SendingStateCase<'a> {
         name: &'static str,
         direction: ChatDirection,
@@ -2820,8 +2797,6 @@ mod tests {
             assert_eq!(state.typing, case.typing, "case {name}: typing");
         }
     }
-
-    // append_message
 
     #[test]
     fn append_message_takes_only_the_conversations_own_messages() {
@@ -2881,8 +2856,6 @@ mod tests {
             }
         }
     }
-
-    // one conversation, scoped to the admin's personal workspace
 
     #[test]
     fn a_selection_change_leaves_the_conversation_alone() {
@@ -2961,8 +2934,6 @@ mod tests {
         assert!(state.typing, "the conversation's own typing cue is shown");
         assert!(!state.sending, "its own live traffic clears the send");
     }
-
-    // History reload reconciliation
 
     /// A stored message the page already shows, with its row id.
     fn stored(id: &str, content: &str, db_id: i64) -> DisplayMessage {
@@ -3105,8 +3076,6 @@ mod tests {
         assert!(!state.sending, "it still frees the composer");
     }
 
-    // A stored row becomes a display message
-
     #[test]
     fn a_stored_entry_becomes_a_display_message() {
         use ChatDirection::{Divider, User};
@@ -3222,8 +3191,6 @@ mod tests {
         }
     }
 
-    // Selection (shift+click / drag)
-
     #[test]
     fn test_select_to_creates_selection() {
         let mut state = make_home_state("ws1");
@@ -3244,8 +3211,6 @@ mod tests {
             "SelectTo makes a selection; got {selection:?}"
         );
     }
-
-    // send_message
 
     #[test]
     fn send_message_sends_only_non_blank_text_and_returns_an_untaken_send() {
@@ -3269,8 +3234,6 @@ mod tests {
             assert!(!optimistic, "case {name}: no optimistic bubble");
         }
     }
-
-    // Voice recording outcomes
 
     /// Put the composer where a mic press leaves it: a recording owns the field,
     /// which holds `text`. The returned receiver stands in for the pipeline that

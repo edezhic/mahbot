@@ -29,8 +29,6 @@ const PAGE_SCROLL_LINES: usize = 40;
 /// amount must not take the wheel from the page behind it.
 const MIN_SCROLL_OVERFLOW: f32 = 0.5;
 
-/// Represents a cursor position (line and character-based column) together
-/// with an optional selection anchor.
 #[derive(Debug, Clone)]
 pub struct CursorState {
     pub line: usize,
@@ -38,7 +36,6 @@ pub struct CursorState {
     pub selection: Option<Box<CursorState>>,
 }
 
-/// Direction for [`EditorAction::Move`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CursorMove {
     Left,
@@ -262,8 +259,6 @@ impl EditorBuffer {
         }
     }
 
-    /// Create a buffer pre-populated with the given text and infer the
-    /// language and file extension from the given file path.
     pub fn from_file(text: &str, path: impl AsRef<std::path::Path>) -> Self {
         let path_ref = path.as_ref();
         let language = path_ref.to_str().and_then(HighlightLanguage::from_path);
@@ -288,8 +283,6 @@ impl EditorBuffer {
         buffer_text(&self.buffer.borrow())
     }
 
-    /// Replace all text, re-highlight with the stored `language`, and reset
-    /// the cursor to `(0, 0)` with no selection.
     pub fn set_text(&self, text: &str) {
         let text = if self.single_line.get() {
             sanitize_single_line(text).to_string()
@@ -308,12 +301,10 @@ impl EditorBuffer {
         self.has_selection.set(false);
     }
 
-    /// Clear all text (equivalent to [`set_text`](Self::set_text) with `""`).
     pub fn clear(&self) {
         self.set_text("");
     }
 
-    /// Returns `true` when every line in the buffer is empty (blank content).
     #[must_use]
     fn is_empty(&self) -> bool {
         self.buffer
@@ -350,7 +341,6 @@ impl EditorBuffer {
             .map_or(0, |l| l.text().chars().count())
     }
 
-    /// Return the current cursor state, including selection anchor if any.
     pub fn cursor(&self) -> CursorState {
         let has_real_selection = self.has_selection.get()
             && (self.sel_line.get() != self.cursor_line.get()
@@ -411,19 +401,15 @@ impl EditorBuffer {
         if line_count == 0 {
             return;
         }
-        // Set cursor to end of last line
         let last_line = line_count - 1;
         let last_line_len = self.line_char_len(last_line);
         self.cursor_line.set(last_line);
         self.cursor_col.set(last_line_len);
-        // Set selection anchor to start
         self.sel_line.set(0);
         self.sel_col.set(0);
         self.has_selection.set(true);
     }
 
-    /// Apply an [`EditorAction`] to the buffer, modifying text and cursor
-    /// as appropriate.
     pub fn perform_action(&self, action: EditorAction) {
         match action {
             EditorAction::Insert(c) => self.do_insert(c),
@@ -514,12 +500,10 @@ impl EditorBuffer {
         }
     }
 
-    /// Borrow the underlying [`cosmic_text::Buffer`] for drawing.
     fn borrow_buffer(&self) -> std::cell::Ref<'_, cosmic_text::Buffer> {
         self.buffer.borrow()
     }
 
-    /// Borrow the underlying [`cosmic_text::Buffer`] mutably for shaping.
     fn borrow_buffer_mut(&self) -> std::cell::RefMut<'_, cosmic_text::Buffer> {
         self.buffer.borrow_mut()
     }
@@ -1117,7 +1101,6 @@ impl EditorBuffer {
         }
     }
 
-    /// Delete from cursor backward to start of previous word.
     fn do_delete_word_back(&self) {
         if self.delete_if_selected() {
             return;
@@ -1140,7 +1123,6 @@ impl EditorBuffer {
         });
     }
 
-    /// Delete from cursor forward to start of next word.
     fn do_delete_word_forward(&self) {
         if self.delete_if_selected() {
             return;
@@ -1653,7 +1635,6 @@ fn reassemble_lines(lines: &[(String, String)]) -> String {
     out
 }
 
-/// Line ending convention detected for a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LineEnding {
     Lf,
@@ -1785,10 +1766,8 @@ fn find_word_end(text: &str, offset: usize) -> usize {
 
     let mut pos = offset;
 
-    // Helper: get char at current position
     let char_at = |p: usize| text[p..].chars().next().map(|c| (c, c.len_utf8()));
 
-    // Skip word chars
     while let Some((ch, ch_len)) = char_at(pos) {
         if !is_word_char(ch) {
             break;
@@ -1799,7 +1778,6 @@ fn find_word_end(text: &str, offset: usize) -> usize {
         }
     }
 
-    // Skip non-word, non-whitespace
     while let Some((ch, ch_len)) = char_at(pos) {
         if is_word_char(ch) || ch.is_whitespace() {
             break;
@@ -1810,7 +1788,6 @@ fn find_word_end(text: &str, offset: usize) -> usize {
         }
     }
 
-    // Skip whitespace to find start of next word
     while let Some((ch, ch_len)) = char_at(pos) {
         if !ch.is_whitespace() {
             break;
@@ -1949,7 +1926,6 @@ fn find_cursor_run<'a>(
 struct EditorWidgetState {
     /// The `Arc<Buffer>` must live across frames for fill_raw to work.
     buffer_for_render: Option<Arc<cosmic_text::Buffer>>,
-    /// Timestamp of last cursor blink toggle.
     last_blink: std::time::Instant,
     /// Current vertical scroll offset in pixels.
     scroll_y: f32,
@@ -1961,12 +1937,10 @@ struct EditorWidgetState {
     max_scroll_x: f32,
     /// Cached gutter width in pixels (computed per frame in layout).
     gutter_width: f32,
-    /// Whether the left mouse button is currently held (for drag-selection).
     mouse_held: bool,
     /// Whether auto-scroll-to-cursor is active. Disabled by manual wheel
     /// scrolling, re-enabled by keyboard cursor movement.
     auto_scroll_enabled: bool,
-    /// Instant of the last mouse click, used for double-click detection.
     last_click_time: Option<std::time::Instant>,
     /// (line, col) of the last mouse click, used for double-click proximity check.
     last_click_pos: Option<(usize, usize)>,
@@ -2060,17 +2034,11 @@ pub struct EditorWidget<'a> {
     /// Identity of the active buffer (typically file path). When this
     /// changes, widget scroll and interaction state are reset.
     buffer_key: Option<&'a str>,
-    /// Render as a single-line field (bare Enter submits / is a no-op).
     single_line: bool,
-    /// Mask the rendered glyphs with `•` (copy still returns plaintext).
     masked: bool,
-    /// Render the line-number gutter.
     show_gutter: bool,
-    /// Enable code-editor hotkeys (line comment, bracket jump, line ops, etc.).
     code_mode: bool,
-    /// How a bare Enter key behaves.
     enter: EnterBehavior,
-    /// Placeholder text drawn when the buffer is empty.
     placeholder: Option<Cow<'a, str>>,
     /// Minimum widget height for auto-sizing prose modes (`None` → the
     /// widget fills its container as a code editor).
@@ -2097,7 +2065,6 @@ pub struct EditorWidget<'a> {
 }
 
 impl<'a> EditorWidget<'a> {
-    /// Create a new [`EditorWidget`] in the default code-editor mode.
     pub const fn new(buffer: &'a EditorBuffer) -> Self {
         Self {
             buffer,
@@ -2247,7 +2214,6 @@ impl<'a> EditorWidget<'a> {
         self
     }
 
-    /// Render as a single-line field (bare Enter submits / is a no-op).
     #[must_use]
     pub const fn single_line(mut self, single_line: bool) -> Self {
         self.single_line = single_line;
@@ -2261,7 +2227,6 @@ impl<'a> EditorWidget<'a> {
         self
     }
 
-    /// Render the line-number gutter.
     #[must_use]
     pub const fn show_gutter(mut self, show_gutter: bool) -> Self {
         self.show_gutter = show_gutter;
@@ -2275,14 +2240,12 @@ impl<'a> EditorWidget<'a> {
         self
     }
 
-    /// Set how a bare Enter key behaves.
     #[must_use]
     pub const fn enter(mut self, enter: EnterBehavior) -> Self {
         self.enter = enter;
         self
     }
 
-    /// Set the placeholder text drawn when the buffer is empty.
     #[must_use]
     pub fn placeholder(mut self, placeholder: impl Into<Cow<'a, str>>) -> Self {
         self.placeholder = Some(placeholder.into());
@@ -2583,11 +2546,9 @@ where
             if let Some(run) = find_cursor_run(buffer.layout_runs(), cursor.line, cursor.column) {
                 let cursor_top = run.line_top;
                 let cursor_bottom = run.line_top + run.line_height;
-                // Cursor above viewport → scroll up
                 if cursor_top < 0.0 {
                     state.scroll_y = (state.scroll_y + cursor_top).max(0.0);
                 }
-                // Cursor below viewport → scroll down
                 if cursor_bottom > text_area_height {
                     state.scroll_y =
                         (state.scroll_y + cursor_bottom - text_area_height).min(state.max_scroll_y);
@@ -3070,12 +3031,10 @@ where
                             let cursor = self.buffer.cursor();
                             let metrics = font_metrics();
 
-                            // Find the cursor's current visual row
                             let cursor_run =
                                 find_cursor_run(buffer.layout_runs(), cursor.line, cursor.column);
 
                             if let Some(run) = cursor_run {
-                                // Compute cursor x-offset within the text area
                                 let cursor_x = run
                                     .glyphs
                                     .iter()
@@ -3460,9 +3419,7 @@ fn publish_move_or_select(
 struct TextGeometry {
     /// The clipping rectangle for text content (same as `text_rect`).
     clip: Rectangle,
-    /// Absolute x-coordinate of the text area origin.
     x: f32,
-    /// Absolute y-coordinate of the text area origin.
     y: f32,
 }
 
@@ -3790,11 +3747,9 @@ fn map_key_to_action(
     match key {
         key::Key::Named(named) => {
             match (named, platform_mod, shift, alt) {
-                // Platform mod + Up/Home → document start
                 (key::Named::ArrowUp | key::Named::Home, true, s, false) => {
                     mv(CursorMove::DocStart, s)
                 }
-                // Platform mod + Down/End → document end
                 (key::Named::ArrowDown | key::Named::End, true, s, false) => {
                     mv(CursorMove::DocEnd, s)
                 }
@@ -3809,11 +3764,9 @@ fn map_key_to_action(
                     mv(CursorMove::End, s)
                 }
 
-                // Page keys
                 (key::Named::PageUp, false, s, false) => mv(CursorMove::PageUp, s),
                 (key::Named::PageDown, false, s, false) => mv(CursorMove::PageDown, s),
 
-                // Alt+Left/Right → word boundary navigation
                 (key::Named::ArrowLeft, false, s, true) => mv(CursorMove::WordLeft, s),
                 (key::Named::ArrowRight, false, s, true) => mv(CursorMove::WordRight, s),
 
@@ -3825,10 +3778,8 @@ fn map_key_to_action(
                     Some(EditorAction::MoveLineDown)
                 }
 
-                // Delete/Backspace
                 (key::Named::Backspace, false, false, false) => Some(EditorAction::Backspace),
                 (key::Named::Delete, false, false, false) => Some(EditorAction::Delete),
-                // Platform mod + Backspace/Delete → delete word
                 (key::Named::Backspace, true, false, false) => Some(EditorAction::DeleteWordBack),
                 (key::Named::Delete, true, false, false) => Some(EditorAction::DeleteWordForward),
 
@@ -3918,29 +3869,24 @@ fn map_key_to_action(
                 }
             }
 
-            // SelectAll via platform mod + A
             // Guard: !altgr_active prevents AltGr+A (on non-macOS) from
             // triggering SelectAll.
             if !altgr_active && latin == Some('a') && platform_mod && !shift {
                 return Some(EditorAction::SelectAll);
             }
 
-            // Toggle line comment via platform mod + / (code-only)
             if code_mode && !altgr_active && latin == Some('/') && platform_mod && !shift {
                 return Some(EditorAction::ToggleLineComment);
             }
 
-            // Jump to matching bracket via platform mod + Shift + \ (code-only)
             if code_mode && !altgr_active && latin == Some('\\') && platform_mod && shift {
                 return Some(EditorAction::JumpToMatchingBracket);
             }
 
-            // Delete line via platform mod + Shift + K (code-only)
             if code_mode && !altgr_active && latin == Some('k') && platform_mod && shift {
                 return Some(EditorAction::DeleteLine);
             }
 
-            // Duplicate line via platform mod + Shift + D (code-only)
             if code_mode && !altgr_active && latin == Some('d') && platform_mod && shift {
                 return Some(EditorAction::DuplicateLine);
             }

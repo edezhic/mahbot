@@ -21,7 +21,6 @@ use std::time::Duration;
 use tracing::{debug, warn};
 
 crate::define_store! {
-    /// Global chat history store.
     pub(crate) static CHAT_HISTORY: ChatHistoryStore,
     expect = "CHAT_HISTORY not initialized — call init_all_stores() first",
 }
@@ -43,7 +42,6 @@ pub struct ChatHistoryInsert {
     pub reply_reference: Option<ReplyReference>,
 }
 
-/// A single chat message record for history display.
 #[derive(Debug, Clone)]
 pub struct ChatHistoryEntry {
     pub id: i64,
@@ -52,7 +50,6 @@ pub struct ChatHistoryEntry {
     pub direction: ChatDirection,
     pub agent_role: Option<String>,
     pub timestamp: Option<String>,
-    /// The replied-to message, for quote-header rendering.
     pub reply_reference: Option<ReplyReference>,
 }
 
@@ -102,7 +99,6 @@ crate::columns! {
     }
 }
 
-/// A row to a [`ChatHistoryEntry`] via the [`CHAT_HISTORY_COLUMNS`] index constants.
 fn chat_history_entry_from_row(row: &Row) -> Result<ChatHistoryEntry> {
     let reply_author = row.get::<Option<String>>(COL_CH_REPLY_AUTHOR)?;
     let reply_snippet = row.get::<Option<String>>(COL_CH_REPLY_SNIPPET)?;

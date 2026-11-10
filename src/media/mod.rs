@@ -530,7 +530,6 @@ async fn frames(
     ))
 }
 
-/// What a read has to say about the sound track.
 enum Sound {
     /// The recogniser's regions, the second the pass reached, and why it could not finish when it
     /// could not — a piece it could not read, or another read holding the file.
@@ -545,20 +544,17 @@ enum Sound {
     Failed(MediaError),
 }
 
-/// One line of the timeline.
 struct Line {
     start: f64,
     end: f64,
     text: String,
 }
 
-/// Everything the timeline is rendered from.
 struct Timeline<'a> {
     path: &'a Path,
     kind: Kind,
     info: &'a ClipInfo,
     window: Window,
-    /// The stretch the transcript covers.
     span: Span,
     /// The frames taken, each with the second it marks, in timeline order.
     frames: &'a [(PathBuf, f64)],

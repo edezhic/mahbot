@@ -488,12 +488,10 @@ struct CaptureDone(Arc<tokio::sync::Notify>);
 
 #[cfg(unix)]
 impl CaptureDone {
-    /// A fresh, unreleased guard.
     fn new() -> Self {
         CaptureDone(Arc::new(tokio::sync::Notify::new()))
     }
 
-    /// Resolve once the capture is over.
     async fn wait(&self) {
         self.0.notified().await;
     }
@@ -1087,7 +1085,6 @@ mod evidence {
         matches!(name, "HOME" | "LOGNAME" | "OLDPWD" | "PWD" | "SHLVL" | "_")
     }
 
-    /// The names a recovered environment carries.
     fn recovered_names(env: &OwnerEnv) -> BTreeSet<String> {
         env.vars()
             .iter()

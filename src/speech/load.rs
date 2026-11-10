@@ -120,7 +120,6 @@ impl<E: Send + 'static> Lazy<E> {
         self.engine()
     }
 
-    /// Restart the idle timer.
     fn touch(&self) {
         self.last_use.store(now_millis(), Ordering::Release);
     }
@@ -148,7 +147,6 @@ impl<E: Send + 'static> Lazy<E> {
         self.idle_for_release() && self.try_release("after an idle period")
     }
 
-    /// Whether a pass holds a cloned handle right now.
     fn in_use(&self) -> bool {
         self.engine
             .lock()

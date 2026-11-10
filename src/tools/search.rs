@@ -33,7 +33,6 @@ pub(crate) const QUERY_ALIAS_KEYS: &[&str] = &["pattern", "search", "search_term
 /// Built via [`LazyLock`] so a new alias propagates here automatically.
 static KNOWN_KEYS: LazyLock<Vec<&str>> = LazyLock::new(|| {
     let mut keys = vec![
-        // schema keys
         "mode",
         "query",
         "grep_mode",
@@ -42,9 +41,7 @@ static KNOWN_KEYS: LazyLock<Vec<&str>> = LazyLock::new(|| {
         "offset",
         "context_lines",
     ];
-    // query aliases (see QUERY_ALIAS_KEYS)
     keys.extend_from_slice(QUERY_ALIAS_KEYS);
-    // mode-switching alias + constraint params
     keys.extend_from_slice(&["file_pattern", "path", "ext"]);
     keys
 });
@@ -613,7 +610,6 @@ fn format_constraint(constraint: &Constraint<'_>) -> String {
     }
 }
 
-/// Format a list of constraints as a comma-separated string.
 fn format_constraints(constraints: &[Constraint<'_>]) -> String {
     constraints
         .iter()
@@ -721,7 +717,6 @@ mod tests {
         expected: Option<&'static str>,
     }
 
-    /// Assert that normalizing `input` produces `expected`.
     fn assert_normalize(input: &serde_json::Value, expected: &serde_json::Value, name: &str) {
         let mut args = input.clone();
         normalize_search_args(&mut args);
@@ -912,7 +907,6 @@ mod tests {
         // Sanity check: KNOWN_KEYS should contain every key we expect — update it when adding
         // schema keys.
         let expected: std::collections::HashSet<&str> = std::collections::HashSet::from([
-            // schema keys
             "mode",
             "query",
             "grep_mode",
@@ -925,16 +919,13 @@ mod tests {
             "search",
             "search_term",
             "grep_search",
-            // mode-switching alias
             "file_pattern",
-            // constraint params
             "path",
             "ext",
         ]);
 
         let actual: std::collections::HashSet<&str> = KNOWN_KEYS.iter().copied().collect();
 
-        // Every expected key is present
         for key in &expected {
             assert!(
                 actual.contains(key),
@@ -951,7 +942,6 @@ mod tests {
         }
     }
 
-    /// Assert that resolving `input` produces `expected`.
     fn assert_resolve(input: &serde_json::Value, expected: Option<&str>, name: &str) {
         let result = resolve_query(input);
         assert_eq!(result.as_deref(), expected, "case '{name}' failed");

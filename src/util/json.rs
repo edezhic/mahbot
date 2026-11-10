@@ -209,8 +209,6 @@ pub(crate) fn get_opt_bool(val: &Value, key: &str) -> anyhow::Result<Option<bool
     }
 }
 
-// JSON parsing from LLM output
-
 /// Attempt to repair malformed JSON using [`jsonrepair_rs::jsonrepair`] then re-parse.
 ///
 /// Returns `None` if either the repair or the re-parse fails.
@@ -274,8 +272,6 @@ mod tests {
         #[serde(default)]
         issues: Vec<String>,
     }
-
-    // parse_fenced_json tests
 
     #[test]
     fn parse_fenced_json_valid_inputs() {

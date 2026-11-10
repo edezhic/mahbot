@@ -144,7 +144,6 @@ pub const PURGE_CUTOFF_HOURS: i64 = 8;
 // Only the columns actually read by the scan paths are copied into memory; caller
 // identity is re-queried on demand by `job_caller`. The DB schema columns stay as-is.
 
-/// A row of the `jobs` table.
 #[derive(Debug, Clone)]
 pub(crate) struct JobRow {
     pub id: String,
@@ -179,7 +178,6 @@ pub(crate) struct AgentRow {
     pub task: String,
 }
 
-/// A row of the `pending_jobs` table.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingJobRow {
     pub id: String,
@@ -501,7 +499,6 @@ async fn insert_job_tx(
     Ok(())
 }
 
-/// One agent slot in a spawn roster.
 pub(crate) struct NewAgent {
     pub agent_id: String,
     pub kind: AgentKind,
@@ -826,7 +823,6 @@ fn ticket_job_row_from(row: &Row) -> anyhow::Result<TicketJobRow> {
     Ok(TicketJobRow { id: row.get(0)? })
 }
 
-/// Load the launched phase job for a ticket, if one exists.
 pub(crate) async fn find_phase_job(
     conn: &Connection,
     ticket_id: &str,
@@ -1263,7 +1259,6 @@ async fn list_active_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
     rows.iter().map(job_row_from).collect()
 }
 
-/// Load the agent roster for a job (with each row's cohort label).
 pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Result<Vec<AgentRow>> {
     let rows = conn
         .query(
@@ -1297,8 +1292,6 @@ pub(crate) async fn resumable_roster_agent_ids(conn: &Connection) -> Result<Vec<
         .collect())
 }
 
-/// Graceful-drain completion watcher.
-///
 /// Waits for the drain flag, then polls the agent registry AND the non-agent call registry. Clean
 /// exit: no agent registered AND no orchestrator-only LLM call in flight (the research orchestrator
 /// holds a whole-run guard so the token never fires into an inter-phase window) → fires the global
@@ -1575,8 +1568,6 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
     Ok(replayed)
 }
 
-/// Stale-job purge.
-///
 /// Cutoff = 8h. Deletes only stale TICKET-PHASE jobs whose updated_at predates the cutoff AND
 /// whose roster agents' sessions are all stale too (live sessions referenced by unfinished jobs
 /// are NEVER purged — the agents table IS the marker). The puller re-creates a purged job on the
@@ -1677,7 +1668,6 @@ fn skip_sync_job(job: &JobRow) -> bool {
 
 /// Binding 3: a resume-eligible job whose workspace can no longer be resolved is left in place,
 /// not terminalized — the boot loop skips it without bumping retry_count or touching the roster.
-/// Returns `true` when it should be skipped.
 ///
 /// Not reported as a failure: the row is parked, not lost, and a merely unmounted workspace resumes
 /// on a later boot (a custom role's launch reaches the consumer loop instead).

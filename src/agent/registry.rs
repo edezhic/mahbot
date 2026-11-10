@@ -370,7 +370,6 @@ impl AgentRegistry {
         self.cancel_matching(move |entry| entry.handle.parent_key.as_ref() == Some(&parent));
     }
 
-    /// Snapshot of all currently running agents (serializable).
     #[must_use]
     pub fn list(&self) -> Vec<AgentHandle> {
         self.inner
@@ -399,7 +398,6 @@ impl AgentRegistry {
         })
     }
 
-    /// Check whether an agent with the given `agent_id` is registered.
     #[must_use]
     pub fn contains(&self, agent_id: &str) -> bool {
         self.inner.lock().unwrap_poison().contains_key(agent_id)
@@ -445,7 +443,6 @@ impl Drop for ActivityGuard {
     }
 }
 
-/// Global static registry.
 pub static AGENT_REGISTRY: LazyLock<AgentRegistry> = LazyLock::new(AgentRegistry::default);
 
 /// Monotonically increasing entry id — each guard removes exactly its own entry on drop,
@@ -508,7 +505,6 @@ impl NonAgentCallRegistry {
         NonAgentCallGuard { id, registry: self }
     }
 
-    /// Snapshot of all in-flight non-agent LLM calls (serializable).
     #[must_use]
     pub fn list(&self) -> Vec<NonAgentCallHandle> {
         self.inner
@@ -542,7 +538,6 @@ impl NonAgentCallRegistry {
     }
 }
 
-/// RAII guard: removes its registry entry on drop.
 #[must_use]
 pub(crate) struct NonAgentCallGuard {
     id: u64,
@@ -555,7 +550,6 @@ impl Drop for NonAgentCallGuard {
     }
 }
 
-/// Global static registry.
 pub(crate) static NON_AGENT_CALLS: LazyLock<NonAgentCallRegistry> =
     LazyLock::new(NonAgentCallRegistry::default);
 
@@ -664,7 +658,6 @@ mod tests {
 
     #[test]
     fn cancel_by_parent_key_cancels_matching_agents_only() {
-        // Two agents of runA + one of runB — a group cancel of runA fires exactly the runA tokens.
         let a1 = format!("cancel_parent_a1_{}", crate::generate_suffix());
         let a2 = format!("cancel_parent_a2_{}", crate::generate_suffix());
         let b1 = format!("cancel_parent_b1_{}", crate::generate_suffix());
@@ -692,7 +685,6 @@ mod tests {
 
         AGENT_REGISTRY.cancel_by_parent_key(&ParentKey::Research("runA".to_string()));
 
-        // runA agents are gone from the registry (cancel removes the entry); runB survives.
         assert!(
             !AGENT_REGISTRY.contains(&a1) && !AGENT_REGISTRY.contains(&a2),
             "runA agents cancelled (entry removed)"
@@ -751,7 +743,6 @@ mod tests {
 
     #[test]
     fn remove_by_parent_key_removes_matching_calls_only() {
-        // Two calls of runA + one of runB — removing runA leaves runB's call visible.
         let run_a1 = NON_AGENT_CALLS.register(
             "consolidate",
             "ws1",

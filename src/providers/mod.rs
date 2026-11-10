@@ -41,8 +41,6 @@ use std::sync::{Arc, RwLock};
 use crate::retry::{FailureClass, RetryFailureRecord};
 use compatible::OpenAiCompatibleProvider;
 
-// Scoped call error
-
 /// Error from a scoped (single-attempt) provider call.
 ///
 /// Carries the underlying error, a granular [`FailureClass`], and the
@@ -283,7 +281,6 @@ pub(crate) fn swap_provider_for_test(provider: Arc<dyn Provider>) -> Option<Arc<
     previous
 }
 
-/// Restore a previously swapped-out global provider (test isolation).
 #[cfg(test)]
 pub(crate) fn restore_provider_for_test(previous: Option<Arc<dyn Provider>>) {
     *PROVIDER.write().unwrap_poison() = previous;
@@ -355,8 +352,6 @@ pub(crate) fn create_provider(api_key: Option<&str>, endpoint: Option<&str>) -> 
 
     Box::new(base)
 }
-
-// Tests
 
 #[cfg(test)]
 mod tests {

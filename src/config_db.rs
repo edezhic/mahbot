@@ -12,8 +12,6 @@ crate::define_store! {
     expect = "CONFIG_STORE not initialized — call init_all_stores() first",
 }
 
-// Column index constants
-
 crate::columns! {
     KV_COLUMNS [KV] {
         KEY   => "key",
@@ -243,7 +241,7 @@ mod tests {
             "set_kv should overwrite existing key"
         );
 
-        // 4. get_all with multiple items (sorted by key). Only the keys this test owns are
+        // get_all with multiple items (sorted by key). Only the keys this test owns are
         // pinned — migrations seed config rows of their own.
         store.set_kv("beta", "second").await.unwrap();
         let all = store.get_all_kv().await.unwrap();
@@ -376,7 +374,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 1. The guard itself: persisting the key is a no-op — the DB row and the in-memory
+        // The guard itself: persisting the key is a no-op — the DB row and the in-memory
         // CONFIG alike.
         crate::config::CONFIG.swap({
             let mut enrolled = crate::config::ConfigData::STRUCT_FIELDS_DEFAULT;

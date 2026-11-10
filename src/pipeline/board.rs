@@ -10,7 +10,6 @@ use std::sync::LazyLock;
 use tracing::{debug, info, warn};
 
 crate::define_store! {
-    /// Global board store.
     pub static BOARD: BoardStore,
     post_open = after_open,
     expect = "BOARD not initialized — call init_all_stores() first",
@@ -100,7 +99,6 @@ crate::columns! {
     }
 }
 
-/// Phases where a ticket occupies the dev/verification pipeline.
 const PIPELINE_OCCUPIED_PHASES: &[TicketPhase] = &[
     TicketPhase::InDevelopment,
     TicketPhase::Verification,
@@ -240,9 +238,7 @@ pub struct Ticket {
     pub superseded_by: Option<String>,
     /// Full commit SHA (40 hex chars), `None` if no commit recorded.
     pub commit_hash: Option<String>,
-    /// Lines added (non-negative) from the associated commit.
     pub lines_added: Option<i64>,
-    /// Lines removed (non-negative) from the associated commit.
     pub lines_removed: Option<i64>,
     /// Creator/tool identity, set at construction time. Also shown by the GUI board: a value
     /// matching a role name renders that role's label (e.g. "Manager"), otherwise the value with
@@ -515,7 +511,6 @@ impl TicketPhase {
         TERMINAL_PHASES.contains(self)
     }
 
-    /// Whether the ticket holds a pipeline-occupied phase.
     #[must_use]
     pub fn is_pipeline_occupied(&self) -> bool {
         PIPELINE_OCCUPIED_PHASES.contains(self)
@@ -599,12 +594,9 @@ impl PreparedUpdate {
     }
 }
 
-/// Whether to load comments when fetching tickets.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LoadComments {
-    /// Load comments alongside the ticket.
     Yes,
-    /// Skip loading comments.
     No,
 }
 
@@ -743,7 +735,6 @@ impl BoardStore {
         Ok((tx, id))
     }
 
-    /// Create a new ticket at the requested phase. Returns the ticket id.
     pub(crate) async fn create_ticket(&self, params: &TicketParams) -> Result<String> {
         let (tx, id) = self
             .begin_tx_and_validate_prerequisites(&params.workspace_name, &params.prerequisites)
@@ -755,7 +746,6 @@ impl BoardStore {
         Ok(id)
     }
 
-    /// Create a new ticket that supersedes (replaces) an existing ticket.
     pub(crate) async fn supersede_and_create(
         &self,
         supersede_id: &str,
@@ -834,7 +824,6 @@ impl BoardStore {
         Ok(new_id)
     }
 
-    /// Build a [`Ticket`] from a [`TICKET_COLUMNS`] SELECT row, optionally with its comments.
     async fn ticket_from_row(&self, row: &db::Row, load_comments: LoadComments) -> Result<Ticket> {
         let id: String = row.get(COL_TICKET_ID)?;
         let comments = if load_comments == LoadComments::Yes {
@@ -1076,7 +1065,6 @@ impl BoardStore {
         Ok(tickets)
     }
 
-    /// Get a ticket by id, loading its comments.
     pub async fn get_ticket(&self, ticket_id: &str) -> Result<Option<Ticket>> {
         Ok(self
             .select_tickets("WHERE id = ?1", db::params![ticket_id], LoadComments::Yes)
@@ -1107,7 +1095,6 @@ impl BoardStore {
         (suffix, params)
     }
 
-    /// Get a ticket's phase by id — lightweight, no comments loaded.
     pub async fn get_ticket_phase(&self, ticket_id: &str) -> Result<Option<TicketPhase>> {
         self.conn
             .query_optional(
@@ -1303,7 +1290,6 @@ impl BoardStore {
         Self::finished_ticket_error(ticket_id, &format!("moved to '{}'", target.as_ref()))
     }
 
-    /// Verify that a mutation affected at least one row, erroring when the ticket was not found.
     fn ensure_ticket_found(rows: u64, ticket_id: &str) -> Result<()> {
         anyhow::ensure!(rows > 0, "Ticket {ticket_id} not found");
         Ok(())
@@ -1395,7 +1381,6 @@ impl BoardStore {
         })
         .await?;
 
-        // Route the comment to any running agents assigned to this ticket.
         self.route_comment_to_agents(ticket_id, role, content).await;
 
         Ok(())
@@ -1501,7 +1486,6 @@ impl BoardStore {
         Ok(())
     }
 
-    /// Get all comments for a ticket, ordered by creation time.
     pub async fn get_comments(&self, ticket_id: &str) -> Result<Vec<TicketComment>> {
         let sql = format!(
             "SELECT {COMMENT_COLUMNS} FROM ticket_comments WHERE ticket_id = ?1 ORDER BY created_at ASC"

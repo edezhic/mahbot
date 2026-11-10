@@ -91,7 +91,6 @@ const FRESH_INSTALL_IMAGE_GEN_MODELS: &str = "google/gemini-nano-banana-2.1\nmic
 const FRESH_INSTALL_VIDEO_MODELS: &str =
     "google/gemini-omni-1.2-flash\nbytedance/seedance-2.0-mini\nminimax/hailuo-3";
 
-/// A per-model provider routing rule.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRouting {
     pub model: String,
@@ -512,7 +511,6 @@ pub(crate) fn is_default_endpoint(endpoint: &str) -> bool {
     normalize_endpoint_url(endpoint) == normalize_endpoint_url(DEFAULT_PROVIDER_ENDPOINT)
 }
 
-/// Whether `endpoint` is a genuinely non-default (custom) endpoint.
 #[must_use]
 pub(crate) fn is_custom_endpoint(endpoint: &str) -> bool {
     !is_default_endpoint(endpoint)
@@ -1190,7 +1188,6 @@ fn validate_config(config: &ConfigData) -> Result<()> {
     Ok(())
 }
 
-/// Construct a [`ModelRouting`] for tests.
 #[cfg(test)]
 pub(crate) fn model_routing(model: &str, provider_order: Option<&str>) -> ModelRouting {
     ModelRouting {

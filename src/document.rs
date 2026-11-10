@@ -81,7 +81,6 @@ const RASTER_MAX_SCALE: f32 = 3.0;
 /// JPEG quality for rasterized pages: small print stays legible, a page stays a few hundred KB.
 const RASTER_JPEG_QUALITY: u8 = 90;
 
-/// Magic bytes at the start of every PDF.
 const PDF_MAGIC: &[u8] = b"%PDF-";
 /// Magic bytes of a ZIP local file header — OOXML packages and plain archives alike.
 const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
@@ -158,7 +157,6 @@ pub(crate) fn spilled_text_note(chars: usize, path: &Path) -> String {
     )
 }
 
-/// The result of converting one document.
 #[derive(Debug)]
 pub(crate) enum DocOutcome {
     /// Text was extracted. `text` may be empty when the document has no text layer; `images`
@@ -656,7 +654,6 @@ fn read_pdf_pages(
     reading
 }
 
-/// What the reader made of one page.
 enum PageText {
     /// The page was read. The text is still empty for a page with no text layer, which is ordinary.
     Read(String),
@@ -794,7 +791,6 @@ impl VisibleArea {
             || self.contains(trm.m11 * advance + trm.m31, trm.m12 * advance + trm.m32)
     }
 
-    /// Whether a user-space point is inside the visible area.
     fn contains(&self, x: f64, y: f64) -> bool {
         x >= self.crop.x0 - CROP_EDGE_SLACK
             && x <= self.crop.x1 + CROP_EDGE_SLACK
@@ -944,11 +940,8 @@ fn page_ranges(pages: &[usize]) -> String {
 /// [`crate::reader_output::Unshown`] instead.
 #[derive(Default, Clone, Copy)]
 pub(crate) struct SkippedImages {
-    /// Format, colour space or bit depth this module does not convert.
     unsupported: usize,
-    /// Decoding, reading or writing the image failed.
     failed: usize,
-    /// Declared geometry over the shared raster envelope.
     oversized: usize,
 }
 
@@ -1140,7 +1133,6 @@ fn page_x_objects<'a>(page: &Page<'a>) -> Vec<Stream<'a>> {
     streams
 }
 
-/// The XObjects a form XObject's own resources name.
 fn form_x_objects<'a>(form: &Stream<'a>) -> Vec<Stream<'a>> {
     let Some(x_objects) = form
         .dict()
@@ -1311,7 +1303,6 @@ enum ColourSpace {
     Gray,
     Rgb,
     Cmyk,
-    /// A single index sample into an RGB palette.
     Indexed(Vec<[u8; 3]>),
 }
 
@@ -1574,7 +1565,6 @@ fn scaled_dimensions(width: u32, height: u32) -> (u32, u32) {
     )
 }
 
-/// JPEG-encode a raster at the same quality as a rasterized page.
 fn encode_jpeg(image: &RgbImage) -> Result<Vec<u8>, ()> {
     let mut jpeg = Vec::new();
     JpegEncoder::new_with_quality(&mut jpeg, RASTER_JPEG_QUALITY)

@@ -137,7 +137,6 @@ enum Ev {
     Eof,
     /// An event that contributes nothing (CDATA, comments, declarations).
     Skip,
-    /// The part can no longer be read.
     Fault,
 }
 
@@ -218,9 +217,7 @@ struct Word {
     paras: Vec<Para>,
     /// Open tables, innermost last, so a nested table works.
     tables: Vec<Table>,
-    /// Open cells, innermost last.
     cells: Vec<Cell>,
-    /// Open fields, innermost last.
     fields: Vec<Field>,
     /// Comment ids whose range was opened in this part; a range does not run between parts.
     comment_ranges: HashSet<String>,
@@ -244,7 +241,6 @@ struct Word {
     /// Whether the walk in progress is rendered: a duplicate copy the walk skips contributes
     /// no text, raises no marker and counts no revision.
     counting: bool,
-    /// The tracked changes seen, for the summary line.
     revisions: Revisions,
 }
 
@@ -1657,7 +1653,6 @@ impl Mark {
     }
 }
 
-/// The cell being read.
 #[derive(Default)]
 struct Cell {
     column: usize,
@@ -1744,7 +1739,6 @@ struct Notes {
     numbers: HashMap<String, usize>,
     /// The ids a reference named, as opposed to a definition alone.
     referenced: HashSet<String>,
-    /// The next free number.
     next: usize,
     /// The part the definitions live in, read up front for the ids it defines
     /// and again, after the body, for the definitions themselves.
@@ -1831,7 +1825,6 @@ struct PartRef {
 #[derive(Default)]
 struct PartRefs {
     parts: Vec<PartRef>,
-    /// A part's position in [`Self::parts`].
     index: HashMap<String, usize>,
 }
 
@@ -1868,7 +1861,6 @@ struct Styles {
 struct StyleDef {
     /// The `w:pPr/w:outlineLvl` the style states, clamped to 0..=9.
     outline: Option<usize>,
-    /// The `w:name` the style carries.
     name: Option<String>,
     /// The `w:basedOn` style id the chain continues through.
     based_on: Option<String>,
@@ -2043,10 +2035,8 @@ fn heading_name_level(text: &str) -> Option<usize> {
     (1..=9).contains(&level).then_some(level)
 }
 
-/// One open complex field.
 #[derive(Default)]
 struct Field {
-    /// The instruction pieces collected so far.
     instr: String,
     /// Whether the instruction has not been reported yet — i.e. the field is
     /// still between its `begin` and its `separate`, where its content is the
@@ -2090,7 +2080,6 @@ fn field_marker(instruction: &str) -> String {
 /// The tracked changes a document carries, for its summary line.
 #[derive(Default)]
 struct Revisions {
-    /// One tally per kind of change.
     tallies: Tallies,
     /// The `w:author` of each revision, in document order, deduplicated: the
     /// list and the set share one allocation per author.
@@ -2105,9 +2094,7 @@ struct Revisions {
 struct Tallies {
     insertions: usize,
     deletions: usize,
-    /// The `w:moveTo` elements seen.
     moved_here: usize,
-    /// The `w:moveFrom` elements seen.
     moved_away: usize,
     /// The `w:moveFromRangeStart` elements seen: Word brackets every move with
     /// one pair of range marks, so this is the move count itself rather than a
@@ -2323,23 +2310,19 @@ mod tests {
         r#"xmlns:v="urn:schemas-microsoft-com:vml""#,
     );
 
-    /// A `word/document.xml` part around `body`.
     fn document(body: &str) -> String {
         format!("<w:document {NAMESPACES}><w:body>{body}</w:body></w:document>")
     }
 
-    /// A `word/_rels/document.xml.rels` part around `entries`.
     fn rels(entries: &str) -> String {
         format!("<Relationships>{entries}</Relationships>")
     }
 
-    /// A relationship entry of the usual shape.
     fn rel(id: &str, kind: &str, target: &str) -> String {
         let base = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         format!(r#"<Relationship Id="{id}" Type="{base}/{kind}" Target="{target}"/>"#)
     }
 
-    /// A package with one body and, optionally, other parts.
     fn package(body: &str, parts: &[(&str, &str)]) -> Vec<u8> {
         let document = document(body);
         let mut entries: Vec<(&str, &[u8])> = vec![("word/document.xml", document.as_bytes())];

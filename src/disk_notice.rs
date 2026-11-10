@@ -160,7 +160,6 @@ fn step(
     Step::Notice(ladder.map_or_else(|| Ladder::delivered(now), |ladder| ladder.advanced(now)))
 }
 
-/// One cadence tick: read the volume and act on one decision.
 async fn tick() {
     let Some(store) = crate::config_db::CONFIG_STORE.get() else {
         return;

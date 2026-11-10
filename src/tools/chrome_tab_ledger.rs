@@ -41,7 +41,6 @@ const TAB_LEDGER_FILE_NAME: &str = "chrome-agent-tabs.json";
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct NamespaceRecord {
-    /// Recency is the order the agent addressed tabs.
     #[serde(default)]
     seq: u64,
     #[serde(default)]
@@ -370,7 +369,6 @@ impl TestLedgerGuard {
         &self.path
     }
 
-    /// The view a restart reads back.
     #[cfg(unix)]
     pub(crate) fn holds(&self, namespace: &str) -> bool {
         let Ok(json) = std::fs::read_to_string(&self.path) else {
@@ -479,7 +477,6 @@ mod tests {
         );
     }
 
-    /// The close is dropped and the pick left to the next appearance.
     #[test]
     #[serial_test::serial(chrome_tabs)]
     fn take_eviction_drops_a_pick_the_run_addressed_again() {

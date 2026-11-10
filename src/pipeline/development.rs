@@ -51,7 +51,6 @@ fn engineer_work_message(ticket: &Ticket) -> String {
     }
 }
 
-/// Dispatch the Engineer agent to implement the ticket on the phase job.
 async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
     let message = engineer_work_message(&ticket);
     let conn = &crate::session::store().conn;
@@ -59,7 +58,6 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
     run_stage_agent(&ticket, &ws, job_id, &message, StageRunKind::Engineer).await;
 }
 
-/// Extract a concise structured summary of the engineer's work for the ticket comment.
 async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
     let ticket_id = agent.ticket.as_ref().map_or("?", |t| t.id.as_str());
     let policy = crate::retry::RetryPolicy::comment();
@@ -114,7 +112,6 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
     crate::util::failure_detail(&out, "engineer summary comment")
 }
 
-/// Build the failure text for a failed Engineer run (the Manager pause notice).
 fn engineer_failure_notice(shutdown: bool, error: Option<&str>) -> String {
     if shutdown {
         return "Engineer failed: service shutting down — the run was interrupted \
@@ -132,7 +129,6 @@ fn engineer_failure_notice(shutdown: bool, error: Option<&str>) -> String {
     }
 }
 
-/// Notify the Manager that a workspace was paused because of an engineer hard failure.
 fn notify_engineer_pause(ticket_id: &str, ws: &Workspace, failure_details: &str, paused: bool) {
     let content = substitute(
         &load_prompt("pipeline/engineer_pause_notification.md"),
@@ -192,7 +188,6 @@ pub(crate) async fn finalize_engineer_stage(
     handle_engineer_failure(ticket, agent, job_id, ws, paused).await;
 }
 
-/// Handle the engineer failure tail (response `None` past the guards).
 async fn handle_engineer_failure(
     ticket: &Ticket,
     agent: &Agent,

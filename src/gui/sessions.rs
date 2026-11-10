@@ -122,11 +122,8 @@ struct CachedSessionItem {
     role: Option<crate::Role>,
     /// User name when present and non-empty, otherwise the workspace name.
     title: String,
-    /// The workspace the agent belongs to, as recorded in the session context.
     workspace_name: Option<String>,
-    /// The custom role this session belongs to, when it is a custom-role session.
     custom_role: Option<String>,
-    /// The named branch this continuable session continues, when named.
     custom_identifier: Option<String>,
     /// Pre-formatted message count, `None` only for a running agent whose first message is not
     /// stored yet.
@@ -330,7 +327,6 @@ pub(crate) struct SessionsState {
     /// so rows that appear, grow or finish converge without the user leaving the page.
     sessions: super::common::PolledList<SessionMetadata>,
     selected_session: Option<String>,
-    /// The flat session ledger built from the selected session's messages.
     entries: Vec<SessionEntry>,
     /// Per-entry parsed bodies, parallel to `entries` (parsed from the
     /// ledger via `session_view::parse_entry_bodies`).
@@ -376,11 +372,9 @@ pub(crate) struct SessionsState {
     /// makes the last event of a burst count.
     refresh_pending: bool,
 
-    // Transcript viewport fields
     /// Stable scrollable ID for the transcript area, preserves scroll position
     /// across widget rebuilds.
     scrollable_id: Id,
-    /// Whether auto-scroll-to-bottom is enabled (user is at or near the bottom).
     auto_scroll_enabled: bool,
 }
 
@@ -651,7 +645,6 @@ impl SessionsState {
         }
     }
 
-    // Clear the currently selected session and ALL per-session transcript state.
     fn clear_selection(&mut self) {
         self.selected_session = None;
         self.entries.clear();
@@ -666,7 +659,6 @@ impl SessionsState {
         self.measure_cache.borrow_mut().clear();
     }
 
-    // Rebuild the cached session list display data from the settled rows.
     fn rebuild_session_cache(&mut self) {
         let items = session_rows(
             self.sessions.entries(),
@@ -676,8 +668,6 @@ impl SessionsState {
         self.cached_session_items = if items.is_empty() { None } else { Some(items) };
     }
 
-    // Coalesced runtime-change tick: re-read the list, rebuild the display data, merge the live
-    // transcript.
     fn on_runtime_changed(
         &mut self,
         workspaces: &HashMap<String, Workspace>,
@@ -686,7 +676,6 @@ impl SessionsState {
         Task::batch([self.merge_selected_transcript(workspaces), self.refresh()])
     }
 
-    // The root the selected session's relative marker targets resolve against.
     fn selected_workspace_root(&self, workspaces: &HashMap<String, Workspace>) -> Option<PathBuf> {
         self.selected_session
             .as_deref()
@@ -700,7 +689,6 @@ impl SessionsState {
             .and_then(|name| workspace_root_for(name, workspaces))
     }
 
-    // Adopt the selected session's workspace root: `true` when it changed.
     fn adopt_workspace_root(&mut self, workspaces: &HashMap<String, Workspace>) -> bool {
         let root = self.selected_workspace_root(workspaces);
         if root == self.workspace_root {
@@ -983,12 +971,10 @@ impl SessionsState {
     }
 }
 
-/// Length of the longest common prefix of two ledgers (first differing entry index).
 fn common_entry_prefix(old: &[SessionEntry], new: &[SessionEntry]) -> usize {
     old.iter().zip(new).take_while(|(a, b)| a == b).count()
 }
 
-/// Author label above a bubble for the roles that carry one, flush left like the bubble.
 fn author_label<'a>(role: crate::ChatRole) -> Option<Element<'a, SessionsMessage>> {
     let name = match role {
         crate::ChatRole::System => "System",
@@ -1000,8 +986,6 @@ fn author_label<'a>(role: crate::ChatRole) -> Option<Element<'a, SessionsMessage
     Some(align_bubble(label, BubbleSide::Left))
 }
 
-/// Chat-bubble row for one ledger entry: the roles that carry an author label get it, the bubble
-/// is aligned by side.
 fn bubble_row(
     role: crate::ChatRole,
     body: Column<'_, SessionsMessage>,
@@ -1082,8 +1066,6 @@ fn element_measurement(
     )
 }
 
-/// The collapsed-preview-versus-full content of a collapsible element: when it is collapsed, the
-/// preview replaces the body.
 fn collapsible_text_block(
     collapses: bool,
     is_expanded: bool,
@@ -1183,7 +1165,6 @@ fn plain_collapsible<'a>(
     click_toggle(key, collapses, el)
 }
 
-/// The collapsible Thinking block: lucide `brain` + "Thinking" header above a collapsible body.
 fn thinking_block<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
@@ -1289,7 +1270,6 @@ fn body_block<'a>(
     click_toggle(key, collapses, el)
 }
 
-/// The tool-call result block: plain collapsible text at [`theme::TEXT_SECONDARY`].
 fn result_block<'a>(
     ctx: &TranscriptCtx<'a>,
     key: (usize, usize),
@@ -1298,8 +1278,6 @@ fn result_block<'a>(
     plain_collapsible(ctx, key, result, theme::TEXT_SECONDARY)
 }
 
-/// Render one session round as a single assistant bubble containing the narration, the reasoning
-/// and the tool blocks.
 fn render_tool_round<'a>(
     ctx: &TranscriptCtx<'a>,
     i: usize,
@@ -1377,8 +1355,6 @@ fn render_tool_round<'a>(
     bubble_row(crate::ChatRole::Assistant, bubble_col, None)
 }
 
-/// Render one ledger entry as a chat-bubble row: a `Message` renders its own bubble, a tool round
-/// its assistant bubble, a narration its divider.
 fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Option<Element<'a, SessionsMessage>> {
     let entry = &ctx.entries[i];
     match entry {
@@ -1417,8 +1393,6 @@ fn render_entry<'a>(ctx: &TranscriptCtx<'a>, i: usize) -> Option<Element<'a, Ses
     }
 }
 
-/// Render the transcript column for the selected session: build the chat column, or the
-/// placeholder when nothing is selected.
 fn render_transcript<'a>(
     ctx: &TranscriptCtx<'a>,
     scrollable_id: &Id,

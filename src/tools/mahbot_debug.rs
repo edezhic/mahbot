@@ -8,7 +8,6 @@ use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
 use crate::{Tool, Workspace};
 use anyhow::anyhow;
 
-/// Struct implementing the [`Tool`] trait for the Assistant's read-only DB query.
 pub(crate) struct MahbotDebugTool;
 
 #[async_trait::async_trait]

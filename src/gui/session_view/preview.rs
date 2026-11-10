@@ -120,7 +120,6 @@ fn preview_line_char_budget(
 pub(crate) struct MessageMeasure {
     /// Width bucket the measurement was computed for (see [`width_bucket`]).
     pub(crate) width_bucket: u32,
-    /// Total wrapped line count of the display text.
     pub(crate) wrapped_lines: u32,
     /// First [`MAX_PREVIEW_LINES`] wrapped lines as plain text — `Some` only when the message
     /// collapses.
@@ -151,7 +150,6 @@ pub(crate) fn width_bucket(width: f32) -> u32 {
 pub(crate) enum BodyText<'a> {
     /// A bubble body parsed as markdown; relative markers resolve against the workspace.
     Markdown(Option<&'a Path>),
-    /// A body drawn as raw selectable text.
     Plain,
 }
 

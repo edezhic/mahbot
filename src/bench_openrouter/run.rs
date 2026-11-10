@@ -669,7 +669,6 @@ pub(crate) async fn run_provider(
         return ProviderRun::not_measured(tag);
     }
 
-    // Ladder
     let rounds = ladder_secs.len() + 1;
     let mut frames: Vec<ToolFrame> = Vec::new();
     let mut classifications: Vec<CacheClassification> = Vec::new();

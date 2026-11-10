@@ -418,7 +418,6 @@ pub(crate) async fn run_analyze_with_job(
         }
     };
 
-    // Run the launched slots; reconstruct done slots from stored outcomes.
     let fresh_slots: Vec<&AnalyzeSlot> = slots
         .iter()
         .filter(|s| !pre_done.iter().any(|(id, _)| id == &s.agent_id))
@@ -578,7 +577,6 @@ pub(crate) async fn resume_analyze_round(job_id: &str, ws: &Workspace, exec_dir:
         .await;
 }
 
-/// A claim with source and confidence, shared with the deep investigation.
 #[expect(clippy::struct_field_names)] // field name matches the JSON schema key
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Claim {
@@ -588,7 +586,6 @@ pub(crate) struct Claim {
     pub contradictions: Vec<String>,
 }
 
-/// Structured claim-level findings extracted from an analyst's response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AnalystFindings {
     pub claims: Vec<Claim>,
@@ -610,7 +607,6 @@ enum AnalystOutcome {
     ParseFailed { raw: String, failure: String },
 }
 
-/// Outcome of one member of a parallel round awaited with a deadline.
 #[derive(Debug)]
 pub(crate) enum RoundMember<T> {
     Done(T),
@@ -739,7 +735,6 @@ impl AnalyzeRun {
     }
 }
 
-/// Verdict of one targeted claim verification, via [`dispatch_claim_verifiers`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VerificationVerdict {
     pub verdict: String,
@@ -1612,7 +1607,6 @@ fn render_raw_analyst_dump(outcomes: &[AnalystOutcome]) -> String {
     sections.join("\n\n")
 }
 
-/// Extraction-failure reasons for the fail-open marker.
 #[must_use]
 fn render_extraction_failures(outcomes: &[AnalystOutcome]) -> String {
     let mut out = String::new();
@@ -2035,7 +2029,6 @@ mod tests {
     enum ConsolidationInput {
         /// Runs that still need findings extraction (which may fail).
         Runs(Vec<AnalyzeRun>),
-        /// Already-extracted outcomes.
         Outcomes(Vec<AnalystOutcome>),
     }
 
@@ -2242,7 +2235,6 @@ mod tests {
     enum AsyncEnvelopeInput {
         /// The real fail-open consolidation result (transport retries exhausted).
         FailOpenAfterTransportExhaustion,
-        /// A failed sub-agent.
         SubAgentError,
     }
 
@@ -2322,7 +2314,6 @@ mod tests {
         name: &'static str,
         job_id: &'static str,
         workspace: &'static str,
-        /// The place directory the crashed round recorded, if it had one.
         place: Option<&'static str>,
         /// The analyst's stored outcome, when the crash left a completed slot.
         outcome: Option<&'static str>,

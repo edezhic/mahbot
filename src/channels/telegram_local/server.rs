@@ -128,7 +128,6 @@ fn record_path() -> Option<PathBuf> {
     Some(root()?.join("server.json"))
 }
 
-/// The installed process, as the record file describes it.
 pub(super) fn read_record() -> Option<Instance> {
     let body = std::fs::read_to_string(record_path()?).ok()?;
     serde_json::from_str(&body).ok()
@@ -614,7 +613,6 @@ async fn terminate_pid(pid: u32) {
     }
 }
 
-/// `true` when `pid` is gone.
 async fn wait_until_gone(pid: u32, bound: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + bound;
     loop {
@@ -696,7 +694,6 @@ fn process_identity(pid: u32) -> Option<u64> {
     }
 }
 
-/// Whether `pid` names a live process.
 fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;

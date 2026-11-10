@@ -100,7 +100,6 @@ fn reference_json(references: &[crate::util::ReferenceImage]) -> serde_json::Val
     )
 }
 
-/// Key of the reference-image array in the generation request body.
 const INPUT_REFERENCES_KEY: &str = "input_references";
 
 /// Ensure the final serialized body fits `max_body_bytes` by compressing references one step at a
@@ -472,7 +471,6 @@ pub(crate) enum SyncDurableCore {
 }
 
 impl SyncDurableCore {
-    /// The log/site label for this core ("Analyze" / "Worker").
     #[must_use]
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -481,7 +479,6 @@ impl SyncDurableCore {
         }
     }
 
-    /// The round kind this core's jobs row carries.
     pub(crate) fn kind_str(self) -> &'static str {
         match self {
             Self::Analyze => crate::jobs::SpawnChild::Analyze.kind_str(),
@@ -702,7 +699,6 @@ impl SyncDurableCore {
         }
     }
 
-    /// Message kind of the async result envelope routed to the caller.
     #[must_use]
     pub(crate) fn message_kind(self) -> MessageKind {
         match self {
@@ -1122,7 +1118,6 @@ pub(crate) fn envelope_attr(value: &str) -> String {
 /// [`crate::Tool::execute_with_payloads`] returns.
 #[derive(Debug, Default)]
 pub(crate) struct ToolOutput {
-    /// The tool's textual result.
     pub text: String,
     /// Images produced by this call, injected by the agent loop as native
     /// image parts after the round's tool-result block.
@@ -1157,17 +1152,13 @@ pub(crate) async fn with_image_payload<T: Tool + ?Sized>(
     }
 }
 
-/// Outcome for a tool execution.
 #[expect(clippy::struct_excessive_bools)] // independent per-call flags, not states
 #[derive(Debug)]
 pub(crate) struct ToolExecutionOutcome {
     pub output: String,
     pub success: bool,
-    /// Images produced by this call, injected after the round's tool-result block.
     pub image_payloads: Vec<ImagePayload>,
-    /// The tool's own [`ToolOutput::text_is_content`], carried through unchanged.
     pub text_is_content: bool,
-    /// The tool's own [`ToolOutput::preserve_text`], carried through unchanged.
     pub preserve_text: bool,
     /// `true` when the tool's durable work was drain-cut and its result is intentionally absent:
     /// the commit skips such outcomes, so the call stays dangling until the resume-completion
@@ -1182,7 +1173,6 @@ pub(crate) struct ToolExecutionOutcome {
 /// with the right opening phrase without knowing which tool produced it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImagePayloadSource {
-    /// On-disk raster read by the read tool.
     Read,
     /// Tool-produced image (image_gen, a rasterized page, an extracted document), or one derived
     /// from a marker.
@@ -1227,7 +1217,6 @@ pub(crate) struct ImagePayload {
     pub width: u32,
     /// Post-EXIF/post-resize height of the encoded JPEG (px).
     pub height: u32,
-    /// Uppercase source-format label: `"PNG" | "JPEG" | "WEBP"`.
     pub format: String,
     /// `Some` when the read resolved a typo'd path to a unique filename match; kept in the
     /// annotation.
@@ -1396,7 +1385,6 @@ pub(crate) struct ToolAnswer {
 }
 
 impl ToolAnswer {
-    /// The whole operation was carried out.
     pub(crate) fn done(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -1404,7 +1392,6 @@ impl ToolAnswer {
         }
     }
 
-    /// Part of the operation did not succeed, as `text` says.
     pub(crate) fn partial(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
@@ -1554,7 +1541,6 @@ async fn save_generated_file(
     Ok(output_path)
 }
 
-/// How a video tool's answer carries the timeline's pictures.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TimelinePictures {
     /// As the images the agent loop attaches, after the text.

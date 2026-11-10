@@ -1052,7 +1052,6 @@ mod tests {
             &self.base
         }
 
-        /// Every path asked for, in arrival order.
         fn asked(&self) -> Vec<String> {
             self.asked.lock().expect("fake release log").clone()
         }

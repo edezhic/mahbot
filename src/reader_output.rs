@@ -135,7 +135,6 @@ pub(crate) fn slide_notes_header(number: usize) -> String {
     )
 }
 
-/// The header of the block a slide's comments and replies print under.
 pub(crate) fn slide_comments_header(number: usize) -> String {
     slide_label(
         &crate::docgen::ppt_slide_labels().comments,
@@ -187,7 +186,6 @@ pub(crate) const DOC_LINK: &str = "(link: ";
 // bare `Chart:`) are deliberately not patterns in the kit's refusals — ordinary words a document's
 // own text can hold.
 
-/// The label a chart's own title prints under.
 pub(crate) const CHART_TITLE: &str = "Title:";
 
 /// The label an axis title prints under.
@@ -196,14 +194,12 @@ pub(crate) const CHART_TEXT: &str = "Text:";
 /// The label a data label's own text prints under.
 pub(crate) const CHART_LABEL: &str = "Label:";
 
-/// The mark a series with no values in the chart part carries in place of them.
 pub(crate) const CHART_NO_VALUES: &str = "(no values in the chart part)";
 
 /// The mark a series whose values are only in the table the chart attaches carries in place
 /// of them: that table is not opened by a reading.
 pub(crate) const CHART_VALUES_ATTACHED: &str = "(values only in the attached table)";
 
-/// The mark a chart part that cannot be read prints.
 pub(crate) const CHART_UNREADABLE: &str = "(the chart part could not be read)";
 
 /// The mark an extended (`chartEx`) chart part prints: its own schema is not read here.
@@ -234,34 +230,24 @@ pub(crate) fn chart_excess(count: usize, noun: &str) -> String {
     format!("{count} more {noun}")
 }
 
-//
 // The names of the Word stories a reader prints. The `.docx` reader numbers one
 // block per definition — `Footnote 1:` — and pairs a header or footer with the
 // variants that use it — `Header (default):`; the legacy `.doc` reader is handed
 // a whole story at once, so it prints the same name with no number.
 
-/// A Word header part's block name.
 pub(crate) const WORD_HEADER: &str = "Header";
-/// A Word footer part's block name.
 pub(crate) const WORD_FOOTER: &str = "Footer";
-/// A `w:footnote` definition's block name.
 pub(crate) const WORD_FOOTNOTE: &str = "Footnote";
-/// A `w:endnote` definition's block name.
 pub(crate) const WORD_ENDNOTE: &str = "Endnote";
-/// A `w:comment` definition's block name.
 pub(crate) const WORD_COMMENT: &str = "Comment";
 
 // The names the legacy `.doc` reader prints. Its reader hands it a whole story at once —
 // every footnote in one — so there is nothing to number and the same word is plural; the
 // header story holds every header and footer, so it names both. The colon a printed header
 // carries is added where the block is built.
-/// The legacy `.doc` header/footer story's name.
 pub(crate) const DOC_HEADERS_FOOTERS: &str = "Headers and footers";
-/// The legacy `.doc` footnote story's name.
 pub(crate) const DOC_FOOTNOTES: &str = "Footnotes";
-/// The legacy `.doc` endnote story's name.
 pub(crate) const DOC_ENDNOTES: &str = "Endnotes";
-/// The legacy `.doc` comment story's name.
 pub(crate) const DOC_COMMENTS: &str = "Comments";
 
 /// One kind of content a reading found in a file and did not show. The variants' order is
@@ -352,7 +338,6 @@ impl Unshown {
         }
     }
 
-    /// How much of one kind the report names.
     pub(crate) fn count(&self, kind: UnshownKind) -> usize {
         self.counts[kind as usize]
     }

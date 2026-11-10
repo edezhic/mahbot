@@ -8,7 +8,6 @@ use tokio::sync::broadcast;
 
 use super::editor_widget::{CursorState, EditorAction, EditorBuffer};
 
-/// Maximum characters allowed in a chat message / comment input.
 pub(crate) const MAX_INPUT_CHARS: usize = 100_000;
 
 /// Shared by dashboard pages that display paginated data.
@@ -36,7 +35,6 @@ impl PaginationState {
         }
     }
 
-    /// `true` if the page changed.
     pub(crate) fn prev_page(&mut self) -> bool {
         if self.page > 0 {
             self.page -= 1;
@@ -46,7 +44,6 @@ impl PaginationState {
         }
     }
 
-    /// `true` if the page changed.
     pub(crate) fn next_page(&mut self) -> bool {
         if self.page + 1 < self.total_pages() {
             self.page += 1;
@@ -115,7 +112,6 @@ impl AsyncLoadState {
         self.error.as_deref()
     }
 
-    /// Clears any previous error.
     pub(crate) fn start_loading(&mut self) {
         self.loading = true;
         self.error = None;
@@ -270,7 +266,6 @@ impl<T> PaginatedViewState<T> {
         self.load_state.fail(e);
     }
 
-    /// The post-delete state of a view whose rows no longer exist.
     pub(crate) fn clear_entries(&mut self) {
         self.entries.clear();
         self.pagination.reset();
@@ -330,10 +325,8 @@ pub(crate) trait UndoableText {
     fn text(&self) -> String;
     fn cursor(&self) -> CursorState;
 
-    /// Resets the cursor to (0, 0).
     fn set_text(&mut self, text: &str);
 
-    /// Clears any selection.
     fn move_to(&mut self, line: usize, col: usize);
 }
 
@@ -583,7 +576,6 @@ pub(crate) struct SingleLineEditorState {
 }
 
 impl SingleLineEditorState {
-    /// Create a single-line field pre-populated with `text`.
     pub(crate) fn new(text: &str) -> Self {
         let buffer = EditorBuffer::with_text(text, None);
         buffer.set_single_line(true);
@@ -672,7 +664,6 @@ mod tests {
     use Step::{Insert, Move, Redo, RedoSnapshot, Restore, Set, Snap, Text, Undo};
     use std::cell::Cell;
 
-    /// A step through an [`UndoStack`]-backed buffer.
     #[derive(Clone, Copy)]
     enum Step {
         Set(&'static str),

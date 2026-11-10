@@ -35,10 +35,8 @@ use super::{
 /// label in log fields. (The recorded transition actor is the phase token.)
 pub(crate) const STAGE: &str = "Verification";
 
-/// The phase a verification round works in.
 const ACTIVE_PHASE: TicketPhase = TicketPhase::Verification;
 
-/// The phase a clean round advances the ticket to.
 const SUCCESS_PHASE: TicketPhase = TicketPhase::InSanitation;
 
 /// Minimum acceptable score (0-10) for a verification verdict.
@@ -100,7 +98,6 @@ impl Participant {
         )
     }
 
-    /// The round's angle supplements for this participant.
     fn angles(self) -> Vec<String> {
         load_prompt_sections(self.angles_path)
     }
@@ -385,7 +382,6 @@ async fn run_project_commands(
     }
 }
 
-/// Run the plan's cohorts concurrently on the phase job and finalize the merged round.
 async fn execute_round(
     ticket: Arc<Ticket>,
     ws: Workspace,
@@ -490,7 +486,6 @@ async fn dispatch_cohort(
     .await
 }
 
-/// Finalize the merged round and record the reviewed base when the code review ran.
 #[expect(clippy::too_many_arguments)]
 async fn finalize_round(
     ws: &Workspace,
@@ -633,7 +628,6 @@ async fn apply_clean_round(ticket: &Ticket, comment: &str, job_id: &str) -> bool
     true
 }
 
-/// Whether a verification verdict passes (score at or above the threshold).
 #[must_use]
 fn verdict_passes(verdict: &crate::Verdict) -> bool {
     verdict.score >= VERIFICATION_THRESHOLD
@@ -664,7 +658,6 @@ async fn skip_review_for_identical_content(ticket: &Ticket, ws: &Workspace) -> b
     }
 }
 
-/// Decide whether the reviewer pass may be skipped for a ticket.
 fn should_skip_review(
     reviewed_head: Option<&str>,
     reviewed_tree: Option<&str>,
@@ -681,7 +674,6 @@ fn should_skip_review(
     head == base_head && tree == base_tree && !has_unstaged_changes(porcelain)
 }
 
-/// Compute the skip-review decision for a ticket.
 async fn compute_review_skip(ticket: &Ticket, repo_path: &Path) -> anyhow::Result<bool> {
     let porcelain = run_git_status(repo_path).await?;
     let head = run_git_head(repo_path).await.ok();
@@ -703,7 +695,6 @@ async fn compute_review_skip(ticket: &Ticket, repo_path: &Path) -> anyhow::Resul
     ))
 }
 
-/// Gather the working-tree churn at review dispatch.
 async fn working_tree_churn(repo_path: &Path) -> anyhow::Result<i64> {
     let snapshot = run_git_worktree_snapshot(repo_path).await?;
     // An unborn HEAD is not a valid churn baseline: surface as Err so the caller defaults the
@@ -817,7 +808,6 @@ mod tests {
     #[tokio::test]
     async fn working_tree_churn_ignores_huge_binary_file_count() {
         let (_dir, repo_path) = init_temp_repo();
-        // A normal untracked file (3 lines) plus an oversized untracked file.
         std::fs::write(repo_path.join("a.rs"), b"fn foo() {\n    bar();\n}\n").unwrap();
         let size = usize::try_from(MAX_UNTRACKED_SIZE).unwrap() + 1;
         std::fs::write(repo_path.join("big.bin"), vec![b'a'; size]).unwrap();

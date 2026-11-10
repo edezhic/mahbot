@@ -820,7 +820,6 @@ fn duration(shape: &DateShape, total_seconds: i64, fraction: &str) -> String {
     parts.join(":")
 }
 
-/// Whether that text holds a non-zero digit of the value's own.
 struct Rendered {
     text: String,
     /// A body of nothing but zeros is what a value rounded away to nothing shows, and the
@@ -855,7 +854,6 @@ impl Point {
         }
     }
 
-    /// Whether the placeholder at `index` is one of the section's fractional ones.
     fn is_fraction(self, index: usize) -> bool {
         match self {
             Self::Absent => false,

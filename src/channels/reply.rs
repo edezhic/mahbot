@@ -29,8 +29,6 @@ pub struct ReplyReference {
 pub fn normalize_reply_text(raw: &str) -> String {
     let mut text = decode_html_entities(raw);
 
-    // 2. Strip a `<blockquote>…</blockquote>` wrapper (format:
-    // `<blockquote>\n{content}\n</blockquote>`).
     let trimmed = text.trim();
     let unwrapped: String =
         if trimmed.starts_with("<blockquote>") && trimmed.ends_with("</blockquote>") {

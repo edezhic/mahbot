@@ -81,7 +81,6 @@ pub(crate) const CHANNEL: &str = "cli";
 /// Whether this instance can serve a command-line operation.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ServiceState {
-    /// The instance is still bringing itself up.
     Starting,
     /// It finished starting: the whole product, so an operation may be served.
     Ready,
@@ -98,12 +97,10 @@ fn service_sender() -> &'static tokio::sync::watch::Sender<ServiceState> {
     SERVICE.get_or_init(|| tokio::sync::watch::channel(ServiceState::Starting).0)
 }
 
-/// The instance has finished bringing itself up: operations can be served.
 pub fn mark_ready() {
     service_sender().send_replace(ServiceState::Ready);
 }
 
-/// The instance did not finish starting up, so it can never serve operations.
 pub fn mark_unavailable() {
     service_sender().send_replace(ServiceState::Unavailable);
 }
@@ -184,7 +181,6 @@ pub(crate) async fn wait_for_service() -> ServiceGate {
 /// published vocabulary as misuse. Each family's help says what its classes mean.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Exit {
-    /// The operation was carried out.
     Ok = 0,
     /// Not carried out, carried out only in part, or an outcome unknowable after
     /// the call went out (it may have happened — never the environment's class).
@@ -198,7 +194,6 @@ pub(crate) enum Exit {
 }
 
 impl Exit {
-    /// The process exit code for this class.
     pub(crate) const fn code(self) -> i32 {
         self as i32
     }
@@ -207,9 +202,7 @@ impl Exit {
 /// One command-line family: the frontend onto one capability of the product, carried by
 /// exactly one of its tools.
 pub(crate) struct Family {
-    /// The command-line word (`mahbot <word> …`).
     pub(crate) word: &'static str,
-    /// The one product tool this family fronts.
     pub(crate) tool: &'static str,
     /// The protocol value this family's operation frames carry: the generation of
     /// the surface it needs. A family whose surface has not changed carries
@@ -225,7 +218,6 @@ pub(crate) struct Family {
     pub(crate) surface: Surface,
 }
 
-/// What follows a family's word on the command line.
 pub(crate) enum Surface {
     /// `mahbot <word> <operation> [flags]`: one operation per sub-command, each
     /// running the family's tool — or, in one case, the product's own reader
@@ -329,14 +321,12 @@ fn family_syntax(family: &Family) -> String {
     }
 }
 
-/// One flag of one operation: the tool argument it fills.
 pub(crate) struct Flag {
     /// The tool's own argument name; the command-line spelling is derived from it
     /// (`ticket_id` → `--ticket-id`), so a flag can never be spelled a way the tool
     /// does not read. The exception is the destination flag
     /// ([`FlagKind::Destination`]), whose name is the command line's own.
     pub(crate) arg: &'static str,
-    /// How a value reaches the argument.
     pub(crate) kind: FlagKind,
     /// A value the caller hands over as a secret: never echoed, recorded or
     /// answered back.
@@ -1373,7 +1363,6 @@ const VIDEO_URL_FLAG: Flag = Flag {
               and last frames",
 };
 
-/// The frame-anchor form's first anchor.
 const VIDEO_FIRST_FRAME_FLAG: Flag = Flag {
     arg: "first_frame",
     kind: FlagKind::Path,
@@ -1382,7 +1371,6 @@ const VIDEO_FIRST_FRAME_FLAG: Flag = Flag {
               the frame-anchor form, which excludes a clip and reference pictures",
 };
 
-/// The frame-anchor form's second anchor.
 const VIDEO_LAST_FRAME_FLAG: Flag = Flag {
     arg: "last_frame",
     kind: FlagKind::Path,
@@ -1488,7 +1476,6 @@ fn family_tools() -> impl Iterator<Item = &'static str> {
     FAMILIES.iter().map(|family| family.tool)
 }
 
-/// The family words, in the order the top-level help lists them.
 pub(crate) fn family_words() -> impl Iterator<Item = &'static str> {
     FAMILIES.iter().map(|family| family.word)
 }
@@ -1531,7 +1518,6 @@ struct Parsed {
     output_dir: Option<String>,
 }
 
-/// A flag's command-line spelling: the argument name with `_` written `-`.
 fn flag_spelling(arg: &str) -> String {
     arg.replace('_', "-")
 }
@@ -2379,14 +2365,12 @@ pub fn refuse_unknown_entry_point() -> i32 {
     Exit::Usage.code()
 }
 
-/// What one attempt's result means for the caller.
 struct Verdict {
     /// The product's own answer, printed to stdout verbatim — present whenever it answered
     /// the operation itself, a refusal included.
     answer: Option<String>,
     /// This command's own diagnostic, printed to stderr.
     diagnostic: Option<String>,
-    /// The exit class the caller reads.
     code: Exit,
 }
 
@@ -2552,7 +2536,6 @@ mod tests {
         )
     }
 
-    /// The parameters schema of one tool.
     fn tool_schema(tool: &str) -> serde_json::Value {
         let tools = admin_toolset();
         crate::tools::find_tool(&tools, tool)
@@ -2680,7 +2663,6 @@ mod tests {
         }
     }
 
-    /// The family a word names, or a panic naming the word.
     fn family_of(family_word: &str) -> &'static Family {
         family(family_word).map_or_else(
             || panic!("'mahbot {family_word}' is no family"),
@@ -2688,7 +2670,6 @@ mod tests {
         )
     }
 
-    /// Parse an operation's flag tail, as one list of tokens.
     fn parse(family_word: &str, operation_word: &str, tokens: &[&str]) -> Result<Tail, String> {
         let operation = operation(family_word, operation_word);
         parse_flags(
@@ -2722,7 +2703,6 @@ mod tests {
         }
     }
 
-    /// A standalone parse that must yield a call.
     fn parsed_standalone(family_word: &str, tokens: &[&str]) -> Parsed {
         match parse_standalone(family_word, tokens) {
             Ok(Tail::Call(parsed)) => parsed,
@@ -2921,12 +2901,10 @@ mod tests {
         }
     }
 
-    /// The JSON types one flag kind can fill.
     fn fillable_types(kind: &FlagKind) -> &'static [&'static str] {
         match kind {
             // One string, so it fills a string argument — a path being one it resolves.
             FlagKind::Value | FlagKind::Path => &["string"],
-            // The number it is.
             FlagKind::Number => &["integer", "number"],
             // Entries, as an array — each one a path for a path list.
             FlagKind::List | FlagKind::PathList => &["array"],
@@ -2952,7 +2930,6 @@ mod tests {
         }
     }
 
-    /// The JSON types an argument's schema entry states.
     fn argument_types(property: &serde_json::Value) -> Vec<&str> {
         match &property["type"] {
             serde_json::Value::String(kind) => vec![kind.as_str()],

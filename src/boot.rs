@@ -115,7 +115,6 @@ pub async fn open_stores() -> anyhow::Result<Arc<crate::logs::LogStore>> {
     // and must be recorded, not lost.
     crate::agent::message_router::init_global()
         .map_err(|e| record_startup_failure("agent::message_router::init_global", e))?;
-    // The microphone, the voice pipeline and the wake word.
     crate::audio::voice::init_global()
         .map_err(|e| record_startup_failure("audio::voice::init_global", e))?;
     // The retired per-user model tree is dead weight now: delete it once, off the boot path.

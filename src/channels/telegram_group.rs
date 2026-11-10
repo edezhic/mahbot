@@ -88,7 +88,6 @@ impl Preparations {
         }
     }
 
-    /// Whether anything of `user` in `target` is being prepared right now.
     fn busy(&self, user: &str, target: &str) -> bool {
         self.preparing
             .lock()
@@ -153,7 +152,6 @@ struct OpenGroup {
 }
 
 impl OpenGroup {
-    /// Start a group from its first part.
     fn new(part: ChannelMessage, now: Instant) -> Self {
         let chars = part.content.chars().count();
         Self {
@@ -244,7 +242,6 @@ enum Release {
     Control,
     /// An urgent message in that chat released the group and left with it.
     Urgent,
-    /// The listener is going away.
     Stop,
 }
 
@@ -263,7 +260,6 @@ impl Release {
     }
 }
 
-/// One released group: its parts, and what released it.
 struct Released {
     parts: Vec<Part>,
     release: Release,
@@ -398,7 +394,6 @@ impl Collector {
         ready
     }
 
-    /// Take the group at `at`.
     fn take_at(&mut self, at: usize, release: Release) -> Released {
         Released {
             parts: self.open.remove(at).parts,
@@ -412,7 +407,6 @@ impl Collector {
 /// the parts stand for are moved onto the envelope, which is what the hand-over settles. The
 /// envelope is urgent when any of its parts is.
 fn group_message(mut parts: Vec<ChannelMessage>) -> ChannelMessage {
-    // A released group always holds at least one part (see `OpenGroup`).
     let newest = parts
         .last()
         .expect("a released group holds at least one part");

@@ -313,7 +313,6 @@ async fn reacquire_instance_lock() -> Result<()> {
 
     let file = try_acquire_lock(&lock_path)?;
 
-    // Re-acquire mutex and update guard with the re-acquired file.
     let mut guard = mutex.lock().await;
     match file {
         Some(file) => {
@@ -355,7 +354,6 @@ fn release_base_url() -> String {
     std::env::var(RELEASE_BASE_URL_ENV).unwrap_or_else(|_| RELEASE_REPO.to_string())
 }
 
-/// The URL of the newest release's version file.
 fn latest_version_url(base: &str) -> String {
     format!("{base}/releases/latest/download/version.txt")
 }
@@ -369,7 +367,6 @@ fn asset_name(version: &semver::Version, os: &str, arch: &str) -> String {
     format!("mahbot-{version}-{os}-{arch}.{extension}")
 }
 
-/// The URL of `version`'s archive for this system.
 fn asset_url(base: &str, version: &semver::Version, os: &str, arch: &str) -> String {
     format!(
         "{base}/releases/download/v{version}/{}",
@@ -535,7 +532,6 @@ fn glibc_below_floor(report: &str) -> bool {
         .is_some_and(|version| version_below_floor(version, GLIBC_FLOOR))
 }
 
-/// The running binary's version, parsed from [`VERSION`].
 fn current_version() -> Result<semver::Version> {
     semver::Version::parse(VERSION)
         .with_context(|| format!("embedded version {VERSION} is not valid semver"))
@@ -745,7 +741,6 @@ fn update_cache() -> &'static UpdateCache {
     })
 }
 
-/// Snapshot of the shared update-availability cache.
 #[must_use]
 pub(crate) fn update_availability() -> UpdateAvailability {
     let cache = update_cache();
@@ -823,7 +818,6 @@ impl Drop for UpdateCacheTestGuard {
     }
 }
 
-/// Set the shared update-availability cache for a test's duration.
 #[cfg(test)]
 pub(crate) fn set_update_cache_for_test(
     available: bool,
@@ -2284,7 +2278,6 @@ fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
     }
 }
 
-/// Truncate a string to its last 64KB, prepending a note if truncated.
 fn truncate_to_last_64k(s: &str) -> String {
     const MAX: usize = 64 * 1024;
     if s.len() <= MAX {
@@ -2372,7 +2365,6 @@ mod tests {
         drop(taken);
     }
 
-    /// Whether a fresh handle on the location finds it locked by someone else.
     fn location_is_held(path: &Path) -> bool {
         !try_flock(&open_lock_file(path).unwrap()).unwrap()
     }

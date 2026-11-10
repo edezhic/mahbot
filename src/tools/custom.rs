@@ -44,7 +44,6 @@ const RUNNABLE_EXTENSIONS: &[&str] = &["ts", "tsx", "js", "jsx", "mts", "cts", "
 /// real one, and it bounds the read of an arbitrarily large script.
 const MAX_HEADER_BYTES: u64 = 16 * 1024;
 
-/// The four argument types the shallow validation knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParamType {
     Str,
@@ -64,7 +63,6 @@ impl ParamType {
         }
     }
 
-    /// Name used in the catalogue block.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Str => "string",
@@ -85,7 +83,6 @@ impl ParamType {
     }
 }
 
-/// One declared parameter.
 #[derive(Debug, Clone)]
 pub(crate) struct Param {
     pub(crate) name: String,
@@ -412,7 +409,6 @@ fn render_line(tool: &CustomToolEntry) -> String {
     out
 }
 
-/// The block's listing: one entry line per tool ([`render_line`]).
 fn render_lines(tools: &[&CustomToolEntry]) -> String {
     let mut out = String::new();
     for tool in tools {
@@ -519,11 +515,8 @@ pub(crate) async fn notify_grant_change(user_name: &str, tool: &str, granted: bo
     }
 }
 
-/// A resolved custom-tool call: the script to run and the arguments it receives.
 pub(crate) struct ResolvedCall {
-    /// The tool's file.
     pub path: PathBuf,
-    /// The declared arguments the caller supplied, coerced to their types.
     pub args: Map<String, Value>,
     /// The supplied argument names the tool does not declare. The call path reports them back
     /// with the run's output; a strict caller refuses them instead.

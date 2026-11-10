@@ -60,7 +60,6 @@ pub(crate) struct RoleEditor {
     pub(crate) name: EditorBuffer,
     pub(crate) prompt: EditorBuffer,
     pub(crate) behavior: CustomRoleBehavior,
-    /// The chosen tool names (the picker's marks).
     pub(crate) tools: Vec<String>,
     /// The tool catalogue the picker offers, captured when the window opened: it constructs the
     /// tool objects and reads CONFIG, so it must not be rebuilt on every render pass.

@@ -63,7 +63,6 @@ pub(crate) use verdict::{
 use development::finalize_engineer_stage;
 use sanitation::finalize_sanitation_stage;
 
-/// Returns the global [`BoardStore`] singleton.
 #[inline]
 fn board() -> &'static BoardStore {
     crate::pipeline::board::store()
@@ -90,7 +89,6 @@ fn claim_phase_body(job_id: &str) -> bool {
         .insert(job_id.to_string())
 }
 
-/// Release a phase body's spawn slot.
 fn release_phase_body(job_id: &str) {
     phase_bodies_running().lock().unwrap_poison().remove(job_id);
 }
@@ -217,7 +215,6 @@ pub async fn run_management() {
     }
 }
 
-/// The poll loop: run the single-puller pass over every workspace every 100 milliseconds.
 pub(crate) async fn poll_round() {
     let workspaces = match crate::workspace::store().list().await {
         Ok(ws_list) => ws_list,
@@ -244,7 +241,6 @@ pub(crate) async fn poll_round() {
     );
 }
 
-/// Process the puller steps for a single workspace.
 async fn process_single_workspace(ws: Workspace) {
     // 0. Pending-workspace pickup — a pending workspace (added without a
     // provider key, or returned to pending after provider-class discovery
@@ -573,8 +569,6 @@ async fn run_claim_pipeline(ws: &Workspace) {
     }
 }
 
-// Shared phase-module constants
-
 /// Neutral reason for a phase-gate bail (transients are not misattributed).
 const PHASE_GATE_BAIL_REASON: &str = "ticket not in expected phase";
 
@@ -592,8 +586,6 @@ pub const BOUNCE_BADGE_WARNING_THRESHOLD: usize = 5;
 /// bounce warning — the 2nd, 4th, 6th, 8th and 10th at the current
 /// [`MAX_BOUNCES`]. See [`bounce_notice_mark`].
 const BOUNCE_NOTICE_INTERVAL: usize = 2;
-
-// Transition + notification helpers (shared by the phase modules)
 
 /// Returns `true` if the ticket is in the expected phase (safe to proceed).
 /// Returns `false` otherwise — the ticket may have been moved externally,
@@ -652,7 +644,6 @@ enum NotifyPolicy {
     Buffer,
 }
 
-/// The transition context for comment+transition operations.
 #[derive(Debug)]
 pub(crate) struct TransitionCtx<'t, 'l> {
     ticket: &'t Ticket,
@@ -731,7 +722,6 @@ impl<'t, 'l> TransitionCtx<'t, 'l> {
     }
 }
 
-/// Result of a stage-finalization comment+transition.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum FinalizeOutcome {
     Applied,
@@ -739,7 +729,6 @@ pub(crate) enum FinalizeOutcome {
     Failed,
 }
 
-/// Unified helper for combining comment writes + phase transition + notification.
 #[must_use]
 async fn with_comment_and_transition<F>(
     ctx: TransitionCtx<'_, '_>,
@@ -797,7 +786,6 @@ where
     outcome
 }
 
-/// Write a comment to a ticket, then transition it to a new phase.
 #[must_use]
 async fn comment_and_transition(
     ctx: TransitionCtx<'_, '_>,
@@ -812,7 +800,6 @@ async fn comment_and_transition(
     .await
 }
 
-/// Shared finalizer for post-agent comment-and-transition sites.
 async fn comment_and_transition_or_bail(
     ctx: TransitionCtx<'_, '_>,
     role: &str,
@@ -830,7 +817,6 @@ async fn comment_and_transition_or_bail(
     info!(ticket = %ticket_id, target = %target, "{message}");
 }
 
-/// Resolve a workspace from a ticket's stored `workspace_name`.
 #[must_use]
 async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<Workspace> {
     match crate::workspace::get_by_name(&ticket.workspace_name).await {
@@ -874,7 +860,6 @@ async fn pause_freezing(ticket: &Ticket, job_id: &str) {
     }
 }
 
-/// Wording for the Manager notification about a paused workspace.
 fn paused_workspace_sentence() -> &'static str {
     "all in-flight work stops and no pipeline stage advances until the workspace is resumed"
 }
@@ -1032,7 +1017,6 @@ async fn discard_failed_first_request_session(ticket_id: &str, agent: &Agent) {
     }
 }
 
-/// Fetch the last ticket comment (any role) as failure details for a Manager notification.
 async fn last_comment_as_failure_details(ticket_id: &str) -> String {
     match board().get_comments(ticket_id).await {
         Ok(comments) => comments.last().map_or_else(
@@ -1202,8 +1186,6 @@ async fn register_running_agent(
 
     incoming_rx
 }
-
-// Parallel-agent machinery (analysis / verification)
 
 /// Canonical agent-id format for ticket phase roster slots
 /// (`ticket_{ticket_id}_{idx}_{suffix}_{role}`).
@@ -1563,7 +1545,6 @@ async fn run_parallel_agents(
     }
 }
 
-/// Build the raw-response dump section for a verdict-extraction failure diagnostic.
 fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
     match failure.last_raw.as_deref() {
         Some(text) if !text.trim().is_empty() => format!(
@@ -1584,8 +1565,6 @@ fn raw_response_dump_section(failure: &crate::retry::RetryExhausted) -> String {
     }
 }
 
-// Single-agent stage rounds (engineer / sanitation)
-
 /// The single-agent stage rounds sharing one run tail (each driven by a
 /// permanently-NULL-seat session pin): engineer and sanitation.
 #[derive(Clone, Copy)]
@@ -1595,7 +1574,6 @@ enum StageRunKind {
 }
 
 impl StageRunKind {
-    /// The role dispatched for this stage round.
     fn role(self) -> Role {
         match self {
             Self::Engineer => Role::Engineer,
@@ -1603,7 +1581,6 @@ impl StageRunKind {
         }
     }
 
-    /// The `agents.kind` roster label for this stage round.
     fn agent_kind(self) -> crate::jobs::AgentKind {
         match self {
             Self::Engineer => crate::jobs::AgentKind::Engineer,
@@ -1640,7 +1617,6 @@ async fn run_single_agent(
     .await
 }
 
-/// Drain-cut guard for the single-agent stage-round finalizers.
 fn stage_drain_cut(ticket_id: &str, label: &str, response: Option<&str>) -> bool {
     let drain_cut = response.is_none() && crate::shutdown::aborting();
     if drain_cut {
@@ -1652,7 +1628,6 @@ fn stage_drain_cut(ticket_id: &str, label: &str, response: Option<&str>) -> bool
     drain_cut
 }
 
-/// Shared post-run guard prologue for the single-agent stage-round finalizers.
 async fn guard_stage(
     ticket_id: &str,
     phase: TicketPhase,
@@ -1743,8 +1718,6 @@ async fn run_stage_agent(
     }
 }
 
-// Stage-handoff roster helpers
-
 /// Persist the phase job's dispatch task at dispatch time. Phase dispatch
 /// re-derives its prompt from live state, so this stored value is not read for
 /// re-dispatch. Best-effort.
@@ -1771,8 +1744,6 @@ async fn clear_implementation_roster(conn: &crate::db::Connection, job_id: &str,
         warn!(ticket = %ticket_id, job = %job_id, error = %e, "Failed to clear running agents on stage handoff");
     }
 }
-
-// Bounce breaker (unified post-development non-success)
 
 /// Comment posted when the bounce breaker trips: a fixed failure notice that
 /// names the "circuit breaker" and the configured `MAX_BOUNCES` budget.

@@ -261,7 +261,6 @@ fn axc(s: &'static str) -> CFRetained<CFString> {
 // re-open the system dialog), and reported through one actionable error naming the
 // terminal macOS holds the grant against. See the module docs.
 
-/// The three grants a computer-use action can need.
 #[derive(Clone, Copy)]
 enum Grant {
     Accessibility,
@@ -300,7 +299,6 @@ impl Grant {
         }
     }
 
-    /// The flag recording that this process already asked for this grant.
     fn asked(self) -> &'static AtomicBool {
         match self {
             Self::Accessibility => &ACCESSIBILITY_ASKED,
@@ -464,7 +462,6 @@ fn screen_capture_needs_14() -> anyhow::Error {
 // known, never earlier from NSWorkspace state. Target-addressed exchanges raise
 // [`NeedsAxThread`] from [`resolve_window`]; [`with_target`] turns it into a main-queue re-run.
 
-/// The longest a self-targeted AX exchange waits for the main queue.
 const SELF_AX_WAIT: Duration = Duration::from_secs(5);
 
 /// Marker for "this exchange resolved to mahbot itself while off the main thread";
@@ -720,7 +717,6 @@ fn ax_error_shared(err: AXError, ctx: impl std::fmt::Display) -> Option<anyhow::
     }
 }
 
-/// Map an AXError to a taxonomy error per the contract.
 fn ax_error(err: AXError, ctx: impl std::fmt::Display) -> anyhow::Error {
     if let Some(mapped) = ax_error_shared(err, &ctx) {
         return mapped;
@@ -942,7 +938,6 @@ struct HeldWindow {
 // AX calls safe, and none are performed.
 unsafe impl Send for HeldWindow {}
 
-/// Held windows by token.
 static HELD_WINDOWS: LazyLock<Mutex<HashMap<u64, HeldWindow>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -1025,12 +1020,10 @@ fn refuse_minimized(window: &AXUIElement) -> Result<(), anyhow::Error> {
 // The two questions the module header names, each answered by the system that can answer it:
 // the order by the compositor's on-screen list, what lies under a point by the hit test.
 
-/// A value of the compositor's dictionary as an integer.
 fn compositor_number(dict: &CFDictionary<CFString, CFType>, key: &CFString) -> Option<i64> {
     dict.get(key)?.downcast_ref::<CFNumber>()?.as_i64()
 }
 
-/// A value of the compositor's dictionary as a rectangle.
 fn compositor_frame(
     dict: &CFDictionary<CFString, CFType>,
     key: &CFString,
@@ -1603,7 +1596,6 @@ fn ascii_key(c: char) -> Option<i64> {
     })
 }
 
-/// Key name → macOS virtual keycode. Unknown names return `None`.
 fn key_code(key: &str) -> Option<i64> {
     let k = key.to_lowercase();
     if k.len() == 1
@@ -1658,7 +1650,6 @@ const KNOWN_KEYS: &str = "return, enter, tab, space, delete, forwarddelete, esca
      pageup, pagedown, up, down, left, right, f1..f12, minus, equal, comma, period, slash, \
      semicolon, quote, backslash, backtick, leftbracket, rightbracket, capslock, a-z, 0-9";
 
-/// The virtual keycode for a parsed key name, with the one message every caller reports.
 fn lookup_key(key: &str) -> Result<i64, anyhow::Error> {
     key_code(key).ok_or_else(|| anyhow!("unknown key '{key}' — supported keys: {KNOWN_KEYS}"))
 }
@@ -1759,7 +1750,6 @@ fn scroll(
     Ok(Impact::Done)
 }
 
-/// The whole gesture — down, interpolated moves, up.
 fn drag(from: CGPoint, to: CGPoint) -> Result<Impact, anyhow::Error> {
     let src = source();
     let mut events = Vec::with_capacity(14);

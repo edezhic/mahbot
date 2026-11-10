@@ -733,7 +733,6 @@ mod unix {
         regions
     }
 
-    /// Whether `text` is a body line of the product's own block for this platform.
     fn is_product_body(text: &str) -> bool {
         !body_entries(text).is_empty()
     }
@@ -798,7 +797,6 @@ mod unix {
         entry.to_string()
     }
 
-    /// `content` with the product's own regions taken out.
     fn strip_regions(content: &str, regions: &[Range<usize>]) -> String {
         if regions.is_empty() {
             return content.to_string();
@@ -924,7 +922,6 @@ mod unix {
             vec![home.join(".local/bin"), home.join(".bun/bin")]
         }
 
-        /// The block body those two directories render to.
         fn block_body(home: &Path) -> String {
             render("zsh", &home_dirs(home), home).expect("render")
         }
@@ -1883,7 +1880,6 @@ mod windows {
         text: String,
     }
 
-    /// Bring the owner's own `Path` value in line with `dirs`.
     pub(super) fn sync(env: &OwnerEnv, dirs: &[PathBuf]) {
         match run(env, dirs) {
             // A write into his own environment happens once, when the value is first needed or has
@@ -1958,7 +1954,6 @@ mod windows {
     /// What the key must end up holding.
     struct Planned {
         kind: REG_VALUE_TYPE,
-        /// The value's new text.
         value: String,
         /// Whether the write puts a directory on his search path or only takes duplicates out.
         written: Written,

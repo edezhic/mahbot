@@ -220,7 +220,6 @@ fn edit_op_fields(
     }
 }
 
-/// The fields op `op` of `family` takes, from the one vocabulary table.
 fn op_fields(family: crate::ooxml::Family, op: &str) -> &'static [&'static str] {
     edit_op_fields(family)
         .iter()
@@ -258,7 +257,6 @@ struct Span {
 }
 
 impl Span {
-    /// Whether `value` sits inside the range.
     fn contains(&self, value: f64) -> bool {
         let above_min = if self.min_exclusive {
             value > self.min
@@ -595,7 +593,6 @@ fn array_arg(items: &Value, description: &str) -> Value {
     json!({ "type": "array", "items": items, "description": description })
 }
 
-/// The scalar a bullet or a cell may be — the kinds the shared rules name.
 fn scalar_arg() -> Value {
     json!({ "type": RULES.scalar_kinds })
 }
@@ -851,7 +848,6 @@ fn block_kind_note(kind: &str) -> Option<String> {
     }
 }
 
-/// How `create` declares one block field, whichever kind carries it.
 fn block_field(name: &str) -> Value {
     match name {
         "text" => text_arg("The block's text."),
@@ -933,7 +929,6 @@ const SHEET_FIELDS: &[(&str, bool)] = &[
     ("merges", false),
 ];
 
-/// The field names of [`SHEET_FIELDS`].
 fn sheet_field_names() -> Vec<&'static str> {
     SHEET_FIELDS.iter().map(|(name, _)| *name).collect()
 }
@@ -963,7 +958,6 @@ fn sheets_arg() -> Value {
     })
 }
 
-/// How `create` declares one field of a sheet (see [`sheets_arg`]).
 fn sheet_field(name: &str) -> Value {
     match name {
         "name" => text_arg(&format!(
@@ -1000,7 +994,6 @@ fn cell_arg() -> Value {
     })
 }
 
-/// A sheet's row: its cells.
 fn sheet_row_arg() -> Value {
     array_arg(
         &cell_arg(),
@@ -1437,7 +1430,6 @@ fn point_arg(what: &str) -> Value {
     ))
 }
 
-/// `degrees`: the rotation a `pdf_rotate` adds.
 fn degrees_arg() -> Value {
     integer_arg(&format!(
         "A multiple of {}, not a whole turn.",
@@ -1768,7 +1760,6 @@ impl DocumentTool {
         self.deliver(request, &outputs, "split the file into").await
     }
 
-    /// `pdf_rotate` — add a rotation to the selected pages.
     async fn pdf_rotate(
         &self,
         ws: &Workspace,
@@ -1816,7 +1807,6 @@ impl DocumentTool {
         self.deliver(request, &outputs, "rotated").await
     }
 
-    /// `pdf_crop` — narrow the visible area of the selected pages.
     async fn pdf_crop(
         &self,
         ws: &Workspace,
@@ -1842,7 +1832,6 @@ impl DocumentTool {
         self.deliver(request, &outputs, "cropped").await
     }
 
-    /// `pdf_resize` — scale the selected pages to a named size.
     async fn pdf_resize(
         &self,
         ws: &Workspace,
@@ -2260,14 +2249,12 @@ impl RealFormat {
 enum Wanted {
     /// One of the three editable packages: a caller that works on files, like `Self::Pdf`.
     Package,
-    /// A sample of the user's own to fill.
     Sample,
     /// A PDF, for the actions that work on one; a real PDF is never refused for it.
     Pdf,
 }
 
 impl Wanted {
-    /// The verb a sentence about this action uses.
     const fn verb(self) -> &'static str {
         match self {
             Self::Package => "edited",
@@ -2550,7 +2537,6 @@ fn edit_string_present<'a>(
     }
 }
 
-/// Require an edit's string field to be a non-empty value.
 fn edit_string_non_empty<'a>(
     object: &'a serde_json::Map<String, Value>,
     key: &str,
@@ -2852,7 +2838,6 @@ enum FormatCellsTarget {
 }
 
 impl FormatCellsTarget {
-    /// The key that names this target.
     fn key(self) -> &'static str {
         match self {
             Self::Range => "range",
@@ -2898,7 +2883,6 @@ fn stated(object: &serde_json::Map<String, Value>, key: &str) -> bool {
     !matches!(object.get(key), None | Some(Value::Null))
 }
 
-/// The one target a xlsx `format_cells` names.
 fn require_format_cells_target(
     object: &serde_json::Map<String, Value>,
     at: &str,
@@ -2982,7 +2966,6 @@ fn require_merge_text(range: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
-/// Require a `merge_cells` `range` to name a merge (see [`require_merge_text`]).
 fn require_merge_range(object: &serde_json::Map<String, Value>, at: &str) -> Result<()> {
     let range = edit_string_non_empty(object, "range", at)?;
     require_merge_text(range, &format!("{at}.range"))
@@ -4172,7 +4155,6 @@ fn require_optional_size(
     }
 }
 
-/// Require an optional boolean field of a content block.
 fn require_optional_bool(
     object: &serde_json::Map<String, Value>,
     key: &str,
@@ -4444,7 +4426,6 @@ fn ensure_picture(path: &Path, formats: &PictureFormats) -> Result<()> {
     }
 }
 
-/// The pages a PDF action acts on: the union of the `pages` elements.
 enum Pages {
     /// Every page (`"all"`, an empty `pages`, or an absent one).
     All,
@@ -4761,7 +4742,6 @@ pub(crate) fn file_marker(path: &Path) -> String {
     format!("{FILE_MARKER}{}]", path.to_string_lossy())
 }
 
-/// A one-line description of what was produced.
 pub(crate) fn describe(prefix: &str, names: &[String], sizes: &[u64]) -> String {
     if names.len() == 1 {
         return format!(
@@ -4826,7 +4806,6 @@ pub(crate) fn sanitize_base(raw: Option<&str>, fallback: &str) -> String {
     }
 }
 
-/// The default base name for a `create` call.
 #[must_use]
 fn default_base(format: &str) -> &'static str {
     match format {
@@ -4861,7 +4840,6 @@ fn copy_extension(input: &Path, family: crate::ooxml::Family) -> String {
     family.name().to_string()
 }
 
-/// Paths as strings for a JSON request.
 #[must_use]
 fn path_strings(paths: &[PathBuf]) -> Vec<String> {
     paths
@@ -4894,14 +4872,12 @@ mod tests {
         (dir, ws)
     }
 
-    /// Add one part with raw bytes to an in-progress package.
     fn add_bytes(zip: &mut zip::ZipWriter<Cursor<Vec<u8>>>, name: &str, body: &[u8]) {
         zip.start_file(name, zip::write::SimpleFileOptions::default())
             .expect("start part");
         zip.write_all(body).expect("write part");
     }
 
-    /// Write a fixture package into the workspace and return its path.
     fn write_fixture(ws: &Workspace, name: &str, bytes: &[u8]) -> PathBuf {
         let path = ws.as_path().join(name);
         std::fs::write(&path, bytes).expect("write fixture");

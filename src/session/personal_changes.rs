@@ -514,7 +514,6 @@ fn personal_user_of(workspace: &Workspace) -> Option<String> {
         .or_else(|| crate::users::personal_user_name(&workspace.name).map(str::to_string))
 }
 
-/// What one scan is for.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scan {
     /// The turn's report: nothing is stored, so only what [`diff`] consults is read.
@@ -1036,7 +1035,6 @@ impl Drop for Establishing {
     }
 }
 
-/// One observation attempt's outcome.
 enum Observation {
     /// An observation to store as the baseline.
     Fresh(String),
@@ -1091,7 +1089,6 @@ async fn observe(root: PathBuf, stored: Option<String>, mode: Scan) -> Observati
     .unwrap_or(Observation::Settled)
 }
 
-/// Store one observation as `user_name`'s baseline.
 async fn store_baseline(user_name: &str, agent_id: &str, json: &str) {
     if let Err(e) = crate::session::store()
         .update_personal_changes(agent_id, json)

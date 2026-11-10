@@ -18,7 +18,6 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::sync::OnceCell;
 
-/// Global search-engine registry, keyed by workspace name.
 static REGISTRY: OnceCell<RwLock<HashMap<String, Arc<SearchEngineEntry>>>> = OnceCell::const_new();
 
 /// Must be called during bootstrap, before any background task that may search.

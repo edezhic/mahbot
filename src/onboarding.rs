@@ -41,7 +41,6 @@ pub fn take_greeting_guide_pending() -> bool {
     GREETING_GUIDE_PENDING.swap(false, Ordering::SeqCst)
 }
 
-/// Parsed Phase-1 provider input.
 #[derive(Debug)]
 pub enum ProviderInput {
     /// An OpenRouter API key (a token containing `sk-or-v1-`).

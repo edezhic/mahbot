@@ -62,16 +62,12 @@ pub fn report_failure(reason: &anyhow::Error) {
     send(&format!("{FAILED_PREFIX}{reason}"));
 }
 
-/// The service's word that it is up.
 const RUNNING: &str = "running";
 
-/// The service's word that a copy is already up.
 const ALREADY_RUNNING: &str = "already running";
 
 /// The prefix of the word that carries a launch failure's reason.
 const FAILED_PREFIX: &str = "failed: ";
-
-// The launcher and the service
 
 #[cfg(unix)]
 use std::io::{IsTerminal as _, Read as _, Write as _};

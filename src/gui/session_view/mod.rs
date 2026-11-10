@@ -15,7 +15,6 @@ use super::media_markers;
 pub(crate) mod preview;
 mod render;
 
-// Shared components re-exported for both pages.
 pub(crate) use render::{MAX_TOOL_TOOLTIP_WIDTH, ToolBlockView, tool_block, truncate_at_boundary};
 
 /// One entry of the flat session ledger: a regular message (optionally carrying a thinking

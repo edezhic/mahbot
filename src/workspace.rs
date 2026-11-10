@@ -23,12 +23,10 @@ use strum::IntoEnumIterator;
 use tracing::warn;
 
 crate::define_store! {
-    /// Global workspace store.
     pub static WORKSPACES: WorkspaceStore,
     expect = "workspace::WORKSPACES not initialized — call init_all_stores() first",
 }
 
-/// Look up a workspace by its name.
 pub async fn get_by_name(name: &str) -> Result<Option<Workspace>> {
     store().get_by_name(name).await
 }
@@ -159,7 +157,6 @@ async fn run_discovery_task(
 
     tracing::info!(workspace_name = ws.name, role = %label, "Starting workspace discovery");
 
-    // Create a Discovery agent for this role and run it with the role's own prompt.
     let agent_id = discovery_agent_id(&ws.name, label);
     let (agent, response) = run_default_agent(
         &agent_id,
@@ -571,7 +568,6 @@ fn pending_pickup_cooldown_duration(attempts: u32) -> Duration {
     Duration::from_mins(minutes)
 }
 
-/// Per-workspace cooldown state.
 #[derive(Debug, Clone, Copy)]
 struct PickupCooldown {
     /// Instant before which the pickup step must not claim the workspace.
@@ -898,7 +894,6 @@ impl WorkspaceStore {
     /// before the key" no longer flips to Failed seconds later. Manual Re-analyze and
     /// the nightly rediscovery path are unaffected.
     pub async fn add(&self, name: &str, path: &str) -> Result<Workspace> {
-        // Validate the workspace name.
         validate_name(name)?;
 
         // Canonicalize and validate the path so bad paths never enter the system.
@@ -926,7 +921,6 @@ impl WorkspaceStore {
         // the INSERT (a rejected add must not touch the folder) but before the index below, so
         // the engine is built with the repository already in place.
         crate::git::commands::init_repo_if_absent(std::path::Path::new(&ws.path)).await;
-        // Eagerly initialize the shared search engine for this workspace.
         if let Err(e) =
             crate::workspace_index::get_or_init_engine(name, std::path::Path::new(&ws.path))
         {
@@ -946,7 +940,6 @@ impl WorkspaceStore {
             .await
     }
 
-    /// Look up a workspace by name.
     pub async fn get_by_name(&self, name: &str) -> Result<Option<Workspace>> {
         self.conn
             .query_optional_cached(
@@ -1158,7 +1151,6 @@ impl WorkspaceStore {
         } else {
             // Clear the cooperative pause-stop flags left on in-flight agents so a resumed
             // workspace does not freeze them at their next LLM round boundary.
-            // LLM round boundary.
             crate::agent::registry::AGENT_REGISTRY.clear_workspace_pause(name);
             tracing::info!(workspace = name, "Workspace pipeline resumed");
         }
@@ -1246,7 +1238,6 @@ impl WorkspaceStore {
         .map(|_| ())
     }
 
-    /// Retrieve discovered diagnostics commands for a workspace.
     pub(crate) async fn get_diagnostics(
         &self,
         name: &str,
@@ -1265,8 +1256,6 @@ impl WorkspaceStore {
         Ok(json.map(|json| serde_json::from_str(&json)).transpose()?)
     }
 
-    /// Set freeform user-curated context notes for a workspace.
-    ///
     /// Truncates to `MAX_WORKSPACE_NOTES_CHARS` characters as defense-in-depth
     /// against prompt bloat. Notes are appended to every agent's system prompt.
     pub async fn set_notes(&self, name: &str, notes: &str) -> Result<()> {
@@ -1290,8 +1279,6 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    /// Read the current generation counter for a workspace's `column`.
-    ///
     /// Used by discovery tasks to check whether the counter was bumped while
     /// they ran; if it no longer matches, their writes are stale.
     async fn get_generation(&self, name: &str, column: GenerationColumn) -> Result<i64> {
@@ -1382,7 +1369,6 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    /// Get a single context entry by workspace name and role.
     pub async fn get_context(&self, name: &str, role: &str) -> Result<Option<String>> {
         self.conn
             .query_optional(
@@ -1393,7 +1379,6 @@ impl WorkspaceStore {
             .await
     }
 
-    /// Upsert a single context entry for a workspace and role.
     async fn set_context(&self, name: &str, role: &str, content: &str) -> Result<()> {
         let now = db::now();
         self.conn
@@ -1438,7 +1423,6 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    /// Save the current set of open editor tabs for a workspace.
     /// Replaces all existing records for this workspace.
     pub async fn save_editor_tabs(&self, name: &str, tabs: &[EditorTabRecord]) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
@@ -1465,7 +1449,6 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    /// Load the saved open editor tabs for a workspace.
     pub async fn load_editor_tabs(&self, name: &str) -> Result<Vec<EditorTabRecord>> {
         let rows = self.conn
             .query_map(
@@ -1754,8 +1737,6 @@ pub async fn run_nightly_check_loop() {
     }
 }
 
-// Test helpers
-
 /// Create a minimal [`Workspace`] from a path for testing.
 /// The name is derived from the path's file name.
 #[cfg(test)]
@@ -1774,8 +1755,6 @@ pub fn test_ws_named(path: &str, name: &str) -> Workspace {
         ..Default::default()
     }
 }
-
-// Tests
 
 #[cfg(test)]
 mod tests {
@@ -1826,8 +1805,6 @@ mod tests {
         }
     }
 
-    // Schema / struct consistency
-
     #[tokio::test]
     async fn schema_default_is_paused() {
         // Insert WITHOUT specifying paused, relying on the schema DEFAULT.
@@ -1859,7 +1836,6 @@ mod tests {
         let (store, _tmp) = test_store().await;
         insert_direct(&store, "toggle_test", "/tmp/toggle_test", true, false, 0, 0).await;
 
-        // Unpause
         store.set_paused("toggle_test", false).await.unwrap();
         let fetched = store
             .get_by_name("toggle_test")
@@ -1871,7 +1847,6 @@ mod tests {
             "Should be unpaused after set_paused(false)"
         );
 
-        // Re-pause
         store.set_paused("toggle_test", true).await.unwrap();
         let fetched = store
             .get_by_name("toggle_test")
@@ -1910,7 +1885,6 @@ mod tests {
         let (store, _tmp) = test_store().await;
         insert_direct(&store, "maint_test", "/tmp/maint_test", true, false, 0, 0).await;
 
-        // Enable maintenance
         store
             .set_maintenance_enabled("maint_test", true)
             .await
@@ -1925,7 +1899,6 @@ mod tests {
             "Should have maintenance enabled after set_maintenance_enabled(true)"
         );
 
-        // Disable maintenance
         store
             .set_maintenance_enabled("maint_test", false)
             .await
@@ -1963,7 +1936,6 @@ mod tests {
             .expect("exists");
         assert!(ws.notes.is_empty(), "New workspace should have empty notes");
 
-        // Set notes and verify round-trip
         let test_notes = "These are important context notes for agents.";
         store
             .set_notes("notes_test", test_notes)
@@ -1976,7 +1948,6 @@ mod tests {
             .expect("exists");
         assert_eq!(ws.notes, test_notes, "Notes should round-trip correctly");
 
-        // Verify that updating notes works
         let updated_notes = "Updated notes with more context.";
         store
             .set_notes("notes_test", updated_notes)
@@ -1992,7 +1963,6 @@ mod tests {
             "Notes update should round-trip correctly"
         );
 
-        // Verify truncation at the cap
         let long_notes = "x".repeat(MAX_WORKSPACE_NOTES_CHARS + 1000);
         store
             .set_notes("notes_test", &long_notes)
@@ -2014,7 +1984,6 @@ mod tests {
             "Notes content should match truncated"
         );
 
-        // Verify UTF-8 safe truncation (multi-byte characters)
         let multi_byte = "é".repeat(MAX_WORKSPACE_NOTES_CHARS + 1000);
         store
             .set_notes("notes_test", &multi_byte)
@@ -2036,8 +2005,6 @@ mod tests {
             "Notes content should match truncated (multi-byte, no broken chars)"
         );
     }
-
-    // finalize_discovery — auto-unpause invariants
 
     #[tokio::test]
     async fn finalize_discovery_success_auto_unpauses() {
@@ -2166,7 +2133,6 @@ mod tests {
     #[tokio::test]
     async fn finalize_discovery_stale_generation_skips_writes() {
         let (store, _tmp) = test_store().await;
-        // Start paused with generation 0.
         insert_direct(&store, "stale", "/tmp/stale", true, false, 0, 0).await;
 
         // Bump the generation behind the scenes (simulates a concurrent
@@ -2176,7 +2142,6 @@ mod tests {
             .await
             .expect("bump generation");
 
-        // Act: try to finalize with the stale generation 0.
         finalize_discovery(
             &store,
             "stale",
@@ -2208,8 +2173,6 @@ mod tests {
     #[tokio::test]
     async fn rediscover_sets_paused() {
         let (store, _tmp) = test_store().await;
-        // Start with paused = false and status = ready (simulating a fully
-        // discovered workspace).
         insert_direct(
             &store,
             "rediscover_test",
@@ -2237,13 +2200,11 @@ mod tests {
             "Precondition: status should be 'ready'"
         );
 
-        // Act: rediscover.
         store
             .rediscover("rediscover_test")
             .await
             .expect("rediscover");
 
-        // Assert: paused is set immediately by the UPDATE.
         let ws = store
             .get_by_name("rediscover_test")
             .await
@@ -2254,8 +2215,6 @@ mod tests {
             "rediscover() must set paused = true when transitioning to 'analyzing'"
         );
     }
-
-    // Integration: add() persists and returns the workspace row
 
     #[tokio::test]
     #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
@@ -2314,7 +2273,6 @@ mod tests {
             ws.path
         );
 
-        // Also verify via get_by_name.
         let fetched = store
             .get_by_name("add_test")
             .await
@@ -2381,14 +2339,11 @@ mod tests {
         );
     }
 
-    // Pending-pickup: atomic claim + boot reclassification
-
     #[tokio::test]
     async fn claim_pending_for_discovery_is_atomic_and_returns_live_generation() {
         let (store, _tmp) = test_store().await;
         insert_direct(&store, "pickup", "/tmp/pickup", true, false, 3, 0).await;
 
-        // Claim succeeds and returns the live generation counter.
         let generation = store
             .claim_pending_for_discovery("pickup")
             .await
@@ -2467,8 +2422,6 @@ mod tests {
             "non-analyzing workspaces are untouched"
         );
     }
-
-    // Discovery failure classification taxonomy
 
     /// Build an agent with a preset typed failure class (simulating a failed
     /// run_agent) and classify it.
@@ -2614,14 +2567,11 @@ mod tests {
         );
     }
 
-    // Diagnostics API tests
-
     #[tokio::test]
     async fn rediscover_diagnostics_clears_and_bumps() {
         let (store, _tmp) = test_store().await;
         insert_direct(&store, "redia_test", "/tmp/redia_test", false, false, 0, 0).await;
 
-        // Set some diagnostics first.
         let cmds = crate::DiagnosticsCommands {
             build: Some("cargo build".into()),
             ..Default::default()
@@ -2638,20 +2588,17 @@ mod tests {
                 .is_some()
         );
 
-        // Verify generation before rediscover.
         let diag_gen_before = store
             .get_generation("redia_test", GenerationColumn::DIAGNOSTICS)
             .await
             .expect("get_generation");
         assert_eq!(diag_gen_before, 1, "Should be 1 after set_diagnostics");
 
-        // Act: rediscover diagnostics (doesn't spawn real agent, just bumps and clears).
         store
             .rediscover_diagnostics("redia_test")
             .await
             .expect("rediscover_diagnostics");
 
-        // Diagnostics should now be None.
         assert!(
             store
                 .get_diagnostics("redia_test")
@@ -2661,7 +2608,6 @@ mod tests {
             "rediscover_diagnostics should clear diagnostics"
         );
 
-        // Generation should have been bumped.
         let diag_gen_after = store
             .get_generation("redia_test", GenerationColumn::DIAGNOSTICS)
             .await
@@ -2671,7 +2617,6 @@ mod tests {
             "rediscover_diagnostics should bump diagnostics_generation to 2"
         );
 
-        // discovery_generation should NOT have been touched.
         let discovery_gen_val = store
             .get_generation("redia_test", GenerationColumn::DISCOVERY)
             .await
@@ -2682,14 +2627,11 @@ mod tests {
         );
     }
 
-    // General (non-role) context tests
-
     #[tokio::test]
     async fn general_context_roundtrip_single_row_per_workspace() {
         let (store, _tmp) = test_store().await;
         insert_direct(&store, "gctx", "/tmp/gctx", true, false, 0, 0).await;
 
-        // No stored general context before discovery writes one.
         assert_eq!(store.get_general_context("gctx").await.unwrap(), None);
 
         store
@@ -2743,8 +2685,6 @@ mod tests {
             Some("other overview")
         );
     }
-
-    // nightly_gate_allows — rolling 7-day frequency gate tests
 
     #[test]
     fn nightly_gate_allows_table() {
@@ -2800,13 +2740,10 @@ mod tests {
         }
     }
 
-    // nightly_gate_should_run — end-to-end config_kv behaviour
-
     #[tokio::test]
     async fn nightly_gate_records_pass_start_and_blocks() {
         let (store, _tmp) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
 
-        // First pass: no stored timestamp → allowed, pass start recorded.
         assert!(
             nightly_gate_should_run(Some(&store)).await,
             "First pass (no stored timestamp) must run",
@@ -2846,8 +2783,6 @@ mod tests {
             "pass-start write must self-heal the stored value",
         );
     }
-
-    // delete — dangling user-selection cleanup
 
     #[tokio::test]
     async fn delete_resolves_the_admin_selection_and_clears_guests() {
@@ -2891,7 +2826,6 @@ mod tests {
             Some("survivor_a".to_string())
         );
 
-        // The workspace row is gone.
         assert!(
             store.get_by_name("doomed_ws").await.unwrap().is_none(),
             "the workspace row must be deleted"

@@ -54,13 +54,11 @@ fn zed_one_dark_palette() -> iced_term::ColorPalette {
     }
 }
 
-/// A single shell tab with an independent terminal session.
 struct ShellTab {
     label: String,
     terminal: iced_term::Terminal,
 }
 
-/// Per-workspace tab collection.
 struct WorkspaceShellState {
     tabs: Vec<ShellTab>,
     active_idx: usize,
@@ -79,15 +77,11 @@ pub enum ShellMessage {
     /// The workspace resolved for the current selection (managed name plus path), pushed only by
     /// `sync_workspace_surfaces` — never a substitution for an unresolved one.
     WorkspaceSelected(String, String),
-    /// Select a tab by its index in the tab list.
     TabSelected(usize),
-    /// Close a tab by its index.
     TabClosed(usize),
-    /// Create a new shell tab.
     NewTab,
     /// Clear the active terminal (sends Ctrl+L / form feed 0x0C).
     ClearTerminal,
-    /// Select all visible content in the active terminal.
     SelectAll,
 }
 
@@ -150,7 +144,6 @@ impl ShellState {
         self.workspace_states.insert(ws_name.to_string(), ws);
     }
 
-    /// Build a fresh workspace state with one default tab.
     fn new_workspace_state(next_id: &mut u64, working_dir: Option<String>) -> WorkspaceShellState {
         match Self::spawn_one_terminal(next_id, "Shell 1", working_dir.clone()) {
             Ok(tab) => WorkspaceShellState {
@@ -170,8 +163,6 @@ impl ShellState {
         }
     }
 
-    /// Spawn a single terminal and return a [`ShellTab`], or an error string saying why it
-    /// could not be created.
     fn spawn_one_terminal(
         next_id: &mut u64,
         label: &str,
@@ -234,10 +225,8 @@ impl ShellState {
             return Self::placeholder_view("Select a workspace to open a terminal.");
         };
 
-        // Tab bar.
         let tab_bar = Self::build_tab_bar(ws_state);
 
-        // Terminal area — shows the active tab's terminal.
         let terminal_area = if let Some(tab) = ws_state.tabs.get(ws_state.active_idx) {
             let term_view = super::shortcut_keys::terminal_keys(
                 TerminalView::show(&tab.terminal).map(ShellMessage::TerminalEvent),
@@ -248,7 +237,6 @@ impl ShellState {
                 .padding(theme::PAD_8)
                 .style(theme::base_container_style);
 
-            // Wrap in a right-click context menu.
             let ctx_menu: Element<'_, ShellMessage> = ContextMenu::new(
                 term_container,
                 vec![
@@ -281,7 +269,6 @@ impl ShellState {
             .into()
     }
 
-    /// Build a placeholder message when no workspace is selected.
     fn placeholder_view(msg: &str) -> Element<'_, ShellMessage> {
         Self::centered_title_subtitle(
             "Terminal",
@@ -324,7 +311,6 @@ impl ShellState {
         .into()
     }
 
-    /// Build the tab bar with tab buttons, close buttons, and a "+" button.
     fn build_tab_bar(ws_state: &WorkspaceShellState) -> Element<'_, ShellMessage> {
         let mut tab_buttons: Vec<Element<'_, ShellMessage>> = Vec::new();
 

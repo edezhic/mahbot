@@ -37,7 +37,6 @@ use crate::db::{OwnConnection, Value};
 /// durable record keeps.
 type Answer<T> = Result<T, String>;
 
-/// The store's own answer, and the file sizes, that a reclaiming checkpoint would shrink from.
 #[derive(Debug)]
 struct ShrinkRefusal {
     /// The store's own answer; `None` when it could not be asked.
@@ -46,7 +45,6 @@ struct ShrinkRefusal {
     main_bytes: Option<u64>,
     /// `-wal` size in bytes; `None` when it could not be obtained.
     wal_bytes: Option<u64>,
-    /// Why the answer is not usable.
     cause: ShrinkRefusalCause,
 }
 
@@ -272,8 +270,6 @@ where
 mod tests {
     use super::*;
 
-    /// The gate's pure decision over exhaustive (page count, main size, WAL size) combinations: it
-    /// refuses exactly the states a reclaiming checkpoint would destroy, or that it cannot trust.
     #[test]
     #[expect(clippy::too_many_lines)] // one table-driven case per behavior
     fn verdict_refuses_only_states_a_shrink_would_destroy_or_cannot_trust() {
@@ -407,9 +403,6 @@ mod tests {
         }
     }
 
-    /// The store's own answer is read strictly: only a non-negative integer is usable, and every
-    /// other shape — a negative value, a non-integer value, a failed read — is a reason to withhold
-    /// the shrink, carrying the text the durable record keeps.
     #[test]
     fn an_unusable_page_count_answer_is_refused_rather_than_read() {
         assert_eq!(page_count_value(Ok(Value::Integer(7))), Ok(7));

@@ -54,7 +54,6 @@ const FRAME_LENGTH: usize = 512;
 /// not affect mel frame spacing.
 const HOP_LENGTH: usize = 256;
 
-/// Maximum command recording duration (10 minutes).
 const MAX_RECORD_SECS: usize = 600;
 
 /// Minimum silence duration before stopping a wake-word command recording.
@@ -103,7 +102,6 @@ const NUM_ENROLLMENT_SAMPLES: usize = 10;
 
 const MIN_NEGATIVE_AUDIO_LEN: usize = SAMPLE_RATE as usize / 2;
 
-/// Maximum number of ambient negative audio chunks retained in memory.
 const MAX_NEGATIVE_AUDIO_CHUNKS: usize = 100;
 
 /// Maximum automatic retry cycles after a model load failure. One cycle is a full
@@ -124,7 +122,6 @@ const MAX_OWNER_NEGATIVE_SAMPLES: usize = SAMPLE_RATE as usize * NEGATIVES_TARGE
 /// Wall-clock timeout for Phase 3 owner-negative collection.
 const PHASE3_TIMEOUT_SECS: u64 = 120;
 
-/// Clipping detection threshold for enrollment quality scoring.
 const ENROLLMENT_QUALITY_CLIPPING_THRESHOLD: f32 = 0.999;
 
 /// Minimum acceptable enrollment utterance duration in milliseconds.
@@ -133,7 +130,6 @@ pub(crate) const ENROLLMENT_QUALITY_DURATION_MIN_MS: u64 = 400;
 /// Maximum acceptable enrollment utterance duration in milliseconds.
 pub(crate) const ENROLLMENT_QUALITY_DURATION_MAX_MS: u64 = 2000;
 
-/// Fraction of utterances that must pass the enrollment self-test for the model to be accepted.
 const ENROLLMENT_QUALITY_SELF_TEST_MIN_FRACTION: f32 = 0.8;
 
 const ENROLLMENT_PROMPTS: &[(&str, usize)] = &[
@@ -441,7 +437,6 @@ pub enum VoiceCommand {
     StopListening,
     StartEnrollment,
     CancelEnrollment,
-    /// Retry loading the recogniser after a failure.
     RetryModelLoading,
     /// Start a recording from the composer mic button, pausing wake-word listening meanwhile.
     StartRecording,
@@ -460,7 +455,6 @@ fn voice_state() -> &'static RwLock<VoicePipelineState> {
     VOICE_PIPELINE.get().expect("VoicePipeline not initialized")
 }
 
-/// Initialize the voice pipeline state. Called during startup.
 pub fn init_global() -> Result<()> {
     // The VAD is the wake word's own.
     VAD_DETECTOR.get_or_init(|| std::sync::Mutex::new(earshot::Detector::default()));
@@ -512,7 +506,6 @@ pub enum RecordingEvent {
     Stopped,
     /// The transcript, already carrying the spoken marker.
     Transcript(String),
-    /// The recording held no speech.
     NoSpeech,
     /// The recording produced no message; the notice says why and a composer holding a committed
     /// message gives the field back.
@@ -527,7 +520,6 @@ pub enum RecordingEvent {
 /// senders): an uninitialized sender would end the composer subscription on its first poll.
 pub(crate) static RECORDING: OnceLock<broadcast::Sender<RecordingEvent>> = OnceLock::new();
 
-/// Initialise the recording broadcast (see [`RECORDING`]).
 pub(crate) fn init_recording_tx() {
     RECORDING.get_or_init(|| broadcast::channel(16).0);
 }
@@ -567,7 +559,6 @@ pub(crate) const NO_SPEECH_NOTICE: &str = "*Voice: no speech detected — record
 pub(crate) const VOICE_UNSENT_NOTICE: &str =
     "*Voice: the voice part was not sent and cannot be restored*";
 
-/// Notice when a recording transcription fails.
 pub(crate) const TRANSCRIPTION_FAILED_NOTICE: &str =
     "*Voice: transcription failed — the voice part was not sent and cannot be restored*";
 
@@ -638,7 +629,6 @@ fn set_status_and_notify(state: &mut VoicePipelineState, status: VoiceStatus) {
     }
 }
 
-/// The currently active wake word enrollment (prototype + calibration).
 #[must_use]
 pub(crate) fn get_enrollment() -> Option<WakeWordEnrollment> {
     voice_state().read().unwrap_poison().enrollment.clone()
@@ -893,7 +883,6 @@ impl Microphone {
     }
 }
 
-/// Start the microphone; returns it with its sample and loss channels.
 #[expect(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 fn start_microphone() -> Result<Microphone> {
     let (tx, rx) = mpsc::channel::<Vec<f32>>(MIC_CHANNEL_CAPACITY);
@@ -1347,7 +1336,6 @@ impl Wake {
 
 #[expect(clippy::struct_excessive_bools)]
 struct PipelineCtx {
-    /// The open microphone, if any (see [`Microphone`]).
     mic: Option<Microphone>,
     is_listening: bool,
     /// The recording in progress: the mic button and the wake word share one mechanism, differing
@@ -1361,7 +1349,6 @@ struct PipelineCtx {
     /// Silence by audio sample count, not wall-clock, so load and processing delays cannot skew the
     /// cutoff.
     silence_sample_count: usize,
-    /// The wake word's own state.
     wake: Wake,
     enrollment_mode: bool,
     auto_start_pending: bool,
@@ -1373,14 +1360,12 @@ struct PipelineCtx {
     collecting_negatives: bool,
     /// Timestamp until which Error→Listening is suppressed, set after transcription failures.
     refractory_until: Option<Instant>,
-    /// Timestamp of the last rate-limited voice notice.
     last_voice_notice_time: Option<Instant>,
     /// Remaining automatic retry cycles ([`MAX_AUTO_MODEL_RETRY_CYCLES`]), consumed only when the
     /// self-healing path retries; the explicit GUI retry bypasses the budget.
     auto_model_retries_left: u32,
 }
 
-/// Parameterised pipeline state reset level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResetLevel {
     Full,
@@ -1547,7 +1532,6 @@ impl PipelineCtx {
         last.is_none_or(|t| t.elapsed() >= NOTICE_INTERVAL)
     }
 
-    /// Voice-notice rate-limit guard.
     fn should_send_voice_notice(&self) -> bool {
         Self::should_send_rate_limited(self.last_voice_notice_time)
     }
@@ -2295,7 +2279,6 @@ async fn finalize_enrollment_pipeline() -> bool {
     true
 }
 
-/// Run the voice pipeline background task.
 #[expect(clippy::too_many_lines)]
 pub async fn run_voice_pipeline() {
     info!("Voice pipeline starting...");
@@ -2604,7 +2587,6 @@ async fn run_enrollment_phases(ctx: &mut PipelineCtx) {
                 }
             }
         } else {
-            // Update status with current progress.
             let accumulated_secs = ctx.wake.negatives_speech_samples / SAMPLE_RATE as usize;
             let wall_clock_elapsed = ctx
                 .wake

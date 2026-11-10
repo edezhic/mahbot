@@ -49,7 +49,6 @@ const PROBE_ENTRIES: &str = "format=duration:stream=codec_type,width,height,dura
                             :stream_tags=rotate:stream_side_data=rotation\
                             :stream_disposition=attached_pic";
 
-/// The video facts the product needs about one file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ClipInfo {
     pub(crate) duration: Duration,
@@ -62,7 +61,6 @@ pub(crate) struct ClipInfo {
     /// The sound track's own length, when the container declares one: a track can stop before its
     /// container does, and a piece cut past its end holds nothing to read.
     pub(crate) sound: Option<Duration>,
-    /// The file's own size in bytes.
     pub(crate) bytes: u64,
 }
 
@@ -125,7 +123,6 @@ impl Audio {
     }
 }
 
-/// The bounds frame extraction is given.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FrameOptions<'a> {
     /// The seconds to take a frame at, in playback order.
@@ -298,7 +295,6 @@ async fn classify(bin: &Binaries, input: &Path, decode: Decode) -> FfmpegError {
     }
 }
 
-/// What one finished tool run left behind.
 struct Output {
     success: bool,
     stdout: Vec<u8>,

@@ -183,7 +183,6 @@ static ACTION_WIRE_NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
         .collect()
 });
 
-/// Serialize a [`ComputerAction`] and extract its wire name.
 fn wire_name(action: &ComputerAction) -> String {
     let v = serde_json::to_value(action).expect("ComputerAction serializes");
     match v {
@@ -209,7 +208,6 @@ const EXPECTED_ACTION_SHAPE: &str = "one of: {\"observe\":{\"target\":\"a1\"}}, 
 /// Wheel ticks a `scroll` moves when `amount` is omitted.
 const DEFAULT_SCROLL_AMOUNT: u32 = 3;
 
-/// Longest `wait` the tool will sit out, in seconds.
 const MAX_WAIT_SECS: f64 = 10.0;
 
 /// The modifiers a click names, one entry each in the schema — and the most entries a
@@ -527,7 +525,6 @@ fn coord_pair(x: Option<f64>, y: Option<f64>, what: &str) -> anyhow::Result<Opti
     }
 }
 
-/// Length-check an optional string argument.
 fn check_opt_arg(field: &str, value: Option<&str>) -> anyhow::Result<()> {
     value.map_or(Ok(()), |value| core::check_arg_len(field, value))
 }
@@ -549,7 +546,6 @@ fn check_modifiers(modifiers: Option<&[core::Modifier]>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Corrective error for an unrecoverable action shape, echoing the expected form.
 fn corrective_action_error(received: &Value) -> String {
     format!(
         "Invalid computer action arguments. Expected action to be {EXPECTED_ACTION_SHAPE}. \
@@ -597,7 +593,6 @@ fn normalize_action(action: Value, args: &Value) -> Result<(Value, Option<String
     }
 }
 
-/// Build a tagged action object from a plain action name plus sibling fields.
 fn build_action_from_siblings(name: &str, args: &Value) -> Result<(Value, Option<String>), String> {
     let Some(obj) = args.as_object() else {
         return Err(corrective_action_error(args));
@@ -630,7 +625,6 @@ fn build_action_from_siblings(name: &str, args: &Value) -> Result<(Value, Option
     ))
 }
 
-/// The backend for the running platform.
 fn backend() -> &'static dyn Backend {
     #[cfg(target_os = "linux")]
     {
@@ -657,7 +651,6 @@ pub(crate) fn is_advertised() -> bool {
 
 type CaptureProbe = (Instant, bool);
 
-/// Cached capture-channel probe result with its timestamp.
 static CAPTURE_CACHE: LazyLock<std::sync::Mutex<Option<CaptureProbe>>> =
     LazyLock::new(|| std::sync::Mutex::new(None));
 
@@ -1817,7 +1810,6 @@ async fn scroll(
     })
 }
 
-/// The surface a `cursor` reading is relative to, with its geometry.
 async fn cursor_surface() -> anyhow::Result<(TargetSpec, core::SurfaceGeometry)> {
     let target = resolve_surface(None).await?;
     let geo = backend().surface_geometry(&target).await?;
@@ -2021,9 +2013,7 @@ mod tests {
         unread: bool,
         frontmost: Option<&'static str>,
         order: core::WindowOrder,
-        /// The refs the answer prints for the listed windows.
         refs: &'static [&'static str],
-        /// The application the request named, when it named one.
         app: Option<&'static str>,
         exact: Option<&'static str>,
         present: &'static [&'static str],

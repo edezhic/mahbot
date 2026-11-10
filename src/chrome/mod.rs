@@ -229,7 +229,6 @@ pub(crate) fn navigation_failure(
         None
     }
 }
-/// The net error code an error page's probe named, when it named one.
 pub(crate) fn error_page_code(probe: &crate::chrome::contract::ChromeResponse) -> Option<String> {
     crate::chrome::contract::parse_error_page_probe(probe)
         .filter(|probe| probe.is_error_page)

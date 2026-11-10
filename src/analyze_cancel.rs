@@ -29,7 +29,6 @@ use crate::agent::message_router::MessageKind;
 use crate::agent::registry::ParentKey;
 use crate::db::Connection;
 
-/// What the cancel action did — the three answers a cancel call can give.
 #[derive(Debug)]
 pub(crate) enum Cancelled {
     /// The round was live and has been stopped.

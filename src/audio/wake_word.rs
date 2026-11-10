@@ -93,7 +93,6 @@ impl WakeWordEnrollment {
         }
     }
 
-    /// The record for a freshly built engine enrolment.
     pub(crate) fn from_engine(
         enrollment: &Enrollment,
         created_at: String,
@@ -155,7 +154,6 @@ impl WakeDetector {
         }
     }
 
-    /// Whether the post-fire cooldown is still running.
     pub(crate) fn cooldown_active(&self) -> bool {
         self.last_fire
             .is_some_and(|last| last.elapsed() < WAKE_WORD_COOLDOWN)
@@ -303,7 +301,6 @@ pub(crate) fn push_capped(buf: &mut Vec<f32>, samples: &[f32], cap: usize) -> us
     excess
 }
 
-/// Build the engine's enrolment from the accepted utterances and the negative pool.
 pub(crate) fn build_enrollment(
     utterance_embeddings: &[Vec<f32>],
     calibration: Calibration,

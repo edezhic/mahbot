@@ -45,7 +45,6 @@ use crate::tools::shell::scan::{self, CdScan};
 
 use super::GrepWord;
 
-/// The argument a served member receives its spec path through.
 pub(super) const SPEC_FILE_FLAG: &str = "--spec-file";
 
 /// Scratch directory (below the daemon's private temp root) holding served members' specs.

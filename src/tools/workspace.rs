@@ -298,7 +298,6 @@ enum PipelineChange {
     NotReady,
     /// Already in the requested state: reported as such, never written again.
     Already,
-    /// The request changes the state and needs the write.
     Write,
 }
 
@@ -323,7 +322,6 @@ async fn pause_or_resume(name: Option<&str>, paused: bool) -> anyhow::Result<Too
     }
 }
 
-/// Pause or resume one workspace's pipeline.
 async fn set_one_pipeline_paused(name: &str, paused: bool) -> anyhow::Result<String> {
     let ws = managed_workspace(name).await?;
     match pipeline_change(&ws, paused) {

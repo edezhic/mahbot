@@ -21,9 +21,7 @@ struct SkillMarkdownMeta {
     description: Option<String>,
 }
 
-/// Parse a minimal YAML frontmatter block (`---` delimited) from markdown.
 fn parse_frontmatter(content: &str) -> SkillMarkdownMeta {
-    /// Strip leading/trailing whitespace and surrounding quotes.
     fn strip_quotes(s: &str) -> String {
         s.trim().trim_matches('"').trim_matches('\'').to_string()
     }
@@ -160,8 +158,6 @@ pub fn skills_to_prompt(skills: &[Skill], ws: &crate::Workspace) -> String {
     )
 }
 
-// Helpers
-
 fn write_xml_text_element(w: &mut String, indent: usize, name: &str, value: &str) {
     let padding = " ".repeat(indent);
     let escaped = crate::util::html::escape_html(value);
@@ -239,7 +235,6 @@ mod tests {
     async fn load_skills_dedup_workspace_priority() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Same skill name in all three directories
         write_skill(
             dir.path(),
             "skills",
@@ -271,7 +266,6 @@ mod tests {
     async fn load_skills_dedup_claude_over_agents() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Same skill name in claude and agents (no workspace/skills)
         write_skill(
             dir.path(),
             ".claude/skills",
@@ -326,8 +320,6 @@ mod tests {
 
     #[test]
     fn write_xml_text_element_escapes_special_chars() {
-        // Verify that `<`, `>`, `&`, `"`, and `'` are all properly escaped
-        // using the shared `escape_html` from `util::html`.
         let mut out = String::new();
         write_xml_text_element(&mut out, 0, "test", "<hello> & \"world\" 'test'");
         assert_eq!(

@@ -37,7 +37,6 @@ pub(crate) enum CustomRoleBehavior {
 }
 
 impl CustomRoleBehavior {
-    /// The stored column value.
     #[must_use]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
@@ -46,7 +45,6 @@ impl CustomRoleBehavior {
         }
     }
 
-    /// Parse a stored column value.
     pub(crate) fn parse(s: &str) -> anyhow::Result<Self> {
         match s {
             "continuous" => Ok(Self::Continuous),
@@ -66,7 +64,6 @@ impl std::fmt::Display for CustomRoleBehavior {
     }
 }
 
-/// One admin-authored custom role.
 #[derive(Debug, Clone)]
 pub(crate) struct CustomRole {
     pub name: String,
@@ -104,7 +101,6 @@ pub(crate) async fn list() -> Result<Vec<CustomRole>> {
     rows.iter().map(custom_role_from_row).collect()
 }
 
-/// One custom role by its exact name.
 pub(crate) async fn get(name: &str) -> Result<Option<CustomRole>> {
     let sql = format!("SELECT {CUSTOM_ROLE_COLUMNS} FROM custom_roles WHERE name = ?1");
     let rows = store().conn.query(&sql, db::params![name]).await?;

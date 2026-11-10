@@ -14,13 +14,11 @@ pub(crate) enum RuntimeEvent {
     Registries,
     /// The local Telegram Bot API server's state: health, mode, version or last error.
     TelegramLocal,
-    /// The voice pipeline status value.
     VoiceStatus,
     /// The self-update availability cache: a release was found or is no longer offered.
     UpdateAvailability,
 }
 
-/// Process-wide broadcast of runtime-change events.
 pub(crate) static RUNTIME_EVENTS: OnceLock<tokio::sync::broadcast::Sender<RuntimeEvent>> =
     OnceLock::new();
 

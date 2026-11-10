@@ -203,8 +203,6 @@ async fn finalize_commit_and_transition(
     }
 }
 
-/// Absorb the post-run tail for the sanitation stage: phase/drain guards, response-None
-/// failure block, verdict extraction, and job terminalization.
 pub(crate) async fn finalize_sanitation_stage(
     ticket: &Ticket,
     agent: &Agent,
@@ -271,7 +269,6 @@ pub(crate) async fn finalize_sanitation_stage(
     }
 }
 
-/// Run the sanitation agent to inspect new/untracked files in the workspace.
 async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
     let untracked_files = match list_new_or_untracked_files(ws.as_path()).await {
         Ok(files) if files.is_empty() => {
@@ -315,7 +312,6 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
     run_stage_agent(&ticket, &ws, job_id, &prompt, StageRunKind::Sanitation).await;
 }
 
-/// Process the result of a sanitation agent inspection.
 async fn process_sanitation_verdict(
     ticket: &Ticket,
     job_id: &str,
@@ -367,7 +363,6 @@ mod tests {
     use crate::pipeline::board::TicketLabel;
     use crate::util::test::TicketFixture;
 
-    /// Every ticket's commit subject starts with its own label.
     #[test]
     fn the_commit_subject_carries_the_ticket_label() {
         let ticket = |label| {

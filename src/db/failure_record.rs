@@ -58,7 +58,6 @@ pub(crate) fn artifact_state_line(wal_bytes: Option<u64>) -> String {
     }
 }
 
-/// The environment-cause marker: this failure is an external condition, not a defect.
 pub(crate) const ENVIRONMENT_CAUSE: &str = "cause: environment — not store damage";
 
 /// Which severe failure a block reports. The variant's header is the block's title.
@@ -70,7 +69,6 @@ pub(crate) enum FailureKind {
     /// A store's periodic checkpoint failure window was exhausted — every round in it failed.
     CheckpointFailure,
     ExitCheckpointFailure,
-    /// A store's periodic integrity check failed.
     RuntimeIntegrityFailure,
     /// A reclaiming checkpoint was refused because the store's own page count would not shrink.
     ShrinkRefused,
@@ -128,7 +126,6 @@ impl FailureReport {
         self
     }
 
-    /// Name the failing step for a block that has no store to name (a start-up or launch failure).
     #[must_use]
     pub(crate) fn step(mut self, step: &str) -> Self {
         self.step = Some(step.to_string());
@@ -235,7 +232,6 @@ fn condition_lines(block: &str) -> String {
     kept.join("\n")
 }
 
-/// Whether the record at `path` provably holds a block for `block`'s condition.
 fn condition_is_recorded(path: &Path, block: &str) -> bool {
     let Ok(existing) = std::fs::read_to_string(path) else {
         return false;

@@ -104,8 +104,6 @@ pub(crate) fn write_artifacts(
     Ok(())
 }
 
-// Manifest
-
 /// Build the run manifest. `args` is the raw argv with any API-key material scrubbed: the
 /// `--api-key` value becomes `"***"`, and any arg containing `sk-or-` is replaced wholesale. The
 /// `env` object records only the three key entries, present-or-absent, values scrubbed.

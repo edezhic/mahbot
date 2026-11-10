@@ -39,7 +39,6 @@ pub(crate) fn report_activity() {
     *LAST_REPORT.lock().unwrap_poison() = Some(Instant::now());
 }
 
-/// Where the user is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Location {
     AtComputer,
@@ -64,7 +63,6 @@ pub(crate) struct State {
 }
 
 impl State {
-    /// The value the line carries.
     pub(crate) fn label(self) -> &'static str {
         if self.by_voice {
             "active, by voice"
@@ -107,7 +105,6 @@ pub(crate) fn is_absent() -> bool {
     read().is_some_and(|state| state.location == Location::Away)
 }
 
-// The operating system's input reading
 // One reader per platform, where the platform answers without asking for a permission.
 // Each gives "how long since real input", or `None` when it cannot tell.
 

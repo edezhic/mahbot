@@ -27,7 +27,6 @@ use crate::util::UnwrapPoison;
 
 /// The engine's event site (`turso_core/vdbe/execute.rs`).
 const ENGINE_TARGET: &str = "turso_core::vdbe::execute";
-/// The message prefix of the engine's checkpoint-failure event.
 const CAUSE_PREFIX: &str = "PRAGMA wal_checkpoint failed";
 /// The engine's reason for a checkpoint it could not run because another operation held the
 /// store back: `LimboError::Busy`, as the captured sentence renders it (the engine formats its
@@ -121,7 +120,6 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CauseCaptureLayer 
     }
 }
 
-/// Keeps the event's `message` field, and only that field.
 struct MessageVisitor(Option<String>);
 
 impl tracing::field::Visit for MessageVisitor {
@@ -147,12 +145,10 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::registry::Registry;
 
-    /// A subscriber holding only the bare capture layer (no filter).
     fn capturing_subscriber() -> impl tracing::Subscriber + Send + Sync {
         Registry::default().with(CauseCaptureLayer)
     }
 
-    /// A subscriber with the production filter applied (see [`filter`]).
     fn filtered_subscriber() -> impl tracing::Subscriber + Send + Sync {
         Registry::default().with(CauseCaptureLayer.with_filter(filter()))
     }
@@ -199,8 +195,6 @@ mod tests {
         }
     }
 
-    /// A sink is armed only for its own calls: each concurrent scope keeps its own reason, and
-    /// an engine event outside any scope reaches no sink.
     #[tokio::test]
     async fn a_sink_keeps_only_its_own_calls_reason() {
         let _guard = tracing::subscriber::set_default(capturing_subscriber());

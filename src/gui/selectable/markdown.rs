@@ -23,7 +23,6 @@ fn bullet_items(bullet: &Bullet) -> &[Item] {
     }
 }
 
-/// Display a bunch of markdown items.
 pub(crate) fn view<'a, Theme, Renderer>(
     items: impl IntoIterator<Item = &'a Item>,
     settings: impl Into<Settings>,
@@ -35,7 +34,6 @@ where
     view_with(items, settings, &SelectableViewer)
 }
 
-/// Displays a heading using the default look.
 fn heading<'a, Message, Theme, Renderer>(
     settings: Settings,
     level: &'a HeadingLevel,
@@ -79,7 +77,6 @@ where
     .into()
 }
 
-/// Displays a paragraph using the default look.
 fn paragraph<'a, Message, Theme, Renderer>(
     settings: Settings,
     text: &Text,
@@ -96,7 +93,6 @@ where
         .into()
 }
 
-/// Displays an unordered list using the default look, calling the [`Viewer`] per bullet.
 pub(crate) fn unordered_list<'a, Message, Theme, Renderer>(
     viewer: &impl Viewer<'a, Message, Theme, Renderer>,
     settings: Settings,
@@ -139,7 +135,6 @@ where
     .into()
 }
 
-/// Displays an ordered list using the default look, calling the [`Viewer`] per item.
 pub(crate) fn ordered_list<'a, Message, Theme, Renderer>(
     viewer: &impl Viewer<'a, Message, Theme, Renderer>,
     settings: Settings,
@@ -182,7 +177,6 @@ where
     .into()
 }
 
-/// Displays a code block using the default look.
 pub(crate) fn code_block<'a, Message, Theme, Renderer>(
     settings: Settings,
     lines: &'a [Text],

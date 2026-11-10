@@ -186,7 +186,6 @@ async fn copy_to_uploads(
     Some(path)
 }
 
-/// Outcome of processing an IMAGE marker.
 enum ImageAction {
     /// Keep the marker unchanged (e.g. HTTP/HTTPS URL).
     Keep,
@@ -987,14 +986,11 @@ pub(crate) fn has_inbound_temp_marker(content: &str) -> bool {
     })
 }
 
-/// Strips common trailing punctuation (commas, periods, closing brackets, colons, semicolons,
-/// exclamation/question marks) that naturally appears around URLs in prose.
 fn extract_urls(text: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for m in URL_RE.find_iter(text) {
         let mut url = m.as_str().to_string();
-        // Strip trailing punctuation that isn't part of the actual URL
         while url.ends_with(&[',', '.', ')', ']', '}', ':', ';', '!', '?'][..]) {
             url.pop();
         }
@@ -1333,7 +1329,6 @@ mod tests {
         let ws_path = tmp_root.join("myworkspace");
         tokio::fs::create_dir_all(&ws_path).await.unwrap();
 
-        // The fixture must be one of this message's inbound attachments to be in scope.
         let source_bytes = real_png(2, 1);
         let (_msg_dir, tmp_img) =
             inbound_attachment_fixture(7002, "photo.png", &source_bytes).await;
@@ -1514,7 +1509,6 @@ mod tests {
     /// `[Invalid image reference: …]` note, and the in-scope temp file is cleaned up.
     #[tokio::test]
     async fn enrich_image_that_is_not_a_decodable_raster_never_fails_open_to_a_junk_data_uri() {
-        // A non-image file with an image extension.
         let (_msg_dir, tmp) = inbound_attachment_fixture(7007, "photo.png", b"not an image").await;
         let path_str = tmp.to_string_lossy().to_string();
         let mut msg = inbound_msg(7007, &format!("Photo: [IMAGE:{path_str}]"));
@@ -1592,7 +1586,6 @@ mod tests {
         let mut msg = inbound_msg(7011, &marker);
         enrich_message(&mut msg, Some(ws_path.as_path())).await;
 
-        // The marker becomes the workspace handle and the text is inlined.
         let copy = ws_path.join("uploads").join("notes.md");
         assert!(
             msg.content.contains(&format!("[FILE:{}]", copy.display())),
@@ -1614,7 +1607,6 @@ mod tests {
             document.as_bytes(),
             "Workspace copy must be byte-identical to the inbound file"
         );
-        // Inbound temp file and its whole per-message directory are gone.
         assert!(!attachment.exists(), "Inbound temp file must be deleted");
         assert!(
             !msg_dir.exists(),

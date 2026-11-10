@@ -37,8 +37,6 @@ fn result_entry_style(bg: Color) -> impl Fn(&iced::Theme) -> container::Style {
     }
 }
 
-/// A clickable search-result row: padded content inside a full-width transparent button whose
-/// container is highlighted when selected.
 fn result_entry(
     content: impl Into<Element<'static, EditorMessage>>,
     bg: Color,
@@ -57,7 +55,6 @@ fn result_entry(
     .into()
 }
 
-/// Build the quick-open overlay: a centered dialog with search input and filtered results list.
 pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, EditorMessage> {
     let search_input = widgets::single_line_editor(
         &qo.filter.buffer,
@@ -75,7 +72,6 @@ pub(super) fn build_quick_open_overlay(qo: &QuickOpenState) -> Element<'_, Edito
         },
     );
 
-    // Convert to Element for use in column.
     let search_elem: Element<'_, EditorMessage> = search_input;
 
     // Build results list with owned data to satisfy 'static lifetime.
@@ -171,7 +167,6 @@ fn warning_title(title: &str) -> Element<'_, EditorMessage> {
     .into()
 }
 
-/// Build the close-save-discard dialog overlay.
 pub(super) fn build_close_dialog(
     on_save: EditorMessage,
     on_discard: EditorMessage,
@@ -193,7 +188,6 @@ pub(super) fn build_close_dialog(
     )
 }
 
-/// Build the delete confirmation dialog overlay.
 pub(super) fn build_delete_confirm_dialog(
     target: &DeleteConfirmTarget,
 ) -> Element<'static, EditorMessage> {
@@ -235,7 +229,6 @@ pub(super) fn build_delete_confirm_dialog(
     )
 }
 
-/// Build the new file/directory name input overlay.
 pub(super) fn build_new_item_input(target: &NewItemTarget) -> Element<'_, EditorMessage> {
     let label = if target.is_dir {
         format!("New directory in \"{}\"", target.parent_dir)
@@ -257,7 +250,6 @@ pub(super) fn build_new_item_input(target: &NewItemTarget) -> Element<'_, Editor
         },
     );
 
-    // Dialog content.
     widgets::modal_backdrop(
         dialog::dialog_shell(
             column![
@@ -288,8 +280,6 @@ pub(super) fn build_new_item_input(target: &NewItemTarget) -> Element<'_, Editor
     )
 }
 
-/// Build the global search (find-in-files) overlay: a search input with status line and
-/// results list, in a centered overlay dialog.
 #[expect(clippy::too_many_lines)]
 pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_, EditorMessage> {
     let search_input = widgets::single_line_editor(
@@ -312,7 +302,6 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
 
     let search_elem: Element<'_, EditorMessage> = search_input;
 
-    // Status/hint line below the input.
     let status_elem: Element<'static, EditorMessage> = match &gs.status {
         GlobalSearchStatus::Idle => text("Type to search across workspace files")
             .size(theme::TEXT_12)
@@ -375,7 +364,6 @@ pub(super) fn build_global_search_overlay(gs: &GlobalSearchState) -> Element<'_,
                 .color(accent)
                 .font(theme::FONT_BOLD);
 
-            // Build the snippet with match portion highlighted in bold.
             let trimmed = line_content.trim().to_string();
             let snippet_label: Element<'static, EditorMessage> =
                 if let Some(&(start, end)) = offsets.first() {

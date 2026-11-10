@@ -10,7 +10,6 @@ use serde_json::{Value, json};
 use crate::chrome::CHROME_USE_DECLARED_BUDGET;
 use crate::chrome::contract::OutKind;
 
-/// Tool-schema parameter block for one action.
 pub(crate) struct ToolParams {
     pub(crate) required: &'static [&'static str],
     pub(crate) properties: Value,
@@ -25,7 +24,6 @@ pub(crate) struct CliFlag {
     /// Whether the flag takes a value. Declared here, never derived from `spelling`: the two
     /// disagreeing is drift.
     pub(crate) takes_value: bool,
-    /// The printed description of the row.
     pub(crate) description: String,
     /// The `session` subcommand the flag belongs to (`--force` → `Some("stop")`); `None` for a flag
     /// every invocation accepts.
@@ -54,7 +52,6 @@ fn value_flag(spelling: &'static str, description: impl Into<String>) -> CliFlag
     }
 }
 
-/// A switch (no value).
 fn switch_flag(spelling: &'static str, description: impl Into<String>) -> CliFlag {
     CliFlag {
         spelling,
@@ -64,7 +61,6 @@ fn switch_flag(spelling: &'static str, description: impl Into<String>) -> CliFla
     }
 }
 
-/// CLI-help data for one action.
 pub(crate) struct CliHelp {
     /// Invocation syntax after the action word, e.g. `<url> [--expect <sel>]`.
     pub(crate) syntax: &'static str,
@@ -722,7 +718,6 @@ fn build_actions() -> Vec<ActionDesc> {
     ]
 }
 
-/// Linear scan for one action's full descriptor.
 #[must_use]
 pub(crate) fn desc(name: &str) -> Option<&'static ActionDesc> {
     ACTIONS.iter().find(|a| a.name == name)

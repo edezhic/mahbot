@@ -47,13 +47,10 @@ pub(crate) const PPT_PRESENTATION_PART: &str = "ppt/presentation.xml";
 const PPT_PRESENTATION_RELS_PART: &str = "ppt/_rels/presentation.xml.rels";
 /// Base every presentation relationship target resolves against.
 const PPT_BASE: &str = "ppt/";
-/// Prefix of the slide parts.
 const PPT_SLIDES_PREFIX: &str = "ppt/slides/";
-/// Prefix of the embedded-media parts in a PowerPoint package.
 const PPT_MEDIA_PREFIX: &str = "ppt/media/";
 /// Charts in a PowerPoint package: `ppt/charts/chart<N>.xml`.
 const PPT_CHARTS_PREFIX: &str = "ppt/charts/";
-/// The objects a PowerPoint package embeds (`ppt/embeddings/`).
 const PPT_EMBEDDINGS_PREFIX: &str = "ppt/embeddings/";
 /// The deck's legacy comment-author registry (`p:cmAuthorLst`): a slide's `p:cm`
 /// entries name their author by an `authorId` into it.
@@ -67,7 +64,6 @@ const PPT_MODERN_AUTHORS_PART: &str = "ppt/authors.xml";
 /// as images, with the reason, because that is what they are.
 const EMBEDDED_EXTRA_IMAGE_EXTENSIONS: &[&str] =
     &["gif", "bmp", "dib", "tif", "tiff", "ico", "jfif"];
-/// Extensions of the audio a package embeds.
 const EMBEDDED_AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "wav", "m4a", "aac", "ogg", "oga", "wma", "flac", "mid", "midi",
 ];
@@ -347,7 +343,6 @@ fn fallback_slide_parts<R: Read + Seek>(archive: &ZipArchive<R>) -> Vec<Option<S
 enum SlideNotes {
     /// The slide declares no notes part — the usual case.
     None,
-    /// The notes part's text lines.
     Text(Vec<String>),
     /// The slide declares a notes part, but it could not be read. A relationships
     /// part that could not be read names no notes part here: the caller states
@@ -1409,7 +1404,6 @@ struct Part<'a> {
 }
 
 impl<'a> Part<'a> {
-    /// A part's walk over its own bytes.
     fn new(bytes: &'a [u8]) -> Self {
         Self {
             bytes,
@@ -1467,12 +1461,10 @@ fn append_entity(text: &mut String, reference: &BytesRef<'_>) {
 /// A named ZIP entry as the reader found it: absent, present but unreadable within
 /// [`MAX_ZIP_ENTRY_BYTES`], or its bytes.
 enum ZipEntry {
-    /// The archive has no entry under the name.
     Missing,
     /// The entry is there but cannot be read whole within [`MAX_ZIP_ENTRY_BYTES`] — a
     /// read failure, a rejected size, or a refused name.
     Unreadable,
-    /// The entry's bytes.
     Bytes(Vec<u8>),
 }
 
@@ -1549,7 +1541,6 @@ pub(crate) mod test_fixtures {
 
     pub(crate) const COLUMN_CHART: &str = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Sales</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:barDir val="col"/><c:ser><c:tx><c:strRef><c:f>Sheet1!$B$1</c:f><c:strCache><c:pt idx="0"><c:v>Revenue</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strCache><c:pt idx="0"><c:v>Jan</c:v></c:pt><c:pt idx="1"><c:v>Feb</c:v></c:pt></c:strCache></c:cat><c:val><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt><c:pt idx="1"><c:v>20</c:v></c:pt></c:numCache></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
 
-    /// Build a ZIP archive in memory from `(entry path, contents)` pairs.
     pub(crate) fn zip_fixture(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default()

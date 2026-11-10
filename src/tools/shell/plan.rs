@@ -162,12 +162,10 @@ pub(super) struct Plan {
 #[derive(Debug)]
 pub(super) struct Step {
     pub(super) run: Run,
-    /// The directory the step runs in (see the module docs).
     pub(super) cwd: PathBuf,
     pub(super) join: Join,
 }
 
-/// What one step runs.
 #[derive(Debug)]
 pub(super) enum Run {
     /// One `cmd.exe /C "<text>"` fold of adjacent verbatim members; a member that
@@ -191,7 +189,6 @@ pub(super) enum Join {
     /// `&`: runs regardless, and its failure does not stop the line. A bare line break ENDS the
     /// command rather than sequencing it, so the shell respells a plain break as this `&`.
     Always,
-    /// `|`: one member of the pipeline the step before it feeds.
     Pipe,
 }
 
@@ -406,14 +403,12 @@ fn fold_push(fold: &mut Option<Fold>, text: &str, join: Join, start_cwd: PathBuf
     }
 }
 
-/// The fold being accumulated by [`build`]: its text, its join and its cwd.
 struct Fold {
     text: String,
     join: Join,
     cwd: PathBuf,
 }
 
-/// Push the open fold (if any) as one [`Run::Shell`] step.
 fn flush_fold(steps: &mut Vec<Step>, fold: &mut Option<Fold>) {
     if let Some(open) = fold.take() {
         steps.push(Step {
@@ -750,7 +745,6 @@ pub(super) struct AppliedRedirects {
 enum RedirectDest {
     /// `nul`/`NUL`.
     Null,
-    /// The file the redirect named, open for writing.
     File(std::fs::File),
 }
 
@@ -1373,9 +1367,6 @@ fn pipe_groups(steps: &[Step]) -> Vec<std::ops::Range<usize>> {
     groups
 }
 
-// Execution
-
-/// One spawned member of a group.
 struct MemberRun {
     child: Child,
     /// The member's pid, taken from the child at spawn — what the memory watchdog
@@ -1966,7 +1957,6 @@ mod tests {
         }
     }
 
-    /// The text one step runs, for the shell steps of a plan.
     fn shell_text(step: &Step) -> &str {
         match &step.run {
             Run::Shell { text } => text,
@@ -1974,7 +1964,6 @@ mod tests {
         }
     }
 
-    /// The cwds of a plan's steps.
     fn step_cwds(plan: &Plan) -> Vec<&Path> {
         plan.steps.iter().map(|step| step.cwd.as_path()).collect()
     }
@@ -2283,7 +2272,6 @@ mod tests {
         assert_eq!(pipe_groups(&[]), Vec::<Range<usize>>::new());
     }
 
-    /// A member whose redirect the runner applies, carried with the step.
     #[test]
     fn a_redirect_rides_its_own_step() {
         let plan = plan(&[own(
@@ -3003,7 +2991,6 @@ mod tests {
         }
     }
 
-    /// Every line that names no own image is left exactly as the shell left it.
     #[test]
     fn a_line_that_names_no_own_image_is_the_shells() {
         let exe = Path::new(EXE);

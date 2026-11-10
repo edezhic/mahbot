@@ -144,8 +144,6 @@ pub(super) enum RunOwner {
     Service,
 }
 
-// Unix
-
 /// Unix containment is the process group the child leads from the moment it is
 /// spawned — see the module docs.
 #[cfg(unix)]
@@ -174,7 +172,6 @@ impl Tree {
         }
     }
 
-    /// Record one spawned member's process group.
     pub(super) fn attach(&mut self, pid: u32) {
         self.pids.lock().unwrap_poison().push(pid);
     }
@@ -209,8 +206,6 @@ impl Tree {
     )]
     pub(super) fn retain_after_completion(self) {}
 }
-
-// Windows
 
 /// Windows containment is a job object — see the module docs.
 #[cfg(not(unix))]
@@ -559,7 +554,6 @@ mod tests {
         line.len() - line.trim_start().len()
     }
 
-    /// The predicate of a `#[cfg(...)]` attribute, when the line carries one.
     fn cfg_predicate(line: &str) -> Option<&str> {
         let rest = line.trim_start().strip_prefix("#[cfg(")?;
         Some(&rest[..rest.rfind(')')?])
@@ -654,7 +648,6 @@ mod tests {
         skipped
     }
 
-    /// The name of the function a line declares, if it declares one.
     fn fn_name(line: &str) -> Option<String> {
         let name: String = line
             .split_once("fn ")?

@@ -74,7 +74,6 @@ pub fn drain_begin() {
     info!("Draining: in-flight work completes before exit");
 }
 
-/// Whether the graceful-drain window is active.
 #[must_use]
 pub fn is_draining() -> bool {
     *drain_sender().borrow()
@@ -192,7 +191,6 @@ impl StopRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StopAction {
     /// Begin the graceful drain: in-flight work finishes its current round.
-    /// Abandon the drain and run the exit path now.
     Drain,
     /// Abandon the drain and run the exit path now.
     ForceCancel,
@@ -525,7 +523,6 @@ mod console {
     /// regardless: it costs nothing, and a console-subsystem build has a console to serve.
     static INSTALLED: AtomicBool = AtomicBool::new(false);
 
-    /// Whether the queue has a consumer.
     static LOOP_RUNNING: AtomicBool = AtomicBool::new(false);
 
     /// Without a console the platform delivers no console control event, so a failed registration

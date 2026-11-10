@@ -58,7 +58,6 @@ const MIN_CONTEXT: i64 = 128_000;
 /// Establish the base cache before the ladder.
 const WARMUP_ROUNDS: usize = 2;
 
-/// Prompt-size estimate heuristic.
 const CHARS_PER_TOKEN: f64 = 4.0;
 
 /// Added to the prefix estimate: the conversation grows across the 2 warmup + N

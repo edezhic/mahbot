@@ -294,7 +294,6 @@ pub(crate) fn parse_error_page_probe(resp: &ChromeResponse) -> Option<ErrorPageP
     })
 }
 
-/// Extract a non-negative element count from a count-eval response.
 pub(crate) fn eval_count(resp: &ChromeResponse) -> Option<u64> {
     let data = eval_result(resp)?;
     data.as_u64()
@@ -923,7 +922,6 @@ mod tests {
                 );
             }
 
-            // Null → empty rows, total 0.
             let out = extract_output(&serde_json::Value::Null, None);
             assert_eq!(
                 out["data"],
@@ -936,7 +934,6 @@ mod tests {
 
     #[test]
     fn expect_outcome_parses_pass_fail_and_timeout() {
-        // pass true, no timeout, no actual.
         let o = expect_outcome(&serde_json::json!({"pass": true})).expect("verdict present");
         assert!(o.pass);
         assert_eq!(o.actual, None);

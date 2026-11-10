@@ -1280,7 +1280,6 @@ impl Connection {
         self.query_cached_at(Place::Read, sql, params).await
     }
 
-    /// [`Self::query_cached`] on the connection `place` names.
     async fn query_cached_at(
         &self,
         place: Place,
@@ -1421,7 +1420,6 @@ impl Connection {
 pub(crate) struct Upkeep<'a>(&'a Connection);
 
 impl Connection {
-    /// The entry for the store's own upkeep reads — see [`Upkeep`].
     #[must_use]
     pub(crate) fn upkeep(&self) -> Upkeep<'_> {
         Upkeep(self)
@@ -1672,7 +1670,6 @@ async fn read_only_connection(
 /// repair, and the exit round's checkpoint, from hanging behind it.
 const READERS_IDLE_WAIT: Duration = Duration::from_secs(5);
 
-/// Why a read issued by the task that holds a transaction is refused.
 const TRANSACTION_READ_REFUSAL: &str = "a read issued while this task holds an open \
      transaction on the connection must be served by the transaction itself \
      (TxGuard::query): a reader connection cannot see what the transaction has \
@@ -2279,7 +2276,6 @@ impl TxGuard<'_> {
         self.conn.execute(sql, params).await
     }
 
-    /// Execute multiple SQL statements (e.g. a schema) inside the transaction.
     pub async fn execute_batch(&self, sql: &str) -> turso::Result<()> {
         self.conn.execute_batch(sql).await
     }
@@ -2297,7 +2293,6 @@ impl TxGuard<'_> {
         Connection::query_impl(&self.conn, sql, params).await
     }
 
-    /// Execute a **change** of the transaction's own work that returns exactly one row.
     pub async fn execute_one<T, E>(
         &self,
         sql: &str,
@@ -2311,8 +2306,6 @@ impl TxGuard<'_> {
         Connection::query_row_impl(&self.conn, sql, params, map).await
     }
 
-    /// Execute a read of the transaction's own work, mapping each row, failing on the first per-row
-    /// error.
     pub async fn query_map_strict<T, E>(
         &self,
         sql: &str,
@@ -5135,7 +5128,6 @@ mod tests {
         (tmp, conn)
     }
 
-    /// The rows currently in `t`, in order.
     async fn orphan_tx_rows(conn: &Connection) -> Vec<i64> {
         conn.query_map_strict("SELECT a FROM t ORDER BY a", (), |row| row.get::<i64>(0))
             .await
@@ -5628,7 +5620,6 @@ mod tests {
             index_named(&conn, TICKETS_FTS_INDEX_NAME).await,
             "the store opens with its ticket-title index"
         );
-        // A reader out of the pool is what a read in flight leaves behind.
         let held = conn
             .readers
             .lease()

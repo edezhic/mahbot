@@ -29,7 +29,6 @@ use crate::{ChatMessage, ChatRole, Role, Workspace};
 
 use super::TranscriptSnapshot;
 
-/// Coordinates session persistence and prompt building across a single agent turn.
 #[derive(Default)]
 pub(crate) struct Session {
     /// In-memory history for the current turn: system prompt, conversation and the latest message.
@@ -316,7 +315,6 @@ impl Session {
                 // the full first-turn message set. The rebuild paths are the folder change above
                 // and `apply_summary` below.
                 let user_msg = crate::session::user_msg_with_ts(&content, round_ts);
-                // Append the user message and update session context atomically.
                 crate::session::store()
                     .append_with_context(
                         agent_id,
@@ -369,8 +367,6 @@ impl Session {
                     "Failed to record branch session metadata"
                 );
             }
-            // The message is durably written above — advance the persisted prefix and refresh the
-            // transcript.
             self.persisted_len = self.history.len();
             self.publish_transcript();
         }
@@ -451,20 +447,16 @@ impl Session {
         }
     }
 
-    // Read-only access to the in-memory history (for LLM calls).
     #[must_use]
     pub(crate) fn history(&self) -> &[ChatMessage] {
         &self.history
     }
 
-    /// Real provider-reported session length (see the field doc). `None` when no usage-bearing
-    /// agent call ever recorded a value, or the last compaction cleared it.
     #[must_use]
     pub(crate) fn token_length(&self) -> Option<u64> {
         self.token_length
     }
 
-    /// Pictures the conversation holds (see the field doc).
     #[must_use]
     pub(crate) fn image_count(&self) -> usize {
         self.image_count
@@ -477,7 +469,6 @@ impl Session {
         self.publish_transcript();
     }
 
-    /// Take persisted messages into the live history, keeping the picture count in step.
     fn take_persisted(&mut self, messages: impl IntoIterator<Item = ChatMessage>) {
         let from = self.history.len();
         self.history.extend(messages);
@@ -532,7 +523,6 @@ impl Session {
         };
         let has_text = content.as_deref().is_some_and(|t| !t.trim().is_empty());
         let call_count = calls.len();
-        // Walk forward over Tool-role entries (stop at the first non-tool).
         let mut completed: std::collections::HashSet<String> = std::collections::HashSet::default();
         for msg in &self.history[frame_idx + 1..] {
             if msg.role == ChatRole::Tool {
@@ -838,7 +828,6 @@ impl Session {
         let workspace_context = {
             let mut ctx = String::new();
 
-            // Auto-discovered workspace context block.
             ctx.push_str(&crate::prompt::wrap_workspace_context(&workspace_context));
 
             // User-curated manual notes block (survives rediscover). NOTE: changes to `ws.notes` do
@@ -1347,7 +1336,6 @@ async fn fetch_personal_files(user_name: &str) -> Option<String> {
     .flatten()
 }
 
-/// Try to find a stored workspace context for the given workspace and role.
 async fn lookup_workspace_context(ws: &Workspace, role: &Role) -> Option<String> {
     let workspaces = crate::workspace::store();
     workspaces.get_context(&ws.name, role.as_str()).await.ok()?
@@ -1470,7 +1458,6 @@ mod tests {
             .await
             .expect("baseline persisted");
 
-        // Switch both models mid-session → one change-info per model.
         crate::users::store()
             .set_image_gen_model(user, "model-b")
             .await
@@ -1500,7 +1487,6 @@ mod tests {
         assert_eq!(out, "again");
         assert!(snapshot.is_none());
 
-        // No persisted baseline at all → nothing to compare against, no line.
         let (out, snapshot) =
             Session::prepend_model_change("test_assistant_no_baseline", "hello", "no_such_user")
                 .await;
@@ -1524,7 +1510,6 @@ mod tests {
         )));
         let agent_id = "test_assistant_partial";
 
-        // Only the video section rendered at session start — the image id is NOT in the baseline.
         crate::users::store()
             .set_video_model(user, "video-a")
             .await
@@ -1538,7 +1523,6 @@ mod tests {
             .await
             .expect("baseline persisted");
 
-        // Switch the video model → change-info for video; the snapshot advances only video.
         crate::users::store()
             .set_video_model(user, "video-b")
             .await
@@ -1555,7 +1539,6 @@ mod tests {
             .await
             .expect("baseline advanced");
 
-        // A later image switch stays silent — the image id was never rendered.
         crate::users::store()
             .set_image_gen_model(user, "image-b")
             .await
@@ -1580,7 +1563,6 @@ mod tests {
             .await
             .expect("baseline persisted");
 
-        // Compaction re-rendered only the image section (video catalog down).
         let rendered = ModelSnapshot {
             image: Some("model-b".into()),
             video: None,
@@ -1632,7 +1614,6 @@ mod tests {
             "earlier user row untouched"
         );
 
-        // Durable: the store row reflects the rewrite.
         let msgs = crate::session::store().load(agent_id).await;
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[2].content, "rewritten");
@@ -1642,7 +1623,6 @@ mod tests {
     async fn rewrite_last_user_message_unpersisted_tail_is_conservative_noop() {
         crate::util::test::init_test_stores().await;
         let agent_id = "test_rewrite_noop";
-        // Seed the DB with one persisted user row.
         crate::session::store()
             .batch_append(
                 agent_id,
@@ -1672,7 +1652,6 @@ mod tests {
             "in-memory history untouched"
         );
 
-        // The durable row is untouched.
         let msgs = crate::session::store().load(agent_id).await;
         assert_eq!(msgs[0].content, "[IMAGE:/tmp/a.png] persisted");
     }
@@ -1715,8 +1694,6 @@ mod tests {
         );
     }
 
-    // Helper: the assistant frame JSON for an analyze tool call.
-
     fn analyze_frame(call_id: &str) -> String {
         crate::providers::reasoning::assistant_replay_payload(
             Some(""),
@@ -1737,7 +1714,6 @@ mod tests {
     fn pending_tool_frame_none_and_dangling_and_partial() {
         assert!(Session::default().pending_tool_frame().is_none());
 
-        // Frame with two calls, no results → both dangling.
         let frame = crate::providers::reasoning::assistant_replay_payload(
             Some(""),
             &[
@@ -1768,7 +1744,6 @@ mod tests {
         assert_eq!(pending[0].id, "call_a");
         assert_eq!(pending[1].id, "call_b");
 
-        // One result present → only the missing one remains.
         session
             .history
             .push(ChatMessage::tool_result("call_a", "result a"));
@@ -1779,7 +1754,6 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, "call_b");
 
-        // All results present → None (nothing dangling).
         session
             .history
             .push(ChatMessage::tool_result("call_b", "result b"));
@@ -1825,7 +1799,6 @@ mod tests {
             .await
             .unwrap();
 
-        // DB rows by id: user, assistant(frame), tool(result).
         let rows = conn
             .query(
                 "SELECT id, role, content FROM sessions WHERE agent_id = ?1 ORDER BY id",
@@ -1846,7 +1819,6 @@ mod tests {
             "the tool row carries the settled result with the original call id"
         );
 
-        // message_count delta == 1 (the result row).
         let count_after: i64 = conn
             .query_optional(
                 "SELECT message_count FROM session_metadata WHERE agent_id = ?1",
@@ -1858,7 +1830,6 @@ mod tests {
             .unwrap();
         assert_eq!(count_after - count_before, 1);
 
-        // In-memory history mirrors the insert; the persisted prefix covers it.
         let roles: Vec<crate::ChatRole> = session.history().iter().map(|m| m.role).collect();
         assert_eq!(
             roles,
@@ -1914,7 +1885,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Settle only call_a; call_b's row is the captured sibling.
         session
             .settle_tool_results(
                 agent_id,
@@ -1924,8 +1894,6 @@ mod tests {
             .await
             .unwrap();
 
-        // DB rows by id: user, assistant(frame), tool(call_a), tool(call_b) — the frame's call
-        // order, and the captured sibling verbatim.
         let conn = &crate::session::store().conn;
         let rows = conn
             .query(
@@ -1982,7 +1950,6 @@ mod tests {
         let files = Some("- album/ — 2 files\n2 files directly in the folder");
         let custom = "<custom-tools>\n- weather\n</custom-tools>";
 
-        // Guest's Assistant: automations + personal files + custom tools, no workspace list.
         let blocks = assistant_context_blocks(
             false,
             std::slice::from_ref(&automation),
@@ -1997,8 +1964,6 @@ mod tests {
         assert!(!blocks[1].contains("<managed-workspaces>"));
         assert_eq!(blocks[2], custom);
 
-        // The admin's Assistant: the workspace list joins them, and the custom-tool block stays
-        // last.
         let blocks = assistant_context_blocks(
             true,
             std::slice::from_ref(&automation),
@@ -2013,7 +1978,6 @@ mod tests {
         assert!(blocks[2].contains("<managed-workspaces>"));
         assert_eq!(blocks[3], custom);
 
-        // Empty data omits the conditional blocks but never the custom tools.
         assert_eq!(
             assistant_context_blocks(true, &[], &[], None, &[], custom),
             vec![custom.to_string()]

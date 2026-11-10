@@ -88,7 +88,6 @@ pub(crate) fn is_control_message(msg: &ChannelMessage) -> bool {
     msg.callback_query_id.is_some() || control_input(msg).is_some()
 }
 
-/// One inbound attachment: a document, photo, video, audio or voice message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IncomingAttachment {
     file_id: String,
@@ -101,7 +100,6 @@ struct IncomingAttachment {
     urgent: bool,
 }
 
-/// The kind of an inbound attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncomingAttachmentKind {
     Document,
@@ -253,7 +251,6 @@ struct MessageContext {
     chat_id: String,
     message_id: i64,
     reply_target: String,
-    /// The reply this message carries, when it replies to one.
     reply_reference: Option<ReplyReference>,
     /// The `[Forwarded from …]` prefix this message's content opens with, rendered once here so any
     /// path that hands the message on keeps it.
@@ -658,7 +655,6 @@ fn attachment_rejection_content(
     }
 }
 
-/// How an outbound attachment reaches Telegram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachmentRoute {
     LocalFile,
@@ -679,7 +675,6 @@ fn attachment_route(kind: TelegramAttachmentKind, target: &str) -> AttachmentRou
     AttachmentRoute::ByAddress
 }
 
-/// The address's last segment as a path component, else `fallback`.
 fn address_file_name(url: &str, fallback: &str) -> String {
     let parsed = url::Url::parse(url).ok();
     parsed
@@ -693,8 +688,6 @@ fn address_file_name(url: &str, fallback: &str) -> String {
         )
 }
 
-/// The name a fetched video uploads under: the address's last segment, normalized to a video
-/// extension.
 fn video_upload_name(url: &str, content_type: Option<&str>) -> String {
     let content_type = content_type
         .and_then(|value| value.split(';').next())
@@ -829,7 +822,6 @@ fn resolve_file_target(
     Ok(crate::util::strip_verbatim_prefix(&canonical))
 }
 
-/// What one parsed `[KIND:...]` marker became.
 enum MarkerOutcome {
     /// A bare word naming no file — prose explaining the syntax. Kept as written.
     Literal,
@@ -1718,7 +1710,6 @@ impl TelegramChannel {
         }
     }
 
-    /// The intake's store for this process.
     fn intake_store(&self) -> TelegramIntakeStore {
         self.intake_store
             .get_or_init(|| crate::channels::telegram_intake::store().clone())
@@ -3518,7 +3509,6 @@ struct HeldBatch {
 /// polling running, bounded so a stuck processor cannot grow it without limit.
 const BATCH_QUEUE: usize = 32;
 
-/// What the opening handshake resolves to.
 struct IntakeSlot {
     account_id: String,
     /// The claim's batch, still unconfirmed: exactly what the intake now has to hold.
@@ -3556,7 +3546,6 @@ enum BatchOrigin {
     /// A batch that may repeat what this run fetched, or predate it.
     Stale,
 }
-/// What one taken-up batch leaves behind.
 struct Polled {
     /// The position the next `getUpdates` resumes from: past the batch once every event is held, or
     /// at the unit that could not be recorded — which the platform then offers again.

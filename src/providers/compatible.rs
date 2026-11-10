@@ -21,13 +21,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// A provider that speaks the OpenAI-compatible chat completions API.
 pub(crate) struct OpenAiCompatibleProvider {
     name: String,
     base_url: String,
     credential: Option<String>,
 
-    /// Extra HTTP headers to include in all API requests.
     extra_headers: std::collections::HashMap<String, String>,
     /// Cached HTTP client shared by warmup and scoped calls: NO total
     /// request timeout — the 600 s idle timeout is the only bound for chats.
@@ -53,7 +51,6 @@ impl OpenAiCompatibleProvider {
         }
     }
 
-    /// Set extra HTTP headers to include in all API requests.
     #[must_use]
     pub fn with_extra_headers(
         mut self,
@@ -325,8 +322,6 @@ struct NativeMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_details: Option<serde_json::Value>,
 }
-
-// Message content types for API serialization
 
 /// Parse `[IMAGE:…]` markers from content, returning cleaned text and extracted
 /// native image payloads.
@@ -921,7 +916,6 @@ fn detect_family(model: &str) -> ReasoningFamily {
     }
 }
 
-/// Outcome of an idle-timeout body read.
 enum BodyReadOutcome {
     /// Body fully read.
     Complete(Vec<u8>),
@@ -1058,14 +1052,12 @@ impl Provider for OpenAiCompatibleProvider {
             Ok(Ok(Ok(resp))) => resp,
         };
 
-        // Response metadata (telemetry)
         let content_length = response.content_length();
 
         if !response.status().is_success() {
             return Err(scoped_http_error(self, response, idle_timeout).await);
         }
 
-        // Read body with idle timeout
         let (body_bytes, read_failure) = match read_body_idle(response, idle_timeout).await {
             BodyReadOutcome::Complete(bytes) => (bytes, None),
             BodyReadOutcome::Failed {
@@ -1732,8 +1724,6 @@ mod tests {
             "Hello from Venice!"
         );
     }
-
-    // Native tool calling tests
 
     #[test]
     #[expect(clippy::type_complexity)]

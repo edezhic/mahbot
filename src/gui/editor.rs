@@ -61,7 +61,6 @@ fn estimated_tab_left(tabs: &[Tab], idx: usize) -> f32 {
     tabs.iter().take(idx).map(estimate_tab_width).sum()
 }
 
-/// Estimated total content width of the tab strip (sum of all tab widths).
 fn estimated_content_width(tabs: &[Tab]) -> f32 {
     tabs.iter().map(estimate_tab_width).sum()
 }
@@ -87,7 +86,6 @@ const GLOBAL_SEARCH_DEBOUNCE_MS: u64 = 300;
 /// Shown with a failed saved-tabs restore: tab persistence stays blocked until it resolves.
 const TABS_SAVE_PAUSED: &str = "tab saving is paused until this is resolved";
 
-/// Is `name` an OS-generated metadata file the tree hides?
 #[must_use]
 fn is_os_file(name: &str) -> bool {
     name.eq_ignore_ascii_case(".ds_store")
@@ -103,7 +101,6 @@ fn bar_harness<'a>(bar: impl Into<Element<'a, EditorMessage>>) -> Element<'a, Ed
         .into()
 }
 
-/// File-system entry for the directory tree.
 #[derive(Debug, Clone)]
 struct FsEntry {
     name: String,
@@ -122,7 +119,6 @@ struct Tab {
     line_ending: LineEnding,
 }
 
-/// Content data for a tab, keyed by full path.
 struct TabData {
     content: super::editor_widget::EditorBuffer,
     undo_stack: RefCell<UndoStack>,
@@ -174,17 +170,14 @@ fn make_tab_and_data(
     (tab, tab_data, mtime)
 }
 
-/// State for the find/replace search bar.
 struct FindReplaceState {
     query: SingleLineEditorState,
     replace: SingleLineEditorState,
-    /// Byte ranges of all matches in the file.
     matches: Vec<std::ops::Range<usize>>,
     current_match_idx: usize,
     case_sensitive: bool,
 }
 
-/// Status of the global (find-in-files) search.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum GlobalSearchStatus {
     Idle,
@@ -240,21 +233,18 @@ fn compute_text_matches(text: &str, query: &str, case_sensitive: bool) -> Vec<Ra
     matches
 }
 
-/// Direction for navigating between find matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FindDirection {
     Next,
     Prev,
 }
 
-/// Direction for switching tabs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabDirection {
     Next,
     Prev,
 }
 
-/// Data returned from the async file load operation.
 #[derive(Debug, Clone)]
 struct FileLoadData {
     path: String,
@@ -262,7 +252,6 @@ struct FileLoadData {
     line_ending: LineEnding,
 }
 
-/// What to do with a dirty tab when closing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloseAction {
     Save,
@@ -457,7 +446,6 @@ pub enum EditorMessage {
     },
 }
 
-/// Target for the delete confirmation dialog.
 #[derive(Debug, Clone)]
 struct DeleteConfirmTarget {
     path: String,
@@ -466,7 +454,6 @@ struct DeleteConfirmTarget {
     abs_path: String,
 }
 
-/// Target for the new file/directory name input.
 struct NewItemTarget {
     /// Parent directory path (relative to workspace root; empty = root).
     parent_dir: String,
@@ -476,7 +463,6 @@ struct NewItemTarget {
     input_text: SingleLineEditorState,
 }
 
-/// Target for the inline rename operation.
 struct RenameTarget {
     path: String,
     abs_path: String,
@@ -546,7 +532,6 @@ fn rekey_map<V>(
     }
 }
 
-/// [`rekey_map`] for a `HashSet`.
 fn rekey_set(set: &mut HashSet<String>, rebase: impl Fn(&str) -> Option<String>) {
     for old_key in set.iter().cloned().collect::<Vec<_>>() {
         let Some(new_key) = rebase(&old_key) else {
@@ -569,7 +554,6 @@ fn rekey_map_prefix<V>(
     rekey_map(map, |k| rebase_tree_key(k, old_prefix, new_prefix), modify);
 }
 
-/// [`rekey_map_prefix`] for a `HashSet`.
 fn rekey_set_prefix(set: &mut HashSet<String>, old_prefix: &str, new_prefix: &str) {
     rekey_set(set, |k| rebase_tree_key(k, old_prefix, new_prefix));
 }
@@ -598,7 +582,6 @@ fn rekey_abs_map<V>(map: &mut HashMap<String, V>, old_dir: &str, new_dir: &str) 
     rekey_map(map, |k| rebase_abs_path(k, old_dir, new_dir), |_| {});
 }
 
-/// [`rekey_abs_map`] for a `HashSet`.
 fn rekey_abs_set(set: &mut HashSet<String>, old_dir: &str, new_dir: &str) {
     rekey_set(set, |k| rebase_abs_path(k, old_dir, new_dir));
 }
@@ -664,7 +647,6 @@ async fn read_directory_entries(root: &str, rel_path: &str) -> Result<Vec<FsEntr
         if name == ".git" {
             continue;
         }
-        // Filter out OS-generated metadata files.
         if is_os_file(&name) {
             continue;
         }
@@ -692,7 +674,6 @@ async fn read_directory_entries(root: &str, rel_path: &str) -> Result<Vec<FsEntr
         }
     }
 
-    // Sort: directories first, then files, alphabetical within each group.
     dirs.sort_by_key(|e| e.name.to_lowercase());
     files.sort_by_key(|e| e.name.to_lowercase());
     result.extend(dirs);
@@ -700,7 +681,6 @@ async fn read_directory_entries(root: &str, rel_path: &str) -> Result<Vec<FsEntr
     Ok(result)
 }
 
-/// Read `dir_path` entries and build a [`DirExpanded`] message.
 async fn dir_expanded_msg(
     ws_path: String,
     dir_path: String,
@@ -716,7 +696,6 @@ async fn dir_expanded_msg(
     }
 }
 
-/// Spawn an async directory read that emits a [`DirExpanded`] message.
 fn dir_expanded_task(
     ws_path: String,
     dir_path: String,
@@ -774,7 +753,6 @@ fn validate_file_content(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Helper to construct a `FileLoaded` message.
 fn file_loaded_msg(
     path: String,
     r#gen: u64,
@@ -824,7 +802,6 @@ fn spawn_file_load(abs_path: String, file_gen: u64) -> Task<EditorMessage> {
     Task::perform(load_file_data(abs_path, file_gen), |msg| msg)
 }
 
-/// Build the `EditorTabRecord` list from the current tab state.
 #[must_use]
 fn build_tab_records(
     tabs: &[Tab],
@@ -868,7 +845,6 @@ fn save_tabs_to_db(
     Task::none()
 }
 
-/// Save a single file to disk (async).
 async fn save_file_to_disk(
     path: String,
     content: String,
@@ -1038,10 +1014,8 @@ async fn run_global_search(
     query: String,
     gs_gen: u64,
 ) -> EditorMessage {
-    // Step 1: Debounce.
     tokio::time::sleep(Duration::from_millis(GLOBAL_SEARCH_DEBOUNCE_MS)).await;
 
-    // Step 2: Get or init the search engine.
     let entry = match crate::workspace_index::resolve_engine(
         &ws_name,
         &ws_path,
@@ -1059,7 +1033,6 @@ async fn run_global_search(
         }
     };
 
-    // Step 3: Run grep on the blocking thread pool.
     let entry_for_blocking = Arc::clone(&entry);
     let query_for_blocking = query.clone();
     let base_path = ws_path.clone();
@@ -1099,7 +1072,7 @@ async fn run_global_search(
             return (Vec::new(), None);
         }
 
-        // Step 4: Extract owned data while holding the picker lock.
+        // Extract owned data while holding the picker lock.
         let base = Path::new(&base_path);
         let mut owned: Vec<OwnedGrepMatch> = Vec::with_capacity(grep_result.matches.len());
 
@@ -1150,12 +1123,10 @@ pub struct EditorState {
     loading_dirs: HashSet<String>,
     /// Directory entries loaded from the filesystem (keyed by full path).
     dir_entries: HashMap<String, Vec<FsEntry>>,
-    /// Shared file tree state (nodes, expanded dirs, focus, visible nodes, scroll ID).
     file_tree: FileTree,
     selected_file: Option<String>,
     tabs: Vec<Tab>,
     active_tab_index: usize,
-    /// Content per tab (keyed by full filesystem path).
     tab_contents: HashMap<String, TabData>,
     tab_scroll_id: Id,
     /// Horizontal scroll offset of the tab bar (px), updated via `on_scroll` so scroll-into-view
@@ -1204,7 +1175,6 @@ pub struct EditorState {
     active_modal: Option<ModalKind>,
     /// Workspace files cached for quick-open, rebuilt on each toggle from the expanded dirs.
     all_workspace_files: Vec<String>,
-    /// Generation counter for global search stale-result prevention.
     global_search_gen: u64,
     /// Pending jump `(abs_path, 1-based line, expected_file_gen)`, consumed by the `FileLoaded`
     /// handler only when both path and generation match.
@@ -1226,7 +1196,6 @@ enum ModalKind {
     CloseOthers(usize),
 }
 
-/// State for the quick-open file picker.
 struct QuickOpenState {
     filter: SingleLineEditorState,
     selected_index: usize,
@@ -1281,7 +1250,6 @@ impl EditorState {
         self.selected_workspace_path.as_deref()
     }
 
-    /// Resolve a relative tree path to an absolute filesystem path.
     fn abs_path(&self, rel_path: &str) -> Option<String> {
         self.selected_workspace_path
             .as_ref()
@@ -2235,7 +2203,6 @@ impl EditorState {
         }
     }
 
-    /// Handle saved tabs loaded from the database — build the tabs and their `TabData`.
     fn saved_tabs_loaded(
         &mut self,
         tabs_data: Result<Vec<SavedTabData>, String>,
@@ -2642,7 +2609,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle FindReplaceAll — replaces all matches in the active buffer.
     fn find_replace_all(&mut self) -> Task<EditorMessage> {
         let Some((idx, path)) = self.active_tab() else {
             return Task::none();
@@ -2651,7 +2617,6 @@ impl EditorState {
         if let Some(tab_data) = self.tab_contents.get_mut(&path) {
             if let Some(ref state) = tab_data.find_replace_state {
                 if !state.matches.is_empty() {
-                    // Take undo snapshot.
                     tab_data
                         .undo_stack
                         .borrow_mut()
@@ -2690,8 +2655,6 @@ impl EditorState {
         }
     }
 
-    /// Toggle directory expansion in the file tree — collapses if already expanded,
-    /// otherwise loads and expands.
     fn toggle_dir(&mut self, dir_path: &str) -> Task<EditorMessage> {
         // Clicking a tree row while renaming means the user is dismissing the rename.
         self.dismiss_rename();
@@ -2716,17 +2679,14 @@ impl EditorState {
 
         self.rebuild_tree();
         self.file_tree.tree_focused = true;
-        // Place focus on the expanding directory.
         self.file_tree.focus_path(dir_path);
         read_task
     }
 
-    /// Handle file selection in the tree — opens or switches to the selected file.
     fn select_file(&mut self, path: &str) -> Task<EditorMessage> {
         // Clicking a file tree row transfers keyboard focus to the tree
         // so that arrow keys navigate the tree instead of the editor.
         self.file_tree.tree_focused = true;
-        // Clicking a tree row while renaming means the user is dismissing the rename.
         self.dismiss_rename();
         self.pending_enter_dir = None;
         // Remember the clicked file's position for Ctrl+B re-focus.
@@ -2782,7 +2742,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle save-active-tab — builds a save task for the active tab.
     fn save_active_tab(&self) -> Task<EditorMessage> {
         if self.active_modal.is_some() {
             return Task::none();
@@ -2793,7 +2752,6 @@ impl EditorState {
         build_save_task(&self.tabs, &self.tab_contents, idx)
     }
 
-    /// Handle close-dialog actions (Save, Discard, Cancel) for a single tab.
     fn close_dialog(&mut self, tab_index: usize, action: CloseAction) -> Task<EditorMessage> {
         match action {
             CloseAction::Save => {
@@ -2820,33 +2778,27 @@ impl EditorState {
         }
     }
 
-    /// Dismiss a close dialog without taking any action.
     fn cancel_close_dialog(&mut self) -> Task<EditorMessage> {
         self.active_modal = None;
         self.pending_close = None;
         Task::none()
     }
 
-    /// Close all tabs except `keep_idx` and persist the remaining tab list.
     fn close_all_tabs_except_and_save(&mut self, keep_idx: usize) -> Task<EditorMessage> {
         self.remove_all_tabs_except(keep_idx);
         self.save_current_tabs()
     }
 
-    /// Handle close-others-dialog — saves dirty tabs then closes all but keep_idx.
     fn close_others_dialog(&mut self, keep_idx: usize, action: CloseAction) -> Task<EditorMessage> {
         match action {
             CloseAction::Save => {
                 self.active_modal = None;
-                // Collect all dirty tabs (excluding keep_idx) to save sequentially.
                 let mut dirty: Vec<usize> = (0..self.tabs.len())
                     .filter(|&i| i != keep_idx && self.tabs[i].is_dirty)
                     .collect();
                 if dirty.is_empty() {
-                    // Nothing to save — just close the rest and persist.
                     return self.close_all_tabs_except_and_save(keep_idx);
                 }
-                // Start saving the first dirty tab in the queue.
                 let first = dirty.remove(0);
                 self.pending_close = Some(PendingCloseAction::CloseOthers {
                     keep_idx,
@@ -2857,24 +2809,20 @@ impl EditorState {
             CloseAction::Discard => {
                 self.active_modal = None;
                 self.pending_close = None;
-                // Close all tabs except keep_idx, discarding unsaved changes.
                 self.close_all_tabs_except_and_save(keep_idx)
             }
             CloseAction::Cancel => self.cancel_close_dialog(),
         }
     }
 
-    /// Handle close-other-tabs — shows a dialog if there are dirty tabs.
     fn close_other_tabs(&mut self, idx: usize) -> Task<EditorMessage> {
         if idx >= self.tabs.len() {
             return Task::none();
         }
-        // Collect indices of dirty tabs (excluding the kept tab).
         let dirty: Vec<usize> = (0..self.tabs.len())
             .filter(|&i| i != idx && self.tabs[i].is_dirty)
             .collect();
         if dirty.is_empty() {
-            // No unsaved changes — close immediately and persist.
             return self.close_all_tabs_except_and_save(idx);
         }
         self.active_modal = Some(ModalKind::CloseOthers(idx));
@@ -2913,7 +2861,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle go-to-line input — applies the typed action.
     fn go_to_line_input(
         &mut self,
         action: super::editor_widget::EditorAction,
@@ -2924,7 +2871,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle go-to-line go — jumps to the entered line number.
     fn go_to_line_go(&mut self) -> Task<EditorMessage> {
         if !matches!(self.active_modal, Some(ModalKind::GotoLine)) {
             return Task::none();
@@ -2943,7 +2889,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle global search input — updates query and triggers async search.
     fn global_search_input(
         &mut self,
         action: super::editor_widget::EditorAction,
@@ -2989,7 +2934,6 @@ impl EditorState {
         })
     }
 
-    /// Handle global search select — opens the selected file at the matching line.
     fn global_search_select(&mut self, idx: usize) -> Task<EditorMessage> {
         let Some(ModalKind::GlobalSearch(state)) = &self.active_modal else {
             return Task::none();
@@ -3001,14 +2945,11 @@ impl EditorState {
         #[expect(clippy::cast_possible_truncation)]
         let line_number = match_result.line_number as usize;
 
-        // Close the search panel.
         self.active_modal = None;
 
-        // Open the file and move to the matching line.
         // Convert from 1-based (grep) to 0-based (editor).
         let cursor_line = line_number.saturating_sub(1);
 
-        // Check if already open in a tab.
         if let Some(existing_idx) = self.tabs.iter().position(|t| t.path == abs_path) {
             self.active_tab_index = existing_idx;
             if let Some(tab_data) = self.tab_contents.get_mut(&abs_path) {
@@ -3026,7 +2967,6 @@ impl EditorState {
         self.open_file_in_editor(&abs_path)
     }
 
-    /// Handle delete-file-requested — shows the delete confirmation dialog.
     fn delete_file_requested(&mut self, path: String) -> Task<EditorMessage> {
         let Some(abs_path) = self.abs_path(&path) else {
             return Task::none();
@@ -3040,7 +2980,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle delete-directory-requested — shows the delete confirmation dialog.
     fn delete_directory_requested(&mut self, path: String) -> Task<EditorMessage> {
         // Guard: don't allow deleting the root directory.
         if path.is_empty() {
@@ -3052,7 +2991,6 @@ impl EditorState {
             return Task::none();
         };
 
-        // Count open tabs that are inside this directory.
         let mut dirty_count = 0;
         for tab in &self.tabs {
             if is_within_abs(&tab.path, &abs_path) {
@@ -3071,7 +3009,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle confirm-delete — performs the actual file/directory deletion.
     fn confirm_delete(&mut self) -> Task<EditorMessage> {
         let Some(ModalKind::DeleteConfirm(target)) = self.active_modal.take() else {
             return Task::none();
@@ -3083,7 +3020,6 @@ impl EditorState {
         }
     }
 
-    /// Handle new-item-submit — validates and creates the new file/directory.
     fn new_item_submit(&mut self, name: &str) -> Task<EditorMessage> {
         let Some(ModalKind::NewItem(target)) = self.active_modal.take() else {
             return Task::none();
@@ -3097,7 +3033,6 @@ impl EditorState {
         self.perform_create_item(&target, trimmed)
     }
 
-    /// Handle new-item-input — updates the input text as the user types.
     fn new_item_input(
         &mut self,
         action: super::editor_widget::EditorAction,
@@ -3108,7 +3043,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle rename-requested — starts the inline rename modal.
     fn rename_requested(&mut self, path: &str) -> Task<EditorMessage> {
         let Some(ref ws) = self.selected_workspace_path else {
             return Task::none();
@@ -3126,7 +3060,6 @@ impl EditorState {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        // Determine if it's a directory by checking the actual filesystem.
         let is_dir = Path::new(&abs_path).is_dir();
 
         self.active_modal = Some(ModalKind::Rename(RenameTarget {
@@ -3140,7 +3073,6 @@ impl EditorState {
         iced::widget::operation::focus::<EditorMessage>(Id::from(format!("rename_input_{path}")))
     }
 
-    /// Handle rename-input — updates the inline rename text as the user types.
     fn rename_input(&mut self, action: super::editor_widget::EditorAction) -> Task<EditorMessage> {
         if let Some(ModalKind::Rename(ref mut target)) = self.active_modal {
             target.input_text.apply_action(action);
@@ -3152,7 +3084,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle rename-submit — validates and performs the async rename operation.
     fn rename_submit(&mut self) -> Task<EditorMessage> {
         let Some(ModalKind::Rename(target)) = self.active_modal.take() else {
             return Task::none();
@@ -3160,7 +3091,6 @@ impl EditorState {
         // All-space names fall through to the empty-name check below.
         let trimmed = target.input_text.text().trim().to_string();
 
-        // `validate_item_name` covers empty names, separators, dot/dotdot and OS-reserved names.
         let error_msg = validate_item_name(&trimmed);
         if let Some(msg) = error_msg {
             let mut rt = target;
@@ -3169,7 +3099,6 @@ impl EditorState {
             return Task::none();
         }
 
-        // Compute the new absolute and relative paths.
         let parent_dir = Path::new(&target.path)
             .parent()
             .map(|p| p.to_string_lossy().to_string())
@@ -3184,7 +3113,6 @@ impl EditorState {
             .to_string_lossy()
             .to_string();
 
-        // Check if target already exists.
         if Path::new(&new_abs_path).exists() {
             let mut rt = target;
             rt.error = Some("A file or directory with that name already exists".into());
@@ -3192,8 +3120,6 @@ impl EditorState {
             return Task::none();
         }
 
-        // All validations passed — clear the inline rename state
-        // and fire the async rename task.
         let old_abs = target.abs_path;
         let old_rel = target.path;
         let is_dir = target.is_dir;
@@ -3266,14 +3192,11 @@ impl EditorState {
         }
     }
 
-    /// Handle rename-cancel — dismisses the inline rename modal.
     fn rename_cancel(&mut self) -> Task<EditorMessage> {
         self.active_modal = None;
         Task::none()
     }
 
-    /// Handle rename-completed — updates paths, tab data, tree, and filesystem
-    /// state after an async rename operation.
     #[expect(clippy::too_many_lines)]
     fn rename_completed(
         &mut self,
@@ -3411,7 +3334,6 @@ impl EditorState {
                         // the generation slot, so insert unconditionally.
                         self.dir_entries.insert(re_path, entries);
                         self.rebuild_tree();
-                        // Focus on the renamed entry.
                         self.file_tree.focus_path(new_path);
                     }
                     Err(ReadDirError::NotFound) => {
@@ -3459,7 +3381,6 @@ impl EditorState {
         }
     }
 
-    /// Handle quick-open toggle — opens/closes the quick-open file picker.
     fn quick_open_toggle(&mut self) -> Task<EditorMessage> {
         if matches!(self.active_modal, Some(ModalKind::QuickOpen(_))) {
             self.active_modal = None;
@@ -3469,7 +3390,6 @@ impl EditorState {
             return Task::none();
         }
 
-        // Refresh file list from all currently expanded directories.
         self.scan_all_workspace_files();
 
         self.active_modal = Some(ModalKind::QuickOpen(QuickOpenState {
@@ -3480,7 +3400,6 @@ impl EditorState {
         iced::widget::operation::focus::<EditorMessage>(Id::new(QUICK_OPEN_INPUT_ID))
     }
 
-    /// Handle quick-open input — filters the file list.
     fn quick_open_input(
         &mut self,
         action: super::editor_widget::EditorAction,
@@ -3504,7 +3423,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle quick-open select — opens the selected file.
     fn quick_open_select(&mut self, idx: usize) -> Task<EditorMessage> {
         let result_path = match &self.active_modal {
             Some(ModalKind::QuickOpen(qo)) => qo.results.get(idx).cloned(),
@@ -3517,7 +3435,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle close-active-tab — closes the currently active tab.
     fn close_active_tab(&mut self) -> Task<EditorMessage> {
         if self.active_modal.is_some() {
             return Task::none();
@@ -3529,7 +3446,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle tree-focus-toggled — toggles keyboard focus between tree and editor.
     fn tree_focus_toggled(&mut self) -> Task<EditorMessage> {
         // Suppress during any modal overlay (QuickOpen, GlobalSearch,
         // GotoLine, Rename, etc.) — the overlay owns keyboard focus
@@ -3548,21 +3464,18 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle tree-scrolled — updates scroll state of the file tree.
     fn tree_scrolled(&mut self, scroll_y: f32, viewport_h: f32) -> Task<EditorMessage> {
         self.file_tree.scroll_y = scroll_y;
         self.file_tree.viewport_h = Some(viewport_h);
         Task::none()
     }
 
-    /// Handle tab-bar-scrolled — updates scroll state of the tab bar.
     fn tab_bar_scrolled(&mut self, scroll_x: f32, viewport_w: f32) -> Task<EditorMessage> {
         self.tab_scroll_x = scroll_x;
         self.tab_viewport_w = Some(viewport_w);
         Task::none()
     }
 
-    /// Handle tree-nav-enter — opens file or expands/collapses directory.
     fn tree_nav_enter(&mut self) -> Task<EditorMessage> {
         // When global search or quick-open is active, Enter selects the
         // highlighted result / file.  Borrow to extract the index without
@@ -3590,18 +3503,14 @@ impl EditorState {
             return Task::none();
         };
         if self.file_tree.focused_is_expanded_dir() {
-            // Collapse: rebuild and keep focus on the collapsed directory.
             return self.collapse_dir(&path);
         }
         if is_dir {
-            // Expand: insert, rebuild, jump to first child.
             return self.expand_dir_and_focus(&path, "TreeNavEnter");
         }
-        // Open file.
         Task::done(EditorMessage::SelectFile(path))
     }
 
-    /// Handle tree-nav-left — collapses expanded directory or navigates to parent.
     fn tree_nav_left(&mut self) -> Task<EditorMessage> {
         // Suppress during active modal overlays — the overlay handles
         // its own keyboard navigation (covers Rename, GotoLine, etc.).
@@ -3613,15 +3522,12 @@ impl EditorState {
         };
 
         if self.file_tree.focused_is_expanded_dir() {
-            // Collapse expanded directory and keep focus on it.
             return self.collapse_dir(&path);
         }
 
-        // ArrowLeft on collapsed directory or file — navigate to parent.
         self.file_tree.focus_parent::<EditorMessage>()
     }
 
-    /// Handle tree-nav-right — expands directory or navigates to first child.
     fn tree_nav_right(&mut self) -> Task<EditorMessage> {
         // Suppress during active modal overlays — the overlay handles
         // its own keyboard navigation (covers Rename, GotoLine, etc.).
@@ -3633,20 +3539,16 @@ impl EditorState {
         };
 
         if !is_dir {
-            // ArrowRight on a file does nothing.
             return Task::none();
         }
 
         if !self.file_tree.expanded_dirs.contains(&path) {
-            // Expand directory and move focus to first child.
             return self.expand_dir_and_focus(&path, "TreeNavRight");
         }
 
-        // Already expanded directory — move focus to first child (if any).
         self.file_tree.focus_next_row::<EditorMessage>(idx)
     }
 
-    /// Handle find-toggle — opens/closes the find/replace bar.
     fn find_toggle(&mut self) -> Task<EditorMessage> {
         if self.active_modal.is_some() {
             return Task::none();
@@ -3656,7 +3558,6 @@ impl EditorState {
         };
         if let Some(tab_data) = self.tab_contents.get_mut(&path) {
             if tab_data.find_replace_state.is_none() {
-                // Open find bar with current selection as default query.
                 let default_query = tab_data.content.selection().unwrap_or_default();
                 let mut state = FindReplaceState {
                     query: SingleLineEditorState::new(&default_query),
@@ -3668,9 +3569,7 @@ impl EditorState {
                 state.recompute(&tab_data.content);
                 tab_data.find_replace_state = Some(state);
             }
-            // Already open — re-focus the search input (no state change needed).
         }
-        // Always focus the search input when FindToggle is pressed.
         iced::widget::operation::focus::<EditorMessage>(Id::new(FIND_SEARCH_ID))
     }
 
@@ -3690,7 +3589,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle find-query-input — updates the search query and recomputes matches.
     fn find_query_input(
         &mut self,
         action: super::editor_widget::EditorAction,
@@ -3706,7 +3604,6 @@ impl EditorState {
         })
     }
 
-    /// Handle find-replace-input — updates the replace text.
     fn find_replace_input(
         &mut self,
         action: super::editor_widget::EditorAction,
@@ -3716,7 +3613,6 @@ impl EditorState {
         })
     }
 
-    /// Handle find-replace — replaces the current match and advances to the next.
     fn find_replace(&mut self) -> Task<EditorMessage> {
         let Some((idx, path)) = self.active_tab() else {
             return Task::none();
@@ -3800,7 +3696,6 @@ impl EditorState {
         Task::none()
     }
 
-    /// Handle find-toggle-case-sensitivity — toggles case-sensitive search.
     fn find_toggle_case_sensitivity(&mut self) -> Task<EditorMessage> {
         self.with_active_find_state(|state, content| {
             state.case_sensitive = !state.case_sensitive;
@@ -3808,7 +3703,6 @@ impl EditorState {
         })
     }
 
-    /// Handle refresh-file-tree — re-reads all expanded directories from disk.
     fn refresh_file_tree(&mut self) -> Task<EditorMessage> {
         // Suppress during active modal overlays — the file tree should
         // not refresh behind an active overlay.  This covers both the
@@ -3820,14 +3714,12 @@ impl EditorState {
             return Task::none();
         };
 
-        // Collect directories to refresh: root + all expanded dirs.
         let mut dirs_to_refresh: Vec<String> = Vec::new();
 
         // Root directory (empty string) is always included — it's
         // implicitly expanded and not tracked in expanded_dirs.
         dirs_to_refresh.push(String::new());
 
-        // All manually expanded directories.
         dirs_to_refresh.extend(self.file_tree.expanded_dirs.iter().cloned());
 
         // Filter out directories currently being loaded by the user
@@ -3965,7 +3857,6 @@ impl EditorState {
         self.git_dirty_mtimes = self.git_dir.as_ref().map(|g| stat_git_dirty_mtimes(g));
     }
 
-    /// Handle check-file-changes — detects external file modifications and reloads.
     fn check_file_changes(&mut self) -> Task<EditorMessage> {
         let Some((idx, path)) = self.active_tab() else {
             return Task::none();
@@ -4018,7 +3909,6 @@ impl EditorState {
             return Task::none();
         };
 
-        // Start the async read.
         Task::perform(
             async move {
                 let result = match tokio::fs::read_to_string(&path).await {
@@ -4036,7 +3926,6 @@ impl EditorState {
         )
     }
 
-    /// Handle file-reloaded — replaces tab content with the reloaded file data.
     fn file_reloaded(
         &mut self,
         path: String,
@@ -4056,18 +3945,15 @@ impl EditorState {
             Ok(text) => {
                 let line_ending = detect_line_ending(&text);
 
-                // Update tab metadata.
                 if let Some(tab) = self.tabs.get_mut(idx) {
                     tab.is_dirty = false;
                     tab.line_ending = line_ending;
                 }
 
-                // Replace content, preserving cursor position (clamped).
                 if let Some(tab_data) = self.tab_contents.get_mut(&path) {
                     // Clear find/replace state — match byte ranges are now stale.
                     tab_data.find_replace_state = None;
                     tab_data.content = EditorBuffer::from_file(&text, &path);
-                    // Restore cursor, clamped to new file bounds.
                     tab_data.content.move_to(cursor_line, cursor_col);
                     // Clear undo stack — new content didn't come from user edits.
                     *tab_data.undo_stack.borrow_mut() = UndoStack::new();
@@ -4115,8 +4001,6 @@ impl EditorState {
         })
     }
 
-    /// Shared helper for navigating search results — adjusts the selected index
-    /// based on the direction, staying within bounds.
     fn navigate_search_results(
         selected_index: &mut usize,
         results_len: usize,
@@ -4135,12 +4019,10 @@ impl EditorState {
     /// in priority order. Only the file-tree path returns a scroll-to-focus
     /// task; the overlay paths return `Task::none()`.
     fn navigate_tree_vertical(&mut self, direction: TreeNavDirection) -> Task<EditorMessage> {
-        // When global search is active, navigate the results list.
         if let Some(ModalKind::GlobalSearch(ref mut gs)) = self.active_modal {
             Self::navigate_search_results(&mut gs.selected_index, gs.results.len(), direction);
             return Task::none();
         }
-        // When quick-open is active, navigate the results list.
         if let Some(ModalKind::QuickOpen(ref mut qo)) = self.active_modal {
             Self::navigate_search_results(&mut qo.selected_index, qo.results.len(), direction);
             return Task::none();
@@ -4152,7 +4034,6 @@ impl EditorState {
         if self.active_modal.is_some() {
             return Task::none();
         }
-        // Navigate the file tree focus index.
         self.file_tree.nav_and_scroll::<EditorMessage>(direction)
     }
 
@@ -4944,7 +4825,6 @@ impl EditorState {
 
     /// Perform file deletion: close tab, delete file, re-read parent directory.
     fn perform_file_delete(&mut self, target: &DeleteConfirmTarget) -> Task<EditorMessage> {
-        // Close tab if open.
         if let Some(tab_idx) = self.tabs.iter().position(|t| t.path == target.abs_path) {
             self.remove_tab_at(tab_idx);
         }
@@ -5122,7 +5002,6 @@ fn map_editor_shortcut(
     // Helper: match a Character key by its Latin equivalent.
     let latin = |target: char| -> bool { key.to_latin(physical_key) == Some(target) };
 
-    // Ctrl+B / Cmd+B → toggle tree focus.
     if km.is_shortcut_platform_mod() && latin('b') {
         return Some(EditorMessage::TreeFocusToggled);
     }
@@ -5131,7 +5010,6 @@ fn map_editor_shortcut(
     if km.is_platform_mod && !km.altgr_active && modifiers.shift() && latin('f') {
         return Some(EditorMessage::GlobalSearchToggle);
     }
-    // Cmd+F / Ctrl+F → toggle the find/replace bar.
     if km.is_shortcut_platform_mod() && !modifiers.shift() && latin('f') {
         return Some(EditorMessage::FindToggle);
     }
@@ -5185,7 +5063,6 @@ fn map_editor_shortcut(
             Some(EditorMessage::FindNext)
         };
     }
-    // F3 / Shift+F3 (all platforms)
     if matches!(key, Key::Named(keyboard::key::Named::F3)) {
         return if modifiers.shift() {
             Some(EditorMessage::FindPrev)

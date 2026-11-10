@@ -26,7 +26,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
-/// The window the accumulating telemetry is kept for.
 const TELEMETRY_HOURS: i64 = 8;
 
 /// Failed tool calls are the record of why a tool call failed, read back through
@@ -34,17 +33,14 @@ const TELEMETRY_HOURS: i64 = 8;
 /// the rest of the telemetry.
 const FAILED_TOOL_CALL_HOURS: i64 = 24 * 7;
 
-/// Records removed per statement.
 const BATCH_ROWS: u64 = 1_000;
 
-/// Pause between batches.
 const BATCH_PAUSE: Duration = Duration::from_millis(50);
 
 /// How long one sweep may keep deleting before it yields to the next one. A
 /// backlog too large for one sweep is drained over several of them.
 const SWEEP_BUDGET: Duration = Duration::from_secs(30);
 
-/// How often the sweep runs.
 const SWEEP_INTERVAL: Duration = Duration::from_mins(10);
 
 /// One class of records and the policy for removing it.

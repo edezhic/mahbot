@@ -39,8 +39,6 @@ macro_rules! __columns_gen {
     };
 }
 
-// Public macro: columns!
-
 /// Generate a column-string constant and matching column-index constants from
 /// a single source-of-truth list.
 ///
@@ -70,8 +68,6 @@ macro_rules! columns {
         $crate::__columns_gen!($vis $prefix 0usize, $($col),+);
     };
 }
-
-// Declarative macro: define_store!
 
 /// Generate a DB-backed store struct, its `open()` constructor, and a global
 /// singleton accessor (`store()`).

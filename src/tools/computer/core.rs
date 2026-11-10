@@ -118,7 +118,6 @@ pub(crate) const LIST_BUDGET: Duration = Duration::from_secs(20);
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) const APP_SLICE: Duration = EXCHANGE_DEADLINE;
 
-/// Why a listing skips one item it names: it did not answer within its share of the call.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) const SKIPPED_NOTE: &str = "did not answer within its share of the call — skipped";
 
@@ -148,7 +147,6 @@ pub(crate) struct Budget {
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 impl Budget {
-    /// Start the clock for `what` (the operation the model asked for) against `target`.
     pub(crate) fn new(limit: Duration, what: &'static str, target: impl Into<String>) -> Self {
         Self {
             end: Instant::now() + limit,
@@ -233,7 +231,6 @@ pub(crate) fn surface_label(app_name: &str, title: Option<&str>) -> String {
     window_description(&cap_label(app_name), &cap_label(title.unwrap_or_default()))
 }
 
-/// The label a listing or search uses for one application's windows, capped like any name.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(crate) fn windows_label(app_name: &str) -> String {
     format!("the windows of {}", cap_label(app_name))
@@ -507,7 +504,6 @@ impl WindowAtPoint {
 pub(crate) const SCREEN_POINT_NOTE: &str =
     "the click names the screen, so the window under the point was not checked";
 
-/// What a click's answer says where the platform cannot attribute a window to a point.
 pub(crate) const UNCHECKED_POINT_NOTE: &str =
     "the window under the point was not identified, so the click's landing could not be checked";
 
@@ -651,7 +647,6 @@ pub(crate) fn is_ceiling_refusal(err: &anyhow::Error) -> bool {
     err.downcast_ref::<CeilingRefusal>().is_some()
 }
 
-/// A capture refused at the ceiling, as a type (see [`ceiling_refused`]).
 #[derive(Debug)]
 struct CeilingRefusal(anyhow::Error);
 
@@ -942,7 +937,6 @@ pub(crate) struct Cut {
     pub limit: usize,
 }
 
-/// The pluralisation rule of the ceiling statements: `one` for a count of one, `many` otherwise.
 fn counted(count: usize, one: &'static str, many: &'static str) -> &'static str {
     if count == 1 { one } else { many }
 }
@@ -1000,12 +994,10 @@ impl Truncation {
         kept
     }
 
-    /// Record one value shortened at the read's own character cap.
     fn cut_value(&mut self, limit: usize) {
         self.values.get_or_insert(Cut { count: 0, limit }).count += 1;
     }
 
-    /// Record one name shortened at the read's own character cap.
     fn cut_name(&mut self, limit: usize) {
         self.names.get_or_insert(Cut { count: 0, limit }).count += 1;
     }
@@ -1540,7 +1532,6 @@ pub(crate) fn parse_key_chord(chord: &str) -> anyhow::Result<(Vec<Modifier>, Str
 // argument is refused with the range, text past its cap with the count and the cap (never with the
 // rejected value, which would repeat the oversized payload back).
 
-/// Refuse a string argument longer than [`MAX_ARG_CHARS`], naming its length and the cap.
 pub(crate) fn check_arg_len(field: &str, value: &str) -> anyhow::Result<()> {
     let len = value.chars().count();
     if len > MAX_ARG_CHARS {
@@ -1775,7 +1766,6 @@ pub(crate) fn a11y_scale(a11y_screen: &SurfaceGeometry, pixels: (u32, u32)) -> O
     Some(f64::midpoint(sx, sy))
 }
 
-/// Map a geometry from an accessibility coordinate space into captured pixels.
 #[cfg_attr(not(any(target_os = "linux", test)), expect(dead_code))]
 pub(crate) fn scale_geometry(geo: SurfaceGeometry, scale: f64) -> SurfaceGeometry {
     SurfaceGeometry {
@@ -1947,7 +1937,6 @@ pub(crate) struct Look {
 static LOOKS: LazyLock<Mutex<HashMap<String, Vec<Arc<Look>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// The surface each session last observed or captured (see [`last_surface`]).
 static LAST_SURFACE: LazyLock<Mutex<HashMap<String, TargetSpec>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -2448,7 +2437,6 @@ fn render_node(
     }
 }
 
-/// How a narrow look is limited, after its arguments were resolved.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Narrow {
     pub at: Option<Locator>,
@@ -3440,7 +3428,6 @@ mod tests {
         );
     }
 
-    /// Where a rect comes from: a region cut out of an image, or a window on a captured screen.
     enum RectSource {
         Region {
             region: Region,
@@ -3673,17 +3660,14 @@ mod tests {
         assert!(portal_uri_to_path("file:///tmp/a%zz.png").is_err());
     }
 
-    /// A tree and what its rendering must show: the lines, the header above them, and the counts.
     struct RenderCase {
         name: &'static str,
         observation: Observation,
         /// The prefix each of the first lines must start with.
         lines: &'static [&'static str],
-        /// Substrings the whole rendering must carry.
         contains: &'static [&'static str],
         /// Statements the header (above the first element line) must carry.
         header: Vec<String>,
-        /// Substrings the rendering must not carry.
         absent: Vec<String>,
         counts: Option<(usize, usize)>,
     }
@@ -4026,7 +4010,6 @@ mod tests {
         forget_look(&window_target("fresh2"));
     }
 
-    /// A tree after the change, and what the change answer must say about it.
     struct ChangeCase {
         name: &'static str,
         after: Observation,
@@ -4564,7 +4547,6 @@ mod tests {
         assert_eq!(scaled, surface(20.0, 40.0, 200.0, 100.0));
     }
 
-    /// A locator and the decision it must reach against the sample surface.
     struct LocatorCase {
         name: &'static str,
         locator: Locator,

@@ -189,7 +189,6 @@ fn established() -> Established {
     ESTABLISHED.load().as_deref().copied().unwrap_or_default()
 }
 
-/// Publish a measured verdict; the next [`established`] read sees it.
 fn publish(verdict: Established) {
     ESTABLISHED.store(Some(Arc::new(verdict)));
 }
@@ -365,7 +364,6 @@ struct Battery {
     /// rows, because such a row is evidence of *nothing* and must not let a group be
     /// established from the rows that did run.
     unmeasured: usize,
-    /// What the probe that decides whether a real search exists here found.
     real_search: Probe,
 }
 
@@ -407,7 +405,6 @@ enum RowOutcome {
 }
 
 impl Group {
-    /// Fold one row's outcome into the tallies.
     fn record(&mut self, battery: &mut Battery, outcome: RowOutcome) {
         battery.rows += 1;
         match outcome {

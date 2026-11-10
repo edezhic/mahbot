@@ -89,7 +89,6 @@ impl CancelRegistry {
         }
     }
 
-    /// Whether the round's cancel signal has been fired.
     fn is_cancelled(&self, job_id: &str) -> bool {
         self.inner
             .lock()
@@ -109,7 +108,6 @@ impl CancelRegistry {
             .map(|entry| entry.token.clone())
     }
 
-    /// Whether a live invocation is registered for the round.
     fn is_registered(&self, job_id: &str) -> bool {
         self.inner
             .lock()
@@ -118,7 +116,6 @@ impl CancelRegistry {
             .contains_key(job_id)
     }
 
-    /// The dispatching session's agent id recorded at registration, if any.
     fn registered_caller(&self, job_id: &str) -> Option<String> {
         self.inner
             .lock()

@@ -55,7 +55,6 @@ const MAX_RETRIES: u8 = 10;
 /// already starts doubled).
 const BASE_BACKOFF_MINUTES: i64 = 10;
 
-/// Maximum backoff in minutes.
 const MAX_BACKOFF_MINUTES: i64 = 40;
 
 /// Grace period: only attempt recovery if the session's last candidate message (user message,
@@ -547,12 +546,10 @@ mod tests {
         assert!(is_recovery_candidate(ChatRole::Tool, ""));
         // Assistant tail — only a dangling emission-time tool-call frame is a
         // candidate (interruption mid-tool-round); anything else is healthy.
-        // Plain assistant reply: turn completed, agent responded → healthy.
         assert!(!is_recovery_candidate(
             ChatRole::Assistant,
             "plain assistant reply"
         ));
-        // Hand-crafted non-frame JSON → healthy (not a tool-call frame).
         assert!(!is_recovery_candidate(
             ChatRole::Assistant,
             r#"{"answer": 42}"#
@@ -577,12 +574,10 @@ mod tests {
             ChatRole::Assistant,
             r#"{"content":"","tool_calls":[]}"#
         ));
-        // Invalid JSON → healthy.
         assert!(!is_recovery_candidate(
             ChatRole::Assistant,
             "not json at all"
         ));
-        // System tail: no in-flight turn → healthy.
         assert!(!is_recovery_candidate(ChatRole::System, ""));
     }
 
@@ -641,18 +636,14 @@ mod tests {
         let tracker = DeadSessionTracker::new();
         let agent_id = "test_backoff_engineer";
 
-        // First attempt should be allowed (fresh session)
         assert!(tracker.should_retry(agent_id));
         tracker.record_attempt(agent_id);
 
-        // Immediately after recording, backoff prevents retry
         assert!(!tracker.should_retry(agent_id));
 
-        // Cleanup removes the entry, allowing a fresh start
         tracker.cleanup(agent_id);
         assert!(tracker.should_retry(agent_id));
 
-        // Simulate daemon restart: create a new tracker (fresh state).
         tracker.record_attempt(agent_id);
         let tracker2 = DeadSessionTracker::new();
         assert!(

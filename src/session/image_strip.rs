@@ -100,7 +100,6 @@ pub(crate) fn extract_provider_reason(exhausted: &RetryExhausted) -> Option<Stri
         .find_map(|f| reason_from_chain(&f.error_chain))
 }
 
-/// Pull the provider reason out of one formatted error-chain string.
 fn reason_from_chain(chain: &str) -> Option<String> {
     // HttpError displays as "{context} API error ({status}): {body}", so the body starts after
     // the first "): " separator (provider names never contain it). Non-HttpError chains

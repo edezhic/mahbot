@@ -439,7 +439,6 @@ pub(crate) mod video {
         })
     }
 
-    /// Tolerates per-model nulls and unknown fields.
     fn parse_model(entry: &Value) -> Option<(String, VideoModelInfo)> {
         // Lookup key is always `id`, never `canonical_slug` — they differ for every
         // live model.
@@ -456,7 +455,6 @@ pub(crate) mod video {
         Some((id, info))
     }
 
-    /// `null`/missing stays `None`.
     fn parse_str_array(v: Option<&Value>) -> Option<Vec<String>> {
         v.and_then(Value::as_array).map(|arr| {
             arr.iter()
@@ -466,7 +464,6 @@ pub(crate) mod video {
         })
     }
 
-    /// `null`/missing stays `None`.
     fn parse_i64_array(v: Option<&Value>) -> Option<Vec<i64>> {
         v.and_then(Value::as_array)
             .map(|arr| arr.iter().filter_map(Value::as_i64).collect())

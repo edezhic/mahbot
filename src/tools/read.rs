@@ -1647,7 +1647,6 @@ mod tests {
         assert!(result.is_ok(), "offset to end should succeed: {result:?}");
         let result = result.unwrap();
         assert!(result.contains("4: ddd") && result.contains("5: eee"));
-        // Limit only (first 2 lines)
         let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),

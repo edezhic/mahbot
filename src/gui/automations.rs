@@ -119,7 +119,6 @@ impl AutomationsState {
     }
 }
 
-/// Read every active automation of every owner.
 async fn load() -> Result<Vec<Automation>, String> {
     crate::automations::list_all_active_automations()
         .await
@@ -260,7 +259,6 @@ fn render_automation(
     .into()
 }
 
-/// The notice a delete attempt is reported with.
 fn delete_outcome(result: Result<Option<Automation>, String>) -> AutomationsMessage {
     match result {
         Ok(Some(_)) => AutomationsMessage::Toast(ToastMessage::Deleted),

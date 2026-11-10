@@ -180,7 +180,6 @@ struct DisplayGroup {
     kind: GroupKind,
     /// Group key (ticket id / round key / run key / launch agent id / workspace name).
     key: String,
-    /// Workspace name for the group header.
     workspace: String,
     /// Human-readable header label (ticket title / analyze question / research question),
     /// captured observationally from any member's `parent_label`. `None` for
@@ -711,9 +710,7 @@ fn render_metrics(token_count: Option<u64>, elapsed: &str) -> Element<'static, R
     metrics.into()
 }
 
-/// What a trace group's line row renders.
 enum GroupLine<'a> {
-    /// The line the group shows.
     Line(trace_line::Line<'a>),
     /// Nothing to show here: the group carries no text and no earlier line to hold, or a newer
     /// group already shows the very same line.
@@ -1055,7 +1052,6 @@ fn render_call_row(call: &CallRow) -> Element<'static, RunningMessage> {
     .into()
 }
 
-/// Format the elapsed time since `started_at` at render time.
 fn format_elapsed(started_at: DateTime<Utc>) -> String {
     let now = Utc::now();
     let secs = now.signed_duration_since(started_at).num_seconds().max(0);

@@ -164,7 +164,6 @@ pub(crate) fn settings_binding_label(identifier: &str) -> String {
 }
 
 crate::define_store! {
-    /// Global account store.
     pub static USER_STORE: UserStore,
     post_open = ensure_admin_user,
     expect = "USER_STORE not initialized — call init_all_stores() first",
@@ -864,7 +863,6 @@ pub struct UserRecord {
     /// the admin is carried and listed like any other; only the account-management card omits it,
     /// the whole catalogue being implicitly available to the admin.
     pub granted_tools: Vec<String>,
-    /// Channel bindings for this account (Telegram, etc.).
     pub channels: Vec<ChannelBinding>,
 }
 
@@ -1427,7 +1425,6 @@ pub(crate) mod test_util {
     /// Safe to call multiple times: [`init_test_stores`] initializes every global store, and
     /// this supplements USER_STORE with telegram-specific accounts and bindings.
     pub(crate) async fn init_test_store() {
-        // Initialize every global store (idempotent OnceCell).
         crate::util::test::init_test_stores().await;
 
         // Supplement USER_STORE with telegram-specific test accounts and

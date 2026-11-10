@@ -419,7 +419,6 @@ fn surface_from_rects(rects: &[(i32, i32, i32, i32)]) -> SurfaceGeometry {
 /// and a silent success in the other.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BusFault {
-    /// Access denied / not authorized.
     Denied,
     Gone,
     /// The reply never arrived. Nothing says whether the call was performed.

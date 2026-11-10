@@ -185,17 +185,12 @@ enum Stmt {
     /// Nothing of the command has been read: a `@` may still prefix its first word.
     #[default]
     Start,
-    /// `@` alone was read: the word it prefixes follows.
     Prefixed,
-    /// The first word opened no statement.
     Plain,
-    /// `if` was read: its `not`, its `/i` switch or its condition follows.
     If,
-    /// `if not` was read: its condition follows.
     Not,
     /// A condition keyword, a comparison operator or a `for`'s `in` was read.
     Keyword,
-    /// `for` was read: its variable and its `in` set follow.
     For,
     /// A `for`'s `in` was read: the set's `(` follows.
     Set,
@@ -219,9 +214,7 @@ struct Word {
 /// ends at a separator, a `(` or a `)`.
 #[derive(Default)]
 struct Words {
-    /// The word being read, when one is open.
     open: Option<Word>,
-    /// Where in a statement's grammar the command is.
     stmt: Stmt,
     /// Whether the `)` last read closed a group of a statement: the `do`/`else` that may
     /// follow it is what the chain is for.
@@ -238,7 +231,6 @@ struct Words {
 }
 
 impl Words {
-    /// Start a word at `at`, unless one is open.
     fn start(&mut self, at: usize, command: bool, escaped: bool) {
         if self.open.is_none() {
             self.open = Some(Word {
@@ -280,7 +272,6 @@ impl Words {
         self.chain = false;
     }
 
-    /// End that absorption where the block the statement is written in has closed.
     fn bounded(&mut self, depth: usize) {
         if self.absorbing && depth < self.absorbing_bound {
             self.absorbing = false;
@@ -312,7 +303,6 @@ impl Words {
     }
 }
 
-/// One word further into the statement a command spells out.
 fn stmt_step(stmt: Stmt, chain: bool, word: &[u8], command: bool) -> Stmt {
     // `@` in front of a word is this platform's suppression prefix, not part of it.
     let word = word.strip_prefix(b"@").unwrap_or(word);
@@ -441,7 +431,6 @@ fn spans_commands(command: &str) -> bool {
         || trailing_run(&command[..line_end(command, break_at)], b'^') % 2 == 1
 }
 
-/// The line a text with no second command is.
 fn before_first_break(command: &str) -> &str {
     match command.find('\n') {
         Some(i) => &command[..line_end(command, i)],
@@ -501,9 +490,7 @@ fn next_significant(bytes: &[u8]) -> Vec<Option<u8>> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Open {
-    /// No group is open.
     None,
-    /// Every open group was proven.
     Proven,
     /// A `(` this reading cannot prove is open.
     Unknown,
@@ -513,7 +500,6 @@ enum Open {
 /// would be read as part of the line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Takes {
-    /// Nothing: the line ends at the break, as a line is meant to.
     #[default]
     Nothing,
     /// The line ends an `if`/`for` statement's own command ([`STATEMENT_SPANS_LINE`]).
@@ -524,7 +510,6 @@ enum Takes {
 
 /// What the walk has read when it meets a break.
 struct BreakSite<'a> {
-    /// The line the break ends.
     segment: &'a str,
     /// The first significant byte after the break, `None` where nothing but the platform's own
     /// separators follows: a break with nothing after it separates nothing.
@@ -535,15 +520,11 @@ struct BreakSite<'a> {
     caret_escapes: Option<u8>,
     /// Whether the line ends on a caret whose escape has nothing to take ([`DANGLING_CARET`]).
     caret_unescaped: bool,
-    /// What the groups this reading has opened and paired left open.
     groups: Open,
-    /// Whether the command read so far is a statement still waiting for its own text.
     statement_unfinished: bool,
     /// The guard's own reading of the text so far, when one of its quoted words is open.
     bash_quote: Option<u8>,
-    /// The line's last significant character.
     last: Option<u8>,
-    /// What the line before the break takes with it ([`Takes`]).
     takes: Takes,
 }
 
@@ -802,7 +783,6 @@ impl Walk {
         }
     }
 
-    /// Which groups are open, as the break rules read them.
     fn open(&self) -> Open {
         if self.unproven > 0 {
             Open::Unknown
@@ -1124,21 +1104,18 @@ fn opens_group(
     }
 }
 
-/// Whether `word` is one of the condition keywords this platform's `if` takes.
 fn is_condition_keyword(word: &[u8]) -> bool {
     [&b"exist"[..], b"defined", b"errorlevel", b"cmdextversion"]
         .iter()
         .any(|keyword| word.eq_ignore_ascii_case(keyword))
 }
 
-/// Whether `word` is one of the comparison operators this platform's `if` takes.
 fn is_comparison_operator(word: &[u8]) -> bool {
     [&b"=="[..], b"equ", b"neq", b"lss", b"leq", b"gtr", b"geq"]
         .iter()
         .any(|operator| word.eq_ignore_ascii_case(operator))
 }
 
-/// How many `c` characters end `text`.
 fn trailing_run(text: &str, c: u8) -> usize {
     text.bytes().rev().take_while(|b| *b == c).count()
 }

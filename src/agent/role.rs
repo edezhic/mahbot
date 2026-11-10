@@ -39,7 +39,6 @@ pub(crate) const SYSTEM_ROLE: &str = "system";
 // summary and discovery prompts.
 
 pub struct RoleInfo {
-    /// Whether this role has a discovery prompt for workspace exploration.
     pub has_discovery: bool,
     /// Badge foreground colour as an RGB tuple, converted to an [`iced::Color`] badge in
     /// `gui/theme.rs`. The badge background is always this colour at 0.1 alpha.
@@ -47,7 +46,6 @@ pub struct RoleInfo {
     /// Default reasoning effort: authoritative, since effort is baked into the binary and not
     /// user-tunable, so request time always uses this value.
     pub default_reasoning_effort: &'static str,
-    /// Human-readable display label (e.g. `"QA"` for [`Role::Qa`]).
     pub display_label: &'static str,
 }
 
@@ -164,7 +162,6 @@ impl Role {
         self.into()
     }
 
-    /// Human-readable display label (e.g. `"QA"` for [`Role::Qa`]).
     #[must_use]
     pub const fn display_label(&self) -> &'static str {
         role_info(self).display_label
@@ -581,9 +578,6 @@ mod tests {
         );
     }
 
-    /// A custom role's tools are exactly the chosen subset of the admin set minus computer use: a
-    /// servable name builds, an unservable one is simply absent (the record keeps it), and `sleep`
-    /// is choosable.
     #[test]
     fn custom_role_tools_are_the_chosen_subset_of_the_admin_set() {
         let catalog = Role::custom_role_tool_catalog();
@@ -591,8 +585,6 @@ mod tests {
             catalog.contains(&"sleep"),
             "sleep must be selectable — it is how a role ends a quiet turn"
         );
-        // The catalogue loses exactly the withheld tools; every other tool of the admin's set
-        // stays.
         let mut expected: Vec<&str> = Role::assistant_core_tools(true)
             .iter()
             .map(|tool| tool.name())
@@ -654,8 +646,6 @@ mod tests {
         );
     }
 
-    /// A granted dispatch tool is built with exactly the kinds its entry names: a kind the holder
-    /// does not have is absent from its interface, and a one-kind holder still states its choice.
     #[test]
     fn granted_dispatch_tools_offer_exactly_the_granted_kinds() {
         let granted = |entries: &[&str]| {

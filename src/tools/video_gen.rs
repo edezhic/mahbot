@@ -218,7 +218,6 @@ impl<'a> Request<'a> {
         Ok(request)
     }
 
-    /// Refuse the inputs the decided shape does not take.
     fn check_shape(&self, args: &serde_json::Value) -> anyhow::Result<()> {
         if let Some(passed) = self.shape.passed_input() {
             for key in GENERATION_ONLY {
@@ -271,7 +270,6 @@ fn omit_duration(spec: VideoModel, shape: Shape) -> bool {
     matches!((spec, shape), (VideoModel::Seedance, Shape::Edit))
 }
 
-/// Validate an optional integer duration against a per-model range.
 fn ensure_duration_in(
     duration: Option<i64>,
     range: std::ops::RangeInclusive<i64>,
@@ -327,8 +325,6 @@ fn validate_duration(spec: VideoModel, shape: Shape, duration: Option<i64>) -> a
     Ok(())
 }
 
-/// Insert an optional value into the request body under `key`, skipping parameters the caller
-/// did not supply.
 fn set_opt<T: Into<serde_json::Value>>(body: &mut serde_json::Value, key: &str, value: Option<T>) {
     if let Some(v) = value {
         body[key] = v.into();

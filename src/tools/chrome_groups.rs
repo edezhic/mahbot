@@ -33,7 +33,6 @@ const PROJECT_MARK: &str = "✦ ";
 /// return costs a bounded wait, never the step.
 const TAIL_BUDGET: Duration = Duration::from_secs(5);
 
-/// Bound on one call within a stage.
 const CALL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A tail's trouble as the Issues view keys it — the failing leg's own reason plus the line
@@ -43,7 +42,6 @@ pub(crate) struct Note {
     pub(crate) detail: String,
 }
 
-/// The legs a tail's note names, one reason each.
 const TABS_UNREAD_REASON: &str = "chrome-tabs:tabs-unread";
 const GROUP_NOT_COLLAPSED_REASON: &str = "chrome-tabs:group-not-collapsed";
 const GROUP_NOT_NAMED_REASON: &str = "chrome-tabs:agent-group-not-named";
@@ -386,7 +384,6 @@ fn placement_group(tabs: &[OwnTab]) -> Option<i64> {
     best.map(|(_, group)| group)
 }
 
-/// Every group this session's own tabs sit in, in id order.
 fn groups_of(tabs: &[OwnTab]) -> Vec<i64> {
     tabs.iter()
         .filter_map(|tab| tab.group)
@@ -469,12 +466,10 @@ fn group_gone(reason: &NoVerdict) -> bool {
     matches!(reason, NoVerdict::Reported(msg) if msg.contains("No group with id"))
 }
 
-/// `tab list --all` on the tail's budget: this session's own rows.
 async fn list(cli: &Path, session: &str, deadline: Instant) -> Result<Vec<OwnTab>, NoVerdict> {
     own_tabs(&call(cli, session, &["tab", "list", "--all"], deadline).await?)
 }
 
-/// One browser call of a tail, on the budget of the stage it belongs to.
 async fn call(
     cli: &Path,
     session: &str,
@@ -491,7 +486,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// One owned row of a `tab list --all` answer, as the tests build it.
     fn own(tab: i64, group: Option<i64>, created: Option<bool>) -> OwnTab {
         OwnTab {
             tab,

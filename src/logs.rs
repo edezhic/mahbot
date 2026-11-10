@@ -80,8 +80,6 @@ impl LogEntry {
     }
 }
 
-/// Turso-backed log store.
-///
 /// NOTE: opened manually inside [`init_tracing()`] rather than through `define_store!`, because
 /// bootstrapping order needs logs available before the other stores. See [`LOG_STORE`].
 #[derive(Clone, Debug)]
@@ -240,7 +238,6 @@ impl LogStore {
     /// carrying one message are one per distinct reason, so they are read and parsed here
     /// rather than matched in SQL against the JSON they store.
     pub(crate) async fn has_reason(&self, message: &str, reason: &str) -> anyhow::Result<bool> {
-        /// The `reason` field of a row's stored `fields`, or `None` when it holds none.
         fn reason_of(fields: &str) -> Option<String> {
             serde_json::from_str::<serde_json::Value>(fields)
                 .ok()?
@@ -474,7 +471,6 @@ pub(crate) async fn record_issue_once(
     }
 }
 
-/// Parameters for filtering log queries.
 #[derive(Debug, Clone, Default)]
 pub struct LogQuery {
     pub level: Option<String>,
@@ -958,9 +954,7 @@ pub(crate) struct LogWriteErrorInfo {
     pub dropped: u64,
     /// RFC 3339 timestamp of the most recent failure.
     pub last_timestamp: Option<String>,
-    /// Message of the most recent failure.
     pub last_message: Option<String>,
-    /// Writer panic-restart state.
     pub panic_state: LogWriterPanicState,
 }
 
@@ -1006,10 +1000,8 @@ impl StderrReporter {
     }
 }
 
-/// The line about a log-store write failure.
 static LOG_WRITE_STDERR: StderrReporter = StderrReporter::new();
 
-/// The line about telemetry records the queue dropped.
 static TELEMETRY_DROP_STDERR: StderrReporter = StderrReporter::new();
 
 /// Rows the telemetry queue dropped that no line has reported yet. The producing path only
@@ -1023,7 +1015,6 @@ pub(crate) fn log_write_error_info() -> LogWriteErrorInfo {
     LOG_WRITE_LAST_ERROR.lock().unwrap_poison().clone()
 }
 
-/// Record a failed log-batch insert on the observability surface.
 fn record_log_write_failure(error: Option<anyhow::Error>) {
     let message = error.map_or_else(
         || "unknown log insert failure".to_string(),
@@ -1119,7 +1110,6 @@ fn reset_log_writer_panic_state() {
     guard.panic_state.reset();
 }
 
-/// True once the writer has permanently stopped flushing (terminal banner).
 fn log_writer_stopped() -> bool {
     LOG_WRITE_LAST_ERROR
         .lock()
@@ -1136,7 +1126,6 @@ fn log_writer_panic_backoff(consecutive: u32) -> std::time::Duration {
     std::time::Duration::from_millis(ms.min(30_000))
 }
 
-/// Extract a string field from a JSON value, defaulting to `""`.
 fn get_str_or_empty(val: &serde_json::Value, key: &str) -> String {
     json::get_opt_str(val, key).unwrap_or("").to_string()
 }
@@ -1402,7 +1391,6 @@ mod tests {
         (Arc::new(store), dir)
     }
 
-    // Helper to seed log entries in tests
     async fn seed_entries(store: &LogStore, entries: &[LogEntry]) {
         store.insert_batch(entries).await.unwrap();
     }
@@ -1433,13 +1421,11 @@ mod tests {
         )
         .await;
 
-        // Issues scope: warnings and errors only — the informational row survives.
         assert_eq!(store.clear_logs(Some("ERROR,WARN")).await.unwrap(), 2);
         let (entries, total) = store.query(&LogQuery::default()).await.unwrap();
         assert_eq!(total, 1);
         assert_eq!(entries[0].level, "INFO");
 
-        // All Logs scope: every stored record.
         assert_eq!(store.clear_logs(None).await.unwrap(), 1);
         assert_eq!(store.query(&LogQuery::default()).await.unwrap().1, 0);
     }
@@ -1583,7 +1569,6 @@ mod tests {
         }];
         flush_log_batch(&store, &mut batch).await;
 
-        // The batch must be dropped and the failure visible on the sanctioned surface.
         assert!(batch.is_empty(), "failed batch must still be cleared");
         let info = log_write_error_info();
         assert!(

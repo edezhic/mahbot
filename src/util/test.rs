@@ -105,7 +105,6 @@ impl FakeProvider {
         }
     }
 
-    /// Push a scripted successful response with the given text.
     #[must_use]
     pub(crate) fn ok(self, text: &str) -> Self {
         self.ok_with_finish(text, None)
@@ -835,7 +834,6 @@ impl<'a> JobRowBuilder<'a> {
         self
     }
 
-    /// Insert the row.
     pub(crate) async fn insert(self) -> anyhow::Result<()> {
         let Self {
             conn,

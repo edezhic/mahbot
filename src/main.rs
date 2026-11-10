@@ -1186,7 +1186,6 @@ async fn handle_models_command(msg: &ChannelMessage, is_image: bool) {
 async fn build_models_keyboard(is_image: bool, user_name: &str) -> serde_json::Value {
     let mut rows: Vec<serde_json::Value> = Vec::new();
 
-    // Model buttons — each on its own row
     let (mut models, active, action_prefix) = if is_image {
         (
             CONFIG.image_gen_models(),

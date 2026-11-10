@@ -393,7 +393,6 @@ pub(crate) fn build_download_client(total_timeout: Duration) -> anyhow::Result<r
 pub(crate) enum DownloadSizeCheck {
     /// Require downloaded bytes to equal the Content-Length header (when present).
     Exact,
-    /// No size validation.
     None,
 }
 
@@ -647,8 +646,6 @@ pub(crate) async fn download_verified(
     temp.disarm();
     Ok(())
 }
-
-// Tests
 
 #[cfg(test)]
 mod tests {

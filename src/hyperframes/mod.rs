@@ -43,7 +43,6 @@ use std::time::Duration;
 
 use crate::tools::shell::ProgramOutcome;
 
-/// The container a render writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Format {
     Mp4,
@@ -71,7 +70,6 @@ impl Format {
     }
 }
 
-/// Encode quality preset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Quality {
     Draft,
@@ -99,7 +97,6 @@ impl Quality {
 
 /// One render request, all paths absolute.
 pub(crate) struct RenderRequest<'a> {
-    /// The project directory handed to the renderer.
     pub project: &'a Path,
     /// The composition inside `project`; `None` renders its `index.html`.
     pub composition: Option<&'a str>,
@@ -515,7 +512,6 @@ fn render_failure(outcome: &ProgramOutcome, output: &Path) -> String {
     crate::util::cut_bytes(&message, MESSAGE_BUDGET_BYTES)
 }
 
-/// What a composition's static check found.
 pub(crate) struct LintReport {
     pub(crate) errors: usize,
     pub(crate) warnings: usize,
@@ -822,7 +818,6 @@ const SPURIOUS: &str = "No composition found in ";
 struct PostWrite {
     /// The vendor's message, filtered like any other diagnosis and on one line.
     message: String,
-    /// The note an agent reads.
     sentence: String,
 }
 

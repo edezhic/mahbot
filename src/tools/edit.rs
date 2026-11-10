@@ -124,7 +124,6 @@ fn not_found_error(path: &str, detail: &str) -> anyhow::Error {
 }
 
 impl EditTool {
-    /// Write a new file with the given content.
     async fn execute_write(&self, ws: &Workspace, path: &str, new_string: &str) -> Result<String> {
         let resolved_target =
             super::path::resolve_write_target(ws.as_path(), path, true, self.access).await?;
@@ -145,7 +144,6 @@ impl EditTool {
         Ok(format!("Written {} bytes to {path}", new_string.len()))
     }
 
-    /// Edit an existing file by replacing `old_string` with `new_string`.
     async fn execute_edit(
         &self,
         ws: &Workspace,
@@ -168,13 +166,11 @@ impl EditTool {
             anyhow::bail!("old_string equals new_string — no change needed");
         }
 
-        // 1. Path pre-validation
         let resolved_target =
             super::path::resolve_write_target(ws.as_path(), path, false, self.access).await?;
 
         let use_ws_matching = is_ws_insensitive_extension(path);
 
-        // 2. Size guard: reject oversized files before read_to_string
         match tokio::fs::metadata(&resolved_target).await {
             Ok(meta) => {
                 super::check_size_within(&meta, super::MAX_FILE_SIZE_BYTES, "File too large")?;
@@ -182,7 +178,6 @@ impl EditTool {
             Err(e) => anyhow::bail!("Cannot access file {path}: {e}"),
         }
 
-        // 3. Read → match → splice → write
         let content = match tokio::fs::read_to_string(&resolved_target).await {
             Ok(c) => c,
             Err(e) => {
@@ -235,8 +230,6 @@ impl EditTool {
     }
 }
 
-// Match planning
-
 /// One planned replacement: the byte span of a match in the file's raw content,
 /// and the text to write there with its line endings already adapted to the file.
 struct Edit {
@@ -274,7 +267,6 @@ impl Edit {
     }
 }
 
-/// The planned replacements for an edit, and how they were matched.
 struct Plan {
     edits: Vec<Edit>,
     /// Set when the match came from the whitespace-tolerant fallback. Its span
@@ -424,8 +416,6 @@ fn line_ending_spans(content: &str, old_string: &str) -> Vec<std::ops::Range<usi
         .collect()
 }
 
-// Line endings
-
 /// The line endings this tool recognises. A lone `\r` is content, not an
 /// ending, so it is never recognised here and never rewritten.
 #[derive(Clone, Copy, Debug)]
@@ -519,8 +509,6 @@ impl LfView {
     }
 }
 
-// Search index maintenance
-
 /// Synchronously update the search engine's file index after a write.
 ///
 /// This mirrors what the background filesystem watcher does, but without
@@ -568,8 +556,6 @@ fn update_search_index_after_write(ws: &Workspace, file_path: &std::path::Path) 
     }
 }
 
-// Whitespace-insensitive matching
-
 /// File extensions for languages where whitespace between tokens has no
 /// semantic meaning, making whitespace-insensitive editing safe.
 const WS_INSENSITIVE_EXTENSIONS: &[&str] = &[
@@ -577,7 +563,6 @@ const WS_INSENSITIVE_EXTENSIONS: &[&str] = &[
     "swift", "dart", "cs", "zig", "scala",
 ];
 
-/// Check whether a file path has a recognized whitespace-insensitive extension.
 fn is_ws_insensitive_extension(path: &str) -> bool {
     let ext = Path::new(path)
         .extension()
@@ -798,8 +783,6 @@ mod tests {
         // TempDir::drop auto-cleans — panic-safe
     }
 
-    // Extension check tests
-
     #[test]
     fn ws_insensitive_extensions() {
         let cases: &[(&str, bool)] = &[
@@ -850,8 +833,6 @@ mod tests {
             );
         }
     }
-
-    // Whitespace-insensitive matching tests
 
     /// (content, old_string, expected_span) that should produce a match.
     const MATCH_CASES: &[(&str, &str, &str)] = &[
@@ -998,58 +979,44 @@ mod tests {
     #[test]
     fn ws_match_is_ambiguous() {
         let cases: &[(&str, &str, &str, bool)] = &[
-            // Repeated pattern — "a b" appears 3x in normalized "a b a b a b"
             ("repeated_pattern", "a  b  a  b  a  b", "a b", true),
-            // Two lines that normalize to the same thing
             (
                 "two_lines_normalize_same",
                 "let  x  =  1;\nlet  x  =  1;",
                 "let x = 1;",
                 true,
             ),
-            // Overlapping match in repeated tokens
             ("overlapping_repeated_tokens", "a a a", "a a", true),
-            // Multi-byte first character (2-byte Latin ñ)
             ("multibyte_2byte_latin", "ñ b ñ b", "ñ b", true),
-            // Multi-byte first character (3-byte CJK)
             ("multibyte_3byte_cjk", "字 符 字 符", "字 符", true),
-            // Multi-byte first character (4-byte emoji)
             ("multibyte_4byte_emoji", "🚀 b 🚀 b", "🚀 b", true),
-            // Single match
             ("single_match", "fn  foo()  {}", "fn foo() {}", false),
-            // Two different functions — only one matches the pattern
             (
                 "two_functions_one_matches",
                 "fn  foo()  {}\nfn  bar()  {}",
                 "fn bar() {}",
                 false,
             ),
-            // Old string appears only once after normalization
             (
                 "appears_once_after_normalization",
                 "let  x  =  5;\nlet  y  =  10;\n    x  +  y",
                 "let x = 5;",
                 false,
             ),
-            // Empty old_string should not be ambiguous
             ("empty_old_string", "anything", "", false),
-            // Not found at all
             ("not_found", "fn foo() {}", "fn bar() {}", false),
-            // Multi-byte single match (2-byte Latin ñ)
             (
                 "multibyte_2byte_latin_single",
                 "fn  ñ  foo()  {}",
                 "fn ñ foo()",
                 false,
             ),
-            // Multi-byte single match (3-byte CJK)
             (
                 "multibyte_3byte_cjk_single",
                 "let  字  =  1;",
                 "let 字 = 1;",
                 false,
             ),
-            // Multi-byte single match (4-byte emoji)
             (
                 "multibyte_4byte_emoji_single",
                 "let  🚀  =  1;",
@@ -1085,7 +1052,6 @@ mod tests {
             .await
             .unwrap();
 
-        // single match without multiple flag still works
         let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
@@ -1102,7 +1068,6 @@ mod tests {
             "a x a c a d"
         );
 
-        // multiple=true replaces all occurrences
         let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
@@ -1119,7 +1084,6 @@ mod tests {
             "y x y c y d"
         );
 
-        // multiple=true with no matches still fails
         let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
@@ -1136,7 +1100,6 @@ mod tests {
             "canonical not-found shape: {err}"
         );
 
-        // multiple=true with single match works too
         tokio::fs::write(dir.path().join("test.txt"), "only one")
             .await
             .unwrap();
@@ -1164,7 +1127,6 @@ mod tests {
             .await
             .unwrap();
 
-        // replace single match
         let result = EditTool::confined()
             .execute(
                 &test_ws(dir.path()),
@@ -1180,7 +1142,6 @@ mod tests {
                 .unwrap(),
             "goodbye world"
         );
-        // not found
         let result = EditTool::confined().execute(&Workspace::from_path(dir.path()), json!({"path": "test.txt", "old_string": "nonexistent", "new_string": "replacement"})).await;
         assert!(
             result.is_err(),
@@ -1191,7 +1152,6 @@ mod tests {
             err.contains("not-found: cannot edit test.txt: old_string not found in file"),
             "canonical not-found shape: {err}"
         );
-        // multiple matches rejected
         tokio::fs::write(dir.path().join("test.txt"), "aaa bbb aaa")
             .await
             .unwrap();
@@ -1419,8 +1379,6 @@ mod tests {
         assert_eq!(content, "original", "original file must not be modified");
     }
 
-    // WS-insensitive ambiguity tests
-
     #[tokio::test]
     async fn ws_ambiguous_rejects_multiple_matches() {
         // Two assignments that normalize to the same string — the WS fallback
@@ -1455,8 +1413,6 @@ mod tests {
         )
         .await;
     }
-
-    // Line-ending handling
 
     /// The raw bytes of `name` in `dir`. Every reading surface hides a CRLF's
     /// carriage return, so a line-ending claim can only be checked on bytes.

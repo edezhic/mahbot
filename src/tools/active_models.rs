@@ -56,7 +56,6 @@ impl ModelSnapshot {
     }
 }
 
-/// Which media surface changed mid-session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelKind {
     Image,

@@ -54,7 +54,6 @@ impl std::fmt::Display for Reply {
 #[derive(Clone, Copy, Debug)]
 pub struct Report {
     pub request: &'static str,
-    /// What the platform answered.
     pub reply: Reply,
 }
 

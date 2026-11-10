@@ -121,7 +121,6 @@ fn wedge_action(env: &OutEnvelope, named: bool, killed_by_clock: bool) -> WedgeA
     WedgeAction::Leave
 }
 
-/// The envelope's `error` text, when it carries one.
 fn envelope_error(env: &OutEnvelope) -> Option<&str> {
     env.payload.get("error").and_then(Value::as_str)
 }
@@ -331,7 +330,6 @@ struct CliSession {
     keep: bool,
 }
 
-/// Parsed CLI invocation.
 struct Invocation {
     action: Action,
     session: Option<String>,
@@ -444,7 +442,6 @@ impl Action {
     }
 }
 
-/// Where `fill` gets its text.
 enum TextInput {
     Inline(String),
     File(String),
@@ -512,7 +509,6 @@ impl StepFailure {
     }
 }
 
-/// Outcome of one spawned chrome-use step.
 type StepOutcome = Result<ChromeResponse, StepFailure>;
 
 /// Whether any session-scoped chrome-use spawn was attempted this process: a
@@ -922,7 +918,6 @@ fn parse_flags_impl(
     Ok((positionals, flags))
 }
 
-/// Positional/flag accumulator for one action.
 #[derive(Default)]
 struct Flags {
     values: HashMap<String, String>,
@@ -1844,7 +1839,6 @@ fn stamp_elapsed(env: &mut OutEnvelope, started: Instant) {
 /// this surface takes. A product kill reports its own `kill` as `timeout_ms`.
 #[derive(Debug, Clone, Copy)]
 struct StepClocks {
-    /// The two clocks of this step ([`crate::chrome::ChromeCallClocks`]).
     call: ChromeCallClocks,
     /// Whether chrome-use's own relay self-heal may run inside this step.
     recovery: CliRecovery,
@@ -3378,7 +3372,6 @@ mod tests {
     // from it instead of repeating its literals.
     use crate::chrome::kill_bound;
 
-    /// Command-line arguments for a test.
     fn argv(s: &[&str]) -> Vec<String> {
         s.iter().copied().map(String::from).collect()
     }

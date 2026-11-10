@@ -27,7 +27,6 @@ pub struct TranscriptSnapshot {
     pub token_count: Option<u64>,
 }
 
-/// One registered agent's snapshot holder.
 struct TranscriptEntry {
     generation: u64,
     holder: Arc<ArcSwap<TranscriptSnapshot>>,
@@ -84,7 +83,6 @@ impl TranscriptRegistry {
     }
 }
 
-/// Global static registry.
 pub(crate) static TRANSCRIPT_REGISTRY: LazyLock<TranscriptRegistry> =
     LazyLock::new(TranscriptRegistry::default);
 

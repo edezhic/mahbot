@@ -26,13 +26,11 @@ use iced::{Color, Element, Event, Length, Pixels, Point, Rectangle, Size, Vector
 
 use super::theme;
 
-/// Menu item hit-target height.
 const MENU_ITEM_HEIGHT: f32 = 28.0;
 
 /// Overlay render index for the chat context menu; a future overlay should use a higher one.
 const CONTEXT_MENU_OVERLAY_INDEX: f32 = 2.0;
 
-/// Draw the popup backdrop: elevated surface, 1px strong border, 4px corner radius.
 fn draw_menu_backdrop<Renderer>(renderer: &mut Renderer, bounds: Rectangle)
 where
     Renderer: text::Renderer<Font = iced::Font>,
@@ -63,10 +61,8 @@ fn item_index_from_y(rel_y: f32, item_height: f32, item_count: usize) -> Option<
     (idx < item_count).then_some(idx)
 }
 
-/// A single item in a context menu.
 #[derive(Debug, Clone)]
 pub struct MenuItem<Message> {
-    /// Display label.
     pub label: String,
     /// Action to fire when clicked. `None` for disabled items (rendered in muted style).
     pub action: Option<Message>,
@@ -75,7 +71,6 @@ pub struct MenuItem<Message> {
 }
 
 impl<Message> MenuItem<Message> {
-    /// Create a new enabled menu item.
     #[must_use]
     pub fn new(label: String, action: Message) -> Self {
         Self {
@@ -116,7 +111,6 @@ impl<'a, Message, Theme, Renderer> ContextMenu<'a, Message, Theme, Renderer>
 where
     Message: Clone + 'a,
 {
-    /// Creates a new [`ContextMenu`] widget around `underlay`, with its label/action items.
     #[must_use]
     pub fn new(
         underlay: impl Into<Element<'a, Message, Theme, Renderer>>,
@@ -367,7 +361,6 @@ where
     }
 }
 
-/// The overlay that renders the context menu.
 struct ContextMenuOverlay<'a, 'b, Message>
 where
     Message: Clone,
@@ -378,12 +371,10 @@ where
     menu_items: &'a [MenuItem<Message>],
 }
 
-// Context-menu layout metrics: contiguous items, 8px panel padding, its own icon/font sizes.
 const CONTEXT_MENU_PADDING: f32 = 8.0;
 const CONTEXT_MENU_MIN_WIDTH: f32 = 140.0;
 const CONTEXT_MENU_FONT_SIZE: f32 = 14.0;
 
-/// Icon glyph size and gap between the icon and the label.
 const CONTEXT_MENU_ICON_SIZE: f32 = 14.0;
 const CONTEXT_MENU_ICON_GAP: f32 = 8.0;
 
@@ -398,7 +389,6 @@ where
         #[expect(clippy::cast_precision_loss)]
         let menu_height = item_count as f32 * MENU_ITEM_HEIGHT + CONTEXT_MENU_PADDING * 2.0;
 
-        // Compute the widest label using the renderer's text measurement.
         let text_size = Pixels(CONTEXT_MENU_FONT_SIZE);
         let max_label_width: f32 = self
             .menu_items
@@ -427,7 +417,6 @@ where
         let menu_width =
             (max_label_width + icon_slot + CONTEXT_MENU_PADDING * 2.0).max(CONTEXT_MENU_MIN_WIDTH);
 
-        // Edge clipping: flip left/up if the menu would overflow bounds.
         let mut x = self.position.x;
         let mut y = self.position.y;
 
@@ -451,10 +440,8 @@ where
     ) {
         let bounds = layout.bounds();
 
-        // Draw menu background.
         draw_menu_backdrop(renderer, bounds);
 
-        // Draw each menu item.
         let font = renderer.default_font();
         let text_size = Pixels(CONTEXT_MENU_FONT_SIZE);
 
@@ -470,7 +457,6 @@ where
 
             let is_disabled = item.action.is_none();
 
-            // Hover highlight (only for enabled items).
             if !is_disabled && *self.hovered == Some(i) {
                 renderer.fill_quad(
                     renderer::Quad {
@@ -486,7 +472,6 @@ where
                 );
             }
 
-            // Draw label text using fill_text.
             let text_color = if is_disabled {
                 theme::TEXT_FAINT
             } else if *self.hovered == Some(i) {
@@ -560,7 +545,6 @@ where
 
         match event {
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-                // Update hovered item index.
                 *self.hovered = cursor.position_in(bounds).and_then(|pos| {
                     item_index_from_y(
                         pos.y - CONTEXT_MENU_PADDING,
@@ -578,20 +562,17 @@ where
                             MENU_ITEM_HEIGHT,
                             self.menu_items.len(),
                         ) {
-                            // Only fire action for enabled items
                             if let Some(action) = self.menu_items[idx].action.clone() {
                                 *self.show = false;
                                 shell.publish(action);
                                 shell.capture_event();
                                 return;
                             }
-                            // Disabled item: consume click but don't fire
                             shell.capture_event();
                             return;
                         }
                     }
                 }
-                // Click outside — dismiss.
                 *self.show = false;
                 shell.request_redraw();
                 shell.capture_event();

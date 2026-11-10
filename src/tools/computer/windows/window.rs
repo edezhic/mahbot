@@ -47,7 +47,6 @@ use windows::core::BOOL;
 const FOREGROUND_RETRIES: usize = 5;
 const FOREGROUND_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// A resolved window target: everything the other modules need about one window.
 pub(super) struct TargetWindow {
     pub hwnd: HWND,
     pub pid: u32,
@@ -66,7 +65,6 @@ pub(super) fn ensure_dpi_aware() {
     });
 }
 
-/// Whether an interactive desktop is attached at all: the channel question.
 pub(super) fn interactive_desktop_available() -> bool {
     ensure_input_desktop().is_ok()
 }
@@ -164,7 +162,6 @@ fn parse_key(key: &WindowKey) -> Option<(u32, HWND)> {
     Some((pid.parse().ok()?, HWND(hwnd as *mut std::ffi::c_void)))
 }
 
-/// Window geometry for a target: the window's own frame, or the virtual-desktop rect.
 pub(super) fn surface_geometry(target: &TargetSpec) -> anyhow::Result<SurfaceGeometry> {
     match target {
         TargetSpec::Screen => screen_geometry(),
@@ -428,7 +425,6 @@ fn process_is_elevated(pid: u32) -> bool {
     }
 }
 
-/// One enumerated top-level window.
 struct Enumerated {
     hwnd: HWND,
     pid: u32,
@@ -555,7 +551,6 @@ pub(super) fn list_windows(app: Option<&AppInfo>) -> WindowListing {
     listing
 }
 
-/// The concrete window a target names right now, as the rest of the backend reports it.
 pub(super) fn window_info(target: &TargetSpec) -> anyhow::Result<WindowInfo> {
     let resolved = resolve(target)?;
     Ok(WindowInfo {
@@ -665,7 +660,6 @@ fn foreground_joins_listing(windows: &[Enumerated], foreground: HWND) -> bool {
     unsafe { IsWindowVisible(foreground) }.as_bool() && !is_cloaked(foreground)
 }
 
-/// One window's enumerated facts.
 fn enumerate(hwnd: HWND, foreground: HWND) -> Enumerated {
     let pid = pid_of(hwnd);
     let title = title_of(hwnd);

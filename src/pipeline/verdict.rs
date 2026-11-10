@@ -382,7 +382,6 @@ pub(crate) fn validate_verdict_score(v: &Verdict) -> Result<(), String> {
     }
 }
 
-/// Validate a blocker-verification verdict.
 pub(crate) fn validate_blocker_verification(
     v: &BlockerVerificationVerdict,
     blockers: &[String],

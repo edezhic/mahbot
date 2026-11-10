@@ -42,17 +42,12 @@ pub enum UsersMessage {
     CancelDelete,
     DeleteResult(Result<(), String>),
 
-    /// Open the inline Telegram binding input for a user.
     OpenBindInput(String),
-    /// Close the inline binding input.
     CloseBindInput,
-    /// Inline binding text input changed.
     BindInputChanged(EditorAction),
     /// Confirm binding the entered Telegram @username or numeric id to the target user.
     SubmitBind(String),
-    /// Unbind a Telegram channel from a user.
     UnbindChannel(String, String),
-    /// Result of a bind/unbind operation.
     BindResult(Result<(), String>, String),
 
     Escape,
@@ -64,7 +59,6 @@ pub struct UsersState {
     pub(crate) users: Vec<UserRecordEntry>,
     pub(crate) load_state: super::common::AsyncLoadState,
 
-    // Delete confirmation
     pub(crate) delete_target: Option<String>,
 
     // Telegram binding inline input (single-target, like delete_target)

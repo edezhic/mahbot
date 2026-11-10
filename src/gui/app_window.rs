@@ -26,7 +26,6 @@ use objc2::{MainThreadMarker, rc::Retained};
 #[cfg(target_os = "macos")]
 use objc2_app_kit::{NSApplication, NSWindow};
 
-/// Whether the window is hidden.
 static HIDDEN: AtomicBool = AtomicBool::new(false);
 
 /// Every animation that would re-arm its own redraw stops while this is true.
@@ -40,7 +39,6 @@ pub fn set_hidden(hidden: bool) {
     HIDDEN.store(hidden, Ordering::Relaxed);
 }
 
-/// Whether the system started this process at login (`crate::autostart`).
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 static LOGIN_START: AtomicBool = AtomicBool::new(false);
 

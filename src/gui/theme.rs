@@ -69,8 +69,6 @@ pub fn log_level_color(level: &str) -> (Color, Color) {
     }
 }
 
-// Role badge colors
-
 /// Role badge colors from [`crate::agent::role::role_info()`] — the single source of truth, so
 /// a role the palette does not name cannot silently fall through to black.
 const fn badge_bg(fg: Color) -> Color {
@@ -147,7 +145,6 @@ pub fn general_context_icon() -> iced::widget::Text<'static, iced::Theme, iced::
     lucide::book_open_text()
 }
 
-/// Returns the Lucide icon widget for the diagnostics pipeline role.
 #[must_use]
 pub fn diagnostics_icon() -> iced::widget::Text<'static, iced::Theme, iced::Renderer> {
     lucide::stethoscope()
@@ -297,8 +294,6 @@ fn markdown_settings_with(font: iced::Font, text_size: f32) -> iced::widget::mar
 
 // All TicketPhase variants exhaustively matched — no catch-all.
 
-/// Returns a `(foreground, background)` tuple — the badge-pill convention shared with
-/// `widgets::badge_pill`.
 #[must_use]
 pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
     use TicketPhase::{
@@ -358,8 +353,6 @@ pub const fn ticket_phase_color(phase: TicketPhase) -> (Color, Color) {
 // Priority uses the same muted-tone approach as phase badges: lighter readable text on darker
 // backgrounds. P0 red (failed-like), P1 orange, P2 yellow, P3/P4+ green (passed/done-like).
 
-/// Returns a `(foreground, background)` tuple — the badge-pill convention shared with
-/// `widgets::badge_pill`.
 #[must_use]
 pub fn ticket_priority_color(priority: i64) -> (Color, Color) {
     match priority {
@@ -386,8 +379,6 @@ pub fn ticket_priority_color(priority: i64) -> (Color, Color) {
     }
 }
 
-/// The ticket's classification label as a `(foreground, background)` tuple — the badge-pill
-/// convention shared with `widgets::badge_pill`.
 #[must_use]
 pub const fn ticket_label_color(label: TicketLabel) -> (Color, Color) {
     match label {
@@ -741,7 +732,6 @@ pub fn button_text(
     button_text_style(status, TEXT_PRIMARY)
 }
 
-/// Flexoki-dark themed style for [`fn@pick_list`] widgets.
 #[must_use]
 pub fn pick_list_style(_theme: &iced::Theme, _status: pick_list::Status) -> pick_list::Style {
     pick_list::Style {
@@ -775,7 +765,6 @@ pub fn pick_list_menu_style(_theme: &iced::Theme) -> iced::overlay::menu::Style 
     }
 }
 
-/// Flexoki-dark themed style for [`fn@toggler`] widgets.
 #[must_use]
 pub fn toggler_style(_theme: &iced::Theme, status: toggler::Status) -> toggler::Style {
     let (track, knob, toggled) = match status {
@@ -804,7 +793,6 @@ pub fn toggler_style(_theme: &iced::Theme, status: toggler::Status) -> toggler::
     }
 }
 
-/// Flexoki-dark themed style for [`fn@checkbox`] widgets.
 #[must_use]
 pub fn checkbox_style(_theme: &iced::Theme, status: checkbox::Status) -> checkbox::Style {
     let (background, icon, border) = match status {

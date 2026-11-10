@@ -259,7 +259,6 @@ pub enum WorkspaceStatus {
     /// Managed workspace added but discovery has not started.
     #[default]
     Pending,
-    /// Discovery agent is running.
     Analyzing,
     /// Discovery completed successfully — workspace is operational.
     Ready,
@@ -267,7 +266,6 @@ pub enum WorkspaceStatus {
     Failed,
 }
 
-/// A persisted workspace entry.
 #[derive(Debug, Clone, Serialize)]
 pub struct Workspace {
     pub name: String,
@@ -401,7 +399,6 @@ pub(crate) fn generate_suffix() -> String {
     generate_nanoid(6)
 }
 
-/// Represents a recognized Telegram bot text command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BotCommand {
     /// `/start` — show the welcome message.
@@ -470,7 +467,6 @@ pub struct ChannelMessage {
     /// Only set for Telegram callback queries (`__act__` prefix), to dismiss the
     /// loading spinner.
     pub callback_query_id: Option<String>,
-    /// The message this one replies to, for the quote header.
     pub reply_reference: Option<crate::channels::ReplyReference>,
     /// Channel-side chat id of the originating message, so it can be addressed in
     /// place (e.g. editing a picker keyboard after a callback).
@@ -593,9 +589,6 @@ pub trait Channel: Send + Sync {
     }
 }
 
-// Chat event broadcast (GUI live display)
-
-/// Direction of a chat message: from the user or from an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatDirection {
@@ -617,7 +610,6 @@ pub enum ChatEvent {
         /// ISO-8601.
         timestamp: String,
         channel: String,
-        /// The agent's role (e.g. "manager"), if from an agent.
         agent_role: Option<String>,
         workspace: String,
         /// So the Home page can replace its optimistic message with the confirmed one.
@@ -901,7 +893,6 @@ pub(crate) enum RunFailure {
     CooperativeStop,
 }
 
-/// Running context for an agent turn.
 pub struct Agent {
     /// Session persistence key, also the registry agent ID: direct-chat agents use
     /// `{user}_{ws_name}_{role}` (or the deduped `{user}_personal:{role}`), stable
@@ -1010,7 +1001,6 @@ pub(crate) struct Verdict {
     pub issues_detected: Vec<String>,
 }
 
-/// Qualitative grade attached to one analysis finding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum IssueGrade {
@@ -1222,7 +1212,6 @@ mod verdict_score_tests {
     }
 }
 
-/// Result of a sanitation agent's file inspection.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct SanitationVerdict {
     /// `true` = clean, `false` = garbage detected.
@@ -1248,8 +1237,6 @@ pub(crate) struct EngineerSummary {
     pub summary: Option<String>,
 }
 
-// Tool trait + types
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ToolSpec {
     pub name: String,
@@ -1260,8 +1247,6 @@ pub(crate) struct ToolSpec {
 #[async_trait]
 pub(crate) trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
-    /// Human-readable description of this tool.
-    ///
     /// The default implementation loads the description from
     /// `src/prompt/tool/{name}.md` in the embedded prompt assets.
     fn description(&self) -> String {
@@ -1596,7 +1581,6 @@ pub(crate) struct ChatRequest {
     /// Comma-separated provider slugs, sent as the provider routing block when non-empty;
     /// omitted when `None` (OpenRouter defaults apply).
     pub provider_order: Option<String>,
-    /// Operation metadata for per-request LLM stats logging.
     pub meta: Option<ChatRequestMeta>,
 }
 

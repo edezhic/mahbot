@@ -177,7 +177,6 @@ const SHELL_PIPE_READ_CAP: usize = 256 * 1024;
 const SHELL_PIPE_TAIL_CAP: usize = 32 * 1024;
 /// Where a stream outgrew its head: a line of its own, so a line scanner cannot mistake the join.
 const TRUNCATED_MIDDLE: &str = "\n…\n";
-/// Max chars of partial output included in timeout error messages.
 const TIMEOUT_OUTPUT_TAIL_CHARS: usize = 2_000;
 const ENGINE_FAILURE_DETAIL_CHARS: usize = 200;
 
@@ -1641,13 +1640,11 @@ async fn leftover_result(
 /// exit-status note, timing, spill hints). `has_output` is the wake/no-wake signal and reads the
 /// streams themselves: output that is nothing but whitespace or escape sequences is still output.
 pub(crate) struct ProgramOutcome {
-    /// Whether the program exited with status 0.
     pub success: bool,
     /// How the run ended, e.g. `exit status 2` or `timed out after 600s`.
     pub detail: String,
     /// Combined stdout+stderr, ANSI-stripped, unscrubbed.
     pub output: String,
-    /// Whether the program emitted anything at all.
     pub has_output: bool,
     /// How the product intervened in this run: it never started it, its wall-clock ceiling, or its
     /// memory watchdog. A stop is a verdict about the machine, never about the program.
@@ -1663,19 +1660,16 @@ pub(crate) enum Stop {
     /// The program could not be started at all: the machine's verdict, so the call is worth
     /// retrying.
     Spawn,
-    /// The wall-clock ceiling the run was given.
     Timeout,
     /// The memory watchdog: the run's tree crossed the machine's share.
     Memory,
 }
 
 impl ProgramOutcome {
-    /// Whether the run was stopped by its wall-clock ceiling rather than finishing.
     pub(crate) fn timed_out(&self) -> bool {
         self.stop == Some(Stop::Timeout)
     }
 
-    /// Whether the product intervened at all rather than the program finishing on its own.
     pub(crate) fn stopped(&self) -> bool {
         self.stop.is_some()
     }
@@ -1701,11 +1695,8 @@ pub(crate) fn timeout_sentence(label: &str, ceiling: Duration) -> String {
 /// it.
 #[derive(Clone, Copy)]
 enum ExitVerdict {
-    /// The run exited with status 0.
     Clean,
-    /// It exited with this status.
     Failed(i32),
-    /// A signal ended it.
     Signalled,
 }
 
@@ -1789,7 +1780,6 @@ async fn run_bounded_within(
     .await
 }
 
-/// [`run_bounded_within`] under the default ceiling ([`DEFAULT_SHELL_TIMEOUT`]).
 async fn run_bounded(
     cmd: tokio::process::Command,
     owner: RunOwner,
@@ -2213,7 +2203,6 @@ fn leftover_stop_recipe(platform: ShellPlatform, scope: Option<u32>) -> String {
 }
 
 pub struct ShellTool {
-    /// Whether the shell runs in full or read-only mode.
     pub mode: ShellMode,
 }
 
@@ -3357,7 +3346,6 @@ static SPILL_OWNERS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, Vec<std::path::PathBuf>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// Record a spill path (file or conversion directory) under [`spill_owner_key`].
 pub(crate) fn record_spill_owner(path: std::path::PathBuf) {
     record_spill_owner_as(&spill_owner_key(), path);
 }
@@ -3935,7 +3923,6 @@ fn combine_output(
     if stderr_trimmed.is_empty() {
         return stdout.to_string();
     }
-    // Apply keep_stderr filtering on both success and failure paths.
     let filtered = keep_stderr.and_then(|patterns| filter_keep_stderr(stderr, patterns));
     let with_stderr_section = |body: &str| {
         if stdout.is_empty() {
@@ -3945,11 +3932,8 @@ fn combine_output(
         }
     };
     match (exit_code == 0, filtered) {
-        // Matching lines found — append them as a stderr section.
         (_, Some(relevant)) => with_stderr_section(&relevant),
-        // Failure without keep_stderr: dump all stderr unconditionally.
         (false, None) if keep_stderr.is_none() => with_stderr_section(stderr_trimmed),
-        // Success or failure with keep_stderr but no matching lines: omit stderr section.
         _ => stdout.to_string(),
     }
 }
@@ -4002,11 +3986,9 @@ fn finish_shell_output(
         return combined;
     }
 
-    // No pre-truncation spill — try spilling the final combined output
     try_spill_to_file(combined, TOOL_OUTPUT_BUDGET_BYTES)
 }
 
-/// Append `line` to `buf`, inserting a `'\n'` separator if `buf` is non-empty.
 fn push_line(buf: &mut String, line: &str) {
     if !buf.is_empty() {
         buf.push('\n');
@@ -4073,17 +4055,14 @@ pub(super) fn filter_cargo_test_output(output: &str, exit_code: i32) -> String {
             continue;
         }
 
-        // Skip "running N" lines
         if trimmed.starts_with("running ") {
             continue;
         }
 
-        // Track compile errors for fallback
         if trimmed.starts_with("error[") || trimmed.starts_with("error:") {
             f.has_compile_errors = true;
         }
 
-        // "failures:" toggles section state
         if trimmed == "failures:" {
             f.section = Section::InFailures;
             continue;
@@ -4098,18 +4077,15 @@ pub(super) fn filter_cargo_test_output(output: &str, exit_code: i32) -> String {
             continue;
         }
 
-        // In failure section — keep the block
         if f.section != Section::Normal {
             f.has_failures = true;
             f.output_lines.push(line.to_string());
             continue;
         }
 
-        // Default: pass through (warnings, non-test output, etc.)
         f.output_lines.push(line.to_string());
     }
 
-    // If we captured failure blocks, show them + summary
     if f.has_failures {
         let mut result = f.output_lines.join("\n");
         if !f.summary_lines.is_empty() {
@@ -4120,7 +4096,6 @@ pub(super) fn filter_cargo_test_output(output: &str, exit_code: i32) -> String {
 
     // If there were compile errors but no test failures, show build error summary
     if f.has_compile_errors && !exit_ok {
-        // Just show last 15 meaningful lines
         let lines: Vec<&str> = f
             .output_lines
             .iter()
@@ -4137,12 +4112,10 @@ pub(super) fn filter_cargo_test_output(output: &str, exit_code: i32) -> String {
         return last.join("\n");
     }
 
-    // All passed — return just the summary
     if !f.summary_lines.is_empty() {
         return f.summary_lines.join("\n");
     }
 
-    // Fallback: return raw output (shouldn't normally reach here)
     let result = output.to_string();
     if exit_ok && result.trim().is_empty() {
         // NOTE: this runs before combine_output, so it only sees stdout. The cargo test profile has
@@ -4189,7 +4162,6 @@ fn parse_ls_line(line: &str) -> Option<ListingEntry> {
     if name.is_empty() || name == "." || name == ".." {
         return None;
     }
-    // Strip symlink target
     let name = name
         .split(" -> ")
         .next()
@@ -4252,7 +4224,6 @@ fn process_shell_output(
     apply_profile_pipeline(profile, stdout, stderr, exit_code, elapsed)
 }
 
-/// Apply strip_lines filter.
 fn apply_strip_lines(output: &str, profile: &Profile) -> String {
     output
         .lines()
@@ -4483,10 +4454,8 @@ fn format_spill_header(path: &Path, byte_count: usize, line_count: usize) -> Str
     )
 }
 
-/// Lines a spilled output's preview shows from each of its ends.
 const SPILL_PREVIEW_LINES: usize = 5;
 
-/// Bytes read from each end of a spilled file to fill those lines.
 const SPILL_PREVIEW_EDGE_BYTES: u64 = 8 * 1024;
 
 /// Widest line a summarised body keeps: ten of them plus their per-line notes and the marker stay
@@ -5722,7 +5691,6 @@ mod tests {
         .await
         .expect("background launch succeeds");
 
-        // The message carries the output-file path.
         let path_line = output
             .lines()
             .find(|l| l.starts_with("output file:"))
@@ -5733,7 +5701,6 @@ mod tests {
             "the launch message must name the product's own output file: {path:?}"
         );
 
-        // The session is registered in the agent-scoped registry.
         assert!(sessions.contains(&path), "session must be registered");
 
         // The read tool can read the output file (temp-area allowlist covers the .agent directory)
@@ -5747,7 +5714,6 @@ mod tests {
             "raw output must be in the file: {content}"
         );
 
-        // And the annotation eventually lands.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !sessions.is_finished(&path) && std::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -5783,7 +5749,6 @@ mod tests {
             .trim_start_matches("output file:")
             .trim();
 
-        // Stop via the tool's `stop` argument, addressing the output-file path.
         let stop_out = execute_with_bg_registry(&tool, &ws, json!({"stop": path}), &sessions)
             .await
             .expect("stop succeeds");
@@ -6027,7 +5992,6 @@ mod tests {
             "the run must return within the bound: {elapsed:?}"
         );
 
-        // The leftover did not survive the call.
         let pid_content = std::fs::read_to_string(&pid_path)
             .expect("grandchild PID file must exist — grandchild was launched");
         let pid: i32 = pid_content.trim().parse().expect("valid PID from file");
@@ -6578,7 +6542,6 @@ mod tests {
     #[test]
     fn truncate_head_tail_triggers_sandwich_large_output() {
         let p = Profile::new("test").head(2).tail(2);
-        // Generate output large enough to exceed TOOL_OUTPUT_BUDGET_BYTES
         let lines: Vec<String> = (0..100)
             .map(|i| {
                 format!(
@@ -6607,7 +6570,6 @@ mod tests {
             result.ends_with("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
             "should end with tail"
         );
-        // Also verify that adding max=N changes nothing when head+tail+1 <= N.
         let p2 = Profile::new("test").head(2).tail(2).max(100);
         let (result2, pre2) = apply_line_truncation(&output, &p2);
         assert!(pre2.is_some(), "should capture pre-truncation output");

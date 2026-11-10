@@ -293,9 +293,7 @@ impl FailureClass {
 
 #[derive(Debug, Clone)]
 pub(crate) struct RetryFailureRecord {
-    /// Granular failure classification.
     pub class: FailureClass,
-    /// Full error cause chain.
     pub error_chain: String,
     /// `choices[0].finish_reason` parsed from the envelope (best effort).
     pub finish_reason: Option<String>,
@@ -319,7 +317,6 @@ impl RetryFailureRecord {
         }
     }
 
-    /// Build a record with envelope telemetry (finish_reason).
     #[must_use]
     pub(crate) fn with_metadata(
         class: FailureClass,

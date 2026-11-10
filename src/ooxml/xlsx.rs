@@ -47,7 +47,6 @@ pub(crate) const WORKBOOK_PART: &str = "xl/workbook.xml";
 const WORKBOOK_RELS_PART: &str = "xl/_rels/workbook.xml.rels";
 /// Part holding the strings the `t="s"` cells index into.
 const SHARED_STRINGS_PART: &str = "xl/sharedStrings.xml";
-/// Part holding the workbook's cell formats.
 const STYLES_PART: &str = "xl/styles.xml";
 /// Note pushed when the workbook declares cell formats this reader cannot read.
 const STYLES_NOTE: &str =
@@ -64,7 +63,6 @@ const WORKBOOK_CUT_NOTE: &str = "the workbook part is cut short, so the sheets a
 const WORKBOOK_NO_SHEETS_NOTE: &str = "the workbook declares no sheets";
 /// Base a worksheet's relationships resolve against: a comment target is relative to it.
 const SHEET_BASE: &str = "xl/worksheets/";
-/// Prefix of the embedded-media parts in an Excel package.
 const XLSX_MEDIA_PREFIX: &str = "xl/media/";
 /// Charts in an Excel package: `xl/charts/chart<N>.xml`.
 const XLSX_CHARTS_PREFIX: &str = "xl/charts/";
@@ -326,7 +324,6 @@ fn sheet_losses(name: &str, read: &SheetRead, notes: &mut Vec<String>) {
 /// list and the loss of what followed it are read together rather than by a pass
 /// of their own each.
 struct Workbook {
-    /// The workbook's `<sheet>` entries.
     sheets: Vec<SheetEntry>,
     /// Whether the workbook's `workbookPr` puts it in the 1904 date system.
     date1904: bool,
@@ -337,7 +334,6 @@ struct Workbook {
     cut: bool,
 }
 
-/// One `<sheet>` entry of the workbook.
 struct SheetEntry {
     /// The sheet's name, one line by construction ([`one_line`]): it reaches the sheet header,
     /// the notes naming the sheet and the defined-names block, each a line of its own.
@@ -1653,7 +1649,6 @@ impl Rect {
         })
     }
 
-    /// Whether `(column, row)` falls inside it.
     fn holds(&self, column: u32, row: u32) -> bool {
         column >= self.min_col
             && column <= self.max_col
@@ -1738,9 +1733,7 @@ impl Shown {
 
 /// What one cell holds, once its value is rendered.
 enum Held {
-    /// A value the cell holds, as this reader shows it.
     Value(Shown),
-    /// The value and the formula that produces it.
     ValueAndFormula(Shown, String),
     /// A formula whose value is not stored, shown as its own text.
     Formula(String),
@@ -1753,7 +1746,6 @@ struct CellLine {
     /// The cell address, from `r` or synthesised from its row and column.
     reference: String,
     held: Held,
-    /// The address's `(column, row)`, or `None` when it is not one.
     position: Option<(u32, u32)>,
 }
 
@@ -1773,7 +1765,6 @@ impl CellLine {
         }
     }
 
-    /// The value the cell shows, when it holds one.
     fn shown(&self) -> Option<&Shown> {
         match &self.held {
             Held::Value(shown) | Held::ValueAndFormula(shown, _) => Some(shown),
@@ -2042,7 +2033,6 @@ fn compress(numbers: &BTreeSet<u32>, joiner: char, label: impl Fn(u32) -> String
     runs.join(", ")
 }
 
-/// One `<c>` cell being read.
 #[derive(Default)]
 struct Cell {
     /// The cell address, from `r` or synthesised from its row and column.

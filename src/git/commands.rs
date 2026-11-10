@@ -42,7 +42,6 @@ const MAX_UNTRACKED_FILES_COUNTED: usize = 500;
 /// Cap on bytes read from untracked files per snapshot refresh.
 const MAX_UNTRACKED_BYTES_READ: u64 = 10 * 1024 * 1024;
 
-/// Classification of an untracked file read for diff display / line counting.
 pub(crate) enum UntrackedFileRead {
     Text(String),
     TooLarge(u64),
@@ -560,7 +559,6 @@ async fn parse_numstat(repo_path: &Path, range: &[&str]) -> anyhow::Result<(i64,
     Ok((lines_added, lines_removed))
 }
 
-/// Whether git is installed.
 pub async fn git_is_installed() -> bool {
     let mut cmd = git_command(None);
     cmd.arg("--version");
@@ -572,12 +570,10 @@ async fn git_has_commits(repo_path: &Path) -> bool {
     run_git_head(repo_path).await.is_ok()
 }
 
-/// This repository's empty tree hash.
 async fn run_git_empty_tree(repo_path: &Path) -> anyhow::Result<String> {
     run_git_trimmed(repo_path, &["hash-object", "-t", "tree", "--stdin"]).await
 }
 
-/// The current branch name (e.g. `main`, `feature/xyz`).
 pub async fn run_git_current_branch(repo_path: &Path) -> anyhow::Result<String> {
     run_git_trimmed(repo_path, &["rev-parse", "--abbrev-ref", "HEAD"]).await
 }
@@ -624,7 +620,6 @@ pub struct GitPushTarget {
     pub publish: Option<bool>,
 }
 
-/// Where the checked-out branch can be pushed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitPushDestination {
     /// A remote accepts pushes: the one a plain `git push` reaches, the branch's tracked
@@ -643,7 +638,6 @@ pub struct GitRemoteState {
     pub branch: String,
     /// Commits the branch would pull from its own update source.
     pub behind: usize,
-    /// Where a push would go.
     pub push: GitPushDestination,
 }
 
@@ -781,7 +775,6 @@ async fn checked_out_branch(repo_path: &Path) -> Option<String> {
 struct DestinationPosition {
     /// Whether the destination has no branch of this name; `None` when it could not be asked.
     publish: Option<bool>,
-    /// Commits a press carries.
     commits: usize,
 }
 
@@ -898,7 +891,6 @@ async fn remotes(repo_path: &Path) -> anyhow::Result<Vec<(String, bool)>> {
     Ok(remotes)
 }
 
-/// Whether a push URL can actually receive a push.
 fn push_destination_accepts_pushes(repo_path: &Path, url: &str) -> bool {
     let url = url.trim();
     if url.is_empty() {
@@ -944,7 +936,6 @@ async fn branch_remotes(repo_path: &Path, branch: &str) -> anyhow::Result<Branch
     })
 }
 
-/// Number of commits `rev` reaches.
 async fn count_commits(repo_path: &Path, rev: &str) -> anyhow::Result<usize> {
     let count = run_git_trimmed(repo_path, &["rev-list", "--count", rev]).await?;
     count
@@ -952,7 +943,6 @@ async fn count_commits(repo_path: &Path, rev: &str) -> anyhow::Result<usize> {
         .with_context(|| format!("git rev-list --count {rev} printed {count:?}"))
 }
 
-/// Whether `rev` resolves to a commit in this repository.
 async fn rev_exists(repo_path: &Path, rev: &str) -> anyhow::Result<bool> {
     Ok(run_git_output(
         repo_path,
@@ -1134,7 +1124,6 @@ impl DiffStats {
     }
 }
 
-/// How an untracked file was classified for display / line counting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UntrackedKind {
     Text,
@@ -1142,7 +1131,6 @@ pub enum UntrackedKind {
     TooLarge(u64),
 }
 
-/// One file in the settled uncommitted change set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeChange {
     /// Relative to the repository root (git reports root-relative paths even from a
@@ -1468,7 +1456,6 @@ pub async fn run_git_discard(
     };
     let _ = run_git_command(repo_path, clean_args).await;
 
-    // Verify: check if any changes remain.
     let status_args = [
         "status",
         "--porcelain",
@@ -1680,7 +1667,6 @@ pub(crate) fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFil
         } else if ix == 'A' || wt == 'A' || (ix == '?' && wt == '?') {
             GitFileStatus::Added
         } else {
-            // Clean or ignored — don't store.
             continue;
         };
 
@@ -1903,7 +1889,6 @@ mod tests {
     #[tokio::test]
     async fn test_run_git_worktree_snapshot_with_changes() {
         let (_dir, repo_path) = init_temp_repo();
-        // Modify: change "line2" to "line2 modified", add "line4"
         std::fs::write(
             repo_path.join("test.txt"),
             b"line1\nline2 modified\nline3\nline4\n",
@@ -2279,7 +2264,6 @@ mod tests {
             .upstream
     }
 
-    /// The remote state of the branch checked out in `repo_path`.
     async fn remote_state(repo_path: &Path) -> GitRemoteState {
         run_git_remote_state(repo_path)
             .await

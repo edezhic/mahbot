@@ -21,7 +21,6 @@ use super::menus::{ContextMenu, MenuItem};
 use super::theme;
 use super::widgets;
 
-/// The two listings the Logs page switches between.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogsView {
     AllLogs,
@@ -542,8 +541,6 @@ impl LogsState {
         .into()
     }
 
-    /// The bottom bar: pagination controls, the view switch, the active view's clear button and
-    /// the search input.
     fn bottom_bar(&self) -> Element<'_, LogMessage> {
         let data = self.view_data(self.active_view);
         let (page, total_pages) = (data.pagination.page, data.pagination.total_pages());

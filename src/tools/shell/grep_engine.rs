@@ -270,7 +270,6 @@ pub(super) struct GrepOutcome {
     pub flags: String,
 }
 
-/// Result of analyzing a shell command for grep serving.
 #[derive(Debug)]
 pub(super) struct GrepServe {
     /// The rewritten command; `None` when no grep was served, which leaves the command
@@ -2502,7 +2501,6 @@ fn has_top_level_alternation(s: &str) -> bool {
     alternation_at(s, true)
 }
 
-/// Scan for `|` outside classes, optionally only at paren depth zero.
 fn alternation_at(s: &str, top_level_only: bool) -> bool {
     let mut depth = 0usize;
     let mut in_class = false;
@@ -2668,7 +2666,6 @@ fn locate_line(bytes: &[u8], term: u8, pos: usize) -> (usize, usize) {
     (start, end)
 }
 
-/// Pipeline context for a served grep member.
 #[expect(
     clippy::struct_excessive_bools,
     reason = "independent facts about one member, each read on its own"
@@ -3753,7 +3750,6 @@ fn traversal_display(
     }
 }
 
-/// Extract (path, normalized message) from an ignore walk error.
 fn walk_error_info(e: &ignore::Error) -> (Option<PathBuf>, String) {
     if let ignore::Error::WithPath { path, err } = e {
         (Some(path.clone()), normalize_io_message(err))
@@ -4226,7 +4222,6 @@ mod parity_tests {
         real_run_fallback_with_stdin(spec, &[])
     }
 
-    /// Run the real grep with explicit stdin bytes (stdin-fed parity rows).
     fn real_run_fallback_with_stdin(spec: &EngineSpec, stdin: &[u8]) -> (Vec<u8>, Vec<u8>, i32) {
         let bin = match spec.verb.as_str() {
             "egrep" => "/usr/bin/egrep",
@@ -4507,7 +4502,6 @@ mod parity_tests {
         );
     }
 
-    /// Assert the command falls back with a specific reason label.
     fn assert_falls_back_reason(command: &str, ws: &Path, home: &Path, reason: &str) {
         let err = analyze_joined(command, ws, home, false)
             .err()
@@ -6068,7 +6062,6 @@ mod refusal_pins {
     use super::*;
 
     /// Serve `command` on Windows (probe bypassed) and require a refusal naming its cause.
-    /// Returns the cause.
     fn refused(command: &str, ws: &Path, home: &Path) -> String {
         let mut serve = serve_command(command, ws, Some(home), ShellPlatform::Windows, || true);
         assert!(

@@ -727,7 +727,6 @@ fn selected_strings(field: &Dict<'_>) -> Vec<String> {
     }
 }
 
-/// The name states an array of names holds.
 fn name_strings(array: &Array<'_>) -> Vec<String> {
     let mut names = Vec::new();
     let mut items = array.flex_iter();
@@ -739,7 +738,6 @@ fn name_strings(array: &Array<'_>) -> Vec<String> {
     names
 }
 
-/// The text of an array's string items, in order.
 fn string_items(array: &Array<'_>) -> Vec<String> {
     let mut items = Vec::new();
     let mut strings = array.flex_iter();
@@ -880,7 +878,6 @@ fn field_page(field: &Dict<'_>, widget_pages: &HashMap<DictId, usize>) -> Option
     widget_pages.get(&dict_id(&field_widget(field)?)).copied()
 }
 
-/// The `/Widget` kids of a field, in order.
 fn widget_kids<'a>(field: &Dict<'a>) -> Vec<Dict<'a>> {
     let Some(kids) = field.get::<Array<'a>>(b"Kids") else {
         return Vec::new();

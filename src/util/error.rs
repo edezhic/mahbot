@@ -16,7 +16,6 @@ use std::time::Duration;
 /// this wrapper and are classified as retryable by default.
 #[derive(Debug)]
 pub struct HttpError {
-    /// The HTTP status code (e.g. 429, 400, 500).
     pub status: u16,
     pub body: String,
     /// Provider or operation name for display purposes.

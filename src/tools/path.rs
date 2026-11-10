@@ -136,7 +136,6 @@ pub(crate) async fn resolve_write_target(
             .context("Failed to create parent directories")?;
     }
 
-    // Canonicalize parent only — the file itself may not exist yet
     let resolved_target = canonicalize_parent_and_join(&full_path)
         .await
         .context("Failed to resolve file path")?;
@@ -497,7 +496,6 @@ pub(crate) fn normalize_path(path: &Path) -> PathBuf {
                 normalized.push(component);
             }
             Component::ParentDir => {
-                // Try to pop the last Normal component.
                 if let Some(last) = normalized.last() {
                     if matches!(last, Component::Normal(_)) {
                         normalized.pop();
@@ -577,7 +575,6 @@ pub(crate) fn allowed_temp_roots() -> Vec<PathBuf> {
     ALLOWED_TEMP_ROOTS.clone()
 }
 
-/// Check whether `path` is under an [`EXTRA_READ_ALLOWED`] directory.
 fn is_path_in_extra_allowed(path: &Path) -> bool {
     is_path_under_roots(path, &EXTRA_READ_ALLOWED)
 }
@@ -1614,7 +1611,6 @@ mod tests {
         assert!(is_path_under_roots(Path::new("/var/tmp/out.txt"), &roots));
         assert!(!is_path_under_roots(Path::new("relative.txt"), &roots));
         assert!(!is_path_under_roots(Path::new("/etc/passwd"), &roots));
-        // Path traversal via `..` must be blocked.
         assert!(
             !is_path_under_roots(Path::new("/tmp/../etc/passwd"), &roots),
             "Path traversal via /tmp/../etc/passwd must be blocked"
@@ -1623,7 +1619,6 @@ mod tests {
             !is_path_under_roots(Path::new("/tmp/../../../etc/passwd"), &roots),
             "Deep path traversal must be blocked"
         );
-        // Traversal that stays within temp after normalization should be allowed.
         assert!(
             is_path_under_roots(Path::new("/tmp/../tmp/file.txt"), &roots),
             "Traversal back into temp should be allowed"
@@ -1764,7 +1759,6 @@ mod tests {
             );
         }
 
-        // Prefix strictness: sibling of an allowed root should NOT match
         #[cfg(unix)]
         {
             assert!(
@@ -1777,7 +1771,6 @@ mod tests {
             );
         }
 
-        // No literal tilde paths in the allowlist itself
         for dir in &*EXTRA_READ_ALLOWED {
             let s = dir.to_string_lossy();
             assert!(
@@ -1794,7 +1787,6 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().to_path_buf();
 
-        // Temp dir file — should be allowed for read via extra_allowed
         let temp_file = std::env::temp_dir().join("test-read.txt");
         let temp_str = temp_file.to_string_lossy().to_string();
         assert!(
@@ -1802,7 +1794,6 @@ mod tests {
             "Temp file should be allowed for read"
         );
 
-        // Dependency path
         if let Ok(home) = std::env::var("HOME") {
             let dep_path = format!("{home}/.cargo/registry/src/crate-0.1.0/src/lib.rs");
             assert!(
@@ -2835,7 +2826,6 @@ mod tests {
             "Path should be within workspace: {resolved:?}"
         );
         assert_eq!(resolved.file_name().unwrap(), "new_file.rs");
-        // The file should NOT exist yet
         assert!(!resolved.exists(), "File should not exist yet");
     }
 
@@ -2918,12 +2908,10 @@ mod tests {
             "Path should be within workspace: {resolved:?}"
         );
         assert_eq!(resolved.file_name().unwrap(), "new_file.rs");
-        // Parent chain should exist
         assert!(
             ws.join("a/b/c").exists(),
             "Parent directories should be created"
         );
-        // File should NOT exist yet
         assert!(!resolved.exists(), "File should not exist yet");
     }
 
