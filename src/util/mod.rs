@@ -1122,9 +1122,10 @@ pub(crate) const VIDEO_EXTENSIONS: &[&str] = &[
     "vob", "rm", "rmvb", "asf", "f4v", "divx", "m2ts",
 ];
 
-/// The containers a sound track rides in, as the managed ffmpeg reads them — the counterpart of
-/// [`VIDEO_EXTENSIONS`] for the media path. Distinct from `speech::AUDIO_FORMATS`, which is what the
-/// in-process decoder takes; a name only decides whether the probe is asked at all.
+/// The containers a sound rides in, as the managed ffmpeg reads them — the counterpart of
+/// [`VIDEO_EXTENSIONS`] for the media path, and the recognise route's accept-set
+/// ([`crate::speech::decode`]): a name decides only that a file is a recording. Which codec it
+/// holds, and so whether the process decodes it itself, comes from its bytes.
 pub(crate) const AUDIO_EXTENSIONS: &[&str] = &[
     "wav", "mp3", "ogg", "oga", "m4a", "m4b", "aac", "flac", "opus", "wma", "aiff", "aif", "amr",
     "caf", "ac3",

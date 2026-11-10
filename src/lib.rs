@@ -53,7 +53,8 @@ pub(crate) mod pdf_marks;
 // The printed shape of a converted document: block headers, unit marks, stories.
 pub(crate) mod reader_output;
 
-// The product's own ffmpeg and ffprobe, never the owner's copy, for probing and frames.
+// The product's own ffmpeg and ffprobe, never the owner's copy: probing, frames, and the
+// conversion of a recording to the form the recogniser takes.
 pub mod ffmpeg;
 // What a video or a recording says: frames as pictures of four, a timestamped transcript, sound
 // labels, and the one timeline a model reads them as.

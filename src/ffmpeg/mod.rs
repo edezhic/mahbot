@@ -1,21 +1,23 @@
 //! The product's own ffmpeg and ffprobe: the copy the product installs itself (`install`) and
-//! the three video operations that copy serves.
+//! the operations that copy serves.
 //!
 //! A copy the owner installed — a package manager's, a vendor download, anything on the search
 //! path — is never run: every command here is the absolute path of the product's own build, and
 //! no `PATH` lookup is ever made.
 //!
-//! The operations are exactly three: [`probe`] (duration, upright dimensions, audio presence, the
+//! The operations are exactly four: [`probe`] (duration, upright dimensions, audio presence, the
 //! file's own size), [`extract_frames`] (one JPEG at each mark asked for, each fitting a bounded
-//! side, written at one quality) and [`extract_audio`] (a stretch of the track re-encoded
-//! to 16 kHz mono WAV, what the recogniser takes). A stretch is asked for as input options, so it is
+//! side, written at one quality), [`extract_audio`] (a stretch of the track re-encoded to 16 kHz
+//! mono WAV, what the recogniser takes) and [`convert_audio`] (the whole of a recording the product
+//! has no decoder for, to the same form). A stretch is asked for as input options, so it is
 //! seeked to rather than decoded up to.
 //!
 //! Each runs under its own [`Duration`], and every output lands in a [`tempfile::TempDir`] under the
 //! product's private temp root, never in the owner's workspace, carried by the returned guard, so
 //! dropping the result removes the files. A first call installs the pair first, under the download
 //! client's own bounds — a copy that cannot be obtained is a missing tool, not a decode that ran
-//! out of time.
+//! out of time. [`convert_audio`] is the exception: it runs only the copy already in place, so a
+//! transcription never downloads a toolchain.
 //!
 //! Failures are typed and deliberately distinct: [`FfmpegError::Unavailable`] is the product's own
 //! half not being usable, while [`FfmpegError::Undecodable`], [`FfmpegError::NoVideoTrack`] and
@@ -26,6 +28,7 @@ mod install;
 mod probe;
 
 pub use install::install_on_start;
+pub(crate) use install::installed;
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -80,7 +83,7 @@ impl ClipInfo {
     }
 }
 
-/// Why a video operation could not answer.
+/// Why an operation could not answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FfmpegError {
     /// The product's own half could not do it: its copy cannot be run (not installed, or a start
@@ -219,13 +222,35 @@ pub(crate) async fn extract_frames(
     Ok(Frames { _dir: dir, frames })
 }
 
-/// The audio track of `input` — the whole file, or `window` of it — as 16 kHz mono WAV.
+/// The audio track of `input` — the whole file, or `window` of it — as 16 kHz mono WAV, through the
+/// pair installed on first use.
 pub(crate) async fn extract_audio(
     input: &Path,
     window: Option<(Duration, Duration)>,
 ) -> Result<Audio, FfmpegError> {
     let bin = binaries().await.map_err(FfmpegError::Unavailable)?;
-    // The copy is obtained before the bound, and the bound covers the classification too.
+    audio_with(&bin, input, window).await
+}
+
+/// The whole of `input` as 16 kHz mono WAV, through the copy already in place — never one fetched:
+/// asking for a transcription is not a reason to install the toolchain, so a missing copy is
+/// [`FfmpegError::Unavailable`] rather than an install.
+pub(crate) async fn convert_audio(input: &Path) -> Result<Audio, FfmpegError> {
+    let Some(bin) = installed() else {
+        return Err(FfmpegError::Unavailable(
+            "no copy of the product's media toolchain is installed".to_string(),
+        ));
+    };
+    audio_with(&bin, input, None).await
+}
+
+/// The sound track of `input` as 16 kHz mono WAV: the whole file, or `window` of it.
+async fn audio_with(
+    bin: &Binaries,
+    input: &Path,
+    window: Option<(Duration, Duration)>,
+) -> Result<Audio, FfmpegError> {
+    // The bound covers the classification too.
     tokio::time::timeout(AUDIO_TIMEOUT, async {
         let dir = scratch()?;
         let path = dir.path().join("audio.wav");
@@ -233,7 +258,7 @@ pub(crate) async fn extract_audio(
         let output = run_tool(&bin.ffmpeg, &args, AUDIO_TIMEOUT).await?;
         if !output.success {
             tracing::debug!("ffmpeg extracted no audio: {}", output.stderr.trim());
-            return Err(classify(&bin, input, Decode::Audio(window)).await);
+            return Err(classify(bin, input, Decode::Audio(window)).await);
         }
         Ok(Audio { _dir: dir, path })
     })
@@ -453,6 +478,10 @@ fn audio_args(
     args
 }
 
+/// Test hook: the install root, so a check never writes into the developer's own `~/.mahbot/ffmpeg`.
+#[cfg(test)]
+pub(crate) use install::ROOT_ENV;
+
 /// Points the ffmpeg release hook ([`install::RELEASES_URL_ENV`]) at `base` for as
 /// long as it lives, and puts the previous value back — on a panic too, so no later
 /// check in this process inherits it. Holds no lock of its own: the caller keeps the
@@ -554,7 +583,58 @@ mod tests {
         assert_eq!(&audio[..at(&audio, "-i")], &replay[..at(&replay, "-i")]);
     }
 
-    /// The live exercise of the three operations — and of the reading mode built on them —
+    /// A throwaway install root, with the release stream pointed at an unreachable host so nothing
+    /// is ever fetched into it. `pair` copies the host pair named by `MAHBOT_FFMPEG_LIVE_BIN` in,
+    /// which is why a run that uses one must be single-threaded: the root is process-wide.
+    struct Install {
+        _home: tempfile::TempDir,
+        host: Option<PathBuf>,
+        root: PathBuf,
+        /// Any parsable tag: a copy in place is what the operations use, and the name only says
+        /// which build it is.
+        bin: PathBuf,
+        // Dropped in declaration order: the hook puts the release URL back while the environment
+        // lock is still held, so it must be declared before the guard that owns that lock.
+        _hook: ReleasesHook,
+        _env: crate::util::test::EnvVarGuard,
+    }
+
+    impl Install {
+        fn new(pair: bool) -> Self {
+            let home = tempfile::tempdir().expect("temp home");
+            let root = home.path().join(".mahbot/ffmpeg");
+            let bin = root.join("ffmpeg-v7.1-mahbot.2").join("bin");
+            let env = crate::util::test::set_env_var(install::ROOT_ENV, root.to_str());
+            let hook = ReleasesHook::at("http://127.0.0.1:1");
+            let host =
+                pair.then(|| {
+                    PathBuf::from(std::env::var_os("MAHBOT_FFMPEG_LIVE_BIN").expect(
+                        "MAHBOT_FFMPEG_LIVE_BIN names a directory holding ffmpeg and ffprobe",
+                    ))
+                });
+            if let Some(host) = &host {
+                std::fs::create_dir_all(&bin).expect("install directory");
+                for tool in ["ffmpeg", "ffprobe"] {
+                    std::fs::copy(host.join(tool), bin.join(tool)).expect("copy the stand-in tool");
+                }
+            }
+            Self {
+                _home: home,
+                host,
+                root,
+                bin,
+                _hook: hook,
+                _env: env,
+            }
+        }
+
+        /// The host pair the root was filled from.
+        fn host(&self) -> &Path {
+            self.host.as_deref().expect("the host pair was copied in")
+        }
+    }
+
+    /// The live exercise of the operations — and of the reading mode built on them —
     /// against a real `ffmpeg` and real files. It is opt-in because the product's own copy comes
     /// from a release stream, which no plain `cargo test` run carries:
     ///
@@ -568,29 +648,18 @@ mod tests {
     #[ignore = "requires MAHBOT_FFMPEG_LIVE_BIN: a directory holding a real ffmpeg and ffprobe"]
     #[serial_test::serial(ffmpeg_live)] // relocates the install root, points the release hook
     #[tokio::test]
-    async fn the_three_operations_on_real_files() {
-        let host = PathBuf::from(
-            std::env::var_os("MAHBOT_FFMPEG_LIVE_BIN")
-                .expect("MAHBOT_FFMPEG_LIVE_BIN names a directory holding ffmpeg and ffprobe"),
-        );
-        let home = tempfile::tempdir().expect("temp home");
-        let root = home.path().join(".mahbot/ffmpeg");
-        let _root = crate::util::test::set_env_var(install::ROOT_ENV, root.to_str());
-        let _hook = ReleasesHook::at("http://127.0.0.1:1");
-        let bin = root
-            // Any parsable tag: a copy in place is what the operations use, and the
-            // name only says which build it is.
-            .join("ffmpeg-v7.1-mahbot.2")
-            .join("bin");
-        std::fs::create_dir_all(&bin).expect("install directory");
-        for tool in ["ffmpeg", "ffprobe"] {
-            std::fs::copy(host.join(tool), bin.join(tool)).expect("copy the stand-in tool");
-        }
+    async fn the_operations_on_real_files() {
+        let install = Install::new(true);
+        let host = install.host();
         let found = install::ensure_installed()
             .await
             .expect("the copy in place is used");
-        assert_eq!(found.ffmpeg, bin.join("ffmpeg"), "by path, not by origin");
-        assert_eq!(found.ffprobe, bin.join("ffprobe"));
+        assert_eq!(
+            found.ffmpeg,
+            install.bin.join("ffmpeg"),
+            "by path, not by origin"
+        );
+        assert_eq!(found.ffprobe, install.bin.join("ffprobe"));
 
         let media = tempfile::tempdir().expect("media directory");
         let good = media.path().join("good.mp4");
@@ -598,7 +667,7 @@ mod tests {
         let rotated = media.path().join("rotated.mp4");
         let broken = media.path().join("broken.mp4");
         make(
-            &host,
+            host,
             &good,
             &[
                 "-f",
@@ -619,7 +688,7 @@ mod tests {
             ],
         );
         make(
-            &host,
+            host,
             &silent,
             &[
                 "-f",
@@ -634,7 +703,7 @@ mod tests {
         );
         let good_text = good.to_str().expect("utf8").to_string();
         make(
-            &host,
+            host,
             &rotated,
             &["-display_rotation", "90", "-i", &good_text, "-c", "copy"],
         );
@@ -705,7 +774,7 @@ mod tests {
         // frames from being planned past its last picture.
         let soundy = media.path().join("soundy.mp4");
         make(
-            &host,
+            host,
             &soundy,
             &[
                 "-f",
@@ -844,13 +913,84 @@ mod tests {
 
         // No copy and an unreachable release: the answer says so instead of hanging
         // or panicking, and the clips above are untouched by the attempt.
-        std::fs::remove_dir_all(home.path().join(".mahbot/ffmpeg")).expect("remove the copy");
+        std::fs::remove_dir_all(&install.root).expect("remove the copy");
         let unavailable = probe(&good).await.expect_err("no copy, no answer");
         assert!(
             matches!(unavailable, FfmpegError::Unavailable(ref reason) if !reason.is_empty()),
             "{unavailable:?}"
         );
         assert!(good.exists());
+    }
+
+    /// Asking for a transcription is not asking for a toolchain: the conversion runs only the copy
+    /// already in place, so a recording this process has no decoder for is refused rather than
+    /// fetched for. The release stream here answers nothing, so an install attempt would fail — and
+    /// the install root is left as empty as it was found.
+    #[serial_test::serial(ffmpeg_live, ffmpeg_releases)] // relocates the install root, points the release hook
+    #[tokio::test]
+    async fn a_conversion_never_installs_the_toolchain() {
+        let install = Install::new(false);
+        let media = tempfile::tempdir().expect("media directory");
+        let recording = media.path().join("note.m4a");
+        std::fs::write(&recording, b"\0\0\0\x20ftypM4A \0\0\0\0").expect("a recording");
+        let error = crate::speech::decode::samples_of(&recording)
+            .await
+            .expect_err("no decoder here, and no toolchain to convert it");
+        assert!(format!("{error:#}").contains("cannot be read"), "{error:#}");
+        assert!(
+            installed().is_none(),
+            "a transcription must not install the pair"
+        );
+        assert!(!install.root.exists(), "nothing was installed");
+    }
+
+    /// Every container the product reads as a sound reaches the recogniser — a file of each accepted
+    /// kind produces audio instead of a refusal. Each is made by the same binary: a one-second sine
+    /// in the AAC and ALAC forms of MP4, FLAC, Vorbis in OGG, ADTS AAC, A-law WAV, AIFF and CAF —
+    /// every one of them a codec this process hands to the toolchain — plus a plain PCM WAV, which is
+    /// the in-process path and proves it is untouched by any of that.
+    ///
+    /// AMR is not here: the product's ffmpeg carries an AMR decoder and no AMR encoder, so a file of
+    /// that kind cannot be produced by the pair the test stands in with. The sniffing matrix for
+    /// AMR, WMA and AC-3 is covered by the unit tests in `speech::decode`.
+    #[ignore = "requires MAHBOT_FFMPEG_LIVE_BIN: a directory holding a real ffmpeg and ffprobe"]
+    #[serial_test::serial(ffmpeg_live)] // relocates the install root, points the release hook
+    #[tokio::test]
+    async fn every_recording_the_product_reads_reaches_the_recogniser() {
+        let install = Install::new(true);
+        install::ensure_installed()
+            .await
+            .expect("the copy in place is used");
+
+        let media = tempfile::tempdir().expect("media directory");
+        // `-ac 2 -strict -2` is the native Vorbis encoder: this build carries no libvorbis, and the
+        // native one writes two channels only.
+        let sine = ["-f", "lavfi", "-i", "sine=frequency=440:duration=1"];
+        let cases: [(&str, &[&str]); 9] = [
+            ("note.m4a", &["-c:a", "aac"]),
+            ("note-alac.m4a", &["-c:a", "alac"]),
+            ("note.flac", &["-c:a", "flac"]),
+            (
+                "note-vorbis.ogg",
+                &["-ac", "2", "-c:a", "vorbis", "-strict", "-2"],
+            ),
+            ("note.aac", &["-f", "adts", "-c:a", "aac"]),
+            ("note-alaw.wav", &["-c:a", "pcm_alaw"]),
+            ("note.aiff", &["-f", "aiff", "-c:a", "pcm_s16be"]),
+            ("note.caf", &["-f", "caf", "-c:a", "pcm_s16le"]),
+            ("plain.wav", &["-c:a", "pcm_s16le"]),
+        ];
+        for (name, codec) in cases {
+            let path = media.path().join(name);
+            let mut args = sine.to_vec();
+            args.extend(codec);
+            make(install.host(), &path, &args);
+            let (samples, rate) = crate::speech::decode::samples_of(&path)
+                .await
+                .unwrap_or_else(|error| panic!("{name} does not reach the recogniser: {error:#}"));
+            assert!(!samples.is_empty(), "{name} produced no audio");
+            assert!(rate > 0, "{name} reported a rate of {rate}");
+        }
     }
 
     /// Run a real `ffmpeg` into `output`.

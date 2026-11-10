@@ -90,8 +90,9 @@ async fn transcribe_audio_marker(path: &std::path::Path) -> Option<String> {
 /// `bound` is the transport's own limit, and only the Telegram receive path has one: a file above
 /// it could only have arrived through the local Bot API server, and receiving such a file means
 /// saving it. The bound stays on the conversions that read the whole file into memory — a document,
-/// or a recording the recogniser decodes in process. A video is not one of them: its timeline is
-/// decoded from the file on disk, a piece at a time, so every inbound video gets one.
+/// or a recording, whose sound the recogniser reads whole: from the file itself, or from what the
+/// media toolchain converted it to. A video is not one of them: its timeline is decoded from the
+/// file on disk, a piece at a time, so every inbound video gets one.
 async fn too_large_to_process(path: &std::path::Path, bound: u64) -> bool {
     tokio::fs::metadata(path)
         .await
@@ -464,8 +465,8 @@ async fn video_timeline(path: &std::path::Path) -> Annotation {
 /// anything reads it, and lives there by the same rule as every other saved media. Saving does not
 /// depend on the transcript: a format the recogniser cannot read, a failed or empty transcription
 /// and transcription switched off all leave the file saved. A recording above the
-/// automatic-processing bound is saved and never decoded in process (only the local Bot API server
-/// could have delivered it, and receiving it means keeping it). A marker naming anything else — one
+/// automatic-processing bound is saved and never read (only the local Bot API server could have
+/// delivered it, and receiving it means keeping it). A marker naming anything else — one
 /// typed by the user, another message's attachment — is annotated without a transcript, never
 /// copied, and its file is never deleted.
 async fn handle_audio(
@@ -483,8 +484,8 @@ async fn handle_audio(
         return (Annotation::shared(AUDIO_ICON.to_string()), false);
     }
 
-    // Above the bound the recording is kept but not read: the recogniser decodes the whole file in
-    // memory.
+    // Above the bound the recording is kept but not read: the recogniser reads the whole file into
+    // memory, whichever decoder reads it.
     let too_large = match processing_bound {
         Some(bound) => too_large_to_process(path_obj, bound).await,
         None => false,
@@ -929,7 +930,7 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
     // desktop composer. Empty when it has no attachment.
     let staging_dirs = msg.attachment_dirs.clone();
     // Automatic processing stops at the carrying transport's bound for the conversions that read
-    // the whole file into memory — a document, or a recording the recogniser decodes in process.
+    // the whole file into memory — a document, or a recording, whatever its codec.
     // Only the Telegram side has one: a file above the cloud's download limit can only have come
     // through the local Bot API server, and receiving it means keeping it.
     let processing_bound = (msg.channel == "telegram")
@@ -1710,7 +1711,7 @@ mod tests {
         let _ = tokio::fs::remove_dir_all(&tmp_root).await;
     }
 
-    /// Above the automatic-processing bound the recording is saved and never decoded in process.
+    /// Above the automatic-processing bound the recording is saved and never read.
     #[tokio::test]
     async fn enrich_audio_above_processing_bound_is_saved_not_transcribed() {
         let tmp_root = crate::util::test::test_root().join("test_enrich_audio_large");

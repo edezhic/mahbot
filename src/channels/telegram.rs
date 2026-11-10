@@ -604,7 +604,8 @@ fn sanitize_remote_extension(remote_ext: &str) -> Option<String> {
 /// The extension a declared audio type names — the container a sound file really is.
 ///
 /// It is what makes a recording saved from a generated name playable, and readable by the
-/// recogniser where its own table names the container (`speech::decode::AUDIO_FORMATS`).
+/// recogniser: every name here is in [`crate::util::AUDIO_EXTENSIONS`], and the bytes then decide
+/// the codec (`crate::speech::decode`).
 fn audio_extension(mime_type: Option<&str>) -> Option<&'static str> {
     match mime_type? {
         "audio/mpeg" | "audio/mp3" => Some("mp3"),

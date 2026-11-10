@@ -26,7 +26,7 @@
 //! whatever it had, never with nothing. A failure names the failed step and carries no
 //! path and no URL, because it is recorded and shown verbatim. Nothing is written outside
 //! the product's own configuration directory — no package-manager directory, no `PATH`
-//! entry. The three video operations that run this copy belong to [`super`].
+//! entry. The operations that run this copy belong to [`super`].
 
 use std::ffi::OsStr;
 use std::fs;
@@ -118,7 +118,7 @@ pub(crate) struct Binaries {
 
 /// Test hook: the install root, so a check never writes into the developer's own `~/.mahbot/ffmpeg`.
 #[cfg(test)]
-pub(super) const ROOT_ENV: &str = "MAHBOT_FFMPEG_ROOT";
+pub(crate) const ROOT_ENV: &str = "MAHBOT_FFMPEG_ROOT";
 
 /// One subdirectory per tag inside the product's configuration directory — never the
 /// daemon's swept temp root, never a package-manager directory. A test run's root is the test
@@ -170,6 +170,11 @@ fn binaries_at(dir: &Path) -> Option<Binaries> {
     let binaries = binaries_in(dir);
     (crate::util::is_executable(&binaries.ffmpeg) && crate::util::is_executable(&binaries.ffprobe))
         .then_some(binaries)
+}
+
+/// The copy already in place, without installing one: a caller that must not download asks here.
+pub(crate) fn installed() -> Option<Binaries> {
+    chosen(&root().ok()?).map(|(_, binaries)| binaries)
 }
 
 /// Holds the one install in flight, so the boot install and a first use never overlap.

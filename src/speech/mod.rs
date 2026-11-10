@@ -16,7 +16,9 @@
 //! Recognition is lazy on every platform: the surfaces are the composer's microphone, a
 //! Telegram voice note or audio attachment, the audio recorded after the wake word,
 //! `mahbot audio transcribe`, and a media read — a video's or a recording's sound track, which is
-//! transcribed in pieces with timestamps and sound labels. The wake word shares the recognition
+//! transcribed in pieces with timestamps and sound labels. A recording whose codec this process has
+//! no decoder for is converted by the product's own copy of ffmpeg first, and only where that copy
+//! is already installed ([`decode`]). The wake word shares the recognition
 //! pair's weights through its own window listener ([`engine::embed_pair`]), so listening never
 //! loads a second copy. Synthesis is the admin Assistant's `say` tool and `mahbot audio speak`;
 //! nothing is ever spoken on its own.
@@ -29,7 +31,7 @@ mod load;
 pub(crate) mod models;
 pub(crate) mod synth;
 
-pub(crate) use decode::{AUDIO_FORMATS, takes_audio};
+pub(crate) use decode::{Sound, sound_of_file};
 pub(crate) use engine::{
     INFERENCE_TIMEOUT, InferenceTimedOut, Interrupted, Segment, UNTRANSCRIBED, Unreadable,
     embed_clip, embed_clips, embed_pair, ensure_ready_once, is_listening_failed,

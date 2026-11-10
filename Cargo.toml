@@ -72,7 +72,9 @@ earshot = "1.2"
 # shared output device on the same host API, and a WAV cue is decoded by `hound`.
 rodio = { version = "0.22", default-features = false, features = ["playback", "hound"] }
 # The recogniser's input decoders: OGG/Opus (a Telegram voice note arrives as one),
-# and MP3 (an audio attachment). WAV is read by the product itself.
+# and MP3 (an audio attachment). WAV is read by the product itself; every other
+# sound the media path reads is converted by the product's own ffmpeg first
+# (`speech::decode`).
 ogg = "0.9"
 opus-decoder = "0.1"
 # 0.6 vendors the minimp3 header that detects MSVC ARM64; 0.5's header predates

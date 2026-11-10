@@ -13,8 +13,9 @@
 # Every capability the product promises is proven by producing output with it,
 # never by a name appearing in a list: H.264, HEVC and VP9 encoding, Opus
 # encoding, PNG encoding and decoding, the zscale filter, an https fetch whose peer
-# is verified against the machine's own store, and the three jobs the product itself
-# runs (probe, JPEG frames, 16 kHz mono WAV).
+# is verified against the machine's own store, and the four jobs the product itself
+# runs (probe, JPEG frames, 16 kHz mono WAV extraction, and the conversion of a
+# recording the product has no decoder for).
 set -eu
 
 if [ $# -lt 3 ]; then
@@ -87,12 +88,13 @@ echo "libraries, all the system's own: $(printf '%s' "$libs" | tr '\n' ' ')"
 # ── Every format the product accepts, and the two containers it used to skip
 
 "$ffprobe" -hide_banner -demuxers | tr ' ,' '\n\n' >"$scratch/demuxers"
-for demuxer in mov matroska avi asf mpeg ogg wav mp3 flac; do
+for demuxer in mov matroska avi asf mpeg ogg wav mp3 flac aac amr aiff caf ac3; do
     grep -qx "$demuxer" "$scratch/demuxers" ||
         fail "the pair cannot read $demuxer"
 done
 "$ffprobe" -hide_banner -decoders | tr ' ,' '\n\n' >"$scratch/decoders"
-for decoder in h264 hevc vp8 vp9 av1 mpeg4 aac vorbis opus flac pcm_s16le mjpeg; do
+for decoder in h264 hevc vp8 vp9 av1 mpeg4 aac vorbis opus flac pcm_s16le pcm_s16be \
+    ac3 mjpeg alac amrnb amrwb pcm_alaw pcm_mulaw adpcm_ima_wav adpcm_ms wmav1 wmav2; do
     grep -qx "$decoder" "$scratch/decoders" ||
         fail "the pair cannot decode $decoder"
 done
@@ -220,7 +222,7 @@ case $(uname -s) in
 esac
 expect_picture "https" "$scratch/https.png"
 
-# ── The three jobs the product itself runs ──────────────────────────
+# ── The four jobs the product itself runs ───────────────────────────
 
 "$ffprobe" -v error -print_format json \
     -show_entries "stream=codec_type,width,height:format=duration" \
@@ -243,4 +245,28 @@ grep -q '"pcm_s16le"' "$scratch/wav.json" &&
     grep -qE '"channels"[[:space:]]*:[[:space:]]*1' "$scratch/wav.json" ||
     fail "the extracted audio is not 16 kHz mono PCM"
 
-echo "every capability and the three jobs work on $(uname -sm)"
+# The recording containers a transcription arrives in are converted by that same
+# extraction, so each one is proven by its own encode and its own output. AMR gets
+# no round-trip: this build carries an AMR decoder and no AMR encoder, so the
+# decoder and demuxer names above are its gate.
+"$ffmpeg" -v error -y -f lavfi -i "sine=frequency=440:duration=1" \
+    -c:a alac "$scratch/tone-alac.m4a"
+# The native Vorbis encoder — this build has no libvorbis — and it writes two
+# channels only.
+"$ffmpeg" -v error -y -f lavfi -i "sine=frequency=440:duration=1" \
+    -ac 2 -c:a vorbis -strict -2 "$scratch/tone-vorbis.ogg"
+for source in "$scratch/tone-alac.m4a" "$scratch/tone-vorbis.ogg"; do
+    name=${source##*/}
+    "$ffmpeg" -v error -nostdin -y -i "$source" \
+        -vn -ac 1 -ar 16000 -c:a pcm_s16le -f wav "$scratch/converted-$name.wav"
+    "$ffprobe" -v error -print_format json \
+        -show_entries "stream=codec_name,sample_rate,channels" \
+        "$scratch/converted-$name.wav" >"$scratch/converted-$name.json"
+    grep -q '"pcm_s16le"' "$scratch/converted-$name.json" &&
+        grep -qE '"sample_rate"[[:space:]]*:[[:space:]]*"?16000"?' "$scratch/converted-$name.json" &&
+        grep -qE '"channels"[[:space:]]*:[[:space:]]*1' "$scratch/converted-$name.json" ||
+        fail "$name did not convert to 16 kHz mono PCM"
+    echo "$name converts: 16 kHz mono PCM"
+done
+
+echo "every capability and the four jobs work on $(uname -sm)"

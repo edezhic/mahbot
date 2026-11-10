@@ -735,9 +735,10 @@ fn main() -> Result<()> {
             std::process::exit(rt.block_on(mahbot::bench_openrouter::run_cli()));
         }
 
-        // A recording into text, text into a spoken file. It touches only the speech models —
-        // the one machine-wide set both engines read — and never a store or the settings, so it
-        // works while the product is stopped and alongside it.
+        // A recording into text, text into a spoken file. It touches the speech models — the one
+        // machine-wide set both engines read — and the product's own copy of its media toolchain
+        // where a recording's format needs it, and never a store or the settings, so it works
+        // while the product is stopped and alongside it.
         EntryPoint::Audio => {
             let rt = command_line_runtime()?;
             std::process::exit(rt.block_on(mahbot::run_audio_cli(&command_line_args())));

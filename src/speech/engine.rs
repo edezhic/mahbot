@@ -196,13 +196,12 @@ pub(crate) async fn ensure_ready_once(announce: impl FnOnce(&Path)) -> Result<()
     TRANSCRIBER.ensure_ready_once(announce).await
 }
 
-/// One recording into words: the whole file, decoded and then read by the engine.
+/// One recording into words: the whole file, decoded — here when the codec is one this process
+/// reads, through the product's own copy of ffmpeg when it is not — and then read by the engine.
+/// `timeout` bounds the recognition pass alone; a conversion carries ffmpeg's own, as a media
+/// read's does.
 pub(crate) async fn transcribe_file_async(path: &Path, timeout: Duration) -> Result<String> {
-    let owned: PathBuf = path.to_owned();
-    let (samples, rate) =
-        tokio::task::spawn_blocking(move || decode::decode_audio_to_mono_f32(&owned))
-            .await
-            .context("Audio decode task panicked")??;
+    let (samples, rate) = decode::samples_of(path).await?;
     transcribe_samples(samples, rate, timeout).await
 }
 
@@ -384,7 +383,7 @@ fn read_all(engine: &mut Transcriber, pieces: Vec<Piece>, deadline: Instant) -> 
 fn read_piece(engine: &mut Transcriber, piece: Piece) -> Result<Vec<Segment>> {
     let (samples, rate, offset) = match piece {
         Piece::File { path, offset } => {
-            let (samples, rate) = decode::decode_audio_to_mono_f32(&path).map_err(|error| {
+            let (samples, rate) = decode::decode_file_in_process(&path).map_err(|error| {
                 // The path is an extracted temp file, not the owner's: the log keeps the chain,
                 // the caller gets the typed failure.
                 tracing::warn!(path = %path.display(), %error, "A transcribed piece could not be decoded");

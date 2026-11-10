@@ -4,8 +4,10 @@
 //! existing recording into text on standard output, `speak` turns text into a spoken WAV file.
 //! Both run on every platform. Neither needs the running product — this command line is
 //! dispatched before the instance lock — and neither touches its stores or settings: both read
-//! the machine-wide speech model folder ([`crate::speech`]) and nothing else, each set obtained
-//! the way the product obtains it (once, saying so on standard error, no retry loop).
+//! the machine-wide speech model folder ([`crate::speech`]), each set obtained the way the
+//! product obtains it (once, saying so on standard error, no retry loop). A recording in a format
+//! this machine has no decoder of its own for is converted by the product's own copy of its media
+//! toolchain — the copy already installed, never one fetched here.
 //!
 //! The product's speech switches are not this command's: they govern what the app says aloud
 //! and transcribes, while these operations are explicit requests carrying their own
@@ -16,9 +18,10 @@
 //!
 //! The four exit classes are the product's own ([`crate::cli::Exit`]), and what separates them
 //! is who judges. This command judges the words and the values they carry (a flag no operation
-//! takes, a recording the recogniser does not take, a destination it cannot write) — the
-//! caller's own misuse. What the ENGINE judges is a failed operation. What is missing to run
-//! at all is the environment: a model folder that is not there or cannot be written.
+//! takes, a destination it cannot write, a recording the recogniser does not take) — the caller's
+//! own misuse. What the ENGINE judges is a failed operation. What is missing to run at all is the
+//! environment: a model folder that is not there or cannot be written, or the media toolchain a
+//! recording's format is read through.
 //!
 //! The order is deliberate: the words first (an operation no word names, a flag this operation
 //! does not take, one given twice, one with no value), then what the caller handed over, then
@@ -84,8 +87,8 @@ impl Operation {
             Self::Transcribe => &[Flag {
                 name: "input",
                 required: true,
-                purpose: "The recording to turn into text — WAV, OGG/Opus or MP3, by name or by \
-                          content",
+                purpose: "The recording to turn into text — any format the product reads as audio, \
+                          by name or by content",
             }],
             Self::Speak => &[
                 Flag {
@@ -227,13 +230,18 @@ const ENGINE_HELP: &str = "\nA frontend onto the product's own speech engines: e
      while the product is up does not disturb it. The first use of an operation fetches the \
      models it needs, once, saying so on standard error; if it cannot obtain them, it fails \
      rather than trying again.\n\
+     \nA recording in a format this machine has no decoder of its own for is converted by the \
+     product's own copy of its media toolchain first. That copy is used only where it is already \
+     installed: this command installs nothing, and a machine without it refuses such a format \
+     rather than fetching anything.\n\
      \nBoth operations run on every platform. The product's speech switches govern what the app \
      itself speaks and transcribes; these operations are explicit requests with their own \
      destination — they neither need those switches nor change them.\n";
 
 /// The exit classes, word for word the numbering a script reads (see [`Exit`]).
 const EXIT_CLASS_HELP: &str = "\nExit codes:\n  0  the operation was carried out\n  1  the engine \
-     could not do the work\n  2  the environment — the models cannot be obtained\n  3  this \
+     could not do the work\n  2  the environment — a component this command needs is not there: \
+     the model set, or the media toolchain a recording's format is read through\n  3  this \
      command was misused — what was asked for cannot be done as asked\n\
      \nThe words are read before anything is fetched, so a malformed invocation is misuse and \
      never an environment failure.\n";
@@ -360,10 +368,10 @@ mod engine {
     use super::{Speak, misuse};
     use crate::cli::Exit;
     use crate::speech::{
-        AUDIO_FORMATS, INFERENCE_TIMEOUT, InferenceTimedOut, ensure_ready_once, synth, takes_audio,
+        INFERENCE_TIMEOUT, InferenceTimedOut, Sound, ensure_ready_once, sound_of_file, synth,
         transcribe_file_async,
     };
-    use crate::util::{print_stderr, print_stdout};
+    use crate::util::{AUDIO_EXTENSIONS, print_stderr, print_stdout};
     use std::io::ErrorKind;
     use std::path::{Path, PathBuf};
 
@@ -372,36 +380,56 @@ mod engine {
     /// true in principle too.
     const CHOSEN_NAME_TRIES: usize = 3;
 
-    /// `transcribe`: the recording into text on standard output.
-    pub(super) async fn transcribe(input: &Path) -> i32 {
-        // What the caller handed over, before anything is fetched: a typo must not cost a model
-        // download. The type is read before anything is opened, because opening is what waits — a
-        // FIFO named like a recording would hold it until somebody writes into it.
+    /// What the caller handed over, judged before anything is fetched: a typo must not cost a model
+    /// download. `Err` is the exit class of the refusal.
+    pub(super) fn judge(input: &Path) -> Result<(), i32> {
+        // The type is read before anything is opened, because opening is what waits — a FIFO named
+        // like a recording would hold it until somebody writes into it.
         match std::fs::metadata(input) {
             Ok(metadata) if metadata.is_file() => {}
             // A directory has metadata too, and is not a recording either.
             Ok(_) => {
-                return misuse(&format!(
+                return Err(misuse(&format!(
                     "'{}' is not a file to transcribe",
                     input.display()
-                ));
+                )));
             }
-            Err(e) => return misuse(&cannot_read(input, &e)),
+            Err(e) => return Err(misuse(&cannot_read(input, &e))),
         }
-        // The recogniser's own rule, asked of the recogniser itself: a name it knows, or content
-        // beginning with Ogg's magic. Opening is part of asking, so an unreadable input is the
-        // caller's mistake, not a failed operation.
-        match takes_audio(input) {
-            Err(e) => return misuse(&cannot_read(input, &e)),
-            Ok(true) => {}
-            Ok(false) => {
-                return misuse(&format!(
-                    "'{}' is not a recording the local recogniser takes — it takes the names {}, \
-                     and a name outside them only when the file's content is Ogg",
+        // The recogniser's own rule, asked of the recogniser itself: what the file's bytes are,
+        // and, for bytes that name no codec, a name the media path reads as a sound. Opening is
+        // part of asking, so an unreadable input is the caller's mistake, not a failed operation.
+        let sound = match sound_of_file(input) {
+            Err(e) => return Err(misuse(&cannot_read(input, &e))),
+            Ok(Some(sound)) => sound,
+            Ok(None) => {
+                return Err(misuse(&format!(
+                    "'{}' is not a recording — the product reads the names {}, and a file under \
+                     another name only when its content is one of those containers",
                     input.display(),
-                    listed(AUDIO_FORMATS.iter().map(|(name, _)| format!("'.{name}'"))),
-                ));
+                    listed(AUDIO_EXTENSIONS.iter().map(|name| format!("'.{name}'"))),
+                )));
             }
+        };
+        // A sound this machine has no decoder for is read through the product's own copy of ffmpeg,
+        // and this command never installs one: a missing copy is refused before the models are
+        // fetched for a file that could not be read.
+        if sound == Sound::Managed && crate::ffmpeg::installed().is_none() {
+            print_stderr(&format!(
+                "mahbot audio: '{}' is a sound this machine has no decoder for, and the product's \
+                 media toolchain is not installed here — the file cannot be read, and nothing was \
+                 transcribed",
+                input.display()
+            ));
+            return Err(Exit::Environment.code());
+        }
+        Ok(())
+    }
+
+    /// `transcribe`: the recording into text on standard output.
+    pub(super) async fn transcribe(input: &Path) -> i32 {
+        if let Err(code) = judge(input) {
+            return code;
         }
 
         if let Err(e) = ensure_ready_once(|dir| {
@@ -748,5 +776,31 @@ mod tests {
                 r.contains("is not a directory") && !r.contains("does not exist")
             })
         );
+    }
+
+    /// A sound this machine has no decoder for is refused before the models are fetched for a file
+    /// that could not be read, and the formats this machine reads itself are never refused for the
+    /// toolchain's absence.
+    #[serial_test::serial(ffmpeg_live, ffmpeg_releases)] // relocates the install root, points the release hook
+    #[test]
+    fn a_format_that_needs_the_toolchain_is_refused_before_any_fetch() {
+        use super::engine::judge;
+        use crate::cli::Exit;
+
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("ffmpeg");
+        let _root = crate::util::test::set_env_var(crate::ffmpeg::ROOT_ENV, root.to_str());
+        let _hook = crate::ffmpeg::ReleasesHook::at("http://127.0.0.1:1");
+        let recording = home.path().join("note.m4a");
+        std::fs::write(&recording, b"\0\0\0\x20ftypM4A \0\0\0\0").unwrap();
+        assert_eq!(judge(&recording), Err(Exit::Environment.code()));
+        // A recording this process decodes itself is not refused for the toolchain's absence.
+        let note = home.path().join("note.mp3");
+        std::fs::write(&note, b"\0\0\0\0\0\0\0\0").unwrap();
+        assert_eq!(judge(&note), Ok(()));
+        // A file that is not a recording at all is the caller's mistake, not a missing tool.
+        let text = home.path().join("notes.txt");
+        std::fs::write(&text, b"words").unwrap();
+        assert_eq!(judge(&text), Err(Exit::Usage.code()));
     }
 }

@@ -185,8 +185,9 @@ pub(crate) enum Exit {
     /// Not carried out, carried out only in part, or an outcome unknowable after
     /// the call went out (it may have happened — never the environment's class).
     Failed = 1,
-    /// Nothing ran: the environment — the instance, the engine, its models —
-    /// could not take the operation on. The environment, not the operation.
+    /// Nothing ran: the environment — the instance, the engine, its models, or a
+    /// component the operation's input needs — could not take the operation on. The
+    /// environment, not the operation.
     Environment = 2,
     /// The caller's own mistake: an invocation that cannot mean what it asks, and —
     /// for a frontend that opens the files itself — the paths it was handed.
