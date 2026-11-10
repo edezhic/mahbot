@@ -688,8 +688,8 @@ fn is_published_copy_at(manifest_dir: &Path) -> bool {
         && !is_registry_source_cache(manifest_dir)
 }
 
-/// How the running binary was installed — see [`UpdateMode`]. Bound once, for the
-/// same reason as [`is_published_copy`].
+/// Determine how the running binary was installed — see [`UpdateMode`]. Bound once, for the same
+/// reason as [`is_published_copy`].
 #[must_use]
 pub(crate) fn update_mode() -> UpdateMode {
     static MODE: OnceLock<UpdateMode> = OnceLock::new();
@@ -1686,7 +1686,8 @@ async fn execute_downloaded_update(pinned: Option<&semver::Version>) -> Result<(
     // the new file is placed at the standard location, which becomes the restart target.
     let current_exe = std::env::current_exe().context("Failed to resolve current_exe()")?;
     let (spawn_path, relocated) = if canonicalize_safe(&current_exe) == canonicalize_safe(&dest) {
-        // A swap that fails leaves the copy that is there working.
+        // The running file IS the standard location, so the swap rewrites it in place. A swap that
+        // fails leaves the copy that is there working.
         if let Err(e) = self_replace::self_replace(&fresh) {
             record_update_unfinished(admin_target.as_deref(), STANDARD_DIR_UNUSABLE).await;
             return Err(e).with_context(|| format!("Failed to swap binary at {}", fresh.display()));

@@ -379,8 +379,8 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::tools::chrome_daemon::run_watchdog(),
     );
 
-    // The sessions the runs that ended handed over (`mahbot::tools::chrome_release` owns what
-    // a release does and trusts).
+    // Ended-run chrome session releases: the sessions the runs that ended handed over
+    // (`mahbot::tools::chrome_release` owns what a release does and trusts).
     spawn_cancellable(
         &mut tasks,
         &shutdown_token,
@@ -805,7 +805,8 @@ fn main() -> Result<()> {
     // came back travels into the boot task, which reports it once the logs store can hold it.
     let slowdown = mahbot::power::exempt_from_slowdown();
 
-    // Before boot and before the interface exists; `shutdown` names the three sources.
+    // Subscribe to the platform's stop requests before boot and before the interface exists;
+    // `shutdown` names the three sources.
     mahbot::shutdown::install_stop_request_sources();
 
     // ALL instance temp files under one private root (`/tmp/mahbot`, mode 0700; `<user
@@ -933,9 +934,9 @@ fn main() -> Result<()> {
     .exit_on_close_request(false)
     .run();
 
-    // A Windows notification-area icon whose owner never removed it outlives the process as a
-    // stale one. An iced error is an exit as well; the self-update tail reaches the removal from
-    // its own thread.
+    // The interface is gone, so its tray icon goes with it: a Windows notification-area icon whose
+    // owner never removed it outlives the process as a stale one. An iced error is an exit as well;
+    // the self-update tail reaches the removal from its own thread.
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     mahbot::tray::remove();
     // Leaving with an error skips the teardown below — one of the exits `shutdown`'s module docs
@@ -1041,8 +1042,8 @@ async fn run_message_dispatch_loop(mut rx: tokio::sync::mpsc::Receiver<ChannelMe
         // This classification decides what the control plane does itself; the burst collector's
         // gate is it plus the button press, so nothing handled here is collected into a burst.
         match control_input(&msg) {
-            // Handled without the agent; spawned so a slow catalog validation in set_image_model
-            // never stalls this loop.
+            // An action payload is handled without the agent. Spawned so a slow catalog validation
+            // in set_image_model never stalls this loop.
             Some(ControlInput::Action(decoded)) => {
                 spawn(handle_action_callback(msg, decoded));
             }
@@ -1063,12 +1064,13 @@ async fn handle_bot_command(msg: &ChannelMessage, cmd: BotCommand) {
     match cmd {
         BotCommand::Start => handle_start_command(msg).await,
         BotCommand::Clear => handle_clear_session(msg).await,
-        // Available to every user: models are stored per-user, and every user has the Assistant
-        // role.
+        // Media model selection is available to every user (models are stored per-user, and every
+        // user has the Assistant role).
         BotCommand::ImageModels | BotCommand::VideoModels => {
             handle_models_command(msg, cmd == BotCommand::ImageModels).await;
         }
-        // Replies that there is nothing to switch — the Assistant is every account's only role.
+        // `/agents` replies that there is nothing to switch (the Assistant is every account's only
+        // role).
         BotCommand::Agents => handle_agents_command(msg).await,
         // Has its own dispatch path because it is workspace-independent and owns its own admin
         // gate and availability pre-check.
@@ -1095,7 +1097,8 @@ async fn send_telegram_reply(msg: &ChannelMessage, content: String) {
     mahbot::channels::telegram::send_reply(&msg.reply_target, &content).await;
 }
 
-/// Reply that there is nothing to switch: the Assistant is every account's only role.
+/// Handle `/agents` — reply that there is nothing to switch: the Assistant is every account's only
+/// role.
 async fn handle_agents_command(msg: &ChannelMessage) {
     send_telegram_reply(
         msg,
@@ -1104,8 +1107,8 @@ async fn handle_agents_command(msg: &ChannelMessage) {
     .await;
 }
 
-/// A per-user welcome message listing the commands available to the current admin state (no
-/// inline keyboard).
+/// Handle `/start` command for Telegram — sends a per-user welcome message listing the commands
+/// available to the current admin state (no inline keyboard).
 async fn handle_start_command(msg: &ChannelMessage) {
     let mut lines = vec![
         "\u{1F916} Welcome to MahBot!\n\nAvailable commands:".to_string(),
@@ -1117,7 +1120,8 @@ async fn handle_start_command(msg: &ChannelMessage) {
     send_telegram_reply(msg, lines.join("\n")).await;
 }
 
-/// Deletes the current session and confirms via the canonical delivery path.
+/// Handle session clearing for `/clear` and the "Clear session" inline button — deletes the current
+/// session and confirms via the canonical delivery path.
 async fn handle_clear_session(msg: &ChannelMessage) {
     // The session the user actually talks to: the same (role, workspace) resolution as routing —
     // DB-selected workspace, the single Assistant role, Assistant pinning.
@@ -1292,6 +1296,8 @@ async fn handle_archive_command(msg: &ChannelMessage) {
     }
 }
 
+/// Handle an action callback (`__act__` prefix).
+///
 /// Actions are processed inline without involving the Manager agent queue.
 async fn handle_action_callback(msg: ChannelMessage, decoded: (String, String)) {
     let (action, payload) = decoded;

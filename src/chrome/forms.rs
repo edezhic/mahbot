@@ -16,8 +16,8 @@ pub(crate) fn text_value_argv(text: &str) -> Vec<String> {
     }
 }
 
-/// The numeric sleep form (`wait 5000`) has no variant — [`wait_target`] rejects
-/// it before one can be built.
+/// What a `wait` waits for. The numeric sleep form (`wait 5000`) has no variant — [`wait_target`]
+/// rejects it before one can be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WaitTarget {
     Selector(String),
@@ -35,8 +35,8 @@ impl WaitTarget {
     }
 }
 
-/// `--timeout <ms>` IS forwarded — chrome-use's wait forms honor it (verified
-/// against 1.5.101); callers additionally bound the spawned step mahbot-side.
+/// Build `wait` argv for a safe target. `--timeout <ms>` IS forwarded — chrome-use's wait forms
+/// honor it (verified against 1.5.101); callers additionally bound the spawned step mahbot-side.
 pub(crate) fn wait_args(target: &WaitTarget, timeout_ms: u128) -> Vec<String> {
     let mut args = match target {
         WaitTarget::Selector(s) => vec!["wait".to_string(), s.clone()],
@@ -48,8 +48,8 @@ pub(crate) fn wait_args(target: &WaitTarget, timeout_ms: u128) -> Vec<String> {
     args
 }
 
-/// The safe allowlist subset of chrome-use's grammar (gone/request/no-errors and
-/// the --not/--regex/--no-wait flags are not exposed).
+/// An `expect` condition — the safe allowlist subset of chrome-use's grammar
+/// (gone/request/no-errors and the --not/--regex/--no-wait flags are not exposed).
 pub(crate) enum ExpectCond {
     State {
         selector: String,
@@ -108,7 +108,8 @@ pub(crate) fn parse_count_op(s: &str) -> Option<String> {
     valid.contains(&s).then(|| s.to_string())
 }
 
-/// Selector-first, chrome-use 1.5.101 grammar, plus the forwarded `--timeout <ms>`.
+/// Build `expect` argv (selector-first, chrome-use 1.5.101 grammar) plus the forwarded `--timeout
+/// <ms>`.
 pub(crate) fn expect_args(cond: &ExpectCond, timeout_ms: u128) -> Vec<String> {
     let mut args = match cond {
         ExpectCond::State { selector, state } => {
@@ -192,9 +193,9 @@ pub(crate) fn describe(cond: &ExpectCond) -> String {
     }
 }
 
-/// Exactly one of selector/url/text, with one policy and one error text for both
-/// frontends. A numeric selector is chrome-use's silent-sleep form (rc 0 without
-/// waiting): rejected here, never forwarded.
+/// Resolve the wait target from the caller-supplied parts — exactly one of selector/url/text, with
+/// one policy and one error text for both frontends. A numeric selector is chrome-use's
+/// silent-sleep form (rc 0 without waiting): rejected here, never forwarded.
 pub(crate) fn wait_target(
     selector: Option<&str>,
     url: Option<&str>,
@@ -239,7 +240,7 @@ pub(crate) enum ExtractGate<E> {
     Fail(E),
 }
 
-/// Shared by both frontends: count the rows selector ([`count_eval_js`]) and let
+/// The extract gate, shared by both frontends: count the rows selector ([`count_eval_js`]) and let
 /// [`ExtractGate`] decide.
 pub(crate) fn extract_gate<E>(count: Result<u64, E>) -> ExtractGate<E> {
     match count {
@@ -506,7 +507,8 @@ mod tests {
         assert!(wait_target(Some("#x"), Some("d"), Some("t")).is_err());
     }
 
-    /// `text`/`html`/`value` and `@<attribute>` pass, everything else is refused.
+    /// The `get:` grammar: `text`/`html`/`value` and `@<attribute>` pass, everything else is
+    /// refused.
     #[test]
     fn validate_extract_getters_accepts_the_grammar_and_rejects_the_rest() {
         struct Case {

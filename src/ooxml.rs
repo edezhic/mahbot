@@ -59,9 +59,9 @@ const PPT_COMMENT_AUTHORS_PART: &str = "ppt/commentAuthors.xml";
 /// `authorId` is a GUID into it.
 const PPT_MODERN_AUTHORS_PART: &str = "ppt/authors.xml";
 
-/// Picture formats a package embeds that this pipeline does not convert and the
-/// product's own picture list ([`crate::util::IMAGE_EXTENSIONS`]) does not name: named
-/// as images, with the reason, because that is what they are.
+/// Extensions of the picture formats a package embeds that this pipeline does not convert and the
+/// product's own picture list ([`crate::util::IMAGE_EXTENSIONS`]) does not name: named as images,
+/// with the reason, because that is what they are.
 const EMBEDDED_EXTRA_IMAGE_EXTENSIONS: &[&str] =
     &["gif", "bmp", "dib", "tif", "tiff", "ico", "jfif"];
 const EMBEDDED_AUDIO_EXTENSIONS: &[&str] = &[

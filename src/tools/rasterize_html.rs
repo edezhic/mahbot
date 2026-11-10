@@ -129,7 +129,7 @@ async fn capture(
         .await,
         name,
     );
-    // Only needed while the browser is looking at the page.
+    // The server is only needed while the browser is looking at the page.
     if let Some(server) = server.as_mut() {
         server.stop();
     }
@@ -396,7 +396,7 @@ async fn stop_session(cli: &Path, name: &str) {
     }
 }
 
-/// Removed on every exit path.
+/// The temporary screenshot file, removed on every exit path.
 struct TempCapture(PathBuf);
 
 impl Drop for TempCapture {
@@ -483,8 +483,9 @@ impl PageServer {
         &self.page_url
     }
 
-    /// Idempotent: the accept loop polls, so this returns within one poll; a connection already
-    /// accepted runs on its own thread to its own read or write bound and holds no listener.
+    /// Release the listening socket. Idempotent: the accept loop polls, so this returns within one
+    /// poll; a connection already accepted runs on its own thread to its own read or write bound
+    /// and holds no listener.
     fn stop(&mut self) {
         self.stopped.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
@@ -534,8 +535,8 @@ fn handle_connection(stream: &mut TcpStream, context: &ServerContext) {
     let _ = stream.write_all(&handle_request(&request, context));
 }
 
-/// The method, the target, and the two headers the authorization rules read. Bodies are not
-/// read — the one accepted method carries none.
+/// One parsed request: the method, the target, and the two headers the authorization rules read.
+/// Bodies are not read — the one accepted method carries none.
 struct Request {
     method: String,
     target: String,
@@ -624,8 +625,8 @@ fn handle_request(request: &Request, context: &ServerContext) -> Vec<u8> {
     else {
         return error_response(404, "Not Found");
     };
-    // A canonical target outside the workspace — a symlink that leaves it, a `..` that survived
-    // the component check — is not served.
+    // The hard boundary: a canonical target outside the workspace — a symlink that leaves it, a
+    // `..` that survived the component check — is not served.
     if !crate::util::is_within(&canonical, &context.root) {
         return error_response(404, "Not Found");
     }
@@ -733,7 +734,8 @@ fn error_response(code: u16, reason: &str) -> Vec<u8> {
     response
 }
 
-/// The token, then the document's path relative to the root, every segment percent-encoded.
+/// The page address: the token, then the document's path relative to the root, every segment
+/// percent-encoded.
 fn build_page_url(document: &Path, root: &Path, addr: SocketAddr, token: &str) -> String {
     let relative = document.strip_prefix(root).unwrap_or(document);
     let mut url = url::Url::parse(&format!("http://127.0.0.1:{}", addr.port()))
@@ -780,8 +782,8 @@ fn content_type_for(path: &Path) -> &'static str {
     }
 }
 
-/// Set by tests so no capture touches a real browser. Clone the hook out before invoking it, so
-/// the lock is never held across the render.
+/// A test stand-in for the browser: set by tests so no capture touches a real browser. Clone the
+/// hook out before invoking it, so the lock is never held across the render.
 #[cfg(test)]
 type CaptureHook = Arc<dyn Fn(&str) -> anyhow::Result<Vec<u8>> + Send + Sync>;
 
@@ -824,7 +826,8 @@ mod tests {
         PageServer::start(&root, &document, PathAccess::Workspace, "page").unwrap()
     }
 
-    /// Answered to EOF: status, headers (lower-cased names), and body.
+    /// One request over a fresh connection, answered to EOF: status, headers (lower-cased names),
+    /// and body.
     fn request(addr: SocketAddr, raw: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
         let mut stream = TcpStream::connect(addr).unwrap();
         stream.write_all(raw.as_bytes()).unwrap();

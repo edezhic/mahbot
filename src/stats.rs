@@ -179,6 +179,8 @@ impl crate::logs::LogStore {
     }
 }
 
+/// One per-operation LLM request stat row (the `llm_requests` table).
+///
 /// One row per completed LLM operation (agent iteration, extraction,
 /// summarization, consolidation) — retry attempts are aggregated into
 /// [`LlmRequestRecord::retry_attempts`]. Metadata only: no request inputs or outputs.
@@ -215,6 +217,8 @@ pub(crate) struct LlmRequestRecord {
     pub recorded_at: String,
 }
 
+/// One per-attempt LLM failure row (the `llm_failures` table).
+///
 /// One row per FAILED attempt of an LLM operation — including intermediate
 /// failures of operations that later succeeded and the terminal exhausted
 /// attempt. Grouped per operation via [`LlmFailureRow::operation_id`].

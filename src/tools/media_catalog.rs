@@ -22,7 +22,7 @@ pub mod image {
             max: i64,
         },
         Boolean,
-        /// Tolerated so a catalog evolution never breaks parsing.
+        /// Unknown constraint shape — tolerated so a catalog evolution never breaks parsing.
         Unknown,
     }
 
@@ -200,8 +200,8 @@ pub mod image {
         if let Some(info) = snapshot.find(model) {
             return reject_text_only(model, info).map(|()| Some(info.clone()));
         }
-        // Only absence from a freshly fetched catalog rejects; a failed refresh
-        // degrades to fail-open.
+        // Membership miss: one forced refresh + re-check. Only absence from a freshly fetched
+        // catalog rejects; a failed refresh degrades to fail-open.
         let Some(snapshot) = catalog.refresh_for_miss(&base).await else {
             return Ok(None);
         };
@@ -406,8 +406,8 @@ pub(crate) mod video {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    /// Every field is optional — the live catalog declares none of them for some
-    /// models (aleph-2).
+    /// Parsed per-model video-generation capabilities. Every field is optional — the live catalog
+    /// declares none of them for some models (aleph-2).
     #[derive(Debug, Clone, Default)]
     pub(crate) struct VideoModelInfo {
         pub(crate) resolutions: Option<Vec<String>>,

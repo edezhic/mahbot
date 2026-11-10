@@ -1611,7 +1611,7 @@ pub async fn deliver_unregistered_user_response(
         return;
     };
 
-    // reply_target from the original message when available (e.g. Telegram chat_id).
+    // Use reply_target from the original message when available (e.g. Telegram chat_id).
     let reply_target = job.reply_target.as_deref().unwrap_or(user_name);
     match deliver_on_channel(chan.as_ref(), user_name, reply_target, response, file_roots).await {
         DeliverOutcome::Unresolvable => warn!(

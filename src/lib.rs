@@ -198,10 +198,11 @@ pub(crate) struct DiagnosticsCommands {
 }
 
 impl DiagnosticsCommands {
-    /// Must match the array length in [`Self::commands`].
+    /// Number of command categories (must match the array length in [`Self::commands`]).
     pub const COMMAND_COUNT: usize = 7;
 
-    /// Spelled once so the label list and [`Self::commands`] cannot drift.
+    /// Label of the `unit-test` slot. Spelled once so the label list and [`Self::commands`] cannot
+    /// drift.
     pub(crate) const UNIT_TEST_LABEL: &str = "unit-test";
 
     pub const COMMAND_LABELS: [&str; Self::COMMAND_COUNT] = [
@@ -214,7 +215,7 @@ impl DiagnosticsCommands {
         Self::UNIT_TEST_LABEL,
     ];
 
-    /// `None` entries are undiscovered — skipped.
+    /// Ordered iterator of (label, command) pairs. `None` entries are undiscovered — skipped.
     #[must_use]
     pub fn commands(&self) -> [(&'static str, Option<&str>); Self::COMMAND_COUNT] {
         [
@@ -228,7 +229,8 @@ impl DiagnosticsCommands {
         ]
     }
 
-    /// Same ordering as [`Self::commands`]. Empty strings become `None`.
+    /// Build `DiagnosticsCommands` from an array of edit buffers (same ordering as
+    /// [`Self::commands`]). Empty strings become `None`
     #[must_use]
     pub fn from_buffers(buffers: &[String; Self::COMMAND_COUNT]) -> Self {
         Self {
@@ -334,7 +336,9 @@ impl Workspace {
         }
     }
 
-    /// The workspace path's last component, for display.
+    /// Return a human-readable display name derived from the workspace path.
+    ///
+    /// Uses the last path component (directory name).
     #[must_use]
     pub fn display_name(&self) -> String {
         last_path_component(self.as_path())
@@ -461,8 +465,8 @@ pub struct ChannelMessage {
     /// The channel this message originated from (e.g. `"telegram"`, `"gui"`).
     pub channel: String,
     pub workspace: String,
-    /// Set by the GUI sender for deduplication in the ChatEvent handler; `None` for
-    /// non-GUI channels.
+    /// Optimistic message ID set by the GUI sender for deduplication in the ChatEvent handler;
+    /// `None` for non-GUI channels.
     pub optimistic_id: Option<String>,
     /// Only set for Telegram callback queries (`__act__` prefix), to dismiss the
     /// loading spinner.
@@ -612,7 +616,8 @@ pub enum ChatEvent {
         channel: String,
         agent_role: Option<String>,
         workspace: String,
-        /// So the Home page can replace its optimistic message with the confirmed one.
+        /// Optional ID the GUI sender generated (via `ChannelMessage::optimistic_id`) so the Home
+        /// page can replace its optimistic message with the confirmed one.
         optimistic_id: Option<String>,
         /// Live GUI display only, deliberately NOT persisted to chat_history (e.g. the
         /// scripted onboarding exchange).
@@ -757,7 +762,7 @@ impl ChannelRegistry {
         }
     }
 
-    /// A snapshot of all registered channels (name → Arc clone).
+    /// Return a snapshot of all registered channels (name → Arc clone).
     pub fn list(&self) -> Vec<(String, Arc<dyn Channel>)> {
         self.channels
             .read()
@@ -863,10 +868,10 @@ pub(crate) struct ToolCallRecord {
     pub tool_name: String,
     /// Serialized arguments as JSON (credentials scrubbed).
     pub arguments: String,
-    /// Milliseconds.
+    /// Execution duration in milliseconds.
     pub duration_ms: i64,
     pub success: bool,
-    /// `None` on success.
+    /// Error message on failure (`None` on success).
     pub error_message: Option<String>,
 }
 
@@ -907,10 +912,10 @@ pub struct Agent {
     tools: Vec<Box<dyn crate::Tool>>,
     /// Chrome sessions this run opened, closed through the browser's own extension.
     chrome_sessions: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
-    /// Computed once from `tools` at construction time.
+    /// Cached tool specs — computed once from `tools` at construction time.
     pub(crate) tool_specs: Vec<ToolSpec>,
-    /// Cooperative mid-loop cancellation (a deliberate stop — GUI cancel, re-dispatch,
-    /// phase transition, or shutdown).
+    /// Cancellation token for cooperative mid-loop cancellation (a deliberate stop — GUI cancel,
+    /// re-dispatch, phase transition, or shutdown).
     cancel_token: CancellationToken,
     /// A workspace-pause (strict freeze) cancellation was requested for this run, set
     /// by `cancel_by_workspace_pause` — a FREEZE distinct from a code-driven
@@ -934,7 +939,8 @@ pub struct Agent {
     /// The user who triggered this run — tools route async sub-agent results back
     /// through it.
     pub(crate) user_name: String,
-    /// Gates the Assistant's widened toolset and role prompt.
+    /// Whether the triggering account is the admin — gates the Assistant's widened toolset and role
+    /// prompt.
     pub(crate) is_admin: bool,
     /// The channel origin (gui, telegram, voice, cli) of the triggering message.
     pub(crate) channel: String,
@@ -994,7 +1000,7 @@ pub struct Agent {
 /// Result of a single verification pass (code reviewer or functional tester).
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Verdict {
-    /// 0 (worst) to 10 (best).
+    /// Quality score from 0 (worst) to 10 (best).
     #[serde(deserialize_with = "de_verdict_score")]
     pub score: u8,
     #[serde(rename = "issues")]
@@ -1028,8 +1034,9 @@ pub(crate) struct AnalysisIssue {
     pub grade: IssueGrade,
 }
 
-/// Unlike the shared `Verdict` (the verification stage's score-based shape), analysis
-/// drops the score and grades each issue minor/major/blocker.
+/// Score-less analysis verdict: a list of individually-graded issues. Unlike the shared `Verdict`
+/// (the verification stage's score-based shape), analysis drops the score and grades each issue
+/// minor/major/blocker.
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct AnalysisVerdict {
     #[serde(rename = "issues")]
@@ -1214,9 +1221,9 @@ mod verdict_score_tests {
 
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct SanitationVerdict {
-    /// `true` = clean, `false` = garbage detected.
+    /// Whether the ticket passes sanitation (`true` = clean, `false` = garbage detected).
     pub pass: bool,
-    /// Empty when `pass` is `true`.
+    /// List of garbage/unwanted files found (empty when `pass` is `true`).
     #[serde(default)]
     pub garbage_files: Vec<String>,
     pub rationale: String,
@@ -1226,7 +1233,7 @@ pub(crate) struct SanitationVerdict {
 /// engineer's session for the ticket comment.
 #[derive(Clone, Debug, Deserialize)]
 pub(crate) struct EngineerSummary {
-    /// What was implemented / fixed / executed.
+    /// Concise bullet points of what was implemented / fixed / executed.
     #[serde(default)]
     pub items: Vec<String>,
     /// Measurements or figures the ticket explicitly asked for.
@@ -1247,6 +1254,8 @@ pub(crate) struct ToolSpec {
 #[async_trait]
 pub(crate) trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
+    /// Human-readable description of this tool.
+    ///
     /// The default implementation loads the description from
     /// `src/prompt/tool/{name}.md` in the embedded prompt assets.
     fn description(&self) -> String {
@@ -1533,7 +1542,8 @@ pub(crate) struct ChatResponse {
     pub reasoning: Option<Reasoning>,
     /// `choices[0].finish_reason` from the provider envelope (stop/length/tool_calls/…).
     pub finish_reason: Option<String>,
-    /// Top-level OpenRouter response field, undocumented in the API reference.
+    /// Serving upstream provider — top-level OpenRouter response field (undocumented in the API
+    /// reference); NULL when omitted.
     pub upstream_provider: Option<String>,
     /// Provider `system_fingerprint` (eviction/backend-switch attribution).
     pub system_fingerprint: Option<String>,

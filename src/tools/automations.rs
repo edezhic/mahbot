@@ -32,8 +32,9 @@ fn identity() -> Result<AssistantIdentity> {
     })
 }
 
-/// An automation may carry a `trigger`: one custom tool available to its owner plus that tool's
-/// arguments, run at fire time so the Assistant is woken only when the check reports something.
+/// The `add_automation` tool. An automation may carry a `trigger`: one custom tool available to its
+/// owner plus that tool's arguments, run at fire time so the Assistant is woken only when the check
+/// reports something.
 pub struct AddAutomationTool;
 
 #[async_trait]
@@ -295,9 +296,9 @@ mod tests {
             .await
     }
 
-    /// The removed `command` parameter is refused for any value (an explicit null counts as not
-    /// passing it), a tool the caller cannot call is refused before anything is looked up, and an
-    /// argument the named tool does not declare is refused rather than stored.
+    /// The arming gate: the removed `command` parameter is refused for any value (an explicit null
+    /// counts as not passing it), a tool the caller cannot call is refused before anything is
+    /// looked up, and an argument the named tool does not declare is refused rather than stored.
     #[tokio::test]
     async fn arming_refuses_the_removed_command_an_unavailable_tool_and_undeclared_arguments() {
         crate::util::test::init_management_test_stores().await;

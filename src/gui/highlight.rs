@@ -518,6 +518,7 @@ impl HighlightLanguage {
     }
 }
 
+// Highlight queries
 // These queries use tree-sitter's pattern syntax to capture tokens.
 // Each capture name maps to a HighlightClass via capture_class().
 

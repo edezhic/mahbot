@@ -1294,7 +1294,7 @@ fn test_forget_directory_prunes_path_descendants_and_root() {
 fn test_dir_deleted_cases() {
     type Check = fn(&EditorState) -> Result<(), String>;
 
-    /// Prunes the directory and registers a re-read.
+    /// The GUI-delete success path prunes the directory and registers a re-read.
     fn pruned_and_refreshed(state: &EditorState) -> Result<(), String> {
         let tree = &state.file_tree;
         for (what, kept) in [

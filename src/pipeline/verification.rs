@@ -123,9 +123,9 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     if guard_job_phase(&ticket.id, ACTIVE_PHASE, &job_id).await {
         return;
     }
-    // The workspace's discovered diagnostics commands, read once before anything is
-    // dispatched: not being able to read them is a technical failure (no bounce budget) — the
-    // round cannot be judged without knowing them.
+    // The round's project-commands part — the workspace's discovered diagnostics commands — read
+    // once before anything is dispatched: not being able to read them is a technical failure (no
+    // bounce budget) — the round cannot be judged without knowing them.
     let commands = match crate::workspace::store().get_diagnostics(&ws.name).await {
         Ok(Some(cmds)) if !cmds.is_empty() => Some(cmds),
         Ok(_) => None,

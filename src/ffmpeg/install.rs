@@ -64,8 +64,8 @@ const LICENCE_AND_SOURCE: [&str; 2] = ["LICENCE.txt", "SOURCE.txt"];
 /// material it has serves a host better than no pair at all.
 const COMPONENT_NOTICES: &str = "LICENCES.txt";
 
-/// Windows decides executability by extension ([`crate::util::is_executable`]), so the
-/// suffix is part of the name there and nowhere else.
+/// The two binaries' file names on this platform. Windows decides executability by extension
+/// ([`crate::util::is_executable`]), so the suffix is part of the name there and nowhere else.
 const fn ffmpeg_file() -> &'static str {
     if cfg!(windows) {
         "ffmpeg.exe"
@@ -165,7 +165,7 @@ fn binaries_in(dir: &Path) -> Binaries {
     }
 }
 
-/// `None` when either file is missing or cannot be executed.
+/// The pair inside one tag directory, or `None` when either file is missing or cannot be executed.
 fn binaries_at(dir: &Path) -> Option<Binaries> {
     let binaries = binaries_in(dir);
     (crate::util::is_executable(&binaries.ffmpeg) && crate::util::is_executable(&binaries.ffprobe))
@@ -184,8 +184,8 @@ async fn installing<T, E>(attempt: impl AsyncFnOnce() -> Result<T, E>) -> Result
     attempt().await
 }
 
-/// Whatever pair is in use, and — when there is none — the newest build the stream
-/// offers, installed first.
+/// The copy a video operation runs: whatever pair is in use, and — when there is none — the newest
+/// build the stream offers, installed first.
 ///
 /// A copy in place is used as it stands, with no proof and no network round-trip: it was
 /// proved before it was placed and the boot task re-proves it, so a pair damaged since
@@ -222,15 +222,15 @@ enum Standing {
     Missing,
 }
 
-/// The step that failed, and what the host is left running.
+/// A start that failed: the step that failed, and what the host is left running.
 #[derive(Debug)]
 struct Failure {
     reason: String,
     standing: Standing,
 }
 
-/// Bring this host to the newest build the stream offers: called once by the binary and
-/// never failing the boot.
+/// The boot task: bring this host to the newest build the stream offers, called once by the binary
+/// and never failing the boot.
 pub async fn install_on_start() {
     match update().await {
         Ok(None) => tracing::debug!("ffmpeg needs nothing at this start"),
@@ -258,7 +258,7 @@ fn report_failure(failure: &Failure) {
     }
 }
 
-/// Proved with two local `-version` runs and no network.
+/// What the host runs now, proved with two local `-version` runs and no network.
 async fn standing(root: &Path) -> Standing {
     match chosen(root) {
         Some((in_use, binaries)) if proves_itself(&binaries, &in_use.upstream).await => {
@@ -317,7 +317,7 @@ async fn proves_itself(binaries: &Binaries, upstream: &Version) -> bool {
         && reports_upstream(&binaries.ffprobe, upstream).await
 }
 
-/// So no later operation in this process pays for it again.
+/// Record a failed attempt, so no later operation in this process pays for it again.
 fn recorded(reason: String) -> String {
     *ATTEMPT_FAILURE.lock().unwrap_poison() = Some(reason.clone());
     reason
@@ -480,7 +480,8 @@ fn extract_into(archive: &Path, staging: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Whichever container this platform's release uses.
+/// Extract `required` and `optional` out of `archive` into `dir`, whichever container this
+/// platform's release uses.
 fn extract(
     archive: &Path,
     dir: &Path,
@@ -587,7 +588,7 @@ mod tests {
         root.join(tag)
     }
 
-    /// For the checks that drive [`install`] and the banner.
+    /// The build a tag names, for the checks that drive [`install`] and the banner.
     fn build(tag: &str) -> Build {
         let (upstream, _) = parse_tag(tag).expect("a parsable tag");
         Build {
@@ -1072,7 +1073,7 @@ mod tests {
         }
     }
 
-    /// The listing, the bytes registered for its path, or a 404.
+    /// Answer one request: the listing, the bytes registered for its path, or a 404.
     #[cfg(unix)]
     fn serve(
         mut stream: TcpStream,
@@ -1230,7 +1231,8 @@ mod tests {
             "only the listing is read again"
         );
 
-        // Picked up by a later start, and the build it replaces is pruned.
+        // A build published after this product binary was is picked up by a later start, and the
+        // build it replaces is pruned.
         let newer = "ffmpeg-v7.1-mahbot.3";
         let asset = host_asset(newer);
         let archive = archive_bytes(files.path(), newer);
@@ -1287,7 +1289,8 @@ mod tests {
             );
         }
 
-        // Replaced by the build the stream offers, and removed.
+        // A copy whose tag outranks the stream's newest is replaced by the build the stream offers,
+        // and removed.
         {
             let files = tempfile::tempdir().expect("stand-in release files");
             let (_home, _lock, root) = temp_root();
@@ -1328,7 +1331,8 @@ mod tests {
         }
     }
 
-    /// Nothing is installed, nothing is reported, and the copy stays in use.
+    /// A stream that cannot be read leaves a copy that proves itself alone: nothing is installed,
+    /// nothing is reported, and the copy stays in use.
     #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(ffmpeg_releases)]

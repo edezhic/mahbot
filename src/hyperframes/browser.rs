@@ -55,8 +55,8 @@ pub(super) struct Shell {
 /// finish proving the one it has.
 #[derive(Debug)]
 pub(super) enum Unavailable {
-    /// No cached build runs here and no download produced one. The sentence names the failing
-    /// step and carries no URL.
+    /// Nothing can be launched: no cached build runs here and no download produced one. The
+    /// sentence names the failing step and carries no URL.
     Missing(String),
     /// The build is there, but the product's own check of it was stopped — never the build's
     /// verdict. The reason is reported when no older copy proves, nothing is recorded against the

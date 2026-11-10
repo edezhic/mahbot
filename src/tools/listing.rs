@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::fmt::Write;
 
 pub(crate) struct ListingEntry {
-    /// Without the directory mark and without any link target.
+    /// Entry name, without the directory mark and without any link target.
     pub name: String,
     pub is_dir: bool,
     /// `None` when the platform could not measure it — rendered as `?`, the size

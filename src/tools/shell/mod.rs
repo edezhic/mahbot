@@ -2461,10 +2461,10 @@ impl ShellTool {
                 .map_err(anyhow::Error::msg)?,
         }
 
-        // `exec_str` may be the grep-engine rewrite — run through its plan when one was built, and
-        // through the shell otherwise. The ORIGINAL `command_str` is what `process_shell_output`
-        // sees below, so the grep output profile keeps matching and `cd … &&` chains still
-        // navigate.
+        // Execute with timeout to prevent hanging commands. `exec_str` may be the grep-engine
+        // rewrite — run through its plan when one was built, and through the shell otherwise. The
+        // ORIGINAL `command_str` is what `process_shell_output` sees below, so the grep output
+        // profile keeps matching and `cd … &&` chains still navigate.
         let mut result = if let Some(plan_run) = &plan_run {
             plan::run(
                 plan_run,

@@ -113,7 +113,7 @@ pub(crate) fn render_timestamp() -> String {
     format!("{} ({})", now.format("%Y-%m-%d %H:%M:%S"), now.format("%Z"))
 }
 
-/// User message with a `<timestamp>` block appended. `round_ts` (pre-rendered via
+/// Build a user message with a `<timestamp>` block appended. `round_ts` (pre-rendered via
 /// [`render_timestamp`]) pins one value per round so parallel members share a byte-identical first
 /// message; `None` stamps now (mid-round injected content).
 #[must_use]
@@ -279,7 +279,7 @@ fn session_metadata_from_row(
 const INSERT_SESSION_ROW: &str =
     "INSERT INTO sessions (agent_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)";
 
-/// Session metadata a message batch writes in the SAME transaction as its rows: the describing
+/// The session metadata a message batch writes in the SAME transaction as its rows: the describing
 /// columns (only a batch that also sets them — a session's first turn) and the leading context
 /// block's length (only the batch that wrote the block).
 #[derive(Clone, Copy, Default)]

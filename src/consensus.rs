@@ -188,7 +188,7 @@ pub(crate) fn bracket_label(n: usize, n_valid: usize, disputed: bool) -> String 
     }
 }
 
-/// One member line attributed to its source: `Agent N: text`.
+/// Render one member line attributed to its source: `Agent N: text`.
 #[must_use]
 pub(crate) fn render_member_line(member: &GroupingMember, table: &ItemTable<'_>) -> String {
     match table.resolve(member.id) {

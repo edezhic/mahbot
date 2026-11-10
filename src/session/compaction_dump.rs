@@ -60,8 +60,8 @@ pub(crate) async fn dump_deleted_messages(
     Some(path)
 }
 
-/// The messages `old_history` contributes to the dump: everything except the retained window
-/// and System-role messages.
+/// Compute the messages `old_history` contributes to the dump: everything except the retained
+/// window and System-role messages.
 ///
 /// Multiset matching, not set matching: each non-System message consumes the FIRST
 /// not-yet-consumed equal message (role + content) in `retained_window`, so two identical user
@@ -160,7 +160,7 @@ async fn dump_dir(role: &Role, user_name: &str) -> Option<PathBuf> {
     Some(dir)
 }
 
-/// `compaction-{sanitized_agent_id}-{seq:03}-{unix_millis}.md`.
+/// Pick the next dump path: `compaction-{sanitized_agent_id}-{seq:03}-{unix_millis}.md`.
 ///
 /// `seq` is per-session monotonic, derived by counting existing files with the same prefix (from
 /// 1). The unix-millis suffix keeps names unique even after an earlier dump was reclaimed. `None`

@@ -1363,8 +1363,9 @@ fn resolve_window(
             // Strictly the frontmost app's focused window: a coordinate action on a fallback surface would
             // land on whatever is visible (another Space, a minimized window).
             let Some(window) = focused_window_of_app(&app) else {
-                // Only a live application's answer says it has no focused window; one that does not answer at
-                // all must be named as such instead.
+                // Both leave AXFocusedWindow unset, and only a live application's answer says it
+                // has no focused window: one that does not answer at all must be named as such
+                // instead.
                 return Err(match attribute_value(&app, &axc(AX_ROLE)) {
                     Ok(_) => core::taxonomy_error(
                         core::ERR_NOT_MATCHED,

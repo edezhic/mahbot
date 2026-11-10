@@ -57,7 +57,8 @@ pub async fn run_telegram_server_supervisor() {
     telegram_local::run_supervisor().await;
 }
 
-/// Called from the exits that skip destructors as well as the ordinary shutdown.
+/// Stop the self-hosted Telegram Bot API server, if this process runs one. Called from the exits
+/// that skip destructors as well as the ordinary shutdown.
 pub async fn stop_telegram_server() {
     telegram_local::stop_for_exit().await;
 }

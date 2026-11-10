@@ -31,7 +31,8 @@ const RESERVED_DEVICE_NAMES: [&str; 30] = [
     "com³", "lpt¹", "lpt²", "lpt³", "conin$", "conout$",
 ];
 
-/// In the words the refusal uses; `None` when it can.
+/// Why `name` cannot be a directory name on every platform the product runs on, in the words the
+/// refusal uses; `None` when it can.
 #[must_use]
 pub(crate) fn folder_name_problem(name: &str) -> Option<&'static str> {
     if name.is_empty() {

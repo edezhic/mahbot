@@ -13,7 +13,7 @@
 //! animation that would re-arm its own redraw reads [`hidden`].
 use std::sync::atomic::{AtomicBool, Ordering};
 
-// Only the platforms whose window is the app's own hide one.
+// The hidden window itself: only the platforms whose window is the app's own hide one.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use super::Message;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -28,13 +28,14 @@ use objc2_app_kit::{NSApplication, NSWindow};
 
 static HIDDEN: AtomicBool = AtomicBool::new(false);
 
-/// Every animation that would re-arm its own redraw stops while this is true.
+/// Whether the dashboard's window is hidden: every animation that would re-arm its own redraw stops
+/// while this is true.
 pub(crate) fn hidden() -> bool {
     HIDDEN.load(Ordering::Relaxed)
 }
 
-/// What hiding and showing the window do before they touch it, and what a launch the updater
-/// restarted hidden starts with (see `main`).
+/// Set the hidden flag — what hiding and showing the window do before they touch it, and what a
+/// launch the updater restarted hidden starts with (see `main`).
 pub fn set_hidden(hidden: bool) {
     HIDDEN.store(hidden, Ordering::Relaxed);
 }
@@ -42,8 +43,8 @@ pub fn set_hidden(hidden: bool) {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 static LOGIN_START: AtomicBool = AtomicBool::new(false);
 
-/// Such a launch is not a second launch and never brings the window up by itself — see
-/// [`login_start`].
+/// Record that the system started the process at login (`crate::autostart`). Such a launch is not a
+/// second launch and never brings the window up by itself — see [`login_start`].
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn set_login_start(login_start: bool) {
     LOGIN_START.store(login_start, Ordering::Relaxed);
@@ -66,9 +67,9 @@ pub(crate) fn hide() -> Task<Message> {
     window::latest().and_then(|id| window::set_mode(id, window::Mode::Hidden))
 }
 
-/// Out of the hidden state and out of the minimized one, in front — including while another
-/// application is in front. Called for a window that has never been drawn too: the one a launch
-/// just created, and the launch the updater restarted hidden.
+/// Bring the window up: out of the hidden state and out of the minimized one, in front — including
+/// while another application is in front. Called for a window that has never been drawn too: the
+/// one a launch just created, and the launch the updater restarted hidden.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn show() -> Task<Message> {
     set_hidden(false);
@@ -136,7 +137,7 @@ fn hide_title_strip() {
         }
     }
     window.setTitlebarSeparatorStyle(NSTitlebarSeparatorStyle::None);
-    // No press over its band moves the window, and the app's own drags still do.
+    // The strip's drag: no press over its band moves the window, and the app's own drags still do.
     window.setMovable(false);
 }
 

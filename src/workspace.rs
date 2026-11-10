@@ -1256,6 +1256,8 @@ impl WorkspaceStore {
         Ok(json.map(|json| serde_json::from_str(&json)).transpose()?)
     }
 
+    /// Set freeform user-curated context notes for a workspace.
+    ///
     /// Truncates to `MAX_WORKSPACE_NOTES_CHARS` characters as defense-in-depth
     /// against prompt bloat. Notes are appended to every agent's system prompt.
     pub async fn set_notes(&self, name: &str, notes: &str) -> Result<()> {
@@ -1279,6 +1281,8 @@ impl WorkspaceStore {
         Ok(())
     }
 
+    /// Read the current generation counter for a workspace's `column`.
+    ///
     /// Used by discovery tasks to check whether the counter was bumped while
     /// they ran; if it no longer matches, their writes are stale.
     async fn get_generation(&self, name: &str, column: GenerationColumn) -> Result<i64> {
@@ -1423,7 +1427,8 @@ impl WorkspaceStore {
         Ok(())
     }
 
-    /// Replaces all existing records for this workspace.
+    /// Save the current set of open editor tabs for a workspace. Replaces all existing records for
+    /// this workspace.
     pub async fn save_editor_tabs(&self, name: &str, tabs: &[EditorTabRecord]) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         tx.execute(

@@ -59,7 +59,7 @@ impl NamespaceRecord {
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct TabEntry {
     name: String,
-    /// Of the call that last addressed this tab.
+    /// Recency sequence of the call that last addressed this tab.
     #[serde(default)]
     seq: u64,
     /// Addressing a closed tab is an error until a reached call revives it.
@@ -71,7 +71,7 @@ struct TabEntry {
     evicting: bool,
 }
 
-/// Ordered by namespace so the file's bytes are stable.
+/// The whole record: one entry per namespace, ordered by namespace so the file's bytes are stable.
 type Namespaces = BTreeMap<String, NamespaceRecord>;
 
 #[derive(Default)]
@@ -93,8 +93,9 @@ impl LedgerState {
         self.loaded_path = path;
     }
 
-    /// Fail-open: an in-memory-only store or a failed write leaves whatever was there, and a
-    /// serialization failure never publishes an empty payload over a live file.
+    /// Write the whole record out (compact JSON, atomic tmp+rename). Fail-open: an in-memory-only
+    /// store or a failed write leaves whatever was there, and a serialization failure never
+    /// publishes an empty payload over a live file.
     fn persist(&self) {
         let Some(path) = store_path() else {
             return;
@@ -138,7 +139,7 @@ fn ledger_state() -> &'static Mutex<LedgerState> {
     LEDGER.get_or_init(|| Mutex::new(LedgerState::default()))
 }
 
-/// The configured storage root, or whatever a test asked for.
+/// The store the record lives in: the configured storage root, or whatever a test asked for.
 fn store_path() -> Option<PathBuf> {
     #[cfg(test)]
     if let Some(store) = test_store() {
@@ -291,7 +292,7 @@ pub(crate) fn settle_eviction(namespace: &str, eviction: &Eviction, gone: bool) 
     }
 }
 
-/// Its tabs are gone: the run-end release concluded.
+/// Drop the whole record of one namespace (its tabs are gone — the run-end release concluded).
 pub(crate) fn forget_namespace(namespace: &str) {
     let mut state = ledger_state().lock().unwrap_poison();
     state.ensure_loaded();
@@ -300,8 +301,8 @@ pub(crate) fn forget_namespace(namespace: &str) {
     }
 }
 
-/// Once at boot: a namespace no live run, no held release record and no resumable job claims is
-/// past its tabs.
+/// Drop every record `protected` does not claim (called once at boot: a namespace no live run, no
+/// held release record and no resumable job claims is past its tabs).
 pub(crate) fn prune(protected: impl Fn(&str) -> bool) {
     let mut state = ledger_state().lock().unwrap_poison();
     state.ensure_loaded();
@@ -540,7 +541,8 @@ mod tests {
         );
     }
 
-    /// The surviving recency order still decides the victim.
+    /// The record survives a simulated restart, and the surviving recency order still decides the
+    /// victim.
     #[test]
     #[serial_test::serial(chrome_tabs)]
     fn the_record_survives_a_restart_with_its_order_intact() {

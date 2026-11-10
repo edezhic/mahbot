@@ -231,8 +231,8 @@ fn git_std_command(repo_root: Option<&Path>) -> std::process::Command {
     cmd
 }
 
-/// Async form of [`git_std_command`] and the only entry point for production async git
-/// subprocess creation in this module.
+/// Create a [`tokio::process::Command`] for `git` — the async form of [`git_std_command`], and the
+/// only entry point for production async git subprocess creation in this module.
 fn git_command(repo_root: Option<&Path>) -> tokio::process::Command {
     git_std_command(repo_root).into()
 }
@@ -476,9 +476,9 @@ pub(crate) fn notify_git_commit(repo_path: &Path) {
 /// A single entry from `git diff --numstat` / `git show --numstat` output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NumstatEntry {
-    /// `None` if the file is binary.
+    /// Lines added, or `None` if the file is binary.
     pub additions: Option<i64>,
-    /// `None` if the file is binary.
+    /// Lines deleted, or `None` if the file is binary.
     pub deletions: Option<i64>,
     /// File path as printed by git.
     pub path: String,
@@ -1099,7 +1099,8 @@ pub struct DiffStats {
     pub added: i64,
     /// Total lines removed (tracked diff only).
     pub removed: i64,
-    /// Oversized/binary untracked files, surfaced as a separate "N files" indicator.
+    /// Count of oversized/binary untracked files surfaced as a separate "N files" indicator, not
+    /// line counts.
     pub huge_binary_file_count: usize,
     /// Untracked files the bounded worktree read left out; both surfaces render
     /// [`Self::omitted_note`] for this.
@@ -1133,7 +1134,7 @@ pub enum UntrackedKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeChange {
-    /// Relative to the repository root (git reports root-relative paths even from a
+    /// Path relative to the repository root (git reports root-relative paths, even from a
     /// subdirectory workspace).
     pub path: String,
     /// Rename/copy source, when git detected one.
@@ -1300,6 +1301,8 @@ async fn classify_untracked_changes(
     (changes, omitted)
 }
 
+/// Capture the working-tree snapshot for a repository path.
+///
 /// A `git status --porcelain --untracked-files=all` failure is fatal: broken or missing git never
 /// yields a snapshot, so callers keep their last-known-good state (or default churn).
 pub async fn run_git_worktree_snapshot(repo_path: &Path) -> anyhow::Result<GitWorktreeSnapshot> {

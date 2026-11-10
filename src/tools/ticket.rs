@@ -962,7 +962,7 @@ mod tests {
                 expected: 5,
             },
         ] {
-            // 0 = highest urgency.
+            // A ticket with a non-default priority (0 = highest urgency).
             let old_id = TicketBuilder::new(store, &ws)
                 .title("Old ticket")
                 .priority(0)
@@ -1031,8 +1031,9 @@ mod tests {
             );
         }
 
-        // Binds a bare number to the bound workspace but takes any well-formed
-        // prefix verbatim; malformed IDs are the shared parser's business.
+        // `resolve_any_ticket_id` binds a bare number to the bound workspace but takes any
+        // well-formed prefix verbatim; malformed IDs are the shared parser's business, already
+        // pinned above.
         assert_eq!(resolve_any_ticket_id("ws", "123").unwrap(), "ws-123");
         assert_eq!(resolve_any_ticket_id("ws", "  7 ").unwrap(), "ws-7");
         assert_eq!(
@@ -1065,8 +1066,8 @@ mod tests {
             .expect("bare number should resolve");
         assert_eq!(result, expected);
 
-        // Accepted even from another workspace — the archive search spans the
-        // installation, so its hits must open here.
+        // A fully prefixed ID is accepted even from another workspace — the archive search spans
+        // the installation, so its hits must open here.
         let foreign = test_ws("/other");
         let result = GetTicketTool::new("manager", &foreign)
             .execute(&foreign, json!({"ticket_id": id, "full": true}))

@@ -80,6 +80,8 @@ impl LogEntry {
     }
 }
 
+/// Turso-backed log store.
+///
 /// NOTE: opened manually inside [`init_tracing()`] rather than through `define_store!`, because
 /// bootstrapping order needs logs available before the other stores. See [`LOG_STORE`].
 #[derive(Clone, Debug)]

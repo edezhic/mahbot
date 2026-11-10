@@ -154,6 +154,7 @@ pub(crate) fn build_ledger_with_sources(
                 });
             }
         }
+        // A message produces at most one entry, so the delta is that entry's
         // source row.
         if entries.len() != before {
             sources.push(index);

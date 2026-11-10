@@ -55,16 +55,16 @@ use crate::bench_openrouter::select::{
 /// Tokens; a provider below this is not benchmarked.
 const MIN_CONTEXT: i64 = 128_000;
 
-/// Establish the base cache before the ladder.
+/// Warmup rounds per provider: establish the base cache before the ladder.
 const WARMUP_ROUNDS: usize = 2;
 
 const CHARS_PER_TOKEN: f64 = 4.0;
 
-/// Added to the prefix estimate: the conversation grows across the 2 warmup + N
-/// ladder rounds.
+/// Fixed prompt-history growth (tokens) added to the prefix estimate: the conversation grows across
+/// the 2 warmup + N ladder rounds.
 const HISTORY_GROWTH_TOKENS: f64 = 3360.0;
 
-/// `Usage` → exit 2 (with usage on stderr), `Hard` → exit 1.
+/// A CLI failure: `Usage` → exit 2 (with usage on stderr), `Hard` → exit 1.
 #[derive(Debug)]
 pub(crate) enum CliError {
     Usage(String),
@@ -115,7 +115,8 @@ fn model_slug(model: &str) -> String {
     slug
 }
 
-/// The inline `--flag=value` part or the next argument; advances `i` in the latter case.
+/// Fetch the value of `flag` — either the inline `--flag=value` part or the next argument; advances
+/// `i` in the latter case.
 fn next_value(
     args: &[String],
     i: &mut usize,
@@ -482,9 +483,9 @@ fn read_config_value(
     }
 }
 
-/// Called from `main()` on a current-thread runtime, before the instance flock is
-/// acquired. `-h`/`--help` prints usage to stdout and exits 0; usage errors print
-/// usage to stderr and exit 2; hard errors exit 1.
+/// Full `bench-openrouter` CLI entry. Called from `main()` on a current-thread runtime, before the
+/// instance flock is acquired. `-h`/`--help` prints usage to stdout and exits 0; usage errors print
+/// usage to stderr and exit 2; hard errors exit 1; a successful dry-run exits 0.
 pub async fn run_cli() -> i32 {
     let args: Vec<String> = std::env::args().skip(2).collect();
 
@@ -580,8 +581,8 @@ the streaming probe, and the /generation audit.
     )
 }
 
-/// The reasoning effort the run will request and which request parameters the model
-/// advertises support for.
+/// Model-level capabilities resolved from the discovery catalog: the reasoning effort the run will
+/// request and which request parameters the model advertises support for.
 pub(crate) struct ModelConfig {
     reasoning_effort_used: Option<String>,
     supports_tools: bool,
@@ -624,7 +625,8 @@ pub(crate) struct SelectionBundle {
     per_provider_guard: f64,
 }
 
-/// Cost estimate + health classification → selection decisions → plan cost.
+/// Build the selection bundle: per-endpoint cost estimate + health classification → selection
+/// decisions → plan cost.
 fn build_selection(opts: &BenchOptions, snapshot: &DiscoverySnapshot) -> SelectionBundle {
     let rounds = rounds_per_provider(&opts.ladder_secs);
     let total_tokens = total_tokens_estimate(opts.prefix_chars, rounds);
@@ -657,7 +659,8 @@ fn build_selection(opts: &BenchOptions, snapshot: &DiscoverySnapshot) -> Selecti
     }
 }
 
-/// Resolved key, discovery snapshot, model config, and selection.
+/// Everything the dry-run plan and the full-run executor need from the shared preamble: resolved
+/// key, discovery snapshot, model config, and selection.
 struct RunPreamble {
     key: String,
     key_source: &'static str,
@@ -758,8 +761,8 @@ async fn dry_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) ->
     0
 }
 
-/// Discovery + selection → one task per selected provider (staggered) → TTL-ladder
-/// rounds → report artifacts.
+/// The full-run executor: discovery + selection → one task per selected provider (staggered) →
+/// TTL-ladder rounds → report artifacts.
 ///
 /// `0` when the artifacts were written and the run was not aborted at run level; `1`
 /// on a hard failure or a run-level abort (spend cap / outer deadline / auth /
@@ -962,7 +965,7 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
     exit_code
 }
 
-/// Bundled so `build_plan` is pure and testable without I/O.
+/// All inputs the plan builder needs (bundled so `build_plan` is pure and testable without I/O).
 pub(crate) struct PlanData<'a> {
     pub opts: &'a BenchOptions,
     pub snapshot: &'a DiscoverySnapshot,
@@ -985,8 +988,8 @@ pub(crate) fn rounds_per_provider(ladder_secs: &[u64]) -> usize {
     WARMUP_ROUNDS + ladder_secs.len() + 1
 }
 
-/// The prefix-size estimate (`prefix_chars / chars-per-token`) across all rounds plus
-/// the fixed prompt-history growth.
+/// Total tokens per provider for the cost estimate: the prefix-size estimate (`prefix_chars /
+/// chars-per-token`) across all rounds, plus the fixed prompt-history growth.
 #[must_use]
 #[expect(clippy::cast_precision_loss)] // usize→f64 exact below 2^53; estimate math
 pub(crate) fn total_tokens_estimate(prefix_chars: usize, rounds: usize) -> f64 {

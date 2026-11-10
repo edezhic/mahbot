@@ -453,7 +453,8 @@ async fn video_timeline(path: &std::path::Path) -> Annotation {
     }
 }
 
-/// The annotation to add and whether the source temp file may be deleted.
+/// Handle an AUDIO marker, answering the annotation to add and whether the source temp file may be
+/// deleted.
 ///
 /// Only this message's own inbound attachment is transcribed; a recording above the
 /// automatic-processing bound is saved to the workspace instead (only the local Bot API server
@@ -750,7 +751,8 @@ impl Annotation {
     }
 }
 
-/// What the finished message gets prepended/appended, and which temp artifacts the pass consumed.
+/// Accumulators shared by the per-kind marker handlers in [`enrich_message`]: what the finished
+/// message gets prepended/appended, and which temp artifacts the pass consumed.
 #[derive(Default)]
 struct EnrichmentBatch {
     /// Annotation blocks prepended to the finished message.
@@ -933,8 +935,8 @@ pub async fn enrich_message(msg: &mut ChannelMessage, workspace_path: Option<&st
                 }
             }
             MediaMarkerKind::Audio => {
-                // Only this message's own inbound attachment is transcribed or deleted; an
-                // out-of-scope marker degrades to the icon only.
+                // macOS: containment applies — only this message's own inbound attachment is
+                // transcribed or deleted; an out-of-scope marker degrades to the icon only.
                 let (annotation, delete_temp) = handle_audio(
                     path,
                     path_obj,
@@ -1155,8 +1157,8 @@ mod tests {
         crate::util::telegram_files_root()
     }
 
-    /// The containment root must exist before path canonicalization — a missing root makes every
-    /// path look out of scope.
+    /// Create the daemon's Telegram temp dir. The containment root must exist before path
+    /// canonicalization — a missing root makes every path look out of scope.
     async fn ensure_telegram_files_dir() {
         tokio::fs::create_dir_all(telegram_root()).await.unwrap();
     }
@@ -1195,7 +1197,8 @@ mod tests {
         (msg_dir, attachment)
     }
 
-    /// In scope for [`inbound_msg`] with the same message id.
+    /// An inbound attachment of [`TEST_CHAT_ID`]: in scope for [`inbound_msg`] with the same
+    /// message id.
     async fn inbound_attachment_fixture(
         message_id: i64,
         file_name: &str,
@@ -1204,7 +1207,8 @@ mod tests {
         telegram_attachment_fixture(TEST_CHAT_ID, message_id, file_name, bytes).await
     }
 
-    /// Plus a workspace to ingest it into. Returns `(tmp_root, ws_path, msg_dir, attachment)`.
+    /// Set up an inbound attachment of [`TEST_CHAT_ID`] plus a workspace to ingest it into. Returns
+    /// `(tmp_root, ws_path, msg_dir, attachment)`.
     async fn inbound_ingest_fixture(
         prefix: &str,
         message_id: i64,

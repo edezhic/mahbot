@@ -3198,7 +3198,7 @@ mod tests {
             "the pending replay of a discarded result delivers nothing"
         );
 
-        // Gone for good: a second cancel answers like an id that never existed.
+        // The row is gone for good: a second cancel answers like an id that never existed.
         let answer = run_as_cancel_test_caller(
             &tool,
             &caller,

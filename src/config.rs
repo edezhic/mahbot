@@ -53,8 +53,8 @@ use tokio::fs;
 
 pub(crate) const DEFAULT_PROVIDER_ENDPOINT: &str = "https://openrouter.ai/api/v1";
 
-/// Pinned by `default_model_identifier_is_pinned` so a typo fails the suite instead of reaching
-/// a provider request.
+/// The default chat model for both slots. Pinned by `default_model_identifier_is_pinned` so a typo
+/// fails the suite instead of reaching a provider request.
 const DEFAULT_CHAT_MODEL: &str = "deepseek/deepseek-v4.1-flash-1017";
 pub(crate) const DEFAULT_MANAGER_MODEL: &str = DEFAULT_CHAT_MODEL;
 pub(crate) const DEFAULT_WORKER_MODEL: &str = DEFAULT_CHAT_MODEL;
@@ -159,7 +159,7 @@ pub struct ConfigData {
     /// When `None`, no explicit choice was made — text searches then go to
     /// DeepSeek and picture searches to Exa when that key is configured.
     pub web_search_provider: Option<String>,
-    /// Hot-reloaded on save.
+    /// Telegram Bot API token (hot-reloaded on save).
     pub telegram_bot_token: Option<String>,
     /// Which Bot API the Telegram transport talks to: `"local"` serves the bot
     /// from the product's own self-hosted server, anything else (or no row) is
@@ -1023,7 +1023,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
                 warning: None,
             });
         }
-        // Hot-reloads the listener after the write.
+        // Telegram token change hot-reloads the listener after the write.
         CONFIG_KEY_TELEGRAM_BOT_TOKEN => {
             let old_token = CONFIG.telegram_bot_token();
             let new_token = trimmed_or_none(&trimmed);

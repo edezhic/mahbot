@@ -32,8 +32,8 @@ pub(crate) enum StoreShape {
     /// No data file — a genuine first launch; the store is created.
     Absent,
     Present,
-    /// Exists but fails the file-level shape check. The service refuses to start; the file is left
-    /// untouched.
+    /// The data file exists but fails the file-level shape check. The service refuses to start; the
+    /// file is left untouched.
     Unusable(ShapeDefect),
 }
 

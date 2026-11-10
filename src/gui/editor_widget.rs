@@ -269,7 +269,8 @@ impl EditorBuffer {
         content
     }
 
-    /// The extension should be the file extension without the dot
+    /// Set the file extension for fallback comment prefix lookup. The extension should be the file
+    /// extension without the dot.
     fn set_file_extension(&self, ext: Option<&str>) {
         *self.file_extension.borrow_mut() = ext.map(String::from);
     }
@@ -576,7 +577,8 @@ impl EditorBuffer {
         }
     }
 
-    /// Returns `None` when the start line is past the end of the buffer.
+    /// Clamp the selection range to valid line boundaries. Returns `None` when the start line is
+    /// past the end of the buffer.
     fn clamped_selection_range(&self) -> Option<(usize, usize, usize, usize)> {
         let (sl, sc, el, ec) = self.selection_range();
         let line_count = self.line_count();
@@ -1335,8 +1337,8 @@ impl EditorBuffer {
         });
     }
 
-    /// No-op at the buffer boundaries; the cursor lands on the moved
-    /// block's first line in both directions.
+    /// Move the current line (or selected lines) up or down by one. No-op at the buffer boundaries;
+    /// the cursor lands on the moved block's first line in both directions.
     fn do_move_line(&self, up: bool) {
         let line_count = self.line_count();
         if line_count <= 1 {
@@ -3379,6 +3381,7 @@ where
     }
 }
 
+/// Interaction reported by [`EditorWidget`] at a cursor position.
 ///
 /// The editor claims [`mouse::Interaction::Text`] only while the cursor is
 /// over its own bounds, matching iced's `text_editor`/`text_input`. Reporting
@@ -3495,7 +3498,8 @@ where
     );
 }
 
-/// Rendered before selection so selection teal appears on top.
+/// Draw find match highlight backgrounds behind text. Rendered before selection so selection teal
+/// appears on top.
 fn draw_find_match_highlights<Renderer>(
     renderer: &mut Renderer,
     buffer: &cosmic_text::Buffer,
@@ -3708,6 +3712,7 @@ const fn is_cursor_movement_key(key: &key::Key) -> bool {
     )
 }
 
+/// Map a keyboard key + modifiers to an [`EditorAction`].
 ///
 /// `has_text` is `true` when the `KeyPressed` event carried a non-empty
 /// `text` field (dead key / IME / AltGr composition). Only used for
@@ -3869,6 +3874,7 @@ fn map_key_to_action(
                 }
             }
 
+            // SelectAll via platform mod + A
             // Guard: !altgr_active prevents AltGr+A (on non-macOS) from
             // triggering SelectAll.
             if !altgr_active && latin == Some('a') && platform_mod && !shift {

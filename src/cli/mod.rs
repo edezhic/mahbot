@@ -1062,7 +1062,7 @@ const DOCUMENT_SLIDE_SIZE_FLAG: Flag = Flag {
     purpose: "A pptx slide size: widescreen, standard or portrait; unnamed is the tool's own default deck",
 };
 
-/// `create`'s blocks, for every format but xlsx.
+/// The document tool's `content` argument — `create`'s blocks, for every format but xlsx.
 const DOCUMENT_CONTENT_FLAG: Flag = Flag {
     arg: "content",
     kind: FlagKind::Structured(&["image"]),

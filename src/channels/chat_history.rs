@@ -38,7 +38,7 @@ pub struct ChatHistoryInsert {
     pub broadcast_id: Option<String>,
     pub workspace: String,
     pub timestamp: Option<String>,
-    /// The replied-to message, rendered as a quote header by the GUI.
+    /// Optional reference to the replied-to message, rendered as a quote header by the GUI.
     pub reply_reference: Option<ReplyReference>,
 }
 

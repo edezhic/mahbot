@@ -26,7 +26,8 @@ pub(crate) fn display_server() -> Option<DisplayServer> {
     Some(probed)
 }
 
-/// The branch every still, coordinate map and input-idle reading takes.
+/// Whether this is a Wayland session — the branch every still, coordinate map and input-idle
+/// reading takes.
 pub(crate) fn wayland() -> bool {
     display_server() == Some(DisplayServer::Wayland)
 }

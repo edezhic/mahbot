@@ -810,8 +810,8 @@ fn render_trace_group<'a>(
                 trace_line_text(&line.text).into(),
             ));
         }
-        // The card-level placeholder covers the case where no group has a line at all, and a
-        // second copy of another group's line is never rendered.
+        // Nothing to show here: the card-level placeholder covers the case where no group has a
+        // line at all, and a second copy of another group's line is never rendered.
         GroupLine::Blank => {}
     }
 

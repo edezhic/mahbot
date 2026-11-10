@@ -689,7 +689,8 @@ mod tests {
         );
     }
 
-    /// Answers exactly as it always has, and is not partial.
+    /// A created account whose personal workspace folder is in place answers exactly as it always
+    /// has, and is not partial.
     #[tokio::test]
     async fn add_user_answers_a_whole_success_when_the_folder_is_created() {
         crate::util::test::init_test_stores().await;

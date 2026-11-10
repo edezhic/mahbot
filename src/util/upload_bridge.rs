@@ -21,8 +21,9 @@ const POW_MAX_ATTEMPTS: u64 = 1 << 26;
 /// pinning a blocking thread. 0807.st's live challenge is 13 bits.
 const POW_MAX_BITS: u32 = 24;
 
-/// The bytes, the file name presented to the host, the MIME declared in the multipart form, and
-/// the content-type prefix the verified URL must be served with ("video/" or "image/").
+/// Parameters for one ephemeral upload: the bytes, the file name presented to the host, the MIME
+/// declared in the multipart form, and the content-type prefix the verified URL must be served with
+/// ("video/" or "image/").
 struct UploadRequest<'a> {
     bytes: &'a [u8],
     file_name: &'a str,
@@ -30,7 +31,7 @@ struct UploadRequest<'a> {
     expected_prefix: &'a str,
 }
 
-/// Takes the upload parameters and returns a verified public HTTPS URL.
+/// An ephemeral-host uploader: takes the upload parameters and returns a verified public HTTPS URL.
 type Uploader<'a> =
     fn(&'a UploadRequest<'a>) -> futures_util::future::BoxFuture<'a, anyhow::Result<String>>;
 
@@ -46,8 +47,9 @@ pub(crate) async fn upload_image_ephemeral(path: &std::path::Path) -> anyhow::Re
     upload_ephemeral(path, mime, "image/").await
 }
 
-/// Each host's URL is GET-validated (status, expected content-type prefix, non-empty body)
-/// before being accepted.
+/// Upload `path` to the first working ephemeral host and return the verified public HTTPS URL. Each
+/// host's URL is GET-validated (status, expected content-type prefix, non-empty body) before being
+/// accepted.
 async fn upload_ephemeral(
     path: &std::path::Path,
     mime: &str,
@@ -132,7 +134,7 @@ pub(crate) async fn verify_media_url(url: &str, expected_prefix: &str) -> anyhow
     }
 }
 
-/// One file part with the given field name and the request's declared MIME.
+/// Multipart helper: one file part with the given field name and the request's declared MIME.
 fn file_part(field: &str, req: &UploadRequest<'_>) -> anyhow::Result<Form> {
     let part = Part::bytes(req.bytes.to_vec())
         .file_name(req.file_name.to_string())
@@ -340,7 +342,8 @@ fn solve_pow(id: &str, bits: u32) -> anyhow::Result<u64> {
     anyhow::bail!("0807.st proof-of-work unsolved after {POW_MAX_ATTEMPTS} attempts (bits={bits})")
 }
 
-/// Each 0x00 byte contributes 8, then the leading zeros of the first non-zero byte.
+/// Count leading zero bits of a digest: each 0x00 byte contributes 8, then the leading zeros of the
+/// first non-zero byte.
 fn leading_zero_bits(digest: &[u8]) -> u32 {
     let mut count = 0;
     for &byte in digest {

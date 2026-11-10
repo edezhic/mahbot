@@ -86,8 +86,8 @@ pub fn is_draining() -> bool {
 pub fn aborting() -> bool {
     shutdown_token().is_cancelled() || is_draining()
 }
-/// Fire the global token immediately (in-flight agents are cancelled and boot-resume via
-/// status='launched'), then the normal exit path (checkpoint + join + exit) runs.
+/// Force-cancel the drain: fire the global token immediately (in-flight agents are cancelled and
+/// boot-resume via status='launched'), then the normal exit path (checkpoint + join + exit) runs.
 pub fn force_cancel() {
     global_shutdown().cancel();
 }
@@ -109,7 +109,7 @@ pub fn shutdown() {
     global_shutdown().cancel();
 }
 
-/// When the global shutdown token fires.
+/// Error returned by [`race_shutdown`] when the global shutdown token fires.
 pub struct Shutdown;
 
 /// `Ok(T)` if the future completes first, `Err(Shutdown)` if shutdown is signalled.
@@ -219,7 +219,8 @@ static STOP_DEADLINE: Mutex<Option<Instant>> = Mutex::new(None);
 #[cfg(windows)]
 const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5);
 
-/// The earliest one wins: that is the kill the process must beat.
+/// Record the deadline a stop has to finish before, for the exit path's budget. The earliest one
+/// wins: that is the kill the process must beat.
 #[cfg(windows)]
 fn record_stop_deadline(deadline: Instant) {
     let mut recorded = STOP_DEADLINE.lock().unwrap_poison();
@@ -228,8 +229,8 @@ fn record_stop_deadline(deadline: Instant) {
     }
 }
 
-/// Half the grace still left, so the checkpoint keeps the rest; a deadline that has passed
-/// leaves nothing.
+/// The exit path's budget from the platform's stop deadline and the moment a stage starts: half the
+/// grace still left, so the checkpoint keeps the rest. A deadline that has passed leaves nothing.
 #[must_use]
 fn stage_budget(deadline: Instant, now: Instant) -> Duration {
     deadline.saturating_duration_since(now) / 2
@@ -264,12 +265,12 @@ pub fn urgent_release_budget() -> Option<Duration> {
 /// — so this makes a stop's reason nameable by that line, not visible.
 static EXIT_TRIGGER: Mutex<Option<&'static str>> = Mutex::new(None);
 
-/// So the exit path can name it.
+/// Record the stop request the exit path is running for, so the exit path can name it.
 pub(crate) fn record_exit_trigger(label: &'static str) {
     *EXIT_TRIGGER.lock().unwrap_poison() = Some(label);
 }
 
-/// `EXIT_TRIGGER` above says what writes one.
+/// The last recorded stop request, if any was recorded — `EXIT_TRIGGER` above says what writes one.
 #[must_use]
 pub fn exit_trigger() -> Option<&'static str> {
     *EXIT_TRIGGER.lock().unwrap_poison()
@@ -296,7 +297,8 @@ fn session_end_label(ending: bool, closes_app_only: bool, log_off: bool) -> Opti
     })
 }
 
-/// Name it for the exit path, bound the stages before the exit-time checkpoint, and force the stop.
+/// Act on a session end: name it for the exit path, bound the stages before the exit-time
+/// checkpoint, and force the stop.
 ///
 /// Forced, not drained: the platform's seconds cannot hold the graceful drain, so waiting would
 /// leave the stop unfinished. It waits for nothing and asks the platform for nothing (no
@@ -510,10 +512,11 @@ mod console {
         SPI_GETHUNGAPPTIMEOUT, SystemParametersInfoW,
     };
 
-    /// Drained in order by the protocol loop.
+    /// Requests queued by handler threads, drained in order by the protocol loop.
     static REQUESTS: Mutex<VecDeque<StopRequest>> = Mutex::new(VecDeque::new());
 
-    /// `notify_one` keeps its permit, so a request queued before the loop waits is never lost.
+    /// Wakes the protocol loop. `notify_one` keeps its permit, so a request queued before the loop
+    /// waits is never lost.
     static QUEUED: Notify = Notify::const_new();
 
     /// Whether the handler is registered. The protocol loop falls back to tokio's Ctrl+C when it
@@ -555,7 +558,8 @@ mod console {
         }
     }
 
-    /// Queues the request for the async protocol loop and, for a close, holds this thread.
+    /// The console control handler: queues the request for the async protocol loop and, for a
+    /// close, holds this thread.
     extern "system" fn handler(event: u32) -> i32 {
         let Some(request) = request_for(event) else {
             // CTRL_LOGOFF_EVENT / CTRL_SHUTDOWN_EVENT: not ours (a session end arrives as a window
@@ -608,7 +612,8 @@ mod console {
         }
     }
 
-    /// `None` for the events this handler deliberately leaves to the default handler.
+    /// Map a console event onto the request class it belongs to, `None` for the events this handler
+    /// deliberately leaves to the default handler.
     fn request_for(event: u32) -> Option<StopRequest> {
         match event {
             CTRL_C_EVENT => Some(StopRequest::Interrupt),
@@ -618,8 +623,8 @@ mod console {
         }
     }
 
-    /// The grace read now (see the module docs), recorded for the exit path's budget and held by
-    /// this handler thread until it.
+    /// The instant this process's closing console stops granting time: the grace read now (see the
+    /// module docs), recorded for the exit path's budget and held by this handler thread until it.
     fn close_deadline() -> Instant {
         let deadline = Instant::now() + close_grace();
         record_stop_deadline(deadline);
@@ -642,8 +647,8 @@ mod console {
     }
 }
 
-/// The platform's stop request for a log-off, shutdown or restart, delivered to a window of
-/// this daemon's own.
+/// The session-end listener — the platform's stop request for a log-off, shutdown or restart,
+/// delivered to a window of this daemon's own.
 ///
 /// # Why a window of its own
 ///
@@ -701,7 +706,7 @@ mod session_end {
     };
     use windows_sys::w;
 
-    /// Nothing looks it up by name: a class needs one.
+    /// The window class this listener registers. Nothing looks it up by name: a class needs one.
     const WINDOW_CLASS: windows_sys::core::PCWSTR = w!("MahBotSessionEnd");
 
     /// On a thread of its own, never joined: a window's messages go to the thread that created
@@ -715,7 +720,7 @@ mod session_end {
         }
     }
 
-    /// Create the window, then pump its messages for the life of the process.
+    /// The listener thread: create the window, then pump its messages for the life of the process.
     fn listen() {
         // SAFETY: a null module name asks for this process's own module, which every
         // process has; the window class below needs an instance to own its procedure.
@@ -784,8 +789,8 @@ mod session_end {
         }
     }
 
-    /// The two session-end notifications, and the default handling for everything else (see the
-    /// module docs for why that is not optional).
+    /// The listener window's procedure: the two session-end notifications, and the default handling
+    /// for everything else (see the module docs for why that is not optional).
     extern "system" fn window_proc(
         window: HWND,
         message: u32,
@@ -843,7 +848,8 @@ fn install_quit_requests() {
     // The receiving half first, so a quit the platform delivers before the dashboard subscribes
     // waits here instead of being lost.
     *QUIT_REQUESTS.lock().unwrap_poison() = Some(rx);
-    // Only macOS sends, so everywhere else the sender is dropped here and the source stays empty.
+    // The channel exists on every platform so the dashboard's subscription always has a source;
+    // only macOS sends, so everywhere else the sender is dropped here and the source stays empty.
     #[cfg(target_os = "macos")]
     macos_quit::install(tx);
     #[cfg(not(target_os = "macos"))]

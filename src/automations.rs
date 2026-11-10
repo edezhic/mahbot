@@ -371,6 +371,8 @@ pub(crate) fn owner_automation_session(agent_id: &str, user_name: &str) -> Strin
     }
 }
 
+/// Create a new automation for a session.
+///
 /// Exactly one of `fire_at` (one-shot) or `interval_seconds` (periodic) must be provided.
 /// One-shot fire times are normalized to RFC3339 UTC and must be in the future; periodic
 /// intervals must be at least 5 seconds. At most [`MAX_ACTIVE_AUTOMATIONS`] active automations
@@ -623,6 +625,8 @@ async fn due_automations(now: &str) -> Result<Vec<Automation>> {
         .collect::<Result<_, _>>()?)
 }
 
+/// Route a due automation into the Assistant's own session and settle it.
+///
 /// A role-addressed automation wakes that custom role instead; the Assistant wakes otherwise — a
 /// triggered automation takes its attempt slot and runs its custom tool (see
 /// [`fire_trigger_automation`]); a plain one delivers its text as the notice. The notice is a

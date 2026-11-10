@@ -42,7 +42,7 @@ pub(crate) fn registry_initialized() -> bool {
 /// must go through [`resolve_engine`], which waits for the scan first.
 #[derive(Debug)]
 pub(crate) struct SearchEngineEntry {
-    /// Used for both `files` and `grep` modes.
+    /// Shared file picker used for both `files` and `grep` modes.
     pub picker: SharedFilePicker,
 }
 

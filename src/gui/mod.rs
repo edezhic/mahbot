@@ -191,7 +191,7 @@ impl Page {
         &[Page::Home, Page::Editor, Page::Shell, Page::Automations]
     }
 
-    /// The sidebar bottom nav — Sessions and Logs are absent by design.
+    /// Pages in the sidebar bottom nav — Sessions and Logs are absent by design.
     const fn sidebar_bottom_pages() -> &'static [Page] {
         &[Page::Settings]
     }
@@ -2621,8 +2621,8 @@ impl Dashboard {
                 .map(|_| Message::Git(git::GitMessage::PeriodicSyncTick)),
             // Board tickets from CDC deltas instead of a 1s full re-poll.
             iced::Subscription::run(board_change_subscription),
-            // A full map reload whenever a workspaces row changes (or the stream lags /
-            // the baseline fires).
+            // Workspaces change-stream subscription: a full map reload whenever a workspaces row
+            // changes (or the stream lags / the baseline fires).
             iced::Subscription::run(workspaces_cdc_subscription),
             // Re-list the Settings users on a users/user_channels row change (or a lag —
             // a full re-list is its own recovery).

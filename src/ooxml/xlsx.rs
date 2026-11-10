@@ -2181,8 +2181,8 @@ impl Cell {
     /// when no display of it was produced.
     fn number(&self, book: Book<'_>) -> Shown {
         let raw = self.value.trim().to_owned();
-        // `s` defaults to the first entry, so a cell naming none and one naming `0` are the
-        // same cell to Excel.
+        // A cell's own `s`, else the workbook's first cell format: `s` defaults to the first entry,
+        // so a cell naming none and one naming `0` are the same cell to Excel.
         let table = &book.styles.cell_xfs;
         let index = match self.style {
             Style::Unread => return Shown::stored(raw),

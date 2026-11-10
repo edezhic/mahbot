@@ -118,8 +118,8 @@ impl RetryPolicy {
         .apply_test_override()
     }
 
-    /// The comment-only extraction policy for fail-open callers: the caller falls back to raw text
-    /// on failure, so a bounded attempt count avoids stalling the pipeline for a non-critical
+    /// Build the comment-only extraction policy for fail-open callers: the caller falls back to raw
+    /// text on failure, so a bounded attempt count avoids stalling the pipeline for a non-critical
     /// operation (the 13-attempt budget is for verdict gates).
     #[must_use]
     pub(crate) fn comment() -> Self {
@@ -240,7 +240,7 @@ pub(crate) enum FailureClass {
     /// Server truncated the response envelope: body-read error or content-length mismatch (the
     /// "error reading response body" / "EOF while parsing" defect class).
     TruncatedEnvelope,
-    /// Body read fully but JSON did not parse (LLM format issue).
+    /// Response body read fully but JSON did not parse (LLM format issue).
     Parse,
     /// Parsed, but a validation hook rejected the value (e.g. verdict score outside [0,10]).
     OutOfRangeScore,

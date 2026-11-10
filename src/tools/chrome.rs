@@ -74,7 +74,8 @@ enum ChromeAction {
         #[serde(default)]
         selector: Option<String>,
     },
-    /// The written value is read back and verified, so success means the field really holds it.
+    /// Clear an input/textarea/contenteditable and fill it with text — the written value is read
+    /// back and verified, so success means the field really holds it.
     Fill {
         selector: String,
         text: String,
@@ -90,7 +91,8 @@ enum ChromeAction {
     Eval {
         js: String,
     },
-    /// Exactly one target. Bounded mahbot-side: the numeric sleep form does not exist.
+    /// Wait until a CSS selector matches, the URL matches a pattern, or text appears — exactly one
+    /// target. Bounded mahbot-side; the numeric sleep form does not exist.
     Wait {
         #[serde(default)]
         selector: Option<String>,
@@ -139,7 +141,7 @@ enum ChromeAction {
         /// For 'text' the substring; for 'role' the role name; for 'first'/'last'/'nth' a CSS
         /// selector.
         value: String,
-        /// click, fill, hover, check, text. "fill" clears the field then types.
+        /// Action to perform: click, fill, hover, check, text. "fill" clears the field then types.
         action: String,
         text: Option<String>,
         /// Accessible name filter for role-based finding. It can fail even when the snapshot shows
@@ -157,7 +159,8 @@ enum ChromeAction {
     /// read.
     Upload {
         selector: String,
-        /// A single path string is taken as the one-element list models keep reaching for.
+        /// A list of local paths; a single path string is taken as the one-element list models keep
+        /// reaching for.
         #[serde(deserialize_with = "one_or_many_paths")]
         files: Vec<String>,
     },
@@ -679,7 +682,7 @@ impl ChromeTool {
         clocks: crate::chrome::ChromeCallClocks,
         workspace: &str,
     ) -> anyhow::Result<ActionOutput<ChromeResponse>> {
-        // Elapsed time of this dispatch, carried on the durable rows it may write.
+        // The elapsed time of this dispatch, carried on the durable rows it may write.
         let started = Instant::now();
         let output = Self::spawn_call(cli, args, session, clocks).await?;
         let elapsed = started.elapsed();

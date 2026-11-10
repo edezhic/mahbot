@@ -75,7 +75,7 @@ const fn badge_bg(fg: Color) -> Color {
     Color::from_rgba(fg.r, fg.g, fg.b, 0.1)
 }
 
-/// The badge (foreground, background) color for a role name.
+/// Returns the badge (foreground, background) color for a role name.
 ///
 /// Accepts canonical names, derivative names carrying a trailing `_<digits>` suffix (stripped by
 /// [`crate::channels::reply::strip_agent_role_suffix`], the same rule the reply author label
@@ -506,7 +506,7 @@ pub fn vertical_scrollbar() -> scrollable::Direction {
     scrollable::Direction::Vertical(thin_scrollbar())
 }
 
-/// A vertical [`scrollable::Direction`] that scrolls without drawing a scrollbar — for a
+/// Returns a vertical [`scrollable::Direction`] that scrolls without drawing a scrollbar — for a
 /// container too narrow to spend its edge on a rail.
 #[must_use]
 pub fn hidden_vertical_scrollbar() -> scrollable::Direction {

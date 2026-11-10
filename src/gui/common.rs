@@ -10,7 +10,7 @@ use super::editor_widget::{CursorState, EditorAction, EditorBuffer};
 
 pub(crate) const MAX_INPUT_CHARS: usize = 100_000;
 
-/// Shared by dashboard pages that display paginated data.
+/// Pagination state shared by dashboard pages that display paginated data.
 #[derive(Debug, Clone)]
 pub(crate) struct PaginationState {
     pub(crate) page: usize,
@@ -122,6 +122,8 @@ impl AsyncLoadState {
         self.has_loaded = true;
     }
 
+    /// Mark failure of an async load.
+    ///
     /// Leaves `has_loaded` untouched, so a failed read never counts as a completed
     /// one — each view decides what an unloaded failure renders.
     pub(crate) fn fail(&mut self, error: String) {
@@ -335,9 +337,9 @@ pub(crate) trait UndoableText {
 /// cursor; restoration replays [`UndoableText::set_text`] + `move_to`.
 #[derive(Debug, Clone)]
 pub(crate) struct UndoStack {
-    /// Newest last.
+    /// Previous states, newest last.
     undo: Vec<UndoSnapshot>,
-    /// Cleared on new edit.
+    /// Undone states, cleared on new edit.
     redo: Vec<UndoSnapshot>,
 }
 
@@ -358,8 +360,8 @@ impl UndoStack {
         }
     }
 
-    /// Content larger than [`Self::LARGE_FILE_UNDO_THRESHOLD`] halves the depth cap
-    /// to bound memory.
+    /// Take a snapshot before an edit is performed. Content larger than
+    /// [`Self::LARGE_FILE_UNDO_THRESHOLD`] halves the depth cap to bound memory.
     pub(crate) fn snap_before_edit(&mut self, content: &impl UndoableText) {
         let text = content.text();
         let max_depth = if text.len() > Self::LARGE_FILE_UNDO_THRESHOLD {
@@ -399,7 +401,7 @@ impl UndoStack {
         Self::push_and_pop(&mut self.undo, &mut self.redo, content)
     }
 
-    /// E.g. after sending a message.
+    /// Reset the stack (e.g. after sending a message).
     pub(crate) fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
@@ -497,7 +499,8 @@ async fn coalesce_loop<Msg, T, F>(
     F: Fn() -> Msg + Send,
 {
     loop {
-        // A Lagged slot means events were lost and still counts as a change.
+        // First event anchors a batch. A Lagged slot means events were lost and still counts as a
+        // change.
         match rx.recv().await {
             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
                 let deadline = tokio::time::Instant::now() + window;
@@ -595,7 +598,7 @@ impl SingleLineEditorState {
         self.buffer.text()
     }
 
-    /// Clears undo too.
+    /// Reset the field to empty (clears undo too).
     pub(crate) fn clear(&mut self) {
         self.buffer.clear();
         self.undo.clear();
@@ -614,7 +617,8 @@ pub(crate) enum SendRules {
     /// The field is content even with no text (an attachment, a recording the send
     /// stops), and an in-flight send is refused before the length limit is reported.
     Chat { has_content: bool },
-    /// Text is required, and the length limit is reported before an in-flight send.
+    /// The board comment box: text is required, and the length limit is reported before an
+    /// in-flight send.
     Board,
 }
 

@@ -76,7 +76,7 @@ pub(super) fn observe(uia: &IUIAutomation, target: &TargetSpec) -> anyhow::Resul
         return Err(core::screen_observe_error());
     }
     let resolved = window::resolve(target)?;
-    // Read before the walk: a walk that spends its budget has to name the window it
+    // The title is read before the walk: a walk that spends its budget has to name the window it
     // abandoned, and this read is one it can no longer afford then.
     let title = window::title_text(resolved.hwnd);
     let element = window_element(uia, &resolved)?;

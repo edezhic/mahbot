@@ -304,8 +304,9 @@ impl ImageGenTool {
         let entries = generations_arg(args)?;
         let user_name = crate::agent::tool_user_name();
         let own_model = crate::users::resolve_image_gen_model(&user_name).await;
-        // The list exactly as configured: a default the picker never showed was never offered
-        // to the account, so it is not a candidate (see [`plan_walk`]).
+        // The other models the account could have picked: the list exactly as configured — a
+        // default the picker never showed was never offered to the account, so it is not a
+        // candidate (see [`plan_walk`]).
         let picker = crate::config::CONFIG.image_gen_models_raw();
         // The command line builds a batch of one and reads the single-picture wording, so its
         // refusals name no position.
@@ -510,7 +511,7 @@ async fn run_generation(
         stopped: None,
     };
 
-    // Raced against global shutdown so a long generation cannot block process teardown.
+    // The walk is raced against global shutdown so a long generation cannot block process teardown.
     let shutdown = crate::shutdown::shutdown_token();
     let walked = tokio::select! {
         () = shutdown.cancelled() => return Err(Aborted),
@@ -537,7 +538,8 @@ async fn run_generation(
         Ok(path) => path,
         Err(e) => return Ok(Produced::failed(e.to_string())),
     };
-    // Which model produced the picture, so a fallback stays diagnosable afterwards.
+    // The record the walk leaves behind: which model produced the picture, so a fallback stays
+    // diagnosable afterwards.
     tracing::info!(
         model = %served_by,
         own_model = %own_model,
@@ -2011,7 +2013,8 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        // An unsupported tier names the values the model does support.
+        // qwen declares resolution ["1K", "2K"] → an unsupported tier names the values the model
+        // does support.
         let err = resolve_size(
             "qwen/qwen-image-3-pro",
             Some("512"),
@@ -2048,7 +2051,8 @@ mod tests {
             Some(("resolution", "1K".to_string()))
         );
 
-        // A supported pixel value is sent verbatim under `size`; an unsupported one is refused.
+        // Explicit-pixel model: A supported pixel value is sent verbatim under `size`; an
+        // unsupported one is refused.
         let size = resolve_size(
             "acme/pixels",
             Some("1024x1024"),
@@ -2120,7 +2124,8 @@ mod tests {
             expected: Option<&'static str>,
         }
 
-        // Generated from CANONICAL_ASPECT_RATIOS, so future ratios are auto-covered.
+        // Every canonical ratio should round-trip exactly — generated from CANONICAL_ASPECT_RATIOS,
+        // so future ratios are auto-covered.
         let mut cases: Vec<Case> = CANONICAL_ASPECT_RATIOS
             .iter()
             .map(|&(ratio_str, ratio_val)| {
@@ -3789,7 +3794,8 @@ mod tests {
         .await
         .expect("both generations produce a picture");
 
-        // Dispatched together, so which request reaches the sender first is no position.
+        // Both generations are dispatched together, so which request reaches the sender first is no
+        // position: the bodies are read as a set.
         let bodies = scripted.bodies();
         assert_eq!(bodies.len(), 2, "one request per generation");
         for body in &bodies {

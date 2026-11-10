@@ -24,8 +24,9 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a stop waits before the kill.
 const STOP_GRACE: Duration = Duration::from_secs(10);
 
-/// A path outside `/bot…` never creates a bot client, so probing costs the platform
-/// nothing and cannot log the bot in anywhere.
+/// The cheapest possible health request: a connection and one HTTP line with a short bound. A path
+/// outside `/bot…` never creates a bot client, so probing costs the platform nothing and cannot log
+/// the bot in anywhere.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Bounded here rather than at the server's 2 GB default.
@@ -79,13 +80,14 @@ pub(super) fn root() -> Option<PathBuf> {
     )
 }
 
-/// TDLib's own state, kept stable across binary updates so the bot's session
-/// survives one.
+/// The server's working directory: TDLib's own state, kept stable across binary updates so the
+/// bot's session survives one.
 pub(super) fn state_dir() -> Option<PathBuf> {
     Some(root()?.join("state"))
 }
 
-/// `--files-dir`: one directory per bot token under it.
+/// Where the server keeps the payloads it downloads (`--files-dir`), one directory per bot token
+/// under it.
 fn files_dir() -> Option<PathBuf> {
     Some(root()?.join("files"))
 }
@@ -109,7 +111,7 @@ fn payload_dirs() -> Vec<PathBuf> {
     [files_dir(), temp_dir()].into_iter().flatten().collect()
 }
 
-/// Likewise swept by age.
+/// The server's own temporary directory, likewise swept by age.
 fn temp_dir() -> Option<PathBuf> {
     Some(root()?.join("tmp"))
 }
@@ -133,7 +135,7 @@ pub(super) fn read_record() -> Option<Instance> {
     serde_json::from_str(&body).ok()
 }
 
-/// Atomically: a torn record is one no later start can read, which is the state
+/// Write the record atomically: a torn record is one no later start can read, which is the state
 /// that lets a second poller start beside a live one.
 fn write_record(instance: &Instance) -> Result<(), String> {
     let Some(path) = record_path() else {
@@ -167,8 +169,8 @@ pub(super) fn credentials_fingerprint(api_id: &str, api_hash: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// The answer says "something speaking HTTP is listening", which is all a liveness
-/// check needs.
+/// Ask a port whether the server answers there. A connection and one HTTP request line: the answer
+/// says "something speaking HTTP is listening", which is all a liveness check needs.
 pub(super) async fn probe(port: u16) -> bool {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let Ok(Ok(mut stream)) = tokio::time::timeout(

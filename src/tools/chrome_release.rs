@@ -1779,7 +1779,8 @@ impl IssueKind {
         }
     }
 
-    /// One reason per namespace, so a repeated pass over the same run is a duplicate, not news.
+    /// The reason prefix this kind's rows are deduped on. One reason per namespace, so a repeated
+    /// pass over the same run is a duplicate, not news.
     fn reason_prefix(self) -> &'static str {
         match self {
             Self::Unclosable => "chrome-tabs:",

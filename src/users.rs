@@ -47,8 +47,8 @@ const TELEGRAM_SERVICE_IDS: [&str; 3] = ["1087968824", "136817688", "777000"];
 /// The nicknames those identities carry (777000 has none), compared case-insensitively.
 const TELEGRAM_SERVICE_NICKNAMES: [&str; 2] = ["groupanonymousbot", "channel_bot"];
 
-/// The single owner identity the desktop GUI always acts as, seeded idempotently by
-/// [`UserStore::ensure_admin_user`].
+/// The app's own admin account — the single owner identity the desktop GUI always acts as. Seeded
+/// idempotently by [`UserStore::ensure_admin_user`].
 pub(crate) const ADMIN_USER_NAME: &str = "admin";
 
 /// How a Telegram binding identifier is written.
@@ -59,7 +59,8 @@ enum TelegramKey {
     Nickname(String),
 }
 
-/// After trimming, a single optional leading `+`, nothing but digits.
+/// The digits of a number-shaped value: after trimming, a single optional leading `+`, nothing but
+/// digits.
 fn telegram_digits(value: &str) -> Option<&str> {
     let digits = value.trim();
     let digits = digits.strip_prefix('+').unwrap_or(digits);
@@ -78,7 +79,8 @@ fn telegram_key(value: &str) -> Option<TelegramKey> {
     (!canonical.is_empty()).then(|| TelegramKey::Number(canonical.to_string()))
 }
 
-/// `None` when the value is not number-shaped or is nothing but zeros.
+/// The canonical form of a numeric id — digits with the leading zeros removed. `None` when the
+/// value is not number-shaped or is nothing but zeros.
 fn canonical_telegram_number(value: &str) -> Option<String> {
     match telegram_key(value) {
         Some(TelegramKey::Number(number)) => Some(number),
@@ -144,7 +146,8 @@ fn telegram_identifier_is_number(identifier: &str) -> bool {
     telegram_digits(identifier).is_some()
 }
 
-/// A nickname keeps the `@` it is entered with; a number is labelled as an id.
+/// Name a Telegram binding in a message a person reads: a nickname keeps the `@` it is entered
+/// with; a number is labelled as an id.
 pub(crate) fn describe_telegram_binding(identifier: &str) -> String {
     if telegram_identifier_is_number(identifier) {
         format!("id {}", identifier.trim())
@@ -153,8 +156,8 @@ pub(crate) fn describe_telegram_binding(identifier: &str) -> String {
     }
 }
 
-/// The nickname exactly as it has always been shown, a number labelled as an id so it can
-/// never read as a nickname.
+/// The Settings → Users row's label for an account's Telegram binding: the nickname exactly as it
+/// has always been shown, a number labelled as an id so it can never read as a nickname.
 pub(crate) fn settings_binding_label(identifier: &str) -> String {
     if telegram_identifier_is_number(identifier) {
         describe_telegram_binding(identifier)
@@ -301,8 +304,8 @@ impl UserStore {
         {
             return;
         }
-        // Through `self`, never the global store: this can run inside USER_STORE's own
-        // bring-up, where `store()` would panic.
+        // Read the bindings through `self`, never the global store: this can run inside
+        // USER_STORE's own bring-up, where `store()` would panic.
         let mut targets =
             telegram_reply_targets(self.get_user_channels(name).await.unwrap_or_default());
         if targets.is_empty() && name != ADMIN_USER_NAME {
@@ -323,7 +326,8 @@ impl UserStore {
         }
     }
 
-    /// Bindings are an account's only child rows, so nothing else needs a cascade.
+    /// Delete an account and all their child rows (channel bindings). Channel bindings are an
+    /// account's only child rows, so nothing else needs a cascade.
     pub async fn delete_user(&self, name: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         tx.execute(
@@ -337,6 +341,8 @@ impl UserStore {
         Ok(())
     }
 
+    /// Fetch a single nullable column from the account's row, if it exists.
+    ///
     /// A NULL column and a missing row both yield `None`.
     async fn user_column(&self, column: &str, user_name: &str) -> Result<Option<String>> {
         self.conn
@@ -454,7 +460,8 @@ impl UserStore {
         Ok(())
     }
 
-    /// An account holds at most one; a legacy account with several reports the first.
+    /// The account's Telegram binding identifier, if it holds one. An account holds at most one; a
+    /// legacy account with several reports the first.
     pub(crate) async fn telegram_binding(&self, user_name: &str) -> Result<Option<String>> {
         Ok(self
             .get_user_channels(user_name)
@@ -595,8 +602,8 @@ impl UserStore {
         })
     }
 
-    /// Run `suffix` (everything after `FROM users`) and collect one [`UserRecordEntry`] per
-    /// row with channel bindings.
+    /// Shared listing body: run `suffix` (everything after `FROM users`) and collect one
+    /// [`UserRecordEntry`] per row with channel bindings.
     async fn list_users_where(
         &self,
         suffix: &str,
@@ -611,7 +618,8 @@ impl UserStore {
         Ok(users)
     }
 
-    /// `None` if no such account exists.
+    /// Find a single account by exact name, returning their full record with channel bindings.
+    /// Returns `None` if no such account exists.
     pub async fn find_by_name(&self, user_name: &str) -> Result<Option<UserRecord>> {
         self.list_users_where("WHERE name = ?1", db::params![user_name])
             .await
@@ -622,8 +630,9 @@ impl UserStore {
         self.list_users_where("", db::params![]).await
     }
 
-    /// `None` clears the column (the account's personal workspace, computed on the fly);
-    /// `Some(name)` selects that managed workspace.
+    /// Set the account's selected managed workspace, beside [`Self::set_image_gen_model`] /
+    /// [`Self::set_video_model`]. `None` clears the column — the account's personal workspace
+    /// (computed on the fly); `Some(name)` selects that managed workspace.
     pub(crate) async fn set_selected_workspace(
         &self,
         name: &str,
@@ -635,7 +644,8 @@ impl UserStore {
         Ok(())
     }
 
-    /// An empty/whitespace value resolves to the default at read time.
+    /// Set the user's active image-generation model (their Telegram picker choice). An
+    /// empty/whitespace value resolves to the default at read time.
     pub async fn set_image_gen_model(&self, name: &str, model: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         upsert_user_column(&tx, name, "image_gen_model", Some(model)).await?;
@@ -643,7 +653,8 @@ impl UserStore {
         Ok(())
     }
 
-    /// An empty/whitespace value resolves to the default at read time.
+    /// Set the user's active video model (their Telegram picker choice). An empty/whitespace value
+    /// resolves to the default at read time.
     pub async fn set_video_model(&self, name: &str, model: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         upsert_user_column(&tx, name, "video_model", Some(model)).await?;
@@ -665,15 +676,17 @@ impl UserStore {
         Ok(())
     }
 
-    /// Byte-sorted; empty when the user has no grants or no row.
+    /// The custom tools granted to `user_name`, byte-sorted; empty when the user has no grants or
+    /// no row.
     pub(crate) async fn get_grants(&self, user_name: &str) -> Result<Vec<String>> {
         Ok(parse_grants(
             self.user_column("granted_tools", user_name).await?,
         ))
     }
 
-    /// Idempotent, and a grant never inserts a users row (a ghost user would appear in the
-    /// GUI), so the caller reports the missing user itself.
+    /// Grant the custom tool `tool` to `user_name`. Granting is idempotent, and a grant never
+    /// inserts a users row (a ghost user would appear in the GUI), so the caller reports the
+    /// missing user itself.
     pub(crate) async fn add_grant(&self, user_name: &str, tool: &str) -> Result<GrantChange> {
         self.update_grants(user_name, |grants| {
             if grants.iter().any(|g| g == tool) {
@@ -685,9 +698,9 @@ impl UserStore {
         .await
     }
 
-    /// Idempotent: an absent grant is a silent no-op. The result tells the caller which of the
-    /// three cases it hit, so it can report a missing user instead of a false confirmation — a
-    /// revoke never inserts a row either.
+    /// Revoke the custom tool `tool` from `user_name`. Idempotent: an absent grant is a silent
+    /// no-op. The result tells the caller which of the three cases it hit, so it can report a
+    /// missing user instead of a false confirmation — a revoke never inserts a row either.
     pub(crate) async fn remove_grant(&self, user_name: &str, tool: &str) -> Result<GrantChange> {
         self.update_grants(user_name, |grants| {
             let before = grants.len();
@@ -697,8 +710,9 @@ impl UserStore {
         .await
     }
 
-    /// Ordered by user name. The empty-list filter runs in Rust rather than SQL: `[]` and an
-    /// unparseable value are both empty sets, and the users table is tiny.
+    /// Every user with at least one granted custom tool, ordered by user name. The empty-list
+    /// filter runs in Rust rather than SQL: `[]` and an unparseable value are both empty sets, and
+    /// the users table is tiny.
     pub(crate) async fn list_grants(&self) -> Result<Vec<(String, Vec<String>)>> {
         let rows = self
             .conn
@@ -719,9 +733,10 @@ impl UserStore {
             .collect())
     }
 
-    /// In one transaction. `mutate` edits the parsed, sorted set; returning `false` skips the
-    /// write (the caller's idempotent no-op). A missing row is left untouched, never inserted —
-    /// the caller reports that from the returned [`GrantChange`].
+    /// Read-modify-write the `users.granted_tools` set for `user_name` in one transaction. `mutate`
+    /// edits the parsed, sorted set; returning `false` skips the write (the caller's idempotent
+    /// no-op). A missing row is left untouched, never inserted — the caller reports that from the
+    /// returned [`GrantChange`] instead.
     async fn update_grants(
         &self,
         user_name: &str,
@@ -778,8 +793,9 @@ fn owner_message(name: &str, error: &anyhow::Error) -> String {
     )
 }
 
-/// The part that did not happen, and nothing more — no cause and no remedy, because another
-/// writer can create the folder later.
+/// What a caller's answer says about an account whose personal workspace folder could not be
+/// created: the part that did not happen, and nothing more — no cause and no remedy, because
+/// another writer can create the folder later.
 #[must_use]
 pub(crate) fn missing_personal_workspace_note(name: &str) -> String {
     format!(
@@ -803,7 +819,8 @@ fn claim_report(name: &str, error: &anyhow::Error, medium: &str) -> bool {
         .insert(format!("{medium}\u{0}{name}\u{0}{error}"))
 }
 
-/// A failed read yields no targets — never a partial send list.
+/// The Telegram reply targets among a channel-binding read. A failed read yields no targets — never
+/// a partial send list.
 fn telegram_reply_targets(bindings: Vec<ChannelBinding>) -> Vec<String> {
     bindings
         .into_iter()
@@ -814,16 +831,16 @@ fn telegram_reply_targets(bindings: Vec<ChannelBinding>) -> Vec<String> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum GrantChange {
-    /// Nothing was written, and none is inserted.
+    /// No such `users` row — nothing was written, and none is inserted.
     NoUser,
-    /// Already held the requested state — nothing written.
+    /// The row exists and already held the requested state — nothing written.
     Unchanged,
-    /// Its grant set changed.
+    /// The row exists and its grant set changed.
     Changed,
 }
 
-/// A NULL, empty or unparseable value yields an empty list (fail-closed: unknown grants are no
-/// grants).
+/// Parse the `users.granted_tools` JSON array column. A NULL, empty or unparseable value yields an
+/// empty list (fail-closed: unknown grants are no grants).
 fn parse_grants(raw: Option<String>) -> Vec<String> {
     let mut grants = raw
         .and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
@@ -855,7 +872,7 @@ async fn upsert_user_column(
 
 #[derive(Debug, Clone)]
 pub struct UserRecord {
-    /// When it is [`ADMIN_USER_NAME`], this is the admin account.
+    /// The canonical account name. When it is [`ADMIN_USER_NAME`], this is the admin account.
     pub name: String,
     /// Selected managed workspace name, NULL = personal workspace.
     pub selected_workspace: Option<String>,
@@ -866,9 +883,10 @@ pub struct UserRecord {
     pub channels: Vec<ChannelBinding>,
 }
 
-/// [`UserRecord`] is channel-empty both when the account has no bindings and when the read
-/// failed, so a surface that renders bindings needs the outcome to tell the two apart; it
-/// travels beside the record, not inside it.
+/// One `users` row together with the outcome of its channel-binding read. The domain [`UserRecord`]
+/// is channel-empty both when the account has no bindings and when the read failed, so a surface
+/// that renders bindings needs the outcome to tell the two apart; it travels beside the record, not
+/// inside it.
 #[derive(Debug, Clone)]
 pub struct UserRecordEntry {
     pub record: UserRecord,
@@ -884,9 +902,10 @@ pub(crate) fn is_admin_name(name: &str) -> bool {
     name == ADMIN_USER_NAME
 }
 
-/// Only [`UserStore::ensure_admin_user`] may create the admin account, and the name IS the admin
-/// marker, so binding a channel to it would address the admin. [`UserStore::add_user`] exempts
-/// the same name from the collision rule for that one seeding path.
+/// Refuse the reserved admin name on a user-facing account path: only
+/// [`UserStore::ensure_admin_user`] may create the admin account, and the name IS the admin marker,
+/// so binding a channel to it would address the admin. [`UserStore::add_user`] exempts the same
+/// name from the collision rule, for that one seeding path.
 pub(crate) fn refuse_admin_name(name: &str) -> Result<()> {
     if is_admin_name(name) {
         anyhow::bail!(
@@ -903,8 +922,8 @@ pub(crate) const NAME_COLLISION_RULE: &str = "A new account's name is also refus
      account or the admin already has it, ignoring case and Unicode composition — on macOS those \
      spellings are one folder, on Windows a case difference alone already is.";
 
-/// The exact duplicate and the case/composition collision alike, so a surface reports both the
-/// same way.
+/// The message every taken-name refusal carries — the exact duplicate and the case/composition
+/// collision alike, so a surface reports both the same way.
 pub(crate) fn name_taken_message(name: &str) -> String {
     format!("A user named '{name}' already exists")
 }
@@ -926,7 +945,8 @@ pub(crate) fn collides_with_existing<'a>(
 /// The name is the only unbounded part of the taken-name line, so this keeps it one line.
 const MAX_NAME_IN_REFUSAL_CHARS: usize = 24;
 
-/// Its first [`MAX_NAME_IN_REFUSAL_CHARS`] characters, then an ellipsis if there were more.
+/// `name` as the taken-name line may spell it: its first [`MAX_NAME_IN_REFUSAL_CHARS`] characters,
+/// then an ellipsis if there were more.
 fn one_line_name(name: &str) -> String {
     match name.char_indices().nth(MAX_NAME_IN_REFUSAL_CHARS) {
         Some((end, _)) => format!("{}…", &name[..end]),
@@ -1042,8 +1062,9 @@ pub fn personal_workspace_path(user_name: &str) -> PathBuf {
     userspaces_root().join(user_name)
 }
 
-/// Personal workspaces are not `workspaces` rows, so a row carrying this prefix is a legacy
-/// leftover rather than a managed workspace.
+/// The prefix of a personal workspace's synthetic name (`personal:{user}`). Personal workspaces are
+/// not `workspaces` rows, so a row carrying this prefix is a legacy leftover rather than a managed
+/// workspace.
 const PERSONAL_WORKSPACE_PREFIX: &str = "personal:";
 
 /// `personal:{user_name}`: the single search-engine key shared by agent side and dashboard.
@@ -1073,7 +1094,7 @@ pub(crate) async fn ensure_personal_workspace(name: &str) -> Result<()> {
             .await
             .with_context(|| format!("create the folder {}", path.display()))?;
     }
-    // `git init` only when there is no repo yet; non-fatal on failure.
+    // Try git init only when there is no repo yet; non-fatal on failure.
     crate::git::commands::init_repo_if_absent(&path).await;
     Ok(())
 }
@@ -1108,8 +1129,8 @@ async fn resolve_user_model_column(user_name: &str, column: &str) -> Option<Stri
     }
 }
 
-/// THE single admin-aware resolution primitive, shared by message routing and the GUI (boot
-/// restore, reverse-sync).
+/// Resolve the account's admin-aware selected workspace name — THE single admin-aware resolution
+/// primitive, shared by message routing and the GUI (boot restore, reverse-sync).
 ///
 /// Workspace membership is admin-only: the admin gets their stored selection (a legacy personal
 /// value normalizes to `personal:{user}`); a guest ALWAYS gets their `personal:{user}` name,
@@ -1225,7 +1246,8 @@ pub async fn resolve_workspace(workspace_name: &str) -> Result<Option<Workspace>
     }
 }
 
-/// Has no diagnostics, no maintenance, no discovery — minimal defaults.
+/// Build a `Workspace` struct for a personal workspace. Has no diagnostics, no maintenance, no
+/// discovery — minimal defaults.
 #[must_use]
 pub(crate) fn personal_workspace_struct(user_name: &str) -> Workspace {
     let mut ws = Workspace::from_path(&personal_workspace_path(user_name));
@@ -1234,7 +1256,8 @@ pub(crate) fn personal_workspace_struct(user_name: &str) -> Workspace {
     ws
 }
 
-/// Falling back to a personal workspace if `get_workspace` fails or returns `None`.
+/// Resolve the workspace for a user, falling back to a personal workspace if `get_workspace` fails
+/// or returns `None`.
 pub async fn resolve_workspace_for_user_name(user_name: &str) -> Workspace {
     match get_workspace(user_name).await {
         Ok(Some(ws)) => ws,
@@ -1310,9 +1333,10 @@ pub fn effective_workspace_for_role(role: Role, ws: Workspace, user_name: &str) 
     personal_workspace_struct(user_name)
 }
 
-/// The same resolution as routing, so ClearChat and Telegram /clear always clear the actual
-/// recipient: the account's selected workspace with Assistant pinning applied, and the Assistant
-/// role (every account's only role), which the session-key builders consume alongside it.
+/// Resolve the (role, workspace) an account's messages route to and their session lives in — the
+/// same resolution as routing, so ClearChat and Telegram /clear always clear the actual recipient:
+/// the account's selected workspace with Assistant pinning applied, and the Assistant role, every
+/// account's only role, which the session-key builders consume alongside it.
 pub async fn resolve_session_target(user_name: &str) -> (Role, Workspace) {
     let ws = resolve_workspace_for_user_name(user_name).await;
     (
@@ -1366,7 +1390,8 @@ async fn is_admin_in(store: Option<&UserStore>, user_name: &str) -> bool {
     })
 }
 
-/// [`is_admin_in`] bound to the process-global account store.
+/// Whether `user_name` is the admin account — [`is_admin_in`] bound to the process-global account
+/// store.
 pub async fn is_admin(user_name: &str) -> bool {
     is_admin_in(USER_STORE.get(), user_name).await
 }
@@ -1395,7 +1420,7 @@ pub(crate) fn format_grants(grants: &[String]) -> String {
     }
 }
 
-/// Called on every incoming message.
+/// Update reply_target for a channel binding (called on every incoming message).
 pub async fn update_channel_contact(
     channel: &str,
     identifier: &str,
@@ -1406,7 +1431,8 @@ pub async fn update_channel_contact(
         .await
 }
 
-/// `personal:{user}`, or `None` when the name is not a personal workspace.
+/// The user name for a `personal:` workspace name (`personal:{user}`), or `None` when the name is
+/// not a personal workspace.
 #[must_use]
 pub fn personal_user_name(workspace_name: &str) -> Option<&str> {
     workspace_name.strip_prefix(PERSONAL_WORKSPACE_PREFIX)

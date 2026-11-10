@@ -333,8 +333,8 @@ impl Session {
                 }
                 self.take_persisted(std::iter::once(user_msg));
             }
-            // Recorded only once the append landed, so a failed write cannot silently swallow the
-            // change.
+            // The activity state the message just written carries — recorded only once the append
+            // landed, so a failed write cannot silently swallow the change.
             if let Some(location) = activity
                 && let Err(e) = crate::session::store()
                     .set_user_activity(agent_id, location.as_str())

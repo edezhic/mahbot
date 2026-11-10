@@ -1399,7 +1399,8 @@ impl Agent {
         &self,
         tool_calls: &[ToolCall],
     ) -> Vec<Option<ToolExecutionOutcome>> {
-        // Unknown tools are conservatively treated as side-effecting.
+        // Determine side_effects for each tool call. Unknown tools are conservatively treated as
+        // side-effecting.
         let side_flags: Vec<bool> = tool_calls
             .iter()
             .map(|call| find_tool(&self.tools, &call.name).is_none_or(super::Tool::side_effects))
@@ -4238,7 +4239,7 @@ mod tests {
 
         let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
         assert_eq!(fingerprints.len(), 3);
-        // Appended-only: one nudge after the first continuation, two after the second.
+        // Strictly appended-only: one nudge after the first continuation, two after the second.
         assert_eq!(
             fingerprints[1]
                 .matches("Resume your unfinished turn")
@@ -5518,7 +5519,8 @@ mod tests {
             name: "media_probe".into(),
             arguments: serde_json::json!({}),
         }];
-        // The trait default: a media tool's marker line is a claim about its image.
+        // `MediaTestTool` does not override the hook, so this round takes the trait default: a
+        // media tool's marker line is a claim about its image.
         let outcomes = vec![ToolExecutionOutcome {
             output: marker.clone(),
             success: true,

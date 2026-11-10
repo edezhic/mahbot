@@ -149,8 +149,9 @@ pub fn exempt_from_slowdown() -> Option<Report> {
             ControlMask: control,
             StateMask: 0,
         };
-        // `allow`, not `expect`: this cast cannot truncate on a 32-bit target, and an
-        // unfired expectation is itself a warning.
+        // The call is handed the structure's own size, as that class documents. `allow`, not
+        // `expect`: this cast cannot truncate on a 32-bit target, and an unfired expectation is
+        // itself a warning.
         #[allow(clippy::cast_possible_truncation)]
         let size = size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32;
         // SAFETY: `state` is a `PROCESS_POWER_THROTTLING_STATE` that outlives the call

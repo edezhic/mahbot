@@ -1167,7 +1167,8 @@ fn opening(clause: &str) -> String {
         .trim_start_matches(['(', '`', ' '])
         .to_ascii_lowercase();
     let mut clause = strip_connectors(clause);
-    // The cue is a label for the instruction behind it, not the instruction's own verb.
+    // `Run: …`, `Try: …` — the cue is a label for the instruction behind it, not the instruction's
+    // own verb.
     if let Some((cue, instruction)) = clause.split_once(": ")
         && is_cue(cue)
     {

@@ -924,7 +924,6 @@ async fn resolve_window(
     }
 }
 
-//
 // A window still must show the window's current visible pixels, occluders included, which reading
 // the window's own drawable would not — so a window still is a crop of the screen capture. AT-SPI
 // extents and captured pixels are different coordinate spaces whenever the desktop scale is not 1,
@@ -2072,9 +2071,12 @@ fn x11_capture_screen(budget: &CaptureBudget) -> Result<(Capture, SurfaceGeometr
     Ok((composite, geo))
 }
 
-// with short timeouts; deny/timeout/missing portal degrades to accessibility-only — no retries, no
-// prompt spam.
+// One Screenshot attempt with short timeouts; deny/timeout/missing portal degrades to
+// accessibility-only — no retries, no prompt spam.
 
+/// Last known screen pixels, stored on every successful `Screen` capture so
+/// zoom can size itself without triggering a second portal dialog, and so AT-SPI
+/// extents can be reconciled with pixels ([`pixel_space`]).
 static SCREEN_DIMS: Mutex<Option<(u32, u32)>> = Mutex::new(None);
 
 static PORTAL_TOKEN_SEQ: AtomicU64 = AtomicU64::new(0);

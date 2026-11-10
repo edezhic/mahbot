@@ -472,7 +472,7 @@ mod tests {
         });
     }
 
-    /// 500px → ~59 body chars per wrapped line at 13px JetBrains Mono.
+    /// Test width: 500px → ~59 body chars per wrapped line at 13px JetBrains Mono.
     const TEST_WIDTH: f32 = 500.0;
 
     fn measure(text: &str) -> MessageMeasure {
@@ -543,7 +543,8 @@ mod tests {
         }
     }
 
-    /// Past the budget a message collapses to its first lines, within it stays whole.
+    /// Collapsing is the bias: past the budget a message collapses to its first lines, within it
+    /// stays whole.
     #[test]
     fn wrapping_and_collapsing_cases() {
         run_measure_cases(&[

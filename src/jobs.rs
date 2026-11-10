@@ -1568,6 +1568,8 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
     Ok(replayed)
 }
 
+/// Stale-job purge.
+///
 /// Cutoff = 8h. Deletes only stale TICKET-PHASE jobs whose updated_at predates the cutoff AND
 /// whose roster agents' sessions are all stale too (live sessions referenced by unfinished jobs
 /// are NEVER purged — the agents table IS the marker). The puller re-creates a purged job on the

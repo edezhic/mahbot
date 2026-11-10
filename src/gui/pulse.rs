@@ -50,7 +50,7 @@ pub(crate) fn pulse_dot(diameter: f32, color: Color) -> PulseDot {
     PulseDot { diameter, color }
 }
 
-/// The pulse dot in the theme accent, sized to sit in a text row.
+/// The activity indicator: the pulse dot in the theme accent, sized to sit in a text row.
 #[must_use]
 pub(crate) fn activity_dot() -> PulseDot {
     pulse_dot(ACTIVITY_DOT, theme::ACCENT)

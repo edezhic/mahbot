@@ -5961,8 +5961,8 @@ mod tests {
                         "edits": [{ "op": "format_text", "find": "x", "size": f64::INFINITY }] }),
                 "at least one of bold",
             ),
-            // An attribute the op does not take beside one it does: the kit reads only the
-            // fields it knows.
+            // A `format_text` naming an attribute the op does not take beside one it does: the kit
+            // reads only the fields it knows, so the extra one would be dropped in silence.
             (
                 json!({ "action": "docx_edit", "path": "doc.docx",
                         "edits": [{ "op": "format_text", "find": "x", "bold": true,

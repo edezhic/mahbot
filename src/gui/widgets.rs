@@ -1218,8 +1218,8 @@ pub fn collect_tree_row_widths(
     out
 }
 
-/// The auto-sized width of the tree panel from the natural content width of every rendered row (in
-/// render order — see [`collect_tree_row_widths`]).
+/// Compute the auto-sized width of the tree panel from the natural content width of every rendered
+/// row (in render order — see [`collect_tree_row_widths`]).
 ///
 /// Only rows currently visible in the viewport are measured: the visible range comes from
 /// [`FileTree::scroll_y`] / [`FileTree::viewport_h`] with [`ESTIMATED_TREE_ROW_HEIGHT`] row

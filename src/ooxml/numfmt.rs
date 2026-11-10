@@ -41,22 +41,25 @@ use std::cmp::Ordering;
 const MAX_FORMAT_LENGTH: usize = 255;
 /// Past this a section stops being one this reader reproduces.
 const MAX_PLACEHOLDERS: usize = 30;
-/// Excel writes at most three (a millisecond).
+/// The fractional-second digits a time section may name (Excel writes at most three, a
+/// millisecond).
 const MAX_SUB_SECOND_DIGITS: usize = 9;
 /// Far past anything Excel displays, but still a value whose days, seconds and hours
 /// have an exact integer form.
 const VALUE_LIMIT: f64 = 1e9;
-/// One per sign and one for text, Excel's own limit.
+/// The sections a format may carry: one per sign and one for text, Excel's own limit.
 const MAX_SECTIONS: usize = 4;
 /// The serial of 9999-12-31 in the 1900 system: the last day Excel's calendar holds.
 const SERIAL_LIMIT: i64 = 2_958_465;
 /// The same last day in the 1904 system, whose day 0 is four years later.
 const SERIAL_LIMIT_1904: i64 = SERIAL_LIMIT - 1_462;
-/// So a value without a plausible display is declined rather than rendered into a
+/// The largest scaled integer a number's display may need, so that a value
+/// without any plausible display is declined rather than rendered into a
 /// three-hundred-digit line.
 const MAX_SCALED: i128 = 10_i128.pow(30);
 
-/// `None` when the id has no ECMA-376/POI builtin meaning.
+/// The built-in number-format code for `id`, or `None` when the id has no ECMA-376/POI builtin
+/// meaning.
 const fn builtin(id: u32) -> Option<&'static str> {
     Some(match id {
         0 => "General",
@@ -120,7 +123,8 @@ fn is_general_code(code: &str) -> bool {
     )
 }
 
-/// The body does not depend on the value its condition is read against.
+/// Whether a section's body is `General`. The body does not depend on the value its condition is
+/// read against.
 fn general_section(section: &str) -> bool {
     split_section(section, 0.0)
         .0
@@ -360,10 +364,12 @@ fn split_section(section: &str, value: f64) -> (&str, Option<Condition>) {
     (body.unwrap_or(rest), condition)
 }
 
-/// Longest first, so a two-character operator is never read as one of its halves.
+/// The operators a numbered condition may carry, longest first so a two-character operator is never
+/// read as one of its halves.
 const CONDITIONS: [&str; 6] = ["<=", ">=", "<>", "<", ">", "="];
 
-/// How Excel tests a value against it, and whether the test passed.
+/// One of a section's own conditions: how Excel tests a value against it, and whether the test
+/// passed.
 #[derive(Clone, Copy)]
 struct Condition {
     operator: &'static str,
@@ -443,7 +449,8 @@ enum Unit {
     AmPm,
 }
 
-/// With the literal text a number format prints around its placeholders.
+/// One meaningful token of a section, with the literal text a number format prints around its
+/// placeholders.
 #[derive(Clone, Copy)]
 enum Tok {
     /// Asked for by the format's author, printed as written.
@@ -465,7 +472,7 @@ enum Tok {
     /// A `*` jump: Excel pads the cell to its width with the next character — not
     /// reproducible in a line of text.
     Star,
-    /// `E+`/`E-`/`e+`/`e-`.
+    /// `E+`/`E-`/`e+`/`e-`: the sign that follows the exponent marker.
     ExpSign(char),
     Date(Unit),
     /// An elapsed `[h]`/`[m]`/`[s]`.
@@ -584,7 +591,8 @@ fn starts_with_ignore_ascii_case(chars: &[char], at: usize, needle: &str) -> boo
             .all(|(current, expected)| current.to_ascii_lowercase() == *expected)
 }
 
-/// `None` for any other bracket (`[Red]`, `[$-409]`, `[>=100]`, …).
+/// The elapsed unit a bracketed run names, or `None` for any other bracket (`[Red]`, `[$-409]`,
+/// `[>=100]`, …).
 fn elapsed_unit(inner: &str) -> Option<Unit> {
     match inner.to_ascii_lowercase().as_str() {
         "h" | "hh" => Some(Unit::Hour),
@@ -615,8 +623,8 @@ fn is_date(tokens: &[Tok]) -> bool {
         .any(|tok| matches!(tok, Tok::Date(_) | Tok::Elapsed(_)))
 }
 
-/// And whether a minute-role `m`, a day, a month or a year is present — the shape the
-/// date renderer works from.
+/// Which date/time units a section names, and whether a minute-role `m`, a day, a month or a year
+/// is present — the shape the date renderer works from.
 #[derive(Default)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -672,7 +680,8 @@ fn date_shape(tokens: &[Tok]) -> DateShape {
     shape
 }
 
-/// It follows an hour, or precedes a second, else it is a month.
+/// Whether the `m` at `index` is a minute: it follows an hour, or precedes a second, else it is a
+/// month.
 fn minute_role(tokens: &[Tok], index: usize) -> bool {
     let is_date_token = |tok: &&Tok| matches!(tok, Tok::Date(_) | Tok::Elapsed(_));
     let preceding = tokens[..index].iter().rev().find(is_date_token);
@@ -862,10 +871,10 @@ impl Point {
     }
 }
 
-/// `None` is a section this reader has no place for: one naming a second point
-/// (`0.0.0`), or one whose point stands outside the placeholders `first..=last` — before
-/// the first (`.00`, whose digits would be counted as the whole part) or after the last
-/// (`0.5`, whose `5` is literal in Excel).
+/// The one decimal point a section body may name. `None` is a section this reader has no place for
+/// — one naming a second point (`0.0.0`), or one whose point stands outside the placeholders
+/// `first..=last`: before the first (`.00`, whose digits would be counted as the whole part) or
+/// after the last (`0.5`, whose `5` is literal in Excel).
 fn decimal_point(tokens: &[Tok], first: usize, last: usize) -> Option<Point> {
     let mut point = Point::Absent;
     for (index, tok) in tokens.iter().enumerate() {
@@ -924,9 +933,10 @@ fn render_number(value: f64, tokens: &[Tok]) -> Option<Rendered> {
     render_plain(value, tokens, first, last, point)
 }
 
-/// A literal, a directive's symbol or the sign a `%` stands for. A body holding one cannot
-/// be a plain layout of digits — the text would drop out of it — so such a section is laid
-/// out in place instead ([`render_layered`]).
+/// Whether a token prints text of its own, in the place the section puts it: a literal, a
+/// directive's symbol or the sign a `%` stands for. A body holding one cannot be a plain layout of
+/// digits — the text would drop out of it — so such a section is laid out in place instead
+/// ([`render_layered`]).
 fn is_text(tok: Tok) -> bool {
     matches!(
         tok,
@@ -934,7 +944,8 @@ fn is_text(tok: Tok) -> bool {
     )
 }
 
-/// The `%` a section prints, a currency directive's symbol, and escaped or quoted characters.
+/// The literal text tokens carry, placeholders and markers contributing nothing: the `%` a section
+/// prints, a currency directive's symbol and escaped or quoted characters.
 fn literal_text(tokens: &[Tok]) -> String {
     let mut out = String::new();
     for tok in tokens {
@@ -996,8 +1007,8 @@ fn scaling_commas(tokens: &[Tok], last: usize) -> usize {
     leading_commas(&tokens[last + 1..])
 }
 
-/// `value` after the `%` and trailing-comma scaling the section asks for, rounded at its
-/// own precision.
+/// The scaled integer a section's placeholders show: `value` after the `%` and trailing-comma
+/// scaling the section asks for, rounded at its own precision.
 fn scaled_plain(value: f64, tokens: &[Tok], last: usize, places: i32) -> Option<i128> {
     let mut value = value;
     for tok in tokens {
@@ -1011,9 +1022,9 @@ fn scaled_plain(value: f64, tokens: &[Tok], last: usize, places: i32) -> Option<
     scaled_magnitude(value, places)
 }
 
-/// The integer part padded to the `0`s that force its width and grouped when the section
-/// asks, the fraction trimmed to the digits that force one, behind the point a section
-/// naming any fractional part always carries.
+/// A scaled integer as the digit body a section shows: the integer part padded to the `0`s that
+/// force its width and grouped when the section asks, the fraction trimmed to the digits that force
+/// one, behind the point a section naming any fractional part always carries.
 fn digit_text(scaled: i128, shape: &PlainShape) -> Option<String> {
     let rendered = magnitude_text(scaled, u32::try_from(shape.frac_placeholders).ok()?)?;
     let (int_raw, mut frac_digits) = rendered.find('.').map_or_else(
@@ -1080,8 +1091,8 @@ fn plain_pieces(
     })
 }
 
-/// Literals around a digit body of integer and fractional placeholders, with `%`, scaling
-/// commas and grouping.
+/// A plain fixed-point section: literals around a digit body of integer and fractional
+/// placeholders, with `%`, scaling commas and grouping.
 fn render_plain(
     value: f64,
     tokens: &[Tok],
@@ -1349,8 +1360,9 @@ fn scaled_magnitude(value: f64, shift: i32) -> Option<i128> {
     };
     (rounded <= MAX_SCALED).then_some(rounded)
 }
-/// The exponent of its leading significant digit, read from the same canonical decimal the
-/// display rounding works from rather than from a logarithm a binary value can land just under.
+/// The decade of a finite non-zero magnitude: the exponent of its leading significant digit, read
+/// from the same canonical decimal the display rounding works from rather than from a logarithm a
+/// binary value can land just under.
 fn decade(magnitude: f64) -> Option<i32> {
     let text = format!("{magnitude:.14e}");
     text.split_once('e')?.1.parse().ok()

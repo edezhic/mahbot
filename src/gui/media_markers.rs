@@ -600,7 +600,7 @@ impl CachedImage {
 static DATA_URI_IMAGE_CACHE: LazyLock<Mutex<BoundedLruCache<String, CachedImage>>> =
     LazyLock::new(|| Mutex::new(BoundedLruCache::with_capacity(MAX_CACHED_IMAGES)));
 
-/// The cached outcome for `key`, decoding and caching it on a miss.
+/// Return the cached outcome for `key`, decoding and caching it on a miss.
 ///
 /// The entry is inspected under the lock and returned through [`CachedImage::handle`] — a cached
 /// [`CachedImage::Failed`] is a hit that yields `None`, never a miss (falling through would

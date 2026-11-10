@@ -551,7 +551,8 @@ mod engine {
             && !parent.as_os_str().is_empty()
             && !parent.is_dir()
         {
-            // A parent that is there and is not a directory is not a missing one.
+            // Why it cannot be used is what the caller needs to hear: a parent that is there and is
+            // not a directory is not a missing one.
             return Err(if parent.exists() {
                 format!(
                     "'{}' cannot be written: '{}' is not a directory, and this command does not \

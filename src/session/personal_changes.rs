@@ -207,8 +207,8 @@ impl Rules {
 }
 
 impl RulesState {
-    /// A path some repository's rules exclude and git does not track. A path git could not
-    /// be asked about stays visible (see [`Rules`]).
+    /// Whether `rel` (folder-relative) is hidden: a path some repository's rules exclude and git
+    /// does not track. A path git could not be asked about stays visible (see [`Rules`]).
     fn hidden(&mut self, root: &Path, rel: &Path, is_dir: bool) -> bool {
         if self.excluded(root, rel, is_dir) && self.tracked(root, rel, is_dir) == Some(false) {
             return true;

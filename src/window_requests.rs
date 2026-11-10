@@ -12,7 +12,7 @@ use crate::util::UnwrapPoison;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum WindowRequest {
-    /// Out of the hidden state, restored from minimized, in front.
+    /// Bring the window up: out of the hidden state, restored from minimized, in front.
     Show,
     Quit,
 }
@@ -37,8 +37,8 @@ fn send(request: WindowRequest) -> bool {
         .is_some_and(|sender| sender.send(request).is_ok())
 }
 
-/// Bring the window up. `false` when nothing will act on it — the channel was never
-/// installed — so the caller falls back.
+/// Ask the dashboard to bring the window up. `false` when nothing will act on it — the channel was
+/// never installed — so the caller falls back.
 pub(crate) fn show() -> bool {
     send(WindowRequest::Show)
 }

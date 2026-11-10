@@ -2947,7 +2947,8 @@ impl EditorState {
 
         self.active_modal = None;
 
-        // Convert from 1-based (grep) to 0-based (editor).
+        // Open the file and move to the matching line. Convert from 1-based (grep) to 0-based
+        // (editor).
         let cursor_line = line_number.saturating_sub(1);
 
         if let Some(existing_idx) = self.tabs.iter().position(|t| t.path == abs_path) {

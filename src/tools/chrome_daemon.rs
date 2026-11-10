@@ -1932,8 +1932,9 @@ pub async fn run_watchdog() {
     // daemon-free status cannot see and would clobber.
     let mut woken = false;
     loop {
-        // A CLI-less host cannot run commands, and an evaluation without a CLI would
-        // only record Unknown for a binary that is not there.
+        // How long to wait before the next iteration, and whether the health evaluation is skipped:
+        // a CLI-less host cannot run commands, and an evaluation without a CLI would only record
+        // Unknown for a binary that is not there.
         let mut sleep = WATCHDOG_INTERVAL;
         let mut skip_health = false;
         let cli_due = last_cli_check.elapsed() >= CLI_RECHECK;

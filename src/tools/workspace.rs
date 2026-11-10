@@ -388,8 +388,8 @@ async fn set_pipelines_paused(
             PipelineChange::Write => match store.set_paused(&ws.name, paused).await {
                 Ok(()) if paused => format!("- {}: paused", ws.name),
                 Ok(()) => format!("- {}: resumed", ws.name),
-                // The rows written before a failure are real, so the report must cover each
-                // workspace.
+                // Reported like every other outcome: the rows written before a failure are real, so
+                // the report must cover each workspace.
                 Err(e) => {
                     incomplete = true;
                     format!("- {}: failed — {e}", ws.name)

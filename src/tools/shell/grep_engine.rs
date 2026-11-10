@@ -183,7 +183,8 @@ struct EngineSpec {
     /// from its own fd 1 (see [`StdoutDest`]), not carried here.
     #[serde(default)] // lenient: a swapped-binary spec reaches the version check
     piped: bool,
-    /// Non-first pipeline member fed by a producer's stdout via stdin (no operands).
+    /// The member is a non-first pipeline member fed by a producer's stdout via stdin (no
+    /// operands): read stdin instead of operands.
     #[serde(default)]
     stdin: bool,
     /// Emit the stream-size marker to stderr (only when stderr still reaches us).
@@ -203,7 +204,8 @@ enum StdoutDest {
 }
 
 impl StdoutDest {
-    /// fd 1 separates a pipe from any real sink ([`stdout_is_pipe`]); `piped` says which.
+    /// This member's destination. fd 1 separates a pipe from any real sink ([`stdout_is_pipe`]);
+    /// `piped` says which.
     fn of(spec: &EngineSpec, fd1_is_pipe: bool) -> Self {
         if !fd1_is_pipe {
             StdoutDest::File
@@ -4170,8 +4172,8 @@ mod parity_tests {
         fs::write(home.join("htree/sub/f2.txt"), "needle\n").unwrap();
         fs::create_dir_all(ws.join("sub")).unwrap();
         fs::write(ws.join("sub/s.txt"), "needle\n").unwrap();
-        // Context rows: two entries whose `-C1` output exceeds the redirected walk's hand-off
-        // chunk (so the chunked destination really interleaves), plus a small entry.
+        // Walk tree for context rows: two entries whose `-C1` output exceeds the redirected walk's
+        // hand-off chunk (so the chunked destination really interleaves), plus a small entry.
         fs::create_dir_all(ws.join("walkctx")).unwrap();
         let walk_block = "needle\nfiller\nfiller\nfiller\nfiller\n".repeat(1000);
         fs::write(ws.join("walkctx/one.txt"), &walk_block).unwrap();
@@ -7552,7 +7554,7 @@ mod unix_operator_pins {
     fn the_unix_word_reading_cases() {
         let (tmp, ws, home) = serve_fixture();
         let cases: &[ReadingCase] = &[
-            // An unquoted `#` opening a word comments out the rest of its line.
+            // `sh`'s comment: an unquoted `#` opening a word comments out the rest of its line.
             ReadingCase {
                 name: "a comment takes an ampersand and an echo with it",
                 command: "grep -rn needle . # note & echo TAIL-RAN",

@@ -34,7 +34,8 @@ unsafe extern "C-unwind" {
     ) -> i32;
 }
 
-/// The body until the frame runs it, then the value it returned.
+/// What one guarded call leaves the frame with: the body until the frame runs it, then the value it
+/// returned.
 struct Slot<F, T> {
     body: Option<F>,
     out: Option<T>,

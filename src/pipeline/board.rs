@@ -129,7 +129,8 @@ const TERMINAL_PHASES: &[TicketPhase] = &[
     TicketPhase::Failed,
 ];
 
-/// SQL fragment listing phases as quoted, comma-separated strings — e.g. `'done', 'cancelled'`.
+/// Produces an SQL fragment listing phases as quoted, comma-separated strings — e.g. `'done',
+/// 'cancelled'`.
 ///
 /// # Precondition
 ///
@@ -260,10 +261,10 @@ pub struct Ticket {
     /// With [`reviewed_head`](Self::reviewed_head) and a clean porcelain this identifies the
     /// exact content reviewers saw.
     pub reviewed_tree: Option<String>,
-    /// Set on transition to Done and never cleared — a finished ticket's phase is immutable.
-    /// `None` for tickets that never reached Done.
+    /// Exact completion timestamp: set on transition to Done and never cleared — a finished
+    /// ticket's phase is immutable. `None` for tickets that never reached Done.
     pub done_at: Option<String>,
-    /// Times this ticket bounced back into development from a non-success in either
+    /// Number of times this ticket bounced back into development from a non-success in either
     /// post-development stage. Drives the bounce-based circuit breaker (max 10). Engineer hard
     /// failures are pause-only (workspace pause, implementation frozen) and do not consume this
     /// budget.
@@ -331,8 +332,8 @@ impl Ticket {
         out
     }
 
-    /// The shared header of [`Self::detailed_display`] and [`Self::detailed_display_limited`],
-    /// rendering `description` verbatim.
+    /// Build the shared header of [`Self::detailed_display`] and
+    /// [`Self::detailed_display_limited`], rendering `description` verbatim.
     #[must_use]
     fn header(&self, description: &str) -> String {
         let mut out = format!(
@@ -1510,7 +1511,7 @@ impl BoardStore {
         prerequisite_ids: &[String],
         workspace_name: &str,
     ) -> Result<()> {
-        // Turso rejects `WHERE id IN ()`.
+        // Guard against empty list — Turso rejects `WHERE id IN ()`.
         if prerequisite_ids.is_empty() {
             return Ok(());
         }

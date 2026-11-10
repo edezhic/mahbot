@@ -10,13 +10,13 @@ use crate::util::unquote_c_style;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffFileStatus {
-    /// Exists on both sides (modified or unchanged).
+    /// File exists on both sides (modified or unchanged).
     Modified,
     /// New file added to git (from `--- /dev/null`).
     Added,
     /// File deleted from git (from `+++ /dev/null`).
     Deleted,
-    /// Renamed (from `rename from`/`rename to`).
+    /// File renamed (from `rename from`/`rename to`).
     Renamed,
     /// Untracked/new file, assembled from raw content by `make_untracked_diff_file`.
     Untracked,
@@ -26,9 +26,9 @@ pub enum DiffFileStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffContent {
     Parseable,
-    /// Binary (detected by git).
+    /// File is binary (detected by git).
     Binary,
-    /// Too large to diff (size in bytes).
+    /// File is too large to diff (size in bytes).
     TooLarge(u64),
 }
 
@@ -43,7 +43,8 @@ pub struct DiffFile {
 }
 
 impl DiffFile {
-    /// Defaults: `old_path: None`, `content: DiffContent::Parseable`.
+    /// Create a new `DiffFile` with the given path, hunks, and status. Defaults: `old_path: None`,
+    /// `content: DiffContent::Parseable`.
     #[must_use]
     pub fn new(path: String, hunks: Vec<DiffHunk>, status: DiffFileStatus) -> Self {
         Self {
