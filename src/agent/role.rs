@@ -9,9 +9,9 @@ use strum::IntoEnumIterator;
 use crate::Role;
 
 /// Role string for the workspace's project commands — `"diagnostics"`. The value outlives the
-/// commands-only phase as a shared key: the shell spill-owner key of a run with no agent identity
-/// (`cleanup_agent_spills`), the sentinel that collapses already-stored diagnostics comments to a
-/// summary in the GUI board, and the diagnostics-discovery agent id / stale-write log label. The
+/// commands-only phase as a shared key: the shell spill-owner key of a run with no agent identity,
+/// the sentinel that collapses already-stored diagnostics comments to a summary in the GUI board,
+/// and the diagnostics-discovery agent id / stale-write log label. The
 /// literal is compared against `comment.role` and against agent ids, so a change must be
 /// coordinated across those sites.
 pub(crate) const DIAGNOSTICS_ROLE: &str = "diagnostics";

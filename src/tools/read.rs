@@ -12,8 +12,8 @@ use super::listing::{ListingEntry, format_listing, human_readable_size};
 use super::path::PathAccess;
 use crate::tools::search::SearchTool;
 use crate::tools::shell::try_spill_to_file;
-use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
 use crate::util::tree_sitter::supported_extensions;
+use crate::util::{TOOL_OUTPUT_BUDGET_BYTES, omitted_lines};
 use crate::{Tool, Workspace};
 use async_trait::async_trait;
 use serde_json::json;
@@ -393,7 +393,7 @@ impl Tool for ReadTool {
                 let body = &output[nl + 1..];
 
                 // Worst-case marker length — `omitted ≤ expected` bounds the actual marker here
-                let marker_budget = format!("\n... ({expected} lines omitted)").len();
+                let marker_budget = format!("\n{}", omitted_lines(expected, "omitted")).len();
                 let body_budget =
                     TOOL_OUTPUT_BUDGET_BYTES.saturating_sub(header.len() + marker_budget + 1);
 
@@ -407,9 +407,10 @@ impl Tool for ReadTool {
                     kept_body.bytes().filter(|&b| b == b'\n').count() + 1
                 };
                 let omitted = expected.saturating_sub(kept);
-                let marker = format!("\n... ({omitted} lines omitted)");
-
-                return format!("{header}\n{kept_body}{marker}");
+                return format!(
+                    "{header}\n{kept_body}\n{}",
+                    omitted_lines(omitted, "omitted")
+                );
             }
         }
 

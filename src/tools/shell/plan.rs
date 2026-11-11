@@ -3338,7 +3338,8 @@ mod tests {
         };
         assert_eq!(
             stdout.len(),
-            SHELL_PIPE_READ_CAP + SHELL_PIPE_TAIL_CAP + TRUNCATED_MIDDLE.len(),
+            // The gap marker is spliced as a line of its own: the sentence plus its two newlines.
+            SHELL_PIPE_READ_CAP + SHELL_PIPE_TAIL_CAP + TRUNCATED_MIDDLE.len() + 2,
             "the head is the cap and the rest is kept as the stream's end"
         );
         assert_eq!(String::from_utf8_lossy(&stderr), "marker\n");

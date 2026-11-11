@@ -53,7 +53,11 @@ use std::time::Duration;
 use super::listing::{ListingEntry, format_listing, human_readable_size};
 use super::with_note;
 use crate::util::TOOL_OUTPUT_BUDGET_BYTES;
+use crate::util::TRUNCATED_MIDDLE;
 use crate::util::UnwrapPoison;
+use crate::util::excerpt::failure_excerpt;
+use crate::util::omitted_lines;
+use crate::util::push_line;
 use crate::util::scrub_credentials;
 use crate::util::strip_ansi_escapes;
 
@@ -175,8 +179,6 @@ const SHELL_PIPE_READ_CAP: usize = 256 * 1024;
 /// line and its exit summary are written last, so the end is what a reader needs most and what an
 /// unbounded run's own progress noise would otherwise push out.
 const SHELL_PIPE_TAIL_CAP: usize = 32 * 1024;
-/// Where a stream outgrew its head: a line of its own, so a line scanner cannot mistake the join.
-const TRUNCATED_MIDDLE: &str = "\n…\n";
 const TIMEOUT_OUTPUT_TAIL_CHARS: usize = 2_000;
 const ENGINE_FAILURE_DETAIL_CHARS: usize = 200;
 
@@ -1143,7 +1145,9 @@ impl Readers {
         // run prints last is never the part that is lost.
         for (stream, end) in streams.iter_mut().zip(ends) {
             if !end.is_empty() {
+                stream.push(b'\n');
                 stream.extend_from_slice(TRUNCATED_MIDDLE.as_bytes());
+                stream.push(b'\n');
                 stream.extend_from_slice(&end);
             }
         }
@@ -2031,25 +2035,40 @@ fn annotate_run(
 /// Elapsed time plus the scrubbed tails of both streams, for a program run that did not complete.
 fn program_error_tail(elapsed: Duration, stdout: &[u8], stderr: &[u8]) -> String {
     let mut msg = format!("elapsed: {:.1}s", elapsed.as_secs_f64());
-    append_output_tail(&mut msg, "stdout", stdout);
-    append_output_tail(&mut msg, "stderr", stderr);
+    msg.push_str(&captured_tails(stdout, stderr));
     msg
 }
 
-/// Decode both raw streams ([`decode_and_strip_ansi`]) and put stderr on its own line when
-/// non-blank (never a leading blank line when stdout is empty). Never credential-scrubbed here: the
-/// `custom` tool's output is scrubbed by the agent-level pass, while an automation's trigger
-/// deliberately shows a check exactly as the check produced it.
-fn decode_raw_streams(stdout: &[u8], stderr: &[u8]) -> String {
-    let stdout = decode_and_strip_ansi(stdout);
-    let stderr = decode_and_strip_ansi(stderr);
+/// The positional tails of both streams, each under its own label — what a stopped run's message
+/// carries when its caller reads the formatted output rather than recording the failure.
+fn captured_tails(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut section = String::new();
+    append_output_tail(&mut section, "stdout", stdout);
+    append_output_tail(&mut section, "stderr", stderr);
+    section
+}
+
+/// Both streams as captured — stdout first, then stderr on the next line when both are non-blank
+/// (never a leading blank line when one is empty). Never credential-scrubbed here: that is the
+/// caller's own step.
+fn raw_streams(stdout: &str, stderr: &str) -> String {
     if stderr.trim().is_empty() {
-        stdout
+        stdout.to_string()
     } else if stdout.trim().is_empty() {
-        stderr
+        stderr.to_string()
     } else {
         format!("{stdout}\n{stderr}")
     }
+}
+
+/// Decode both raw streams ([`decode_and_strip_ansi`]) into [`raw_streams`]' reading — the two call
+/// sites are the `custom` tool, whose output the agent-level pass scrubs, and an automation's
+/// trigger, which deliberately shows a check exactly as the check produced it.
+fn decode_raw_streams(stdout: &[u8], stderr: &[u8]) -> String {
+    raw_streams(
+        &decode_and_strip_ansi(stdout),
+        &decode_and_strip_ansi(stderr),
+    )
 }
 
 fn tail_chars(s: &str, max_chars: usize) -> String {
@@ -2075,13 +2094,15 @@ fn append_output_tail(msg: &mut String, label: &str, data: &[u8]) {
     }
 }
 
+/// The timeout failure's structured block: the command, its elapsed time and limit, and the
+/// caller-built captured-output section (`output` — its own lines, a leading newline, or empty when
+/// nothing was captured; see [`ShellTool::stopped_output`]).
 fn format_timeout_error(
     command: &str,
     elapsed: Duration,
     timeout_limit: Duration,
     pid: Option<u32>,
-    stdout: &[u8],
-    stderr: &[u8],
+    output: &str,
 ) -> String {
     let mut msg = format!(
         "Shell command timed out.\n\
@@ -2099,24 +2120,23 @@ fn format_timeout_error(
         "\nhint: for known-long commands, pass a larger per-call timeout via the `timeout_secs` tool argument (max 3600s).",
     );
 
-    append_output_tail(&mut msg, "stdout", stdout);
-    append_output_tail(&mut msg, "stderr", stderr);
+    msg.push_str(output);
     msg
 }
 
 /// The memory failure's structured block, in the shape of [`format_timeout_error`]: the same fields
-/// and output tails, a reason naming the memory ceiling rather than the timeout, and a hint at the
-/// one thing an agent can do. It never says "timed out" — a run ended for memory must be impossible
-/// to mistake for one that ran out of time. The amount is weighed against the machine's RAM in the
-/// first line, and the crossed ceiling is its own field, as `timeout_limit` is for a timeout.
+/// and captured-output section, a reason naming the memory ceiling rather than the timeout, and a
+/// hint at the one thing an agent can do. It never says "timed out" — a run ended for memory must be
+/// impossible to mistake for one that ran out of time. The amount is weighed against the machine's
+/// RAM in the first line, and the crossed ceiling is its own field, as `timeout_limit` is for a
+/// timeout.
 fn format_memory_error(
     command: &str,
     elapsed: Duration,
     used: u64,
     limit: u64,
     pid: Option<u32>,
-    stdout: &[u8],
-    stderr: &[u8],
+    output: &str,
 ) -> String {
     let mut msg = format!(
         "Shell command {}.\n\
@@ -2136,8 +2156,7 @@ fn format_memory_error(
          input it reads or split it into smaller commands.",
     );
 
-    append_output_tail(&mut msg, "stdout", stdout);
-    append_output_tail(&mut msg, "stderr", stderr);
+    msg.push_str(output);
     msg
 }
 
@@ -2204,12 +2223,51 @@ fn leftover_stop_recipe(platform: ShellPlatform, scope: Option<u32>) -> String {
 
 pub struct ShellTool {
     pub mode: ShellMode,
+    /// Return the command's own output instead of the profile-formatted reading — see
+    /// [`Self::unfiltered`].
+    unfiltered: bool,
 }
 
 impl ShellTool {
     #[must_use]
     pub const fn new(mode: ShellMode) -> Self {
-        Self { mode }
+        Self {
+            mode,
+            unfiltered: false,
+        }
+    }
+
+    /// Return the command's own output instead of the profile's formatted, budget-bounded reading:
+    /// both streams as captured (still bounded by the pipe caps and credential-scrubbed), with no
+    /// profile filter, line cap or spill — for a caller that decides for itself what part of the
+    /// output to keep, such as the verification round's record of a failing project command
+    /// ([`crate::util::excerpt`]). A timeout or a memory stop of such a run carries the
+    /// failure-identifying excerpt of the captured output for the same reason, where the formatted
+    /// reading carries only its positional tail. The one addition is the residual-leftover note: a
+    /// process the command left running and that outlived the stop is still named, because nothing
+    /// else would report it.
+    ///
+    /// Not for an agent-facing toolset: the output reaches the capture caps (~288 KB), so the
+    /// caller must bound what it keeps.
+    #[must_use]
+    pub(crate) const fn unfiltered(mut self) -> Self {
+        self.unfiltered = true;
+        self
+    }
+
+    /// The captured output a stopped run's message carries: the positional tails by default, or —
+    /// for an [`Self::unfiltered`] run, whose caller records the failure — the excerpt that names
+    /// it, so a failure printed before the last [`TIMEOUT_OUTPUT_TAIL_CHARS`] characters is not
+    /// lost.
+    fn stopped_output(&self, stdout: &[u8], stderr: &[u8]) -> String {
+        if !self.unfiltered {
+            return captured_tails(stdout, stderr);
+        }
+        let output = raw_streams(&strip_and_scrub(stdout), &strip_and_scrub(stderr));
+        if output.trim().is_empty() {
+            return String::new();
+        }
+        format!("\noutput:\n{}", failure_excerpt(&output))
     }
 
     /// Launch a command in the background (Full mode only): it keeps running after this call
@@ -2293,8 +2351,9 @@ impl ShellTool {
 
     /// Execute a command and return `(formatted_output, exit_code)`: `Some(0)` for success,
     /// `Some(n)` for a non-zero exit, `None` when a signal terminated the process. The output
-    /// carries the `[exit status: N]` annotation for non-zero exits and signal termination, and
-    /// credentials are already scrubbed.
+    /// carries the `[exit status: N]` annotation for non-zero exits and signal termination — except
+    /// for an [`Self::unfiltered`] run, whose caller reads the status from the returned code — and
+    /// credentials are already scrubbed in every case.
     #[expect(clippy::too_many_lines)] // orchestration: validation, engine hook, containment
     pub(crate) async fn execute_with_status(
         &self,
@@ -2647,14 +2706,22 @@ impl ShellTool {
                 // All completed commands return output with exit info, whatever the code. Only
                 // actual execution failures (timeout, launch failure) are tool errors — plus the
                 // Windows unserved search refused above.
-                let processed = process_shell_output(
-                    command_str,
-                    &stdout,
-                    &stderr,
-                    exit_code.unwrap_or(-1),
-                    elapsed,
-                );
-                let combined = if exit_code == Some(0) {
+                let processed = if self.unfiltered {
+                    // The caller reads the command's own output: both streams as captured, nothing
+                    // filtered out of them.
+                    raw_streams(&scrub_credentials(&stdout), &scrub_credentials(&stderr))
+                } else {
+                    process_shell_output(
+                        command_str,
+                        &stdout,
+                        &stderr,
+                        exit_code.unwrap_or(-1),
+                        elapsed,
+                    )
+                };
+                // An unfiltered caller reads the status from the tuple and records it itself, so the
+                // annotation would only repeat it inside the text it keeps.
+                let combined = if exit_code == Some(0) || self.unfiltered {
                     processed
                 } else {
                     with_note(&processed, &exit_note)
@@ -2709,8 +2776,13 @@ impl ShellTool {
                     stderr_bytes = stderr.len(),
                     "Shell command timed out"
                 );
-                let msg =
-                    format_timeout_error(command_str, elapsed, timeout, pid, &stdout, &stderr);
+                let msg = format_timeout_error(
+                    command_str,
+                    elapsed,
+                    timeout,
+                    pid,
+                    &self.stopped_output(&stdout, &stderr),
+                );
                 anyhow::bail!("{msg}");
             }
             ShellRunResult::MemoryExceeded {
@@ -2731,8 +2803,14 @@ impl ShellTool {
                     stderr_bytes = stderr.len(),
                     "Shell command terminated: exceeded memory limit"
                 );
-                let msg =
-                    format_memory_error(command_str, elapsed, used, limit, pid, &stdout, &stderr);
+                let msg = format_memory_error(
+                    command_str,
+                    elapsed,
+                    used,
+                    limit,
+                    pid,
+                    &self.stopped_output(&stdout, &stderr),
+                );
                 anyhow::bail!("{msg}");
             }
             ShellRunResult::SpawnFailed(e) => anyhow::bail!(
@@ -3391,9 +3469,8 @@ pub(crate) fn is_live_spill_name(name: &OsStr) -> bool {
 
 /// Delete the spill paths recorded for `agent_id` (owner-deletes-at-end): a directory (the read
 /// tool's conversion artifacts) whole, a file with [`std::fs::remove_file`], and the registry entry
-/// cleared so a later run of the same id starts fresh. Callers: the run-end cleanup guard
-/// (`RunEndCleanup`, which fires on every unwinding exit path) and the verification round's
-/// project-commands run ([`crate::agent::role::DIAGNOSTICS_ROLE`], `"diagnostics"`).
+/// cleared so a later run of the same id starts fresh. The caller is the run-end cleanup guard
+/// (`RunEndCleanup`, which fires on every unwinding exit path).
 pub(crate) fn cleanup_agent_spills(agent_id: &str) {
     let mut map = SPILL_OWNERS.lock().unwrap_poison();
     let Some(paths) = map.remove(agent_id) else {
@@ -3989,13 +4066,6 @@ fn finish_shell_output(
     try_spill_to_file(combined, TOOL_OUTPUT_BUDGET_BYTES)
 }
 
-fn push_line(buf: &mut String, line: &str) {
-    if !buf.is_empty() {
-        buf.push('\n');
-    }
-    buf.push_str(line);
-}
-
 /// Collapse runs of blank lines to at most 2 consecutive.
 fn collapse_blank_lines(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
@@ -4260,16 +4330,11 @@ fn format_sandwich(output: &str, head: usize, tail: usize, marker_verb: &str) ->
     if !result.is_empty() {
         result.push('\n');
     }
-    result.push_str(&omitted_lines_marker(omitted, marker_verb));
+    result.push_str(&omitted_lines(omitted, marker_verb));
     if tail > 0 {
         let _ = write!(result, "\n{}", lines[total - tail..].join("\n"));
     }
     result
-}
-
-/// The line both sandwich builders put in place of the omitted middle.
-fn omitted_lines_marker(omitted: usize, verb: &str) -> String {
-    format!("... ({omitted} lines {verb})")
 }
 
 /// Head/tail sandwich (byte-gated), `max_lines`-only absolute cap, or passthrough. Returns
@@ -4527,7 +4592,7 @@ fn file_spill_preview(spilled: &Spilled) -> String {
     let marker = if omitted == 0 {
         "...".to_string()
     } else {
-        omitted_lines_marker(omitted, "omitted")
+        omitted_lines(omitted, "omitted")
     };
     bounded_body(
         &spilled.path,
@@ -5601,7 +5666,7 @@ mod tests {
             "the last line is what the head had to drop"
         );
         assert!(
-            out.output.contains(TRUNCATED_MIDDLE.trim()),
+            out.output.contains(TRUNCATED_MIDDLE),
             "the gap is marked: {}",
             &out.output[out.output.len() - 200..]
         );
@@ -5659,6 +5724,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The unfiltered reading is the command's own output: every captured line, in order, and no
+    /// exit-status note — the caller reads the status from the returned code and builds its own
+    /// record from the text.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unfiltered_output_is_the_commands_own_capture() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = test_ws(tmp.path());
+        std::fs::write(
+            tmp.path().join("noisy.sh"),
+            "for i in $(seq 1 800); do echo \"checking item $i of the suite\"; done\n\
+             echo '---- test_add stdout ----'\n\
+             echo \"thread 'test_add' panicked at src/lib.rs:10:5:\"\n\
+             for i in $(seq 1 400); do echo \"cleanup note $i\"; done\n\
+             exit 101\n",
+        )
+        .expect("write the script");
+        let (output, code) = ShellTool::new(ShellMode::Full)
+            .unfiltered()
+            .execute_with_status(&ws, json!({"command": "sh noisy.sh"}))
+            .await
+            .expect("the command runs");
+        assert_eq!(code, Some(101));
+        for needle in [
+            "checking item 1 of the suite",
+            "checking item 800 of the suite",
+            "---- test_add stdout ----",
+            "thread 'test_add' panicked at src/lib.rs:10:5:",
+            "cleanup note 400",
+        ] {
+            assert!(output.contains(needle), "the capture lacks {needle:?}");
+        }
+        assert!(
+            !output.contains("[exit status:"),
+            "the caller reads the status from the tuple: {output}"
+        );
+    }
+
+    /// A stopped unfiltered run's message carries the excerpt, so a failure printed early survives.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unfiltered_timeout_carries_the_failure_excerpt() {
+        let tmp = TempDir::new().expect("tempdir");
+        let ws = test_ws(tmp.path());
+        std::fs::write(
+            tmp.path().join("slow.sh"),
+            "echo 'error: the build is broken at src/lib.rs:10:5'\n\
+             for i in $(seq 1 200); do echo \"noise noise noise noise noise $i\"; done\n\
+             sleep 30\n",
+        )
+        .expect("write the script");
+        let message = ShellTool::new(ShellMode::Full)
+            .unfiltered()
+            .execute_with_status(&ws, json!({"command": "sh slow.sh", "timeout_secs": 1}))
+            .await
+            .expect_err("a timeout is a tool error")
+            .to_string();
+        assert!(
+            message.contains("error: the build is broken"),
+            "the excerpt names the failure: {message}"
+        );
     }
 
     /// Run `shell_tool.execute(...)` inside the agent tool-batch context with a background-session
@@ -5878,7 +6006,7 @@ mod tests {
 
         // The reported failure's shape: the memory sentence first, then the timeout block's fields,
         // never a timeout's wording.
-        let msg = format_memory_error("test", elapsed, used, limit, None, &[], &[]);
+        let msg = format_memory_error("test", elapsed, used, limit, None, "");
         assert!(
             msg.starts_with("Shell command terminated: exceeded memory limit (used ~"),
             "msg: {msg}"

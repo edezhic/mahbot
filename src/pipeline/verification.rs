@@ -2,7 +2,8 @@
 //! reviewers and the single functional tester at the same time on one phase job, and the
 //! round produces ONE consolidated comment and one advance/bounce decision. The project
 //! commands are nobody's roster slot: they are the round's own work, run in parallel with
-//! the participants.
+//! the participants. A failing command's record carries the part of its output that names the
+//! failure ([`failed_command_record`]), so the next round can tell what broke.
 //!
 //! The round's cohorts are told apart by their stored `agents.kind` labels, never by slot
 //! order, and a roster that is not the round's shape is never resumed as one. The
@@ -13,7 +14,6 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::agent::role::DIAGNOSTICS_ROLE;
 use crate::git::commands::{
     has_unstaged_changes, run_git_add_all, run_git_head, run_git_status, run_git_worktree_snapshot,
     run_git_write_tree,
@@ -21,6 +21,7 @@ use crate::git::commands::{
 use crate::pipeline::board::Ticket;
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::tools::shell::{ShellMode, ShellTool};
+use crate::util::excerpt::failure_excerpt;
 use crate::{DiagnosticsCommands, Role, Workspace};
 
 use super::{
@@ -313,7 +314,10 @@ struct ProjectCommands {
 /// held back to a step of its own.
 ///
 /// The judgement is the exit status and nothing else (`Some(0)` is a pass): what a command
-/// writes is kept for the comment, but never read to decide the outcome.
+/// writes is kept for the comment, but never read to decide the outcome. A failing command's
+/// output is read unfiltered, so the record is built from what the tool printed rather than from
+/// a profile's positional reading of it — [`failed_command_record`] keeps the lines that name
+/// the failure, wherever they are in the output.
 async fn run_project_commands(
     commands: Option<&DiagnosticsCommands>,
     ws: &Workspace,
@@ -337,41 +341,28 @@ async fn run_project_commands(
         let started = std::time::Instant::now();
         let elapsed = || started.elapsed().as_secs_f64();
         match ShellTool::new(ShellMode::Full)
+            .unfiltered()
             .execute_with_status(ws, serde_json::json!({ "command": cmd }))
             .await
         {
             Ok((_output, Some(0))) => {
                 let _ = writeln!(lines, "- {label} (`{cmd}`): PASSED in {:.1}s", elapsed());
             }
-            Ok((output, _exit_code)) => {
-                let display = if output.is_empty() {
-                    "(no output)".to_string()
-                } else {
-                    output
-                };
-                let _ = writeln!(
-                    lines,
-                    "- {label} (`{cmd}`): FAILED in {:.1}s\n\n```\n{display}\n```",
-                    elapsed(),
-                );
+            Ok((output, exit_code)) => {
+                failed_command_record(&mut lines, label, cmd, elapsed(), exit_code, &output);
                 failed_at = Some(label);
                 break;
             }
+            // A timeout or a launch failure: the tool's message carries the captured output's
+            // failure-identifying excerpt, so the record needs no second cut here.
             Err(e) => {
-                let _ = writeln!(
-                    lines,
-                    "- {label} (`{cmd}`): FAILED in {:.1}s\n\n```\n{e}\n```",
-                    elapsed(),
-                );
+                write_failed(&mut lines, label, cmd, elapsed(), "", &e.to_string());
                 failed_at = Some(label);
                 break;
             }
         }
     }
 
-    // The commands' shell spills are this round's own leftovers, not an agent's — the phase
-    // body runs them with no agent identity.
-    crate::tools::shell::cleanup_agent_spills(DIAGNOSTICS_ROLE);
     let footer = match failed_at {
         Some(label) => format!("{} `{label}`", load_prompt("pipeline/commands_failed.md")),
         None => load_prompt("pipeline/commands_passed.md"),
@@ -380,6 +371,50 @@ async fn run_project_commands(
         section: format!("**Project commands**\n\n{}\n\n{footer}", lines.trim_end()),
         passed: failed_at.is_none(),
     }
+}
+
+/// The record of one failed command: the exit status on the command's own line, then the part of
+/// its output that names the failure — inline, because the record must stand on its own. Output
+/// that fits is recorded whole; a longer one is cut to the lines that identify the failure and
+/// their context ([`failure_excerpt`]), never to a positional head and tail that a middle failure
+/// would not survive.
+fn failed_command_record(
+    lines: &mut String,
+    label: &str,
+    cmd: &str,
+    elapsed: f64,
+    exit_code: Option<i32>,
+    output: &str,
+) {
+    let suffix = exit_code.map_or_else(
+        || " (terminated by signal)".to_string(),
+        |code| format!(" (exit status {code})"),
+    );
+    let output = output.trim();
+    let display = if output.is_empty() {
+        "(no output)".to_string()
+    } else {
+        failure_excerpt(output)
+    };
+    write_failed(lines, label, cmd, elapsed, &suffix, &display);
+}
+
+/// Write a failed command's record: its verdict line (`suffix` naming how it failed), then its text
+/// in a fence no run of backticks in that text can close.
+fn write_failed(
+    lines: &mut String,
+    label: &str,
+    cmd: &str,
+    elapsed: f64,
+    suffix: &str,
+    text: &str,
+) {
+    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat((longest + 1).max(3));
+    let _ = writeln!(
+        lines,
+        "- {label} (`{cmd}`): FAILED in {elapsed:.1}s{suffix}\n\n{fence}\n{text}\n{fence}"
+    );
 }
 
 async fn execute_round(
@@ -814,5 +849,138 @@ mod tests {
         let churn = working_tree_churn(&repo_path).await.unwrap();
         // Churn is added+removed only; the oversized file contributes nothing.
         assert_eq!(churn, 3);
+    }
+
+    /// A command that fails after ~28 KB of noise: the record must carry the lines that name the
+    /// failure, wherever they are, and never the positional head a volume-based cut would show.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failing_project_command_records_the_lines_that_name_the_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = crate::workspace::test_ws(dir.path());
+        std::fs::write(
+            dir.path().join("fail.sh"),
+            "for i in $(seq 1 800); do echo \"checking item $i of the suite\"; done\n\
+             echo '---- test_add stdout ----'\n\
+             echo \"thread 'test_add' panicked at src/lib.rs:10:5:\"\n\
+             echo 'assertion `left == right` failed'\n\
+             for i in $(seq 1 400); do echo \"cleanup note $i\"; done\n\
+             exit 101\n",
+        )
+        .unwrap();
+        let commands = DiagnosticsCommands {
+            unit_test: Some("sh fail.sh".to_string()),
+            ..Default::default()
+        };
+
+        let record = run_project_commands(Some(&commands), &ws).await;
+
+        assert!(!record.passed);
+        assert!(
+            record.section.contains("(exit status 101)"),
+            "{}",
+            record.section
+        );
+        for needle in [
+            "---- test_add stdout ----",
+            "thread 'test_add' panicked at src/lib.rs:10:5:",
+            "assertion `left == right` failed",
+        ] {
+            assert!(
+                record.section.contains(needle),
+                "the record lacks {needle:?}:\n{}",
+                record.section
+            );
+        }
+        assert!(
+            !record.section.contains("checking item 1 of the suite"),
+            "the record must not spend its room on the output's head:\n{}",
+            record.section
+        );
+        assert!(
+            record.section.contains("lines omitted"),
+            "a partial record says so:\n{}",
+            record.section
+        );
+    }
+
+    /// A passing command's record is exactly what it always was: its own line, nothing of its
+    /// output.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_passing_project_command_records_only_its_verdict() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = crate::workspace::test_ws(dir.path());
+        std::fs::write(
+            dir.path().join("pass.sh"),
+            "echo passing-output-marker\nexit 0\n",
+        )
+        .unwrap();
+        let commands = DiagnosticsCommands {
+            format: Some("sh pass.sh".to_string()),
+            ..Default::default()
+        };
+
+        let record = run_project_commands(Some(&commands), &ws).await;
+
+        assert!(record.passed);
+        assert!(
+            record.section.contains("format (`sh pass.sh`): PASSED in "),
+            "{}",
+            record.section
+        );
+        assert!(
+            !record.section.contains("passing-output-marker"),
+            "{}",
+            record.section
+        );
+    }
+
+    /// A command's own output cannot end the record's block: the fence grows past its backticks.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_record_fences_output_that_holds_backticks() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = crate::workspace::test_ws(dir.path());
+        std::fs::write(
+            dir.path().join("fence.sh"),
+            "printf 'error: a block\\n```\\ninside the output\\n```\\n'\nexit 1\n",
+        )
+        .unwrap();
+        let commands = DiagnosticsCommands {
+            unit_test: Some("sh fence.sh".to_string()),
+            ..Default::default()
+        };
+
+        let record = run_project_commands(Some(&commands), &ws).await;
+
+        assert!(record.section.contains("````"), "{}", record.section);
+        assert!(
+            record.section.contains("inside the output"),
+            "{}",
+            record.section
+        );
+    }
+
+    /// A command that printed nothing still records how it failed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_silent_failure_records_its_exit_status() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = crate::workspace::test_ws(dir.path());
+        let commands = DiagnosticsCommands {
+            unit_test: Some("exit 1".to_string()),
+            ..Default::default()
+        };
+
+        let record = run_project_commands(Some(&commands), &ws).await;
+
+        assert!(!record.passed);
+        assert!(
+            record.section.contains("(exit status 1)"),
+            "{}",
+            record.section
+        );
+        assert!(record.section.contains("(no output)"), "{}", record.section);
     }
 }

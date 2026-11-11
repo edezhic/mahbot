@@ -4,6 +4,7 @@ pub(crate) mod disk;
 #[cfg(target_os = "linux")]
 pub(crate) mod display_server;
 pub(crate) mod error;
+pub(crate) mod excerpt;
 pub(crate) mod folder_name;
 pub(crate) mod html;
 pub(crate) mod http;
@@ -653,6 +654,30 @@ pub(crate) const FAILURE_DETAIL_CAP: usize = 24_000;
 pub(crate) fn failure_detail(text: &str, label: &str) -> String {
     truncate_sandwich(&scrub_credentials(text), FAILURE_DETAIL_CAP, label)
 }
+
+/// The line a line-count cut puts in place of the lines it dropped — `"... (N lines omitted)"`, the
+/// `verb` being "omitted" for a head/tail cut or "truncated" for a head-only cap — so every such cut
+/// reads the same way. A byte cut or a line-width cut says so in its own words.
+#[must_use]
+pub(crate) fn omitted_lines(omitted: usize, verb: &str) -> String {
+    format!("... ({omitted} lines {verb})")
+}
+
+/// Append `line` to `body` as its own line.
+pub(crate) fn push_line(body: &mut String, line: &str) {
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    body.push_str(line);
+}
+
+/// Where a capture stopped before the end of a stream: a sentence rather than an ellipsis, so a
+/// reader of the output (an agent, or a record built from it) sees that the middle is missing
+/// instead of taking the gap for the program's own text. The shell splices it between a stream's
+/// head and its end as a line of its own, and [`excerpt::failure_excerpt`] keeps it whatever else it
+/// cuts.
+pub(crate) const TRUNCATED_MIDDLE: &str =
+    "... (the middle of this output was not captured: it exceeded the capture limit)";
 
 /// Truncate a string using a head/tail "sandwich": the first ~2/3 and last ~1/3 of `max_bytes` with
 /// an omission marker between them, or the input unchanged if it fits.
