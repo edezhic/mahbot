@@ -121,21 +121,6 @@ pub(crate) fn parse_media_marker<'h>(caps: &regex::Captures<'h>) -> (MediaMarker
     (kind, path)
 }
 
-/// The media markers a message carries outside markdown code, as the kind and the path slice —
-/// inside code a marker is source text the user reads, not an attachment.
-#[must_use]
-pub(crate) fn markers_outside_code(text: &str) -> Vec<(MediaMarkerKind, &str)> {
-    let code = markdown::scan(text).code;
-    MEDIA_MARKER_RE
-        .captures_iter(text)
-        .filter(|caps| {
-            let whole = caps.get(0).expect("the whole match is always present");
-            !code.iter().any(|range| range.contains(&whole.start()))
-        })
-        .map(|caps| parse_media_marker(&caps))
-        .collect()
-}
-
 /// Placeholder that replaces an inline image data URI wherever bounded, displayable text is
 /// persisted (see [`strip_data_uris`]). `gui::media_markers` recognises it by this prefix alone;
 /// the byte count that follows is display-only.

@@ -129,11 +129,6 @@ impl Tool for HyperframesTool {
         Some("[VIDEO:")
     }
 
-    /// Instructions, references and checks answer without one.
-    fn media_marker_always(&self) -> bool {
-        false
-    }
-
     fn preserve_full_output(&self) -> bool {
         // The instruction documents and a render's timeline must arrive whole.
         true

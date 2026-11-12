@@ -8,8 +8,7 @@
 //! http(s) target is an address, and it performs no containment: only `[FILE:…]` is
 //! workspace-confined; the other kinds deliberately accept any location on disk. A local path
 //! that does not exist is offered [`repaired_local_target`] next: one directory component the
-//! sender clearly misspelled is corrected, and a file name never is. [`target_file_key`] reduces
-//! a marker to the one file it names, so a reply can tell which of a turn's renders it chose.
+//! sender clearly misspelled is corrected, and a file name never is.
 //! What a placed target becomes is decided here too — [`local_refusal`] gates delivery (Telegram,
 //! which must ship bytes), [`remote_marker`] and [`inline_marker_refusal`] answer wherever a
 //! marker of an unservable kind is refused, and [`marker_refusal`] words the refusal shared by
@@ -265,21 +264,6 @@ fn edit_distance_within(a: &[char], b: &[char], limit: usize) -> Option<usize> {
 #[must_use]
 pub(crate) fn is_inline_payload(target: &str) -> bool {
     target.starts_with("data:") || target.starts_with(crate::util::DATA_URI_OMITTED_PREFIX)
-}
-
-/// The identity two targets share when they name one file: a local target resolved the way
-/// delivery resolves it — a relative one joined to the workspace that has it, a clearly misspelled
-/// directory repaired — then [`crate::util::canonical_or_self`]. An address and an inline payload
-/// name no local file and answer `None`, as does prose that names nothing (`[IMAGE:path]` with no
-/// workspace file of that name).
-#[must_use]
-pub(crate) fn target_file_key(target: &str, roots: &[PathBuf]) -> Option<PathBuf> {
-    let MarkerTarget::Local(path) = resolve_marker_target(target, roots) else {
-        return None;
-    };
-    Some(crate::util::canonical_or_self(
-        &repaired_local_target(&path).unwrap_or(path),
-    ))
 }
 
 /// True when a target names something: it has a path separator, or its last segment carries an

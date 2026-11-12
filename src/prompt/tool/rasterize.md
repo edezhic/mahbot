@@ -1,4 +1,4 @@
-Turn a file or a page into an ordinary picture. The input is rendered and saved as a PNG in your workspace's generated/ folder, and the picture is attached to your conversation as a native image in the same step; the output carries an [IMAGE:path] marker, which sends the picture to the user like any generated image.
+Turn a file or a page into an ordinary picture. The input is rendered and saved as a PNG in your workspace's generated/ folder, and the picture is attached to your conversation as a native image in the same step; the output carries an [IMAGE:path] marker — name it in your reply to send the picture to the user.
 
 Accepted inputs:
 - SVG markup, plain or gzip-compressed.

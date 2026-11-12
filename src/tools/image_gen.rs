@@ -461,8 +461,8 @@ fn line_bytes(lines: usize, fixed: usize, cap: usize) -> usize {
 }
 
 /// A provider's own words before they enter the report: credentials scrubbed, and media markers
-/// broken, since the agent appends every `[IMAGE:…]` a successful result carries — a file this
-/// tool never produced would otherwise be handed to the user.
+/// broken — a marker the provider wrote must not become a file this tool never produced, because a
+/// reply that copies it would deliver that file.
 fn provider_words(text: &str) -> String {
     let text = crate::util::scrub_credentials(text);
     if !crate::util::has_media_marker(&text, crate::util::MediaMarkerKind::Image) {

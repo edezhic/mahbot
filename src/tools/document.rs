@@ -424,8 +424,8 @@ impl Tool for DocumentTool {
         crate::tools::bun::bun_binary_path().is_some()
     }
 
-    /// Advertises the `[FILE:…]` marker kind, so an answer that omitted it gets it
-    /// appended and the media sweep keeps the file the reply mentions.
+    /// Advertises the `[FILE:…]` marker kind: the reply must name it to deliver the file, and
+    /// the marker this result carries is what mentions the file to the media sweep.
     fn media_marker(&self) -> Option<&'static str> {
         Some(FILE_MARKER)
     }

@@ -1,7 +1,7 @@
-//! Markdown classification shared by the chat render and the delivery path: the parser options
-//! iced's markdown view runs with, and the one pass that finds the regions it draws as source code
-//! — where a media marker is text the user reads, not an attachment — and the markdown pictures it
-//! draws in place of their syntax.
+//! Markdown classification behind the desktop's chat render: the parser options iced's markdown
+//! view runs with, and the one pass that finds the regions it draws as source code — where a media
+//! marker is text the user reads, not an attachment — and the markdown pictures it draws in place of
+//! their syntax.
 
 use std::ops::Range;
 
@@ -17,8 +17,8 @@ pub(crate) fn iced_markdown_options() -> pulldown_cmark::Options {
         | pulldown_cmark::Options::ENABLE_TASKLISTS
 }
 
-/// What one [`scan`] pass finds for its consumers: the code regions, and the markdown pictures the
-/// desktop draws as attachments instead of their syntax.
+/// What one [`scan`] pass finds for the desktop's render: the code regions, and the markdown
+/// pictures it draws as attachments instead of their syntax.
 pub(crate) struct MarkdownScan {
     /// Byte ranges drawn as source code: fenced and indented blocks, and inline spans.
     pub code: Vec<Range<usize>>,
@@ -27,8 +27,8 @@ pub(crate) struct MarkdownScan {
 }
 
 /// One `into_offset_iter` pass over `text` with iced's parser options — the parser the markdown
-/// view runs. It is the single classification of the code regions, shared by the desktop's render
-/// and the delivery decision, and the only parse either of them makes to reach it.
+/// view runs. It is the one classification of the code regions and pictures the desktop's render
+/// consumes, and the only parse that render makes.
 #[must_use]
 pub(crate) fn scan(text: &str) -> MarkdownScan {
     let mut code = Vec::new();

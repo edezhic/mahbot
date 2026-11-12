@@ -129,7 +129,7 @@ impl Tool for RasterizeTool {
 
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         // The picture travels as the tool's `[IMAGE:...]` marker, the shape every produced picture
-        // uses: the marker delivers the file to the user, and the agent loop derives the
+        // uses: the reply names that marker to deliver the file, and the agent loop derives the
         // assistant's own bounded copy of it in this same step (`Agent::tool_result_content`).
         Ok(self.format_media_result(&self.rasterize(ws, &args).await?))
     }

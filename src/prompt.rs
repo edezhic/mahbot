@@ -46,10 +46,9 @@ pub(crate) fn load_prompt(asset_key: &str) -> String {
     asset_text(file.data.as_ref())
 }
 
-/// The one statement of the render-delivery rule — a reply that names some of the turn's video
-/// renders sends those, one that names none sends every render — substituted as
-/// `{{media_delivery}}` into every prompt an agent that can render writes a reply from: both
-/// Assistant role prompts and a custom role's context block.
+/// The one statement of the delivery rule — a produced file reaches the user only when the reply
+/// names it — substituted as `{{media_delivery}}` into every prompt an agent that can produce files
+/// writes a reply from.
 #[must_use]
 pub(crate) fn media_delivery() -> String {
     load_prompt("context/media_delivery.md").trim().to_owned()

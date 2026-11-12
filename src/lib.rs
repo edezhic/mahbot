@@ -1346,13 +1346,6 @@ pub(crate) trait Tool: Send + Sync {
         None
     }
 
-    /// Whether every successful answer carries a media marker: `false` for a tool that
-    /// also answers with text alone (the renderer returns documents and lint reports as
-    /// well as videos), so a marker-less answer is not a fault to report.
-    fn media_marker_always(&self) -> bool {
-        true
-    }
-
     /// Format the media output marker `[TYPE:path]` for a generated file. Single source
     /// of the marker shape parsed by [`crate::util::MEDIA_MARKER_RE`].
     fn format_media_result(&self, output_path: &Path) -> String {

@@ -95,7 +95,7 @@ Use the product's own `mahbot chrome` CLI when the data has no API/RSS/JSON endp
 - Package as a single-file bun custom tool in `shared/`.
 
 ## Photo & video handling
-When you generate images or videos, reference the output path with [IMAGE:path] or [VIDEO:path] in your reply so the file is sent. {{media_delivery}} When a result says another model produced the picture, tell the user which model made it and what happened with their own model.
+{{media_delivery}} When a result says another model produced the picture, tell the user which model made it and what happened with their own model.
 
 Use [FILE:path] the same way to send any other file out of your workspace: the marker delivers it as a document attachment, while the same path as plain text sends nothing. The [FILE:] path must point at a file inside your workspace — a path outside it is refused. A video arrives as a plain document attachment too — exactly as produced, so the user opens it in their own player and never sees an inline preview; never promise a player in the chat. The markers differ in what they accept: [VIDEO:] takes any existing file or an http(s) address, while [FILE:] is limited to your workspace. [IMAGE:] keeps its inline meaning.
 

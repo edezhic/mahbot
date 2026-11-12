@@ -4,9 +4,7 @@
 //! reads and publishes (`role`, `registry`, `message_router`, `skills`,
 //! `extraction`, `maintainer`) — not the conversation store of `crate::session`.
 
-use std::collections::HashSet;
-use std::fmt::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,7 +17,6 @@ use crate::tools::{
     ImagePayload, ToolExecutionOutcome, find_tool, format_tool_failure_feedback,
     normalize_tool_call, scrub_tool_output,
 };
-use crate::util::media_target;
 use crate::util::{
     MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, parse_media_marker, scrub_credentials,
 };
@@ -230,114 +227,6 @@ fn interrupted_outcome() -> ToolExecutionOutcome {
 type CompletePendingToolCallsFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<bool>> + Send + 'a>>;
 
-/// `(kind, path)` for every successful media tool outcome carrying its [`Tool::media_marker`]
-/// (e.g. `[IMAGE:path]`); failed outcomes and non-media tools are skipped. Limitation: a path
-/// containing `]` is truncated by the regex — harmless, media tools write safe temporary names.
-fn extract_media_from_outcomes(
-    tools: &[Box<dyn Tool>],
-    tool_calls: &[ToolCall],
-    outcomes: &[ToolExecutionOutcome],
-) -> Vec<(MediaMarkerKind, String)> {
-    let mut paths = Vec::new();
-    for (call, outcome) in tool_calls.iter().zip(outcomes.iter()) {
-        if !outcome.success {
-            continue;
-        }
-        let Some(tool) = find_tool(tools, &call.name) else {
-            continue;
-        };
-        let Some(marker_prefix) = tool.media_marker() else {
-            continue;
-        };
-        // "[IMAGE:" -> "IMAGE", per `media_marker()`'s documented `[KIND:` shape.
-        let marker = &marker_prefix[1..marker_prefix.len() - 1];
-        let mut matched = false;
-        for caps in MEDIA_MARKER_RE.captures_iter(&outcome.output) {
-            let (captured_kind, path) = parse_media_marker(&caps);
-            if captured_kind.token() == marker {
-                matched = true;
-                paths.push((captured_kind, path.to_string()));
-            }
-        }
-        if matched {
-            continue;
-        }
-        // A marker-always tool ([`Tool::media_marker_always`]) that carried none is
-        // a defect to see; a tool that also answers with text alone is normal here.
-        let message = "a successful media call carried no media marker";
-        if tool.media_marker_always() {
-            tracing::warn!(
-                media_tool = %call.name,
-                marker = %marker_prefix,
-                "{message}",
-            );
-        } else {
-            tracing::debug!(
-                media_tool = %call.name,
-                marker = %marker_prefix,
-                "{message}",
-            );
-        }
-    }
-    paths
-}
-
-/// Append the turn's media markers the reply did not already name.
-///
-/// A video render (`video_gen`, `hyperframes`) reaches the user only when the reply
-/// names it — by any kind, in any path form — or when it names none of the turn's video renders,
-/// the safety net for a model that forgot its markers. The renders it left out stay where they
-/// were produced, reachable from the workspace. Other kinds keep today's append, and one file is
-/// never attached twice.
-fn append_turn_media(
-    reply: &mut String,
-    accumulated: &[(MediaMarkerKind, String)],
-    roots: &[PathBuf],
-) {
-    if accumulated.is_empty() {
-        return;
-    }
-    let written: Vec<(MediaMarkerKind, String)> = crate::util::markers_outside_code(reply)
-        .into_iter()
-        .map(|(kind, path)| (kind, path.to_string()))
-        .collect();
-    let named: HashSet<PathBuf> = written
-        .iter()
-        .filter_map(|(_, path)| media_target::target_file_key(path, roots))
-        .collect();
-    let keys: Vec<Option<PathBuf>> = accumulated
-        .iter()
-        .map(|(_, path)| media_target::target_file_key(path, roots))
-        .collect();
-    let video_named = accumulated.iter().zip(&keys).any(|((kind, _), key)| {
-        *kind == MediaMarkerKind::Video && key.as_ref().is_some_and(|key| named.contains(key))
-    });
-    let mut attached = HashSet::new();
-    let mut withheld = 0usize;
-    for ((kind, path), key) in accumulated.iter().zip(&keys) {
-        let already_named = key.as_ref().is_some_and(|key| named.contains(key));
-        if video_named && *kind == MediaMarkerKind::Video {
-            withheld += usize::from(!already_named);
-            continue;
-        }
-        let written_already = already_named
-            || written
-                .iter()
-                .any(|(written_kind, written_path)| written_kind == kind && written_path == path);
-        let first_of_its_file = key.as_ref().is_none_or(|key| attached.insert(key.clone()));
-        if !written_already && first_of_its_file {
-            let _ = write!(reply, "\n[{}:{path}]", kind.token());
-        }
-    }
-    if withheld > 0 {
-        tracing::debug!(
-            withheld,
-            "the reply names its video render — the turn's other video renders stay where they \
-             were produced"
-        );
-    }
-}
-
 /// Count DISTINCT data-URI image markers in the session's user messages — the
 /// second summarization trigger ([`crate::session::SUMMARIZATION_IMAGE_COUNT`]).
 /// The `data:image/` pre-gate keeps the per-turn scan cheap and never undercounts
@@ -351,9 +240,9 @@ fn session_image_marker_count(history: &[ChatMessage]) -> usize {
 }
 
 /// An [`ImagePayload`] derived from a real on-disk `[IMAGE:path]` marker in a
-/// successful tool output that supplied none, so a marker-delivered image reaches
-/// the agent's own context. Fails open (`None`) for a non-absolute or
-/// non-compressible path (e.g. an SVG); the marker still delivers the file.
+/// successful tool output that supplied none, so the agent sees a picture its own round
+/// produced. Fails open (`None`) for a non-absolute or non-compressible path (e.g. an
+/// SVG) — the marker still stands in the tool result for the reply to name.
 ///
 /// Deliberately not routed through the shared classifier: as a *producer* it must
 /// emit a bounded compressed payload, so the async full decode + resize + JPEG
@@ -375,7 +264,8 @@ async fn derive_image_payload_from_marker(output: &str) -> Option<ImagePayload> 
         }
         let Ok(meta) = crate::util::local_image_to_compressed_data_uri_with_meta(p).await else {
             // Fail open for this marker (missing file, non-raster e.g. SVG,
-            // over-cap input). The marker stays in the raw output for delivery.
+            // over-cap input). The marker stays in the tool result, so the reply can
+            // still name it.
             continue;
         };
         return Some(ImagePayload::from_compressed_meta(
@@ -1203,10 +1093,8 @@ impl Agent {
 
     /// The round loop: LLM call → tool execution → repeat until a final answer.
     /// Runs inside [`Self::work`]'s span, which carries the run's log scope.
-    #[expect(clippy::too_many_lines)] // the round loop with its cut and drain gates
     async fn llm_loop(&mut self) -> anyhow::Result<String> {
         let mut tool_rounds = 0usize;
-        let mut accumulated_media_paths: Vec<(MediaMarkerKind, String)> = Vec::new();
         loop {
             if self.cancel_token.is_cancelled() {
                 anyhow::bail!("Agent cancelled");
@@ -1290,7 +1178,7 @@ impl Agent {
             }
 
             let PreparedAssistantTurn {
-                mut display_text,
+                display_text,
                 tool_calls,
                 history_content,
                 raw_text,
@@ -1300,13 +1188,6 @@ impl Agent {
 
             if tool_calls.is_empty() {
                 self.session.push_assistant(history_content);
-                let roots = [PathBuf::from(&self.workspace.path)];
-                // The marker gates `stat`, `read_dir` and `canonicalize` on local files, so this
-                // runs off the async worker, as delivery's own marker parse does.
-                display_text = crate::util::with_block_in_place(|| {
-                    append_turn_media(&mut display_text, &accumulated_media_paths, &roots);
-                    display_text
-                });
                 return Ok(display_text);
             }
 
@@ -1339,12 +1220,6 @@ impl Agent {
                 .into_iter()
                 .map(|outcome| outcome.unwrap_or_else(interrupted_outcome))
                 .collect();
-
-            accumulated_media_paths.extend(extract_media_from_outcomes(
-                &self.tools,
-                &tool_calls,
-                &all_outcomes,
-            ));
 
             // Read before the commit, which consumes the outcomes' payloads.
             let sleep_ended = all_outcomes.iter().any(|o| o.success && o.ends_turn);
@@ -3066,11 +2941,11 @@ mod tests {
         }
     }
 
-    /// A media-generation test tool with a configurable [`Tool::media_marker`], for
-    /// [`extract_media_from_outcomes`] without real generation.
+    /// A stand-in media tool with a fixed answer, so a tool round can be driven without real
+    /// generation.
     struct MediaTestTool {
         name: &'static str,
-        marker: &'static str,
+        output: String,
     }
 
     #[async_trait]
@@ -3092,296 +2967,102 @@ mod tests {
             _ws: &crate::Workspace,
             _args: serde_json::Value,
         ) -> anyhow::Result<String> {
-            Ok(String::new())
-        }
-
-        fn media_marker(&self) -> Option<&'static str> {
-            Some(self.marker)
+            Ok(self.output.clone())
         }
     }
 
-    #[test]
-    #[expect(clippy::too_many_lines)]
-    fn extract_media_outcomes_consolidated() {
-        enum ToolDef {
-            /// [`NonMedia`] is a unit variant: only [`Tool::media_marker`] is consulted,
-            /// never [`Tool::execute`], so the output value has no behavioral effect.
-            Media {
-                name: &'static str,
-                marker: &'static str,
-            },
-            NonMedia,
-        }
-
-        struct OutcomeDef {
-            output: &'static str,
-            success: bool,
-        }
-
-        struct TestCase {
-            name: &'static str,
-            msg: &'static str,
-            tools: Vec<ToolDef>,
-            outcomes: Vec<OutcomeDef>,
-            expected: Vec<(MediaMarkerKind, &'static str)>,
-        }
-
-        let cases = vec![
-            TestCase {
-                name: "parses_valid_marker",
-                msg: "valid marker with success=true should extract the path",
-                tools: vec![ToolDef::Media {
-                    name: "image_gen",
-                    marker: "[IMAGE:",
-                }],
-                outcomes: vec![OutcomeDef {
-                    output: "[IMAGE:/tmp/img.png]",
-                    success: true,
-                }],
-                expected: vec![(MediaMarkerKind::Image, "/tmp/img.png")],
-            },
-            // A bare marker prefix yields an empty path, which the filter rejects.
-            TestCase {
-                name: "skips_malformed_marker",
-                msg: "malformed marker should be skipped",
-                tools: vec![ToolDef::Media {
-                    name: "image_gen",
-                    marker: "[IMAGE:",
-                }],
-                outcomes: vec![OutcomeDef {
-                    output: "description text [IMAGE:",
-                    success: true,
-                }],
-                expected: vec![],
-            },
-            TestCase {
-                name: "skips_empty_marker",
-                msg: "empty marker '[IMAGE:]' should be skipped",
-                tools: vec![ToolDef::Media {
-                    name: "image_gen",
-                    marker: "[IMAGE:",
-                }],
-                outcomes: vec![OutcomeDef {
-                    output: "[IMAGE:]",
-                    success: true,
-                }],
-                expected: vec![],
-            },
-            TestCase {
-                name: "skips_no_closing_bracket_non_empty_path",
-                msg: "output with '[IMAGE:bogus' (no closing bracket, non-empty path) should be skipped",
-                tools: vec![ToolDef::Media {
-                    name: "image_gen",
-                    marker: "[IMAGE:",
-                }],
-                outcomes: vec![OutcomeDef {
-                    output: "oops [IMAGE:bogus",
-                    success: true,
-                }],
-                expected: vec![],
-            },
-            TestCase {
-                name: "skips_non_media_tool",
-                msg: "non-media tool should not be inspected for media markers",
-                tools: vec![ToolDef::NonMedia],
-                outcomes: vec![OutcomeDef {
-                    output: "[IMAGE:path]",
-                    success: true,
-                }],
-                expected: vec![],
-            },
-            TestCase {
-                name: "skips_failed_outcome",
-                msg: "failed outcomes should not produce media paths",
-                tools: vec![ToolDef::Media {
-                    name: "image_gen",
-                    marker: "[IMAGE:",
-                }],
-                outcomes: vec![OutcomeDef {
-                    output: "[IMAGE:/tmp/img.png]",
-                    success: false,
-                }],
-                expected: vec![],
-            },
-            TestCase {
-                name: "handles_mixed_tools",
-                msg: "mixed tools with valid outcomes should extract only media paths",
-                tools: vec![
-                    ToolDef::Media {
-                        name: "image_gen",
-                        marker: "[IMAGE:",
-                    },
-                    ToolDef::NonMedia,
-                    ToolDef::Media {
-                        name: "video_gen",
-                        marker: "[VIDEO:",
-                    },
-                ],
-                outcomes: vec![
-                    OutcomeDef {
-                        output: "[IMAGE:/tmp/img.png]",
-                        success: true,
-                    },
-                    OutcomeDef {
-                        output: "non-media output",
-                        success: true,
-                    },
-                    OutcomeDef {
-                        output: "[VIDEO:/tmp/vid.mp4]",
-                        success: true,
-                    },
-                ],
-                expected: vec![
-                    (MediaMarkerKind::Image, "/tmp/img.png"),
-                    (MediaMarkerKind::Video, "/tmp/vid.mp4"),
-                ],
-            },
-        ];
-
-        for case in cases {
-            let tools: Vec<Box<dyn Tool>> = case
-                .tools
-                .iter()
-                .map(|t| match t {
-                    ToolDef::Media { name, marker } => {
-                        Box::new(MediaTestTool { name, marker }) as Box<dyn Tool>
-                    }
-                    ToolDef::NonMedia => Box::new(TestTool {
-                        // The output value is irrelevant: only media_marker() is consulted.
-                        output: String::new(),
-                        scrub: false,
-                    }) as Box<dyn Tool>,
-                })
-                .collect();
-
-            let calls: Vec<ToolCall> = case
-                .tools
-                .iter()
-                .enumerate()
-                .map(|(i, t)| {
-                    let name = match t {
-                        ToolDef::Media { name, .. } => *name,
-                        ToolDef::NonMedia => "never_scrub",
-                    };
-                    ToolCall {
-                        id: (i + 1).to_string(),
-                        name: name.to_string(),
-                        arguments: serde_json::json!({}),
-                    }
-                })
-                .collect();
-
-            let outcomes: Vec<ToolExecutionOutcome> = case
-                .outcomes
-                .iter()
-                .map(|o| ToolExecutionOutcome {
-                    output: o.output.to_string(),
-                    success: o.success,
-                    image_payloads: Vec::new(),
-                    text_is_content: false,
-                    preserve_text: false,
-                    suspended: false,
-                    ends_turn: false,
-                })
-                .collect();
-
-            let expected: Vec<(MediaMarkerKind, String)> = case
-                .expected
-                .iter()
-                .map(|(n, p)| (*n, p.to_string()))
-                .collect();
-
-            let result = extract_media_from_outcomes(&tools, &calls, &outcomes);
-            assert_eq!(result, expected, "case '{}': {}", case.name, case.msg);
-        }
-    }
-
-    /// Three real video renders of one turn, so a marker's path resolves and canonicalizes.
-    fn three_renders(root: &Path) -> Vec<(MediaMarkerKind, String)> {
-        let generated = root.join("generated");
-        std::fs::create_dir_all(&generated).expect("generated dir");
-        ["draft.mp4", "final.mp4", "old.mp4"]
+    /// Three real on-disk rasters — their display paths — and the one tool answer that names them
+    /// all, so a round renders without generation and its derived-image step runs on real files.
+    fn three_rendered_pictures(dir: &Path) -> (Vec<String>, String) {
+        let pictures: Vec<String> = ["first.png", "second.png", "third.png"]
             .iter()
             .map(|name| {
-                let path = generated.join(name);
-                std::fs::write(&path, b"clip").expect("write clip");
-                (MediaMarkerKind::Video, path.display().to_string())
+                let path = dir.join(name);
+                std::fs::write(&path, crate::util::test::noisy_png(4, 4)).expect("write png");
+                std::fs::canonicalize(&path)
+                    .expect("canonicalize")
+                    .display()
+                    .to_string()
             })
-            .collect()
+            .collect();
+        let rendered = pictures
+            .iter()
+            .map(|picture| format!("[IMAGE:{picture}]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (pictures, rendered)
     }
 
-    #[test]
-    fn append_turn_media_delivers_only_the_named_video_renders() {
+    /// One Assistant turn over a tool round that answers `tool_answer` and a model that answers
+    /// `answer`; the reply the owner receives.
+    async fn turn_answering(agent_id: &str, tool_answer: &str, answer: &str) -> String {
+        let tool = Box::new(MediaTestTool {
+            name: "media_probe",
+            output: tool_answer.to_string(),
+        }) as Box<dyn Tool>;
+        let fake = std::sync::Arc::new(FakeProvider::new().ok_tool_call("media_probe").ok(answer));
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let mut agent = make_agent_with_role(vec![tool], crate::Role::Assistant);
+        agent.agent_id = agent_id.to_string();
+        agent
+            .work(&["draw me three pictures"], false)
+            .await
+            .expect("turn")
+    }
+
+    /// The reply the owner receives is the assistant's own text: a produced file is delivered only
+    /// when the reply names it, so of three renders a reply that names one delivers that one.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn a_reply_that_names_one_of_three_renders_delivers_that_one() {
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+
         let dir = tempfile::TempDir::new().expect("tempdir");
-        let root = std::fs::canonicalize(dir.path()).expect("canonical root");
-        let roots = [root.clone()];
-        let renders = three_renders(&root);
-        let final_path = &renders[1].1;
+        let (pictures, rendered) = three_rendered_pictures(dir.path());
+        let answer = format!("The second one is the cut.\n[IMAGE:{}]", pictures[1]);
+        let reply = turn_answering("named_render_agent", &rendered, &answer).await;
 
-        // Naming one render delivers it and withholds the turn's other two.
-        let mut reply = format!("Here is the cut you asked for.\n[VIDEO:{final_path}]");
-        let as_written = reply.clone();
-        append_turn_media(&mut reply, &renders, &roots);
-        assert_eq!(reply, as_written, "only the named render is delivered");
-
-        // Naming none delivers every render, as before.
-        let mut reply = "Three versions are ready.".to_string();
-        append_turn_media(&mut reply, &renders, &roots);
-        assert_eq!(reply.matches("[VIDEO:").count(), 3, "{reply}");
-
-        // A relative marker, another kind and a repaired directory all name the same file.
-        for named in [
-            "[VIDEO:generated/final.mp4] is the one.".to_string(),
-            format!("[FILE:{final_path}]"),
-            "[VIDEO:generate/final.mp4] is the one.".to_string(),
-        ] {
-            let mut reply = named.clone();
-            append_turn_media(&mut reply, &renders, &roots);
-            assert_eq!(
-                reply, named,
-                "{named} names the file, so nothing is attached twice"
-            );
-        }
-
-        // A marker inside code is source text, so it names nothing: every render is delivered,
-        // even when the fenced marker spells a render's path exactly.
-        for quoted in [
-            format!("```\n[VIDEO:{final_path}]\n```"),
-            format!("The marker `[VIDEO:{final_path}]` sends a clip."),
-        ] {
-            let mut reply = quoted;
-            append_turn_media(&mut reply, &renders, &roots);
-            assert_eq!(reply.matches("[VIDEO:").count(), 4, "{reply}");
-        }
-
-        // A marker for a file of another turn names nothing of this one.
-        let mut reply = "[VIDEO:/elsewhere/previous.mp4]".to_string();
-        append_turn_media(&mut reply, &renders, &roots);
-        assert_eq!(reply.matches("[VIDEO:").count(), 4, "{reply}");
-
-        // Another kind still reaches the user while the named video render is withheld.
-        let poster = root.join("generated/poster.png");
-        std::fs::write(&poster, b"png").expect("write poster");
-        let mut accumulated = renders.clone();
-        accumulated.push((MediaMarkerKind::Image, poster.display().to_string()));
-        let mut reply = format!("[VIDEO:{final_path}]");
-        append_turn_media(&mut reply, &accumulated, &roots);
-        assert!(reply.contains("[IMAGE:"), "{reply}");
-        assert_eq!(reply.matches("[VIDEO:").count(), 1, "{reply}");
-
-        // One file is never attached twice.
-        let mut reply = String::new();
-        append_turn_media(
-            &mut reply,
-            &[renders[0].clone(), renders[0].clone()],
-            &roots,
+        assert_eq!(
+            reply, answer,
+            "the reply reaches the owner exactly as the assistant wrote it"
         );
-        assert_eq!(reply.matches("[VIDEO:").count(), 1, "{reply}");
+        assert_eq!(
+            reply.matches("[IMAGE:").count(),
+            1,
+            "the two renders the reply did not name are not delivered: {reply}"
+        );
+    }
 
-        // A turn with no renders leaves the reply untouched.
-        let mut reply = "Nothing was rendered.".to_string();
-        append_turn_media(&mut reply, &[], &roots);
-        assert_eq!(reply, "Nothing was rendered.");
+    /// A turn that names none of its renders adds nothing to its reply, and the reply the owner
+    /// receives is the message the session persisted.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn a_turn_that_names_none_of_its_renders_delivers_its_reply_unchanged() {
+        crate::util::test::init_test_stores().await;
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let (_pictures, rendered) = three_rendered_pictures(dir.path());
+        let agent_id = "unnamed_render_agent";
+        let reply = turn_answering(agent_id, &rendered, "Three pictures are ready.").await;
+
+        assert_eq!(
+            reply, "Three pictures are ready.",
+            "the reply reaches the owner exactly as the assistant wrote it"
+        );
+        let history = crate::session::store().load(agent_id).await;
+        let persisted = history
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::ChatRole::Assistant)
+            .expect("assistant message");
+        assert_eq!(
+            persisted.content, reply,
+            "a reasoning-free answer is persisted exactly as it is delivered"
+        );
     }
 
     #[tokio::test]
@@ -5509,7 +5190,7 @@ mod tests {
         // output — image_gen, chrome and computer ship their own and never reach it.
         let tool = Box::new(MediaTestTool {
             name: "media_probe",
-            marker: "[IMAGE:",
+            output: String::new(),
         }) as Box<dyn Tool>;
         let mut agent = make_agent(vec![tool]);
 
@@ -5530,14 +5211,6 @@ mod tests {
             suspended: false,
             ends_turn: false,
         }];
-
-        // Delivery via the raw-output marker is preserved; read before the commit.
-        let media = extract_media_from_outcomes(&agent.tools, &tool_calls, &outcomes);
-        assert_eq!(
-            media,
-            vec![(MediaMarkerKind::Image, abs.display().to_string())],
-            "marker preserved for user delivery: {media:?}"
-        );
 
         agent
             .commit_tool_results(&tool_calls, outcomes)
