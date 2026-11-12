@@ -1270,11 +1270,10 @@ mod retry_policy_guard_tests {
 }
 
 /// Deterministic per-pixel noise that defeats image compression (used by the
-/// reference-image loader and body-budget tests to build reliably large files),
-/// in the format the caller hands a writer.
-fn noisy_image(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
+/// reference-image loader and body-budget tests to build reliably large files).
+fn noisy_image(width: u32, height: u32) -> image::RgbImage {
     use image::{ImageBuffer, Rgb};
-    let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(width, height, |x, y| {
+    ImageBuffer::from_fn(width, height, |x, y| {
         let mut v = x.wrapping_mul(0x9E37_79B9) ^ y.wrapping_mul(0x85EB_CA6B);
         v ^= v >> 13;
         v ^= v << 17;
@@ -1284,17 +1283,70 @@ fn noisy_image(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
             ((v >> 8) & 0xFF) as u8,
             ((v >> 16) & 0xFF) as u8,
         ])
-    });
+    })
+}
+
+/// Encode `img` as a PNG.
+fn png_of(img: image::RgbImage) -> Vec<u8> {
     let mut out = Vec::new();
     image::DynamicImage::ImageRgb8(img)
-        .write_to(&mut std::io::Cursor::new(&mut out), format)
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
         .unwrap();
     out
 }
 
-/// The PNG form of [`noisy_image`].
+/// A PNG of deterministic noise.
 pub fn noisy_png(width: u32, height: u32) -> Vec<u8> {
-    noisy_image(width, height, image::ImageFormat::Png)
+    png_of(noisy_image(width, height))
+}
+
+/// A single-colour PNG of the given size: many pixels, few bytes — for tests about dimensions
+/// rather than about file size.
+pub fn solid_png(width: u32, height: u32) -> Vec<u8> {
+    png_of(image::RgbImage::from_pixel(
+        width,
+        height,
+        image::Rgb([40, 90, 160]),
+    ))
+}
+
+/// A 2x1 JPEG of a red and a blue pixel, stored unrotated: the smallest picture whose orientation
+/// is visible in its dimensions.
+pub fn red_blue_strip_jpeg() -> Vec<u8> {
+    let strip = image::RgbImage::from_fn(2, 1, |x, _| {
+        if x == 0 {
+            image::Rgb([255, 0, 0])
+        } else {
+            image::Rgb([0, 0, 255])
+        }
+    });
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut out)
+        .encode_image(&image::DynamicImage::ImageRgb8(strip))
+        .unwrap();
+    out
+}
+
+/// Inject an EXIF orientation tag (0x0112 = 6 → Rotate90) into a JPEG right after the SOI marker.
+/// The stored pixels stay unrotated; a viewer (or the compression path) must rotate them per the
+/// tag.
+pub fn jpeg_with_exif_orientation(jpeg: &[u8]) -> Vec<u8> {
+    assert!(jpeg.starts_with(&[0xFF, 0xD8]));
+    let mut out = jpeg[..2].to_vec();
+    out.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x22]);
+    out.extend_from_slice(b"Exif\0\0");
+    // Little-endian TIFF: header (8) + IFD (2 count + 12 entry + 4 next).
+    out.extend_from_slice(&[
+        0x49, 0x49, 0x2A, 0x00, // "II", 42
+        0x08, 0x00, 0x00, 0x00, // IFD offset = 8
+        0x01, 0x00, // 1 entry
+        0x12, 0x01, 0x03, 0x00, // tag 0x0112, type SHORT
+        0x01, 0x00, 0x00, 0x00, // count = 1
+        0x06, 0x00, 0x00, 0x00, // value = 6 (Rotate90)
+        0x00, 0x00, 0x00, 0x00, // next IFD = none
+    ]);
+    out.extend_from_slice(&jpeg[2..]);
+    out
 }
 
 /// The canonical path as the resolvers hand it on: the platform's

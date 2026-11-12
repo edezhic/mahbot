@@ -105,10 +105,12 @@ impl Tool for ImageGenTool {
     }
 }
 
-/// A finished generation: the picture on disk and the note that must reach the assistant with
-/// it (`None` when the account's own model produced it).
+/// A finished generation: the picture on disk, its own pixel size (the file the user receives —
+/// `None` when it holds no decodable raster picture), and the note that must reach the assistant
+/// with it (`None` when the account's own model produced it).
 struct Generated {
     path: PathBuf,
+    size: Option<(u32, u32)>,
     note: Option<String>,
 }
 
@@ -239,14 +241,15 @@ impl ImageGenTool {
         out
     }
 
-    /// One generation's report line, by position — always exactly one line.
+    /// One generation's report line, by position — always exactly one line. The picture's own size
+    /// comes before the walk's note so a cut line never loses it.
     fn line(&self, position: usize, outcome: &Produced) -> String {
         let line = match outcome {
             Produced::Picture(generated) => {
-                let marker = self.format_media_result(&generated.path);
+                let picture = self.picture_text(generated);
                 match &generated.note {
-                    Some(note) => format!("{position}. {marker} {note}"),
-                    None => format!("{position}. {marker}"),
+                    Some(note) => format!("{position}. {picture} {note}"),
+                    None => format!("{position}. {picture}"),
                 }
             }
             Produced::Failed { short, .. } => format!("{position}. failed — {short}"),
@@ -279,12 +282,23 @@ impl ImageGenTool {
         }
     }
 
-    /// The tool result text for one picture: the delivery marker, then the note naming the model
-    /// when it was not the account's own.
+    /// The tool result text for one picture: the delivery marker with the picture's own size, then
+    /// the note naming the model when it was not the account's own.
     fn result_text(&self, generated: &Generated) -> String {
-        let marker = self.format_media_result(&generated.path);
+        let picture = self.picture_text(generated);
         match &generated.note {
-            Some(note) => format!("{marker}\n{note}"),
+            Some(note) => format!("{picture}\n{note}"),
+            None => picture,
+        }
+    }
+
+    /// A produced picture's marker and its own pixel size — the size of the file the user
+    /// receives. Stated in the result itself because the command line reads only the result and
+    /// never sees the attachment annotation.
+    fn picture_text(&self, generated: &Generated) -> String {
+        let marker = self.format_media_result(&generated.path);
+        match generated.size {
+            Some((width, height)) => format!("{marker} ({width}x{height})"),
             None => marker,
         }
     }
@@ -538,6 +552,8 @@ async fn run_generation(
         Ok(path) => path,
         Err(e) => return Ok(Produced::failed(e.to_string())),
     };
+    // The written file's own size — what the user receives, not what the provider claimed.
+    let size = crate::util::local_raster_dimensions(&path).await;
     // The record the walk leaves behind: which model produced the picture, so a fallback stays
     // diagnosable afterwards.
     tracing::info!(
@@ -547,6 +563,7 @@ async fn run_generation(
     );
     Ok(Produced::Picture(Generated {
         path,
+        size,
         note: walk.fallback_note(&served_by),
     }))
 }
@@ -2782,6 +2799,7 @@ mod tests {
             // reads it beside the marker.
             let generated = Generated {
                 path: std::path::PathBuf::from("x.png"),
+                size: Some((4, 4)),
                 note: Some(note),
             };
             assert!(
@@ -3959,6 +3977,71 @@ mod tests {
         );
     }
 
+    /// A produced picture reports the size of the file it saved — the picture the user receives —
+    /// in the result itself, so the command line (which never sees the attachment annotation) has
+    /// it too; the smaller copy the model is given is labelled separately.
+    #[tokio::test]
+    #[serial_test::serial(active_models, config_persist)]
+    async fn a_produced_picture_reports_the_size_of_the_file_it_saved() {
+        crate::util::test::init_test_stores().await;
+        seed_fixture_catalog().await;
+        let own = "qwen/qwen-image-3-pro";
+        let _config = batch_config("");
+        let (_dir, ws, _) = uploads_ws(0);
+        let (width, height) = (1200, 1600);
+        let picture = STANDARD.encode(crate::util::test::solid_png(width, height));
+        let args = batch_args(&[generation(&[], None, None)]);
+
+        let scripted = Scripted::new();
+        scripted.answer(own, Ok(served(&picture)));
+        let output = as_account(
+            "image_gen_batch_user",
+            own,
+            ImageGenTool.output(&ws, &args, &scripted),
+        )
+        .await
+        .expect("the picture is produced");
+
+        let payload = output
+            .image_payloads
+            .first()
+            .expect("the picture is attached");
+        assert_eq!(
+            payload.picture_size,
+            (width, height),
+            "the file's own pixels, not the copy's"
+        );
+        assert!(payload.copy_size.0 < width, "the model's copy is smaller");
+        assert!(
+            output.text.contains(&format!("({width}x{height})")),
+            "the report states the file's size: {}",
+            output.text
+        );
+
+        // The command line reads the result and never the annotation, so the file's size must be
+        // in that wording itself.
+        let scripted = Scripted::new();
+        scripted.answer(own, Ok(served(&picture)));
+        let answer = as_account("image_gen_batch_user", own, async {
+            crate::agent::CURRENT_TOOL_COMMAND_LINE
+                .scope(true, async {
+                    let outcomes = ImageGenTool.batch(&ws, &args, &scripted).await?;
+                    ImageGenTool.lone_answer(&outcomes)
+                })
+                .await
+        })
+        .await
+        .expect("a lone generation answers");
+        assert!(
+            answer.contains(&format!("({width}x{height})")),
+            "the command line reads the file's size: {answer}"
+        );
+        assert!(
+            !answer.contains("The model's copy"),
+            "the command line never sees the attachment annotation: {answer}"
+        );
+    }
+
     /// The tightest room a call has: ten generations whose lines hold everything the answer owes,
     /// so nothing is lost to truncation — in the report or in the all-failed message.
     #[tokio::test]
@@ -4005,6 +4088,10 @@ mod tests {
             assert!(
                 line.starts_with(&format!("{}. [IMAGE:", index + 1)),
                 "every position keeps its own line: {line}"
+            );
+            assert!(
+                line.contains("(4x4)"),
+                "the picture's own size survives the cut, ahead of the note: {line}"
             );
         }
 

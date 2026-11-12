@@ -691,17 +691,8 @@ static ACTION_LOCK: LazyLock<tokio::sync::Mutex<()>> =
 
 /// The last screenshot/zoom of each agent, keyed by [`core::agent_key`], so a concurrent agent's
 /// capture is never re-attached by another agent's call.
-static CAPTURES: LazyLock<std::sync::Mutex<HashMap<String, CaptureRecord>>> =
+static CAPTURES: LazyLock<std::sync::Mutex<HashMap<String, PathBuf>>> =
     LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
-
-/// One capture as it was produced: the file on disk and the pixel size it was taken at, so the
-/// attachment can say when it had to reduce the image.
-#[derive(Clone)]
-struct CaptureRecord {
-    path: PathBuf,
-    width: u32,
-    height: u32,
-}
 
 /// Drop the state one turn owns when its agent run ends: the capture waiting to be attached and
 /// the element refs of its last observation. Application and window ids are kept —
@@ -852,7 +843,7 @@ impl Tool for ComputerTool {
 }
 
 /// The image a `screenshot`/`zoom` call produced, or `None` for every other action: the action
-/// is re-parsed so a stale capture is never attached to a non-capture call, and the record is
+/// is re-parsed so a stale capture is never attached to a non-capture call, and the capture is
 /// looked up per agent. Failing to attach is an error the caller must report.
 async fn captured_payload(
     args: &serde_json::Value,
@@ -872,7 +863,7 @@ async fn captured_payload(
     ) {
         return Ok(None);
     }
-    let Some(record) = CAPTURES
+    let Some(path) = CAPTURES
         .lock()
         .unwrap_poison()
         .get(&core::agent_key())
@@ -881,28 +872,13 @@ async fn captured_payload(
         // Unreachable: a capture records its file before it can return success.
         return Ok(None);
     };
-    let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&record.path).await?;
-    let mut payload = crate::tools::ImagePayload::from_compressed_meta(
-        &record.path,
+    let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&path).await?;
+    Ok(Some(crate::tools::ImagePayload::from_compressed_meta(
+        &path,
         meta,
         None,
         crate::tools::ImagePayloadSource::Computer,
-    );
-    // A capture larger than the shared attachment cap reaches the model reduced, so the model is
-    // told: an image it measured at its capture size would otherwise describe pixels it never saw.
-    let longest = record.width.max(record.height);
-    if longest > crate::util::INBOUND_IMAGE_MAX_SIDE {
-        payload.note = Some(format!(
-            "reduced from the captured {}x{} to {}x{} — an attached image is capped at {} px on \
-             its long edge",
-            record.width,
-            record.height,
-            payload.width,
-            payload.height,
-            crate::util::INBOUND_IMAGE_MAX_SIDE
-        ));
-    }
-    Ok(Some(payload))
+    )))
 }
 
 /// Whether an action needs the interactive desktop. Listing applications and windows and `wait`
@@ -1904,15 +1880,11 @@ async fn capture(target: Option<&str>, region: Option<&Region>) -> anyhow::Resul
     // A capture that produced pixels is an observation of that surface: later calls with no
     // target address it.
     core::set_last_surface(target.clone());
-    // Stash the capture under the owning agent id, with the size it was taken at.
-    CAPTURES.lock().unwrap_poison().insert(
-        core::agent_key(),
-        CaptureRecord {
-            path: path.clone(),
-            width: cw,
-            height: ch,
-        },
-    );
+    // Stash the capture under the owning agent id.
+    CAPTURES
+        .lock()
+        .unwrap_poison()
+        .insert(core::agent_key(), path.clone());
     let kind = if rect_opt.is_some() {
         "zoom"
     } else {

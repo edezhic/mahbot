@@ -1203,9 +1203,8 @@ impl ImagePayloadSource {
 
 /// Per-call image payload: read from disk, generated or captured by a tool, or derived by the loop
 /// from a real `[IMAGE:path]` marker in a successful output. The loop injects `[IMAGE:{data_uri}]`
-/// as a synthetic persisted User-role message after the round. `width`/`height` are the
-/// post-EXIF/post-resize dimensions of the encoded JPEG and `format` the uppercase source label
-/// (`PNG`/`JPEG`/`WEBP`).
+/// as a synthetic persisted User-role message after the round. `picture_size` is the figure the
+/// annotation states for the picture; `copy_size` describes the JPEG the model is given.
 #[derive(Debug, Clone)]
 pub(crate) struct ImagePayload {
     /// Canonical path of the image, surfaced in the annotation and the debug log. The dedup key is
@@ -1213,10 +1212,12 @@ pub(crate) struct ImagePayload {
     pub path: String,
     /// Bounded JPEG data-URI (`data:image/jpeg;base64,...`).
     pub data_uri: String,
-    /// Post-EXIF/post-resize width of the encoded JPEG (px).
-    pub width: u32,
-    /// Post-EXIF/post-resize height of the encoded JPEG (px).
-    pub height: u32,
+    /// The size the naming sentence states: the file's own pixels (post-EXIF), or — for a payload
+    /// that is not a picture of that file (a video's frame grid) — the payload's own.
+    pub picture_size: (u32, u32),
+    /// The attached copy's pixels (post-EXIF/post-resize); when it is smaller than `picture_size`
+    /// the annotation states it separately as the model's copy.
+    pub copy_size: (u32, u32),
     pub format: String,
     /// `Some` when the read resolved a typo'd path to a unique filename match; kept in the
     /// annotation.
@@ -1259,23 +1260,28 @@ impl ImagePayload {
     }
 
     /// Render the annotation shared by both variants: `{opener} {path} ({w}x{h}, {format}).
-    /// {sentence}`, then the tool's own `note`, with the read's recovery note as a prefix.
+    /// {sentence}`, then — when the attached copy is smaller — the copy's own size as a separate
+    /// fact, then the tool's own `note`, with the read's recovery note as a prefix.
+    ///
+    /// The naming sentence states the picture's own size, because that is what the user receives;
+    /// the copy the model is given is a different figure and is never mixed into it.
     #[must_use]
     fn annotation(&self, sentence: &str) -> String {
-        let base = format!(
-            "{} {} ({}x{}, {}). {}",
+        let (width, height) = self.picture_size;
+        let mut lines = vec![format!(
+            "{} {} ({width}x{height}, {}). {sentence}",
             self.source.opener(),
             self.path,
-            self.width,
-            self.height,
             self.format,
-            sentence
-        );
-        let base = match self.note.as_deref() {
-            Some(note) => format!("{base}\n{note}"),
-            None => base,
-        };
-        with_recovery_note(self.recovery_note.as_deref(), base)
+        )];
+        if self.copy_size != self.picture_size {
+            let (copy_width, copy_height) = self.copy_size;
+            lines.push(format!("The model's copy is {copy_width}x{copy_height}."));
+        }
+        if let Some(note) = &self.note {
+            lines.push(note.clone());
+        }
+        with_recovery_note(self.recovery_note.as_deref(), lines.join("\n"))
     }
 
     /// Build an [`ImagePayload`] from a post-decode [`crate::util::CompressedImageMeta`] and the
@@ -1288,12 +1294,17 @@ impl ImagePayload {
         recovery_note: Option<String>,
         source: ImagePayloadSource,
     ) -> Self {
+        let crate::util::CompressedImageMeta {
+            data_uri,
+            sizes,
+            format,
+        } = meta;
         Self {
             path: path.display().to_string(),
-            data_uri: meta.data_uri,
-            width: meta.width,
-            height: meta.height,
-            format: meta.format,
+            data_uri,
+            picture_size: sizes.file_size,
+            copy_size: sizes.copy_size,
+            format,
             recovery_note,
             note: None,
             source,
@@ -1574,8 +1585,11 @@ pub(crate) async fn timeline_output(
                     ImagePayload {
                         path: reading.path.display().to_string(),
                         data_uri: picture.data_uri,
-                        width: picture.size.0,
-                        height: picture.size.1,
+                        // The payload is a grid of the video's frames, not a picture of the file:
+                        // the grid's own size is what the annotation states, and the copy is that
+                        // same grid, so no copy clause is owed.
+                        picture_size: picture.size,
+                        copy_size: picture.size,
                         format: "JPEG".to_string(),
                         recovery_note: None,
                         note: Some(note),
@@ -1855,8 +1869,8 @@ mod tests {
         let payload = ImagePayload {
             path: "/gen/img.png".into(),
             data_uri: "data:image/jpeg;base64,aaa".into(),
-            width: 4,
-            height: 4,
+            picture_size: (4, 4),
+            copy_size: (4, 4),
             format: "PNG".into(),
             recovery_note: None,
             note: None,
@@ -1897,6 +1911,115 @@ mod tests {
                 .already_attached_annotation()
                 .ends_with("\nServed by fallback model fallback-1"),
             "note also rides on the already-attached annotation"
+        );
+    }
+
+    /// A produced picture larger than the model-facing cap states the file's own size in the
+    /// naming sentence and the copy's size as a separate, labelled fact — the two figures are
+    /// never confusable.
+    #[tokio::test]
+    async fn a_downscaled_copy_is_labelled_apart_from_the_file_size() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("big.png");
+        let (width, height) = (1536, 2048);
+        tokio::fs::write(&path, crate::util::test::solid_png(width, height))
+            .await
+            .unwrap();
+        let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&path)
+            .await
+            .unwrap();
+        let payload =
+            ImagePayload::from_compressed_meta(&path, meta, None, ImagePayloadSource::Generated);
+
+        assert_eq!(
+            payload.picture_size,
+            (width, height),
+            "the file's own pixels"
+        );
+        assert_eq!(
+            payload.copy_size.1,
+            crate::util::INBOUND_IMAGE_MAX_SIDE,
+            "the copy is bounded by the attachment cap"
+        );
+        assert!(
+            payload.copy_size.0 < width,
+            "the copy is smaller than the file"
+        );
+
+        let annotation = payload.attached_annotation();
+        assert!(
+            annotation.starts_with(&format!(
+                "Generated image file {} ({width}x{height}, PNG). Image content attached to the \
+                 conversation as a native image.",
+                path.display()
+            )),
+            "the naming sentence states the file's size: {annotation}"
+        );
+        let (copy_width, copy_height) = payload.copy_size;
+        assert!(
+            annotation.ends_with(&format!(
+                "\nThe model's copy is {copy_width}x{copy_height}."
+            )),
+            "the copy's size is its own labelled fact: {annotation}"
+        );
+        assert!(
+            payload.already_attached_annotation().ends_with(&format!(
+                "\nThe model's copy is {copy_width}x{copy_height}."
+            )),
+            "a deduped repeat states the copy's size too"
+        );
+        assert!(
+            !annotation.contains(&format!("({copy_width}x{copy_height}, PNG)")),
+            "the copy's figure is never printed as the file's: {annotation}"
+        );
+    }
+
+    /// A picture at or below the cap is attached whole, so it owes no copy clause — the file's
+    /// size is the whole story.
+    #[tokio::test]
+    async fn a_picture_within_the_cap_owes_no_copy_clause() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("small.png");
+        let (width, height) = (crate::util::INBOUND_IMAGE_MAX_SIDE, 768);
+        tokio::fs::write(&path, crate::util::test::solid_png(width, height))
+            .await
+            .unwrap();
+        let meta = crate::util::local_image_to_compressed_data_uri_with_meta(&path)
+            .await
+            .unwrap();
+        let payload =
+            ImagePayload::from_compressed_meta(&path, meta, None, ImagePayloadSource::Generated);
+
+        assert_eq!(payload.picture_size, (width, height));
+        assert_eq!(payload.copy_size, (width, height));
+        assert_eq!(
+            payload.attached_annotation(),
+            format!(
+                "Generated image file {} ({width}x{height}, PNG). Image content attached to the \
+                 conversation as a native image.",
+                path.display()
+            )
+        );
+    }
+
+    /// A frame grid is not a picture of the file it came from: the size it states is the grid's
+    /// own, and no copy clause is owed.
+    #[test]
+    fn a_frame_grid_states_its_own_size_and_owes_no_copy_clause() {
+        let payload = ImagePayload {
+            path: "/clip.mp4".into(),
+            data_uri: "data:image/jpeg;base64,grid".into(),
+            picture_size: (320, 240),
+            copy_size: (320, 240),
+            format: "JPEG".into(),
+            recovery_note: None,
+            note: Some("picture 1 of 2: frames 1-4".into()),
+            source: ImagePayloadSource::Grid,
+        };
+        assert_eq!(
+            payload.attached_annotation(),
+            "Video frame grid /clip.mp4 (320x240, JPEG). Image content attached to the conversation \
+             as a native image.\npicture 1 of 2: frames 1-4"
         );
     }
 

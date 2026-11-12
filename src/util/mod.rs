@@ -724,8 +724,7 @@ fn data_uri_of(path: &std::path::Path, bytes: &[u8]) -> String {
 /// re-encode behind [`local_image_to_compressed_data_uri_with_meta`] (used by
 /// every ingestion path — the `read` tool, chrome/computer screenshots,
 /// document page images, inbound channel media) scales the longest side down to
-/// this many pixels, aspect-preserving. Callers that must tell the model an
-/// image was reduced read the cap from here.
+/// this many pixels, aspect-preserving.
 pub(crate) const INBOUND_IMAGE_MAX_SIDE: u32 = 1024;
 const INBOUND_IMAGE_JPEG_QUALITY: u8 = 85;
 
@@ -737,19 +736,19 @@ const INBOUND_IMAGE_JPEG_QUALITY: u8 = 85;
 /// decode budget, never a transfer limit — no outgoing attachment is refused on it.
 pub(crate) const INBOUND_IMAGE_MAX_INPUT_BYTES: u64 = 50 * 1024 * 1024;
 
-/// Result of bounded inbound-image compression, with the post-EXIF/post-resize
-/// dimensions and the source-format label for annotation rendering.
+/// Result of bounded inbound-image compression: the encoded copy, both sizes from the one decode,
+/// and the source-format label, all for annotation rendering.
 pub(crate) struct CompressedImageMeta {
     pub data_uri: String,
-    pub width: u32,
-    pub height: u32,
+    pub sizes: RasterSizes,
     pub format: String,
 }
 
-/// Read a local image file and return a bounded-JPEG data URI plus the post-EXIF/post-resize
-/// dimensions of the encoded JPEG (longest side [`INBOUND_IMAGE_MAX_SIDE`], quality
-/// [`INBOUND_IMAGE_JPEG_QUALITY`], alpha flattened onto white, EXIF orientation applied) — the
-/// single source of the annotation dims, which describe the very encode the data URI carries.
+/// Read a local image file and return a bounded-JPEG data URI plus both sizes of the picture
+/// (longest side [`INBOUND_IMAGE_MAX_SIDE`], quality [`INBOUND_IMAGE_JPEG_QUALITY`], alpha
+/// flattened onto white, EXIF orientation applied): the encoded copy's dimensions — the pixels the
+/// model is given — and the file's own, both from the one decode, so neither can disagree with the
+/// other.
 pub(crate) async fn local_image_to_compressed_data_uri_with_meta(
     path: &std::path::Path,
 ) -> anyhow::Result<CompressedImageMeta> {
@@ -770,11 +769,10 @@ pub(crate) async fn local_image_to_compressed_data_uri_with_meta(
         );
     }
     let bytes = tokio::fs::read(path).await?;
-    let (out, width, height, format) = with_block_in_place(|| compress_inbound_image(&bytes))?;
+    let (out, sizes, format) = with_block_in_place(|| compress_inbound_image(&bytes))?;
     Ok(CompressedImageMeta {
         data_uri: jpeg_data_uri(&out),
-        width,
-        height,
+        sizes,
         format,
     })
 }
@@ -793,17 +791,25 @@ pub(crate) fn image_format_native_label(fmt: image::ImageFormat) -> Option<&'sta
     }
 }
 
+/// A decoded raster's two sizes. They differ only when the longest side had to be downscaled.
+pub(crate) struct RasterSizes {
+    /// The file's own pixels, post-EXIF — what the user receives.
+    pub file_size: (u32, u32),
+    /// The encoded JPEG copy's pixels — what the model is given.
+    pub copy_size: (u32, u32),
+}
+
 /// One bounded compression step for inbound photos: decode, apply EXIF orientation, downscale the
 /// longest side to [`INBOUND_IMAGE_MAX_SIDE`] (aspect-preserving, Triangle filter, min 1 px),
 /// flatten alpha onto white and re-encode as JPEG at [`INBOUND_IMAGE_JPEG_QUALITY`]. Returns the
-/// bytes, the final dimensions and the uppercase source label (`"PNG" | "JPEG" | "WEBP"`, else
-/// `"IMAGE"`); the input-size ceiling is the caller's.
-fn compress_inbound_image(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32, String)> {
+/// bytes, both sizes and the uppercase source label (`"PNG" | "JPEG" | "WEBP"`, else `"IMAGE"`); the
+/// input-size ceiling is the caller's.
+fn compress_inbound_image(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, RasterSizes, String)> {
     let format = match image::guess_format(bytes) {
         Ok(f) => image_format_native_label(f).unwrap_or("IMAGE"),
         Err(_) => "IMAGE",
     };
-    let (out, width, height) = compress_jpeg_core(
+    let (out, sizes) = compress_jpeg_core(
         bytes,
         "inbound",
         |w, h| {
@@ -814,7 +820,7 @@ fn compress_inbound_image(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32, St
         },
         INBOUND_IMAGE_JPEG_QUALITY,
     )?;
-    Ok((out, width, height, format.to_string()))
+    Ok((out, sizes, format.to_string()))
 }
 
 fn compress_jpeg_core(
@@ -822,7 +828,7 @@ fn compress_jpeg_core(
     label: &str,
     scale_for: impl FnOnce(u32, u32) -> f32,
     quality: u8,
-) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+) -> anyhow::Result<(Vec<u8>, RasterSizes)> {
     use image::GenericImageView;
     let mut img = image::load_from_memory(bytes)
         .with_context(|| format!("Failed to decode {label} image"))?;
@@ -834,6 +840,7 @@ fn compress_jpeg_core(
         img.apply_orientation(orientation);
     }
     let (w, h) = img.dimensions();
+    let file_size = (w, h);
     let scale = scale_for(w, h);
     let img = if scale < 1.0 {
         #[expect(
@@ -853,7 +860,7 @@ fn compress_jpeg_core(
         img
     };
     let rgb = flatten_alpha_onto_white(&img);
-    let (width, height) = rgb.dimensions();
+    let copy_size = rgb.dimensions();
     let mut out = Vec::new();
     {
         let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
@@ -866,7 +873,13 @@ fn compress_jpeg_core(
             )
             .with_context(|| format!("Failed to encode compressed {label} image"))?;
     }
-    Ok((out, width, height))
+    Ok((
+        out,
+        RasterSizes {
+            file_size,
+            copy_size,
+        },
+    ))
 }
 
 /// Input-size ceiling for the reference-image compression path (aligned with the video tool's
@@ -1090,21 +1103,68 @@ fn sniff_reference_content(path: &Path, bytes: &[u8]) -> anyhow::Result<image::I
 fn compress_reference_step(bytes: &[u8], step: usize) -> anyhow::Result<Vec<u8>> {
     // Both call sites guarantee `step < REFERENCE_COMPRESSION_LADDER.len()`.
     let (scale, quality) = REFERENCE_COMPRESSION_LADDER[step];
-    let (out, _, _) = compress_jpeg_core(bytes, "reference", |_, _| scale, quality)?;
+    let (out, _) = compress_jpeg_core(bytes, "reference", |_, _| scale, quality)?;
     Ok(out)
 }
 
 /// Read the EXIF orientation tag without decoding pixels (the decoder's header-only
 /// `orientation()`).
 pub(crate) fn exif_orientation(bytes: &[u8]) -> Option<image::metadata::Orientation> {
-    use image::ImageDecoder;
-    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?;
-    let mut decoder = reader.into_decoder().ok()?;
-    match decoder.orientation().ok()? {
+    use image::ImageDecoder as _;
+    match raster_decoder(bytes)?.orientation().ok()? {
         image::metadata::Orientation::NoTransforms => None,
         orientation => Some(orientation),
+    }
+}
+
+/// A header-only decoder over `bytes`, its format sniffed from the content — never from the
+/// extension, which a generated picture may get wrong.
+fn raster_decoder(bytes: &[u8]) -> Option<impl image::ImageDecoder + '_> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_decoder()
+        .ok()
+}
+
+/// A raster picture's own pixel size, read from its bytes: content-sniffed and post-EXIF, so a
+/// caller states the same figure the attachment annotation does for the same file. `None` when the
+/// bytes hold no raster picture mahbot can decode — vector art, an unsupported codec, a header that
+/// names no picture.
+fn raster_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    use image::ImageDecoder as _;
+    let mut decoder = raster_decoder(bytes)?;
+    let dimensions = decoder.dimensions();
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    Some(oriented_dimensions(dimensions, orientation))
+}
+
+/// Read a raster file's own pixel size from disk, as [`raster_dimensions`] reports it. Over the
+/// inbound decode cap a file has no size to state: the attachment path refuses it for the same
+/// reason.
+pub(crate) async fn local_raster_dimensions(path: &std::path::Path) -> Option<(u32, u32)> {
+    if tokio::fs::metadata(path).await.ok()?.len() > INBOUND_IMAGE_MAX_INPUT_BYTES {
+        return None;
+    }
+    raster_dimensions(&tokio::fs::read(path).await.ok()?)
+}
+
+/// Apply an EXIF orientation to a size alone. `image` offers no size-only form of
+/// `DynamicImage::apply_orientation`, so the quarter-turn tags are listed here; the agreement test
+/// pins this against a real decode.
+fn oriented_dimensions(
+    (width, height): (u32, u32),
+    orientation: image::metadata::Orientation,
+) -> (u32, u32) {
+    use image::metadata::Orientation;
+    match orientation {
+        Orientation::Rotate90
+        | Orientation::Rotate270
+        | Orientation::Rotate90FlipH
+        | Orientation::Rotate270FlipH => (height, width),
+        _ => (width, height),
     }
 }
 
@@ -2166,28 +2226,6 @@ mod reference_image_tests {
         }
     }
 
-    /// Inject an EXIF orientation tag (0x0112 = 6 → Rotate90) into a JPEG right after the SOI
-    /// marker. The stored pixels stay unrotated; a viewer (or the compression path) must rotate
-    /// them per the tag.
-    fn jpeg_with_exif_orientation(jpeg: &[u8]) -> Vec<u8> {
-        assert!(jpeg.starts_with(&[0xFF, 0xD8]));
-        let mut out = jpeg[..2].to_vec();
-        out.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x22]);
-        out.extend_from_slice(b"Exif\0\0");
-        // Little-endian TIFF: header (8) + IFD (2 count + 12 entry + 4 next).
-        out.extend_from_slice(&[
-            0x49, 0x49, 0x2A, 0x00, // "II", 42
-            0x08, 0x00, 0x00, 0x00, // IFD offset = 8
-            0x01, 0x00, // 1 entry
-            0x12, 0x01, 0x03, 0x00, // tag 0x0112, type SHORT
-            0x01, 0x00, 0x00, 0x00, // count = 1
-            0x06, 0x00, 0x00, 0x00, // value = 6 (Rotate90)
-            0x00, 0x00, 0x00, 0x00, // next IFD = none
-        ]);
-        out.extend_from_slice(&jpeg[2..]);
-        out
-    }
-
     #[test]
     fn over_cap_jpeg_exif_orientation_applied() {
         use image::GenericImageView;
@@ -2195,18 +2233,9 @@ mod reference_image_tests {
         // 2x1 JPEG stored with EXIF orientation=6 (Rotate90): the compressed
         // output must come out 1x2 — a silently-rotated reference is exactly
         // the class of invisible corruption this pipeline exists to prevent.
-        let src = image::RgbImage::from_fn(2, 1, |x, _| {
-            if x == 0 {
-                image::Rgb([255, 0, 0])
-            } else {
-                image::Rgb([0, 0, 255])
-            }
-        });
-        let mut jpeg = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
-            .encode_image(&image::DynamicImage::ImageRgb8(src))
-            .unwrap();
-        let oriented = jpeg_with_exif_orientation(&jpeg);
+        let oriented = crate::util::test::jpeg_with_exif_orientation(
+            &crate::util::test::red_blue_strip_jpeg(),
+        );
 
         let reader = image::ImageReader::new(std::io::Cursor::new(&oriented))
             .with_guessed_format()
@@ -2219,6 +2248,42 @@ mod reference_image_tests {
         let out = compress_reference_step(&oriented, 0).unwrap();
         let decoded = image::load_from_memory(&out).unwrap();
         assert_eq!(decoded.dimensions(), (1, 2));
+    }
+}
+
+#[cfg(test)]
+mod raster_dimensions_tests {
+    use super::*;
+
+    #[test]
+    fn a_pictures_size_comes_from_its_content() {
+        // A generated file may be saved under a misleading extension, so the size is read from
+        // the bytes, never the name.
+        let png = crate::util::test::solid_png(1200, 1600);
+        assert_eq!(raster_dimensions(&png), Some((1200, 1600)));
+        let jpeg = crate::util::test::red_blue_strip_jpeg();
+        assert_eq!(raster_dimensions(&jpeg), Some((2, 1)));
+
+        // Bytes holding no raster picture have no size to state.
+        assert_eq!(raster_dimensions(b"GIF89a"), None);
+        assert_eq!(
+            raster_dimensions(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_header_read_agrees_with_the_decode_under_exif_orientation() {
+        // The header read must state the same size a full decode does, or the file's figure and
+        // the copy's could disagree about which way the picture is turned.
+        let oriented = crate::util::test::jpeg_with_exif_orientation(
+            &crate::util::test::red_blue_strip_jpeg(),
+        );
+
+        assert_eq!(raster_dimensions(&oriented), Some((1, 2)));
+        let (_, sizes) = compress_jpeg_core(&oriented, "test", |_, _| 1.0, 85).unwrap();
+        assert_eq!(sizes.file_size, (1, 2), "the decoded file's own size");
+        assert_eq!(sizes.copy_size, (1, 2), "no downscale was asked for");
     }
 }
 

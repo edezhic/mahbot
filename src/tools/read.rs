@@ -1840,8 +1840,8 @@ mod tests {
                 case.name,
                 payload.data_uri
             );
-            assert_eq!(payload.width, width, "{}: payload width", case.name);
-            assert_eq!(payload.height, height, "{}: payload height", case.name);
+            assert_eq!(payload.copy_size, (width, height), "{}", case.name);
+            assert_eq!(payload.picture_size, (width, height), "{}", case.name);
             assert_eq!(payload.format, format, "{}: payload format", case.name);
             if case.payload_path {
                 let expected_path =
@@ -1887,13 +1887,47 @@ mod tests {
             .image_payload(&ws, &json!({"path": "tiny_imag.png"}))
             .await
             .expect("recovered image payload must be produced");
-        assert_eq!(payload.width, 4, "unexpected payload width");
-        assert_eq!(payload.height, 4, "unexpected payload height");
+        assert_eq!(payload.copy_size, (4, 4), "unexpected copy size");
+        assert_eq!(payload.picture_size, (4, 4), "unexpected picture size");
         assert_eq!(payload.format, "PNG", "unexpected payload format");
         let note = payload
             .recovery_note
             .expect("recovered read must carry a recovery note");
         assert!(note.contains("tiny_imag.png"), "note: {note}");
+    }
+
+    /// Reading a picture back hands the loop the file's own size — the one the user receives — even
+    /// when the copy the model is given is smaller. (The annotation's wording is pinned in
+    /// `tools::tests`; what matters here is the payload the read tool builds.)
+    #[tokio::test]
+    async fn reading_a_picture_back_reports_the_files_own_size() {
+        crate::util::test::init_test_stores().await;
+
+        let dir = TempDir::new().unwrap();
+        let ws_path = dir.path().to_path_buf();
+        let (width, height) = (1536, 2048);
+        tokio::fs::write(
+            ws_path.join("big.png"),
+            crate::util::test::solid_png(width, height),
+        )
+        .await
+        .unwrap();
+        let ws = Workspace::from_path(&ws_path);
+
+        let payload = tool()
+            .image_payload(&ws, &json!({"path": "big.png"}))
+            .await
+            .expect("a native raster is attached");
+        assert_eq!(
+            payload.picture_size,
+            (width, height),
+            "the file's own pixels"
+        );
+        assert_eq!(
+            payload.copy_size.1,
+            crate::util::INBOUND_IMAGE_MAX_SIDE,
+            "the model is given a copy bounded by the attachment cap"
+        );
     }
 
     struct SymbolModeCase {
