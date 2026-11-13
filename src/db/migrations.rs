@@ -114,8 +114,11 @@
 //! the session's history holds, so a request is kept under the picture cap
 //! without walking the whole history; NULL is "never counted" and the next use
 //! establishes it from the loaded history (likewise a no-op on fresh installs).
+//! `79` adds the `guest_reports` table — the one-day ledger behind a guest
+//! assistant's `report_gap` daily cap and duplicate check (see
+//! [`GUEST_REPORTS_TABLE`] for what it does and does not hold).
 //!
-//! Future schema changes resume the chain at id `79` with monotonically
+//! Future schema changes resume the chain at id `80` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -325,6 +328,12 @@ CREATE TABLE IF NOT EXISTS user_channels (
     identifier  TEXT NOT NULL,
     reply_target TEXT,
     UNIQUE(channel, identifier)
+);
+CREATE TABLE IF NOT EXISTS guest_reports (
+    user_name TEXT NOT NULL,
+    day       TEXT NOT NULL,
+    digest    TEXT NOT NULL,
+    PRIMARY KEY (user_name, day, digest)
 );
 -- ── Config ─────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS config_kv (
@@ -911,6 +920,18 @@ CREATE TABLE IF NOT EXISTS session_personal_changes (
 INSERT INTO session_personal_changes (agent_id, baseline)
     SELECT agent_id, personal_changes FROM session_metadata WHERE personal_changes IS NOT NULL;";
 
+/// Delta `79` (existing installs): the `guest_reports` table — the one-day ledger behind a
+/// guest assistant's `report_gap` tool's daily cap and duplicate check. It holds no report
+/// text, only the account, the local day and a digest of what was filed, and every write
+/// prunes the days before. The baseline (`24`) already declares it, so on a fresh install
+/// this is an `IF NOT EXISTS` no-op.
+const GUEST_REPORTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS guest_reports (
+    user_name TEXT NOT NULL,
+    day       TEXT NOT NULL,
+    digest    TEXT NOT NULL,
+    PRIMARY KEY (user_name, day, digest)
+);";
+
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
 /// Entries `24`–`26` are the consolidated current-shape baseline; entries
@@ -1303,6 +1324,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "78",
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_session_metadata_image_count),
+    },
+    Migration {
+        id: "79",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(GUEST_REPORTS_TABLE),
     },
 ];
 
@@ -3079,6 +3105,7 @@ mod tests {
                 "dirty_content",
             ],
         ),
+        ("guest_reports", &["user_name", "day", "digest"]),
         (
             "jobs",
             &[
@@ -3412,6 +3439,7 @@ mod tests {
         "telegram_intake",
         "telegram_bursts",
         "session_personal_changes",
+        "guest_reports",
     ];
 
     /// Domain tables whose row counts a reopen snapshot compares: every
@@ -4263,10 +4291,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
                 "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-                "70", "72", "73", "74", "75", "76", "77", "78"
+                "70", "72", "73", "74", "75", "76", "77", "78", "79"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–78 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–79 tail exactly"
         );
     }
 
@@ -4953,7 +4981,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-            "70", "72", "73", "74", "75", "76", "77", "78",
+            "70", "72", "73", "74", "75", "76", "77", "78", "79",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -4962,7 +4990,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–78"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–79"
         );
 
         // Only the tables named here change shape (`72` makes one appear under
@@ -4992,6 +5020,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "telegram_bursts",
                 // Introduced by delta 62 — absent from the pre-reopen fixture.
                 "session_personal_changes",
+                // Introduced by delta 79 — absent from the pre-reopen fixture.
+                "guest_reports",
             ],
         )
         .await;
@@ -5318,6 +5348,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                     && *n != "telegram_bursts"
                     // Introduced by delta `62` — absent from the pre-reopen fixture.
                     && *n != "session_personal_changes"
+                    // Introduced by delta `79` — absent from the pre-reopen fixture.
+                    && *n != "guest_reports"
             })
             .collect();
         let before_other = column_sets(&conn, &untouched_tables).await;
@@ -5369,7 +5401,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-            "70", "72", "73", "74", "75", "76", "77", "78",
+            "70", "72", "73", "74", "75", "76", "77", "78", "79",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -5378,7 +5410,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–78"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–79"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -5434,7 +5466,8 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
              alarms.command → trigger (deltas 32/41/42/43) and \
              tickets/ticket_chronicle (delta 34) \
              columns may change on the 0.5.0 upgrade (plus the custom-role \
-             columns of deltas 52/53 and the delta-72 rename to automations)"
+             columns of deltas 52/53, the delta-72 rename to automations and the \
+             delta-79 guest_reports table)"
         );
     }
 

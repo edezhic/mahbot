@@ -436,9 +436,9 @@ impl SendTool {
     /// durable; an agent's turn is durable already, so its handovers are routed best-effort.
     fn answered_for() -> crate::agent::message_router::AnsweredFor {
         if Self::command_line() {
-            crate::agent::message_router::AnsweredFor::CommandLine
+            crate::agent::message_router::AnsweredFor::Caller
         } else {
-            crate::agent::message_router::AnsweredFor::Agent
+            crate::agent::message_router::AnsweredFor::Nobody
         }
     }
 

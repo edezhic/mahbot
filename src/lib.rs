@@ -124,6 +124,8 @@ pub mod boot;
 pub mod config;
 // The low-disk notice, raised when free space on the temp volume falls below 5%.
 pub mod disk_notice;
+// A guest assistant's report of a capability its user needed and the guest toolset lacks.
+pub(crate) mod guest_report;
 // The nightly memory inventory: an assistant whose memory no longer fits is asked to trim.
 pub mod memory_inventory;
 // Asking the OS not to throttle a daemon whose window is never visible.

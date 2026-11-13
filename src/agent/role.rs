@@ -240,8 +240,8 @@ use crate::tools::{
     ComputerTool, CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool, FilesTool,
     GetTicketTool, HyperframesTool, ImageGenTool, ListAutomationsTool, ListTicketsTool,
     MahbotConfigTool, MahbotDebugTool, RasterizeTool, ReadTool, RemoveAutomationTool,
-    SearchArchivedTicketsTool, SearchTool, SendTool, ShellMode, ShellTool, SleepTool,
-    UpdateTicketTool, VideoGenTool, WebSearchTool, WorkspaceTool,
+    ReportGapTool, SearchArchivedTicketsTool, SearchTool, SendTool, ShellMode, ShellTool,
+    SleepTool, UpdateTicketTool, VideoGenTool, WebSearchTool, WorkspaceTool,
 };
 
 /// Tools in the admin Assistant's set that a custom role is never offered or built: the `computer`
@@ -288,10 +288,11 @@ impl Role {
     }
 
     /// The Assistant's static core tool set: the admin's own minus `web_search` ([`Role::tools`]
-    /// appends that afterwards), plus the guest-only `files`. `is_admin` widens it with the
-    /// admin-only shell, send, computer, config, pipeline and voice tools, and narrows it in one
-    /// place — `files`, which exists only because a guest has no shell. A custom role's
-    /// derivation starts from this set minus [`CUSTOM_ROLE_WITHHELD_TOOLS`].
+    /// appends that afterwards), plus the guest-only `files` and `report_gap`. `is_admin` widens it
+    /// with the admin-only shell, send, computer, config, pipeline and voice tools, and narrows it
+    /// in two places — `files`, which exists only because a guest has no shell, and `report_gap`,
+    /// the guest's only route to the owner. A custom role's derivation starts from this set minus
+    /// [`CUSTOM_ROLE_WITHHELD_TOOLS`].
     fn assistant_core_tools(is_admin: bool) -> Vec<Box<dyn Tool>> {
         // The optional `place` argument belongs to the admin's Assistant: a guest's round always
         // runs in its own workspace, and a custom role's dispatch tools come from its own grants.
@@ -328,6 +329,9 @@ impl Role {
         // A guest's Assistant has no shell, so arranging its own files needs a tool of its own.
         if !is_admin {
             t.push(Box::new(FilesTool));
+            // Nor has it any mail, calendar or shell to offer a user who asks for one, so that
+            // gap needs a route to the owner. The report grants nothing — it is a notice.
+            t.push(Box::new(ReportGapTool));
         }
         // The grant-gated forwarding tool: the grant (or admin rights) decides what each call may
         // reach.
@@ -372,11 +376,11 @@ impl Role {
     /// operation is confined to it, except that the archive search spans the installation and
     /// `get_ticket` opens a prefixed ID from any workspace. `is_admin` widens the Assistant's set
     /// with `shell`, `send`, `computer`, `mahbot_config`, `mahbot_debug`, `workspace` and (on
-    /// macOS) `say`, and removes the guest-only `files`; every other role's set is byte-identical
-    /// whatever its value. `computer` is offered where the platform can serve it and `say` where
-    /// the speech engine lives — [`Tool::is_advertised`] decides the rest. `chrome_sessions` is the
-    /// run-scoped tracker shared with the agent's `ChromeTool`, so every session the run opens is
-    /// handed to the run-end release queue.
+    /// macOS) `say`, and removes the guest-only `files` and `report_gap`; every other role's set is
+    /// byte-identical whatever its value. `computer` is offered where the platform can serve it and
+    /// `say` where the speech engine lives — [`Tool::is_advertised`] decides the rest.
+    /// `chrome_sessions` is the run-scoped tracker shared with the agent's `ChromeTool`, so every
+    /// session the run opens is handed to the run-end release queue.
     #[must_use]
     pub(crate) fn tools(
         self,
@@ -977,6 +981,7 @@ mod tests {
             ("custom", any_assistant),
             ("document", any_assistant),
             ("files", guest_assistant),
+            ("report_gap", guest_assistant),
             ("sleep", assistant_or_manager),
             ("say", admin_assistant),
         ];

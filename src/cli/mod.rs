@@ -3231,7 +3231,7 @@ mod tests {
     /// socket is. The tools named below are the checkpoint for that.
     #[test]
     fn tools_no_family_publishes_are_not_served_by_name() {
-        for tool in ["shell", "edit", "analyze", "say"] {
+        for tool in ["shell", "edit", "analyze", "say", "report_gap"] {
             assert!(
                 !fronts_tool(tool),
                 "'{tool}' is published by no family, so the channel must not serve it by name"

@@ -68,6 +68,12 @@ pub enum MessageKind {
     /// `originating_workspace` stays unset, so the guest's workspace is the only root its
     /// RELATIVE media markers resolve in.
     GuestMessage,
+    /// A guest's capability report into the owner's Assistant (`<guest-report>`): the job
+    /// runs AS the owner, in the owner's personal workspace, and the answer reaches the
+    /// owner's own channels — that is the guest raising a gap with the owner. Not
+    /// `UserMessage`: the report is not the owner's message, and the failure-emoji gate must
+    /// structurally exclude it, so a guest can never make the owner's phone flash a failure.
+    GuestReport,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,16 +363,17 @@ async fn persist_and_stamp(job: &mut AgentJob) -> anyhow::Result<()> {
 pub(crate) enum AnsweredFor {
     // Nobody is told about this handover's failure — an agent, whose own turn is durable
     // already, or a background sweep: the failed write is logged and the envelope routed.
-    Agent,
-    /// The command line: the failure is returned with NOTHING routed, since its caller is
-    /// answered and gone the moment it returns.
-    CommandLine,
+    Nobody,
+    /// The producer's caller is told: the failure is returned with NOTHING routed, since a
+    /// caller that is answered and gone the moment the producer returns — the command line, a
+    /// tool result — must never hear of a delivery that was not made durable.
+    Caller,
 }
 
 // Hand one durable envelope over under `answered_for`'s contract — the ONE handover body:
 // persist to `pending_jobs`, then route unless a drain began after the write (the row is
 // left to boot replay; the drain must not be raced with a live route). Only a
-// [`CommandLine`](AnsweredFor::CommandLine) handover returns `Err`; any other failure is
+// [`Caller`](AnsweredFor::Caller) handover returns `Err`; any other failure is
 // logged and routed best-effort — the price of never dropping a failed write.
 pub(crate) async fn hand_over(
     mut job: AgentJob,
@@ -377,7 +384,7 @@ pub(crate) async fn hand_over(
     let persisted = match persist_and_stamp(&mut job).await {
         Ok(()) => true,
         Err(e) => {
-            if answered_for == AnsweredFor::CommandLine {
+            if answered_for == AnsweredFor::Caller {
                 warn!(
                     error = %e,
                     producer,
@@ -400,10 +407,10 @@ pub(crate) async fn hand_over(
     Ok(())
 }
 
-/// [`hand_over`] under [`AnsweredFor::Agent`]: a failed write is logged and the envelope
+/// [`hand_over`] under [`AnsweredFor::Nobody`]: a failed write is logged and the envelope
 /// routed best-effort rather than dropped.
 pub(crate) async fn stamp_and_route(job: AgentJob, target: &str, producer: &str) {
-    let _ = hand_over(job, target, producer, AnsweredFor::Agent).await;
+    let _ = hand_over(job, target, producer, AnsweredFor::Nobody).await;
 }
 
 /// Build the `<assistant-message>` envelope job addressed to the workspace
@@ -508,13 +515,7 @@ pub(crate) async fn deliver_command_line_message(content: String) -> anyhow::Res
         None,
     );
     let target = crate::jobs::envelope_target(&job);
-    hand_over(
-        job,
-        &target,
-        "command-line message",
-        AnsweredFor::CommandLine,
-    )
-    .await?;
+    hand_over(job, &target, "command-line message", AnsweredFor::Caller).await?;
 
     crate::channels::broadcast_and_persist_incoming_message(
         &crate::ChannelMessage {
@@ -583,6 +584,20 @@ fn assistant_notice_job(content: String, user_name: &str) -> AgentJob {
 /// bookkeeping: settle the record after this returns if a repeat is affordable, else before.
 pub(crate) fn post_assistant_notice(agent_id: &str, user_name: &str, content: String) {
     route(agent_id, assistant_notice_job(content, user_name));
+}
+
+/// Hand a guest's capability report to the OWNER's Assistant ([`MessageKind::GuestReport`],
+/// durable): the job runs as the owner in his personal workspace, so it holds his toolset and
+/// its answer reaches his own channels — the guest raising a gap with him, nothing back to the
+/// guest. `content` is already framed and escaped by [`crate::guest_report`].
+///
+/// [`AnsweredFor::Caller`]: the guest's tool result is answered and gone the moment this
+/// returns, so a report that could not be written down is refused with NOTHING routed rather
+/// than handed over at-most-once.
+pub(crate) async fn deliver_guest_report(content: String) -> anyhow::Result<()> {
+    let job = admin_assistant_job(content, MessageKind::GuestReport, None);
+    let target = crate::jobs::envelope_target(&job);
+    hand_over(job, &target, "guest report", AnsweredFor::Caller).await
 }
 
 /// Register an agent without a consumer loop and hand back the receiver (`llm_loop` drains

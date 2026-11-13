@@ -674,7 +674,7 @@ async fn fire_custom_role_automation(automation: &Automation) -> Result<()> {
                 &automation.text,
                 automation.identifier.as_deref(),
                 &workspace,
-                crate::agent::message_router::AnsweredFor::Agent,
+                crate::agent::message_router::AnsweredFor::Nobody,
             )
             .await
         }

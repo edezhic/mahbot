@@ -31,6 +31,8 @@ pub(crate) mod rasterize;
 pub(crate) mod rasterize_html;
 pub(crate) mod read;
 pub(crate) mod read_document;
+// A guest assistant's report of a capability its user needed and the toolset lacks.
+pub(crate) mod report_gap;
 pub(crate) mod research;
 // One short phrase spoken aloud by the admin's Assistant.
 pub(crate) mod say;
@@ -166,6 +168,7 @@ pub(crate) use mahbot_config::MahbotConfigTool;
 pub(crate) use mahbot_debug::MahbotDebugTool;
 pub(crate) use rasterize::RasterizeTool;
 pub(crate) use read::ReadTool;
+pub(crate) use report_gap::ReportGapTool;
 pub(crate) use say::SayTool;
 pub(crate) use search::SearchTool;
 pub(crate) use search_archived_tickets::SearchArchivedTicketsTool;
