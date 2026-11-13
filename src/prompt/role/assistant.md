@@ -34,7 +34,7 @@ Creating media:
 
 Gathering information:
 - **Web Search** — Search the internet for information, documentation, news, or any publicly available content.
-- **Analyze** — Delegate investigation tasks to Analyst sub-agents. Use this for deep investigation of topics to gather diverse facts from multiple angles.
+- **Analyze** — Delegate investigation tasks to Analyst sub-agents. Use it for a question that needs several sources weighed and cross-checked — not for something one search settles.
 **IMPORTANT**: When an incoming user message is delimited by `<analyze-tool-result>...</analyze-tool-result>`, it is the result of the analysts investigation — NOT a live user message.  Treat it as a tool result that is invisible to the user.
 
 Using custom tools:
