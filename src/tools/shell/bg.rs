@@ -1,7 +1,7 @@
 //! Background shell sessions (Full shell roles only).
 //!
 //! An agent can launch a long-running non-interactive command that keeps running after the
-//! initiating tool call returns. Output is written RAW (no scrubbing, no profile transforms) to
+//! initiating tool call returns. Output is written RAW (no profile transforms) to
 //! a file in the temp area's `.agent` directory; the agent reads progress with the read tool and
 //! stops the session via the shell tool's `stop` argument. The file holds a program's own bytes,
 //! so the read tool reads it the way the shell reads a program's output ([`is_output_file`]).
@@ -677,7 +677,7 @@ fn append_exit_annotation(output_path: &Path, status: std::process::ExitStatus) 
 }
 
 /// Read up to `max_bytes` from the START of the output file, decoded as a program's output
-/// ([`super::windows_text::decode`]) and scrubbed, for the launch-failure tool error.
+/// ([`super::windows_text::decode`]), for the launch-failure tool error.
 fn read_output_prefix(path: &Path, max_bytes: usize) -> Option<String> {
     use std::io::Read;
     let mut f = File::open(path).ok()?;
@@ -691,9 +691,7 @@ fn read_output_prefix(path: &Path, max_bytes: usize) -> Option<String> {
         buf.extend_from_slice(&chunk[..n]);
     }
     buf.truncate(max_bytes);
-    Some(crate::util::scrub_credentials(
-        &super::windows_text::decode(&buf),
-    ))
+    Some(super::windows_text::decode(&buf))
 }
 
 async fn wait_for_finished(finished: &AtomicBool, bound: Duration) {

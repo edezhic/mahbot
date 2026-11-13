@@ -92,9 +92,7 @@ fn deleted_conversation_messages<'a>(
     deleted
 }
 
-/// Render the deleted messages as a plain readable transcript, the whole output through
-/// [`crate::util::scrub_credentials`] — the same scrubbing tool output gets, since any agent with
-/// a read tool can open a dump.
+/// Render the deleted messages as a plain readable transcript.
 fn render_dump(messages: &[&ChatMessage]) -> String {
     let mut out = String::new();
     for msg in messages {
@@ -135,7 +133,7 @@ fn render_dump(messages: &[&ChatMessage]) -> String {
         }
         out.push('\n');
     }
-    crate::util::scrub_credentials(out.trim_end())
+    out.trim_end().to_string()
 }
 
 /// - [`Role::Assistant`]: `<personal_workspace>/{[`DUMP_DIR_NAME`]}` — the one location both
@@ -242,11 +240,11 @@ mod tests {
     }
 
     #[test]
-    fn render_dump_renders_native_frames_and_scrubs_credentials() {
+    fn render_dump_renders_native_frames() {
         let frame = ChatMessage {
             role: ChatRole::Assistant,
             content: serde_json::json!({
-                "content": "checking api_key: supersecretvalue123",
+                "content": "checking the file",
                 "tool_calls": [
                     {"id": "call_1", "name": "read", "arguments": {"path": "x.md"}}
                 ]
@@ -257,8 +255,7 @@ mod tests {
 
         let out = render_dump(&[&frame, &result]);
         assert!(out.contains("=== assistant ==="));
-        assert!(out.contains("checking api_key: supe*[REDACTED]"));
-        assert!(!out.contains("supersecretvalue123"));
+        assert!(out.contains("checking the file"));
         assert!(out.contains("[tool_call call_1] read: {\"path\":\"x.md\"}"));
         assert!(out.contains("=== tool ==="));
         assert!(out.contains("[result for tool_call call_1]"));

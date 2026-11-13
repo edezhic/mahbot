@@ -2,7 +2,7 @@
 
 For long-running non-interactive commands set `background: true` (default false); the command keeps running after this tool call returns.
 
-- The tool returns the path of the command's output file (in the OS temp area's `.agent` directory). All output — stdout and stderr — is written there RAW: no truncation, no filtering, no credential scrubbing. Do not run commands that print secrets in background mode.
+- The tool returns the path of the command's output file (in the OS temp area's `.agent` directory). All output — stdout and stderr — is written there RAW: no truncation, no filtering.
 - {{trailing_separator}}
 - Read progress with the read tool on that path. When the command exits, `[exit status: N]` is appended to the end of the file UNCONDITIONALLY — including exit 0 (`[exit status: terminated by signal]` if a signal ended it). Its presence with ANY exit code is the only signal that the command finished; its absence means it is still running, and a non-zero exit is a normal completion, not a launch failure.
 - `timeout_secs` is IGNORED in background mode: the command runs until it exits, you stop it, or your run ends.

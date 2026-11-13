@@ -149,10 +149,6 @@ impl Tool for MahbotConfigTool {
         )
     }
 
-    fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
-        false
-    }
-
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         Ok(self.answer(args).await?.text)
     }

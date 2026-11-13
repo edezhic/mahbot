@@ -456,34 +456,27 @@ fn generations_arg(args: &serde_json::Value) -> anyhow::Result<&[serde_json::Val
     Ok(entries)
 }
 
-/// What a credential scrub can add to a composed line, kept back so the cut lands inside the
-/// budget: every scrubbed value grows, and the scrub runs after the text is built.
-const SCRUB_SLACK_BYTES: usize = 64;
-
 /// The room one line of the tool's own text has — a walk's failure, a call's batch report: what a
-/// tool result may return, less everything fixed around the lines, the newline each takes and the
-/// scrub's growth, shared out over the lines. Counted in bytes, so a name cannot eat its
-/// neighbour's room.
+/// tool result may return, less everything fixed around the lines and the newline each takes,
+/// shared out over the lines. Counted in bytes, so a name cannot eat its neighbour's room.
 fn line_bytes(lines: usize, fixed: usize, cap: usize) -> usize {
     let lines = lines.max(1);
     let share = WALK_MESSAGE_BYTES
         .saturating_sub(fixed)
-        .saturating_sub(SCRUB_SLACK_BYTES)
         .saturating_sub(lines)
         / lines;
     share.min(cap)
 }
 
-/// A provider's own words before they enter the report: credentials scrubbed, and media markers
-/// broken — a marker the provider wrote must not become a file this tool never produced, because a
-/// reply that copies it would deliver that file.
+/// A provider's own words before they enter the report: media markers broken — a marker the
+/// provider wrote must not become a file this tool never produced, because a reply that copies it
+/// would deliver that file.
 fn provider_words(text: &str) -> String {
-    let text = crate::util::scrub_credentials(text);
-    if !crate::util::has_media_marker(&text, crate::util::MediaMarkerKind::Image) {
-        return text;
+    if !crate::util::has_media_marker(text, crate::util::MediaMarkerKind::Image) {
+        return text.to_string();
     }
     crate::util::MEDIA_MARKER_RE
-        .replace_all(&text, |caps: &regex::Captures<'_>| {
+        .replace_all(text, |caps: &regex::Captures<'_>| {
             format!("[{}]", &caps["kind"])
         })
         .into_owned()
@@ -1085,9 +1078,8 @@ impl ImageWalk<'_> {
                 describe_failure(failures, self.has_references())
             ),
         };
-        // The note carries the provider's own answer into the report: scrubbed and marker-free
-        // before it is cut, so a marker in a provider's words never becomes a file (see
-        // `provider_words`).
+        // The note carries the provider's own answer into the report, marker-free before it is cut,
+        // so a marker in a provider's words never becomes a file (see `provider_words`).
         let fate = crate::util::cut_bytes(&provider_words(&own_fate), WALK_ENTRY_MAX_BYTES);
         let full_stop = if fate.ends_with(['.', '…']) {
             ""
@@ -2812,13 +2804,12 @@ mod tests {
         }
     }
 
-    /// The note and a failed generation's reason carry the provider's own words, and
-    /// they enter a SUCCESSFUL tool result, which the agent scans for media markers and
-    /// prints without a scrub of its own — so both are scrubbed of credentials and
-    /// stripped of marker shapes where they are built.
+    /// The note and a failed generation's reason carry the provider's own words, and they enter
+    /// a SUCCESSFUL tool result, which the agent scans for media markers and prints — so marker
+    /// shapes are broken where they are built.
     #[tokio::test]
     #[serial_test::serial(active_models)]
-    async fn the_fallback_note_scrubs_the_providers_own_words() {
+    async fn the_fallback_note_breaks_the_providers_media_markers() {
         seed_fixture_catalog().await;
         let own = "qwen/qwen-image-3-pro";
         let fallback = "recraft/recraft-v4.1";
@@ -2836,10 +2827,9 @@ mod tests {
 
         let note = report.note.expect("a fallback carries the note");
         assert!(
-            !note.contains("sk-live-0123456789"),
-            "a credential in the provider's answer is redacted: {note}"
+            note.contains("rejected"),
+            "the provider's words are kept: {note}"
         );
-        assert!(note.contains("*[REDACTED]"), "{note}");
         assert!(
             !note.contains("[IMAGE:"),
             "a marker in the provider's answer never becomes a file handed to the user: {note}"

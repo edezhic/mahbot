@@ -51,18 +51,11 @@ impl CallSource {
 /// Longer arguments are truncated at a UTF-8-safe boundary.
 const MAX_STATS_ARG_LENGTH: usize = 500;
 
-/// The `arguments` text one tool call is recorded with: the arguments
-/// serialized, the caller's own secrets removed, credential-shaped text
-/// scrubbed, then capped to [`MAX_STATS_ARG_LENGTH`].
-///
-/// The value redaction runs FIRST: [`crate::util::scrub_credentials`] keeps a
-/// four-character prefix of what it redacts, which must not happen to a value
-/// the caller handed over as a secret.
-pub(crate) fn recorded_arguments(args: &serde_json::Value, secrets: &[String]) -> String {
+/// The `arguments` text one tool call is recorded with: the arguments serialized, then
+/// capped to [`MAX_STATS_ARG_LENGTH`].
+pub(crate) fn recorded_arguments(args: &serde_json::Value) -> String {
     let serialized = serde_json::to_string(args).expect("Value is always serializable");
-    let redacted = crate::util::redact_secrets(&serialized, secrets);
-    let scrubbed = crate::util::scrub_credentials(&redacted);
-    crate::util::truncate_bytes(&scrubbed, MAX_STATS_ARG_LENGTH).to_string()
+    crate::util::truncate_bytes(&serialized, MAX_STATS_ARG_LENGTH).to_string()
 }
 
 impl crate::logs::LogStore {
@@ -498,26 +491,22 @@ pub(crate) fn record_llm_failure(
 mod tests {
     use super::*;
 
-    /// `recorded_arguments` closes the two leak paths: (a) the value the caller
-    /// handed over as a secret is gone entirely, under a key the shared scrubber
-    /// may or may not know, and (b) not even the first four characters of a
-    /// handed-over secret survive the scrubber's context prefix.
+    /// `recorded_arguments` records the serialized arguments as produced, capped at
+    /// [`MAX_STATS_ARG_LENGTH`].
     #[test]
-    fn recorded_arguments_closes_both_leak_paths() {
-        let key = "sk-1234567890abcdef";
-        let args = serde_json::json!({"action": "setup_web_search", "key": key});
-        let recorded = recorded_arguments(&args, &[key.to_string()]);
-        assert!(
-            !recorded.contains(key),
-            "the caller's key must be gone: {recorded}"
+    fn recorded_arguments_keeps_the_arguments_and_caps_them() {
+        let args = serde_json::json!({"action": "search", "query": "rust"});
+        assert_eq!(
+            recorded_arguments(&args),
+            serde_json::to_string(&args).expect("Value is always serializable")
         );
 
-        let token = "123456:AAHsecret";
-        let args = serde_json::json!({"action": "setup_telegram_bot", "token": token});
-        let recorded = recorded_arguments(&args, &[token.to_string()]);
-        assert!(
-            !recorded.contains(&token[..4]),
-            "not even the prefix of a handed-over secret may survive: {recorded}"
-        );
+        let args = serde_json::json!({
+            "action": "search",
+            "query": "x".repeat(MAX_STATS_ARG_LENGTH * 2),
+        });
+        let recorded = recorded_arguments(&args);
+        assert_eq!(recorded.len(), MAX_STATS_ARG_LENGTH);
+        assert!(recorded.starts_with(r#"{"action":"search","query":"xxx"#));
     }
 }

@@ -794,13 +794,7 @@ impl WebSearchTool {
             }
         }
 
-        // A picture call scrubs its own text (see `should_scrub_output`) and then appends the
-        // pictures.
-        let mut output = if matches!(pictures, Pictures::NotRequested) {
-            lines.join("\n")
-        } else {
-            crate::util::scrub_credentials(&lines.join("\n"))
-        };
+        let mut output = lines.join("\n");
         if let Some(section) = picture_section(&pictures) {
             output.push_str("\n\n");
             output.push_str(&section);
@@ -948,16 +942,6 @@ impl Tool for WebSearchTool {
         false // web search has no workspace side effects
     }
 
-    fn should_scrub_output(&self, args: &serde_json::Value) -> bool {
-        // An instance with no picture backend never honours `pictures`, so it
-        // always scrubs. Otherwise a picture call scrubs its own text and then
-        // appends picture addresses, which this pass would redact (`?token=…` in
-        // a signed image URL) — an address the agent cannot fetch is not a
-        // discovered picture. The formatting side reads the same fact from
-        // `Pictures::NotRequested`.
-        self.pictures.is_none() || !pictures_requested(args)
-    }
-
     async fn execute(
         &self,
         _ws: &crate::Workspace,
@@ -982,16 +966,6 @@ impl Tool for WebSearchTool {
             .format_search_output(query, &answer.rows, answer.pictures)
             .await)
     }
-}
-
-/// Whether the call asks for pictures and is a search rather than an expand.
-///
-/// This is the reading `should_scrub_output` needs before `execute` has parsed
-/// the arguments; `execute` reads the same flag through `get_opt_bool` so a
-/// wrong type is a usage error.
-fn pictures_requested(args: &serde_json::Value) -> bool {
-    let expanding = !matches!(args.get("expand"), None | Some(Value::Null));
-    !expanding && super::get_opt_bool(args, "pictures").ok().flatten() == Some(true)
 }
 
 #[cfg(test)]
@@ -1338,27 +1312,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_scrub_policy_covers_picture_calls_only() {
-        let exa = || WebSearchBackend::Exa { key: String::new() };
-        let tool = WebSearchTool::new(exa(), Some(String::new()));
-        // A picture search scrubs its own text, so the agent-level pass is off;
-        // an expand or a plain search keeps the default, and an explicit null
-        // is the same as an absent argument on either flag.
-        assert!(!tool.should_scrub_output(&json!({"query": "frogs", "pictures": true})));
-        assert!(tool.should_scrub_output(&json!({"query": "frogs"})));
-        assert!(tool.should_scrub_output(&json!({"query": "frogs", "pictures": null})));
-        assert!(tool.should_scrub_output(&json!({"expand": 3, "pictures": true})));
-        assert!(
-            !tool.should_scrub_output(&json!({"query": "frogs", "pictures": true, "expand": null}))
-        );
-
-        // Without a picture backend the flag is never honoured, so it cannot
-        // turn the agent-level scrub off.
-        let text_only = WebSearchTool::new(WebSearchBackend::DeepSeek { key: String::new() }, None);
-        assert!(text_only.should_scrub_output(&json!({"query": "frogs", "pictures": true})));
-    }
-
     #[tokio::test]
     async fn test_picture_section_keeps_addresses_intact() {
         let tool = WebSearchTool::new(
@@ -1385,9 +1338,9 @@ mod tests {
                 }]),
             )
             .await;
-        // The page text is scrubbed ...
-        assert!(output.contains("*[REDACTED]"), "{output}");
-        // ... while the picture address survives whole, with its page.
+        // The page text is kept as found ...
+        assert!(output.contains("api_key=abcdefgh12345678"), "{output}");
+        // ... and so is the picture address, with its page.
         assert!(output.contains(signed), "{output}");
         assert!(output.contains("(from https://site.test/page)"), "{output}");
         // Pictures never take expand ids: only the row was cached.

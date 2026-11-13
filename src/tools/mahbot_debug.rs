@@ -39,12 +39,6 @@ impl Tool for MahbotDebugTool {
         false // read-only — safe to group with other read-only tools
     }
 
-    fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
-        // A result cell is returned as stored — the agent-level credential pass
-        // would rewrite the values this read-only surface exists to show.
-        false
-    }
-
     async fn execute(&self, _ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         let db = super::get_opt_str(&args, "db").unwrap_or("core");
         let query = super::get_str(&args, "query")?;

@@ -45,7 +45,7 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
 
     // Only a tool a frontend publishes is served by name: the owner's whole toolset must not be
     // reachable through the channel, or a same-user socket would drive a surface neither reviewable
-    // nor tied to the command line. The caller's own secrets are removed even from this refusal.
+    // nor tied to the command line.
     if !crate::cli::fronts_tool(&call.tool) {
         return unknown_tool_refusal(&call);
     }
@@ -133,7 +133,7 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
 
     record_operation(&call, tool_name, duration_ms, &outcome, &ws.path);
 
-    reply(outcome, &call.secrets)
+    reply(outcome)
 }
 
 /// Serve the document family's `read`: the same reading the read tool does, with the caller's
@@ -164,7 +164,7 @@ async fn execute_document_read(call: &CallRequest) -> CallReply {
         &outcome,
         &ws.path,
     );
-    reply(outcome, &call.secrets)
+    reply(outcome)
 }
 
 /// Run one command-line operation the way the instance carries every one out: under the span the
@@ -218,8 +218,7 @@ pub(crate) fn hold_flight() -> crate::agent::registry::NonAgentCallGuard {
 /// advice. A tool a family DOES front that the owner's toolset does not hold is a
 /// product-side inconsistency ([`crate::Role::Assistant`]'s own toolset is the
 /// command line's whole tool surface), where nothing is implied about the build
-/// and a restart is the wrong advice. The caller's own secrets are removed on both
-/// paths: the tool name is caller input like any other.
+/// and a restart is the wrong advice.
 fn unknown_tool_refusal(call: &CallRequest) -> CallReply {
     let wording = if crate::cli::fronts_tool(&call.tool) {
         format!(
@@ -233,7 +232,7 @@ fn unknown_tool_refusal(call: &CallRequest) -> CallReply {
             call.tool
         )
     };
-    CallReply::unavailable(crate::util::redact_secrets(&wording, &call.secrets))
+    CallReply::unavailable(wording)
 }
 
 /// What a partly carried-out operation's row says: the tool's own text names the
@@ -269,12 +268,12 @@ fn record_operation(
     ));
 }
 
-/// The row a finished operation becomes. The caller's secrets are removed from the recorded error
-/// text as well as from the arguments — a failed tool can quote what it was given. The reason is
-/// recorded with the same `Error executing <tool>: …` wrap the agent path uses, even though the
-/// caller was answered with the tool's own words: the record is read as a tool failure, not a
-/// human's answer. A partly carried-out operation is recorded as [`PARTIAL_RECORD_REASON`] with
-/// `success` unset, so the caller's failed answer and the row agree.
+/// The row a finished operation becomes. The reason is recorded with the same
+/// `Error executing <tool>: …` wrap the agent path uses, even though the caller
+/// was answered with the tool's own words: the record is read as a tool failure,
+/// not a human's answer. A partly carried-out operation is recorded as
+/// [`PARTIAL_RECORD_REASON`] with `success` unset, so the caller's failed answer
+/// and the row agree.
 fn operation_record(
     call: &CallRequest,
     tool_name: &str,
@@ -283,40 +282,36 @@ fn operation_record(
 ) -> crate::ToolCallRecord {
     crate::ToolCallRecord {
         tool_name: tool_name.to_string(),
-        // The caller's secrets are removed before the serialized arguments are scrubbed and capped.
-        // The DESTINATION is deliberately not among them: it is this command line's own operand
-        // rather than an argument the tool was handed, and the answer already names every produced
-        // file by absolute path.
-        arguments: crate::stats::recorded_arguments(&call.args, &call.secrets),
+        // The DESTINATION is deliberately not among the arguments: it is this command line's own
+        // operand rather than an argument the tool was handed, and the answer already names every
+        // produced file by absolute path.
+        arguments: crate::stats::recorded_arguments(&call.args),
         duration_ms,
         success: matches!(outcome, Ok(answer) if !answer.partial),
         error_message: match outcome {
             Ok(answer) if answer.partial => Some(PARTIAL_RECORD_REASON.to_string()),
             Ok(_) => None,
             Err(reason) => {
-                let reason = crate::util::redact_secrets(reason, &call.secrets);
-                let reason = crate::tools::tool_failure_reason(tool_name, &reason);
+                let reason = crate::tools::tool_failure_reason(tool_name, reason);
                 (!reason.is_empty()).then_some(reason)
             }
         },
     }
 }
 
-/// The reply one finished execution becomes. Any text going back to the caller — success or failure
-/// — passes through [`crate::util::redact_secrets`], so no value handed over as a secret can reach
-/// its own answer. The product's answer is otherwise neither shortened nor rewritten, and a partly
-/// carried-out operation is marked as such rather than dressed up.
-fn reply(outcome: Result<ToolAnswer, String>, secrets: &[String]) -> CallReply {
+/// The reply one finished execution becomes. The product's answer is neither shortened nor
+/// rewritten, and a partly carried-out operation is marked as such rather than dressed up.
+fn reply(outcome: Result<ToolAnswer, String>) -> CallReply {
     match outcome {
         Ok(answer) => {
-            let text = crate::util::redact_secrets(&answer.text, secrets);
+            let text = answer.text;
             if answer.partial {
                 CallReply::partial(text)
             } else {
                 CallReply::done(text)
             }
         }
-        Err(reason) => CallReply::refused(crate::util::redact_secrets(&reason, secrets)),
+        Err(reason) => CallReply::refused(reason),
     }
 }
 
@@ -325,48 +320,38 @@ mod tests {
     use super::*;
     use crate::db::ipc::CallOutcome;
 
-    /// The reply carries what the tool said, with the caller's own secrets removed: a partly
-    /// carried-out operation is `Partial`, a whole one `Done`, and a refusal is the tool's own
-    /// wording. The `Error executing <tool>: …` wrap the record carries is added by
-    /// [`record_operation`], never by the reply.
+    /// The reply carries what the tool said: a partly carried-out operation is `Partial`, a whole
+    /// one `Done`, and a refusal is the tool's own wording. The `Error executing <tool>: …` wrap
+    /// the record carries is added by [`record_operation`], never by the reply.
     #[test]
-    fn replies_carry_the_answer_with_the_callers_secrets_removed() {
-        let secrets = vec!["s3cret".to_string()];
-
-        let done = reply(
-            Ok(ToolAnswer::done("registered, key s3cret stored")),
-            &secrets,
-        );
+    fn replies_carry_the_answer_as_the_tool_gave_it() {
+        let done = reply(Ok(ToolAnswer::done("registered, key stored")));
         assert_eq!(done.outcome, CallOutcome::Done);
-        assert_eq!(done.answer, "registered, key [REDACTED] stored");
+        assert_eq!(done.answer, "registered, key stored");
 
-        let partial = reply(
-            Ok(ToolAnswer::partial(
-                "added, but the activation write failed",
-            )),
-            &secrets,
-        );
+        let partial = reply(Ok(ToolAnswer::partial(
+            "added, but the activation write failed",
+        )));
         assert_eq!(partial.outcome, CallOutcome::Partial);
 
-        let refused = reply(Err("no workspace named s3cret".to_string()), &secrets);
+        let refused = reply(Err("no workspace named elsewhere".to_string()));
         assert_eq!(refused.outcome, CallOutcome::Refused);
-        assert_eq!(refused.answer, "no workspace named [REDACTED]");
+        assert_eq!(refused.answer, "no workspace named elsewhere");
     }
 
     /// The recorded row says what the caller saw: a whole operation is a success with nothing to
     /// report, a partly carried-out one a failure naming the shortfall, and a refusal keeps the
-    /// tool's own reason, with the caller's secrets scrubbed out.
+    /// tool's own reason.
     #[test]
     fn a_recorded_row_reports_a_partial_answer_as_a_failure() {
-        let call = |args: serde_json::Value, secrets: Vec<String>| CallRequest {
+        let call = |args: serde_json::Value| CallRequest {
             tool: "document".to_string(),
             args,
-            secrets,
             output_dir: None,
         };
 
         let done = operation_record(
-            &call(serde_json::json!({}), Vec::new()),
+            &call(serde_json::json!({})),
             "document",
             5,
             &Ok(ToolAnswer::done("a document was produced")),
@@ -375,7 +360,7 @@ mod tests {
         assert_eq!(done.error_message, None);
 
         let partial = operation_record(
-            &call(serde_json::json!({}), Vec::new()),
+            &call(serde_json::json!({})),
             "document",
             5,
             &Ok(ToolAnswer::partial("produced, but a placeholder stayed")),
@@ -387,18 +372,15 @@ mod tests {
         );
 
         let refused = operation_record(
-            &call(
-                serde_json::json!({ "key": "s3cret" }),
-                vec!["s3cret".to_string()],
-            ),
+            &call(serde_json::json!({ "path": "missing.docx" })),
             "document",
             5,
-            &Err("nothing named s3cret".to_string()),
+            &Err("nothing named missing.docx".to_string()),
         );
         assert!(!refused.success);
         assert_eq!(
             refused.error_message.as_deref(),
-            Some("Error executing document: nothing named [REDACTED]")
+            Some("Error executing document: nothing named missing.docx")
         );
     }
 
@@ -429,7 +411,6 @@ mod tests {
         let show = execute(CallRequest {
             tool: "workspace".to_string(),
             args: serde_json::json!({ "action": "ticket", "ticket_id": id }),
-            secrets: Vec::new(),
             output_dir: None,
         })
         .await;
@@ -447,7 +428,6 @@ mod tests {
                 "ticket_id": id,
                 "content": "a note from a script",
             }),
-            secrets: Vec::new(),
             output_dir: None,
         })
         .await;
@@ -477,7 +457,6 @@ mod tests {
             let reply = execute(CallRequest {
                 tool: "document".to_string(),
                 args,
-                secrets: Vec::new(),
                 output_dir: Some(destination.to_string_lossy().into_owned()),
             })
             .await;
@@ -608,7 +587,6 @@ mod tests {
                 "file_name": "sample",
                 "content": [{ "type": "paragraph", "text": "Hello, {name}! {unfilled}" }],
             }),
-            secrets: Vec::new(),
             output_dir: Some(destination.to_string_lossy().into_owned()),
         })
         .await;
@@ -628,7 +606,6 @@ mod tests {
                 "values": { "name": "Ada" },
                 "file_name": "filled",
             }),
-            secrets: Vec::new(),
             output_dir: Some(destination.to_string_lossy().into_owned()),
         })
         .await;
@@ -670,7 +647,6 @@ mod tests {
         let reply = execute(CallRequest {
             tool: "rasterize".to_string(),
             args: serde_json::json!({ "path": drawing.to_string_lossy() }),
-            secrets: Vec::new(),
             output_dir: Some(destination.to_string_lossy().into_owned()),
         })
         .await;
@@ -709,7 +685,6 @@ mod tests {
                 "file_name": "page-source",
                 "content": [{ "type": "paragraph", "text": "a page to render" }],
             }),
-            secrets: Vec::new(),
             output_dir: Some(destination.to_string_lossy().into_owned()),
         })
         .await;
@@ -725,7 +700,6 @@ mod tests {
         let page = execute(CallRequest {
             tool: "rasterize".to_string(),
             args: serde_json::json!({ "path": source.to_string_lossy(), "page": 1 }),
-            secrets: Vec::new(),
             output_dir: Some(destination.to_string_lossy().into_owned()),
         })
         .await;
@@ -769,7 +743,6 @@ mod tests {
                 "action": crate::cli::DOCUMENT_READ,
                 "path": source.to_string_lossy(),
             }),
-            secrets: Vec::new(),
             output_dir: Some(destination.to_string_lossy().into_owned()),
         })
         .await;

@@ -113,8 +113,7 @@ static LOOSE_LINES: LazyLock<RegexSet> = LazyLock::new(|| {
 
 /// The part of `output` that names the failure, with context, bounded by
 /// [`FAILURE_EXCERPT_BYTES`] — or `output` itself when it already fits, so a short failure reads
-/// exactly as the command printed it. `output` must already be credential-scrubbed: the excerpt is
-/// stored verbatim in a durable record, so a secret left in it would persist.
+/// exactly as the command printed it. The excerpt is stored verbatim in a durable record.
 #[must_use]
 pub(crate) fn failure_excerpt(output: &str) -> String {
     if output.len() <= FAILURE_EXCERPT_BYTES {

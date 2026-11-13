@@ -329,9 +329,6 @@ pub(crate) struct Flag {
     /// ([`FlagKind::Destination`]), whose name is the command line's own.
     pub(crate) arg: &'static str,
     pub(crate) kind: FlagKind,
-    /// A value the caller hands over as a secret: never echoed, recorded or
-    /// answered back.
-    pub(crate) secret: bool,
     /// One line for the operation's help.
     pub(crate) purpose: &'static str,
 }
@@ -438,7 +435,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 flags: &[Flag {
                     arg: "token",
                     kind: FlagKind::Value,
-                    secret: true,
                     purpose: "The bot token BotFather gave you",
                 }],
             },
@@ -448,7 +444,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 flags: &[Flag {
                     arg: "handle",
                     kind: FlagKind::Value,
-                    secret: false,
                     purpose: "Your Telegram username or your numeric id — write './@name' for the \
                               '@' spelling, which otherwise names a file",
                 }],
@@ -460,14 +455,12 @@ pub(crate) const FAMILIES: &[Family] = &[
                     Flag {
                         arg: "name",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "The new user's display name, which is also their personal \
                                   workspace folder",
                     },
                     Flag {
                         arg: "telegram",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "Their Telegram username or their numeric id — write './@name' \
                                   for the '@' spelling, which otherwise names a file",
                     },
@@ -480,13 +473,11 @@ pub(crate) const FAMILIES: &[Family] = &[
                     Flag {
                         arg: "provider",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "'deepseek' or 'exa'",
                     },
                     Flag {
                         arg: "key",
                         kind: FlagKind::Value,
-                        secret: true,
                         purpose: "The API key for the chosen provider",
                     },
                 ],
@@ -507,7 +498,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 flags: &[Flag {
                     arg: "user",
                     kind: FlagKind::Value,
-                    secret: false,
                     purpose: "The user's name; omit it to list every user's grants",
                 }],
             },
@@ -518,28 +508,24 @@ pub(crate) const FAMILIES: &[Family] = &[
                     Flag {
                         arg: "name",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "The role's name — ASCII letters, digits, '_' and '-' only, and \
                                   not a built-in agent namespace",
                     },
                     Flag {
                         arg: "prompt",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "The whole definition of the role: everything it is told besides \
                                   the folder it works in",
                     },
                     Flag {
                         arg: "tools",
                         kind: FlagKind::List,
-                        secret: false,
                         purpose: "A tool name, optionally `name:kind1,kind2` for one with kinds; \
                                   repeat once per tool (omit for none)",
                     },
                     Flag {
                         arg: "behavior",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "'continuous' (one shared branch of the role) or 'one_off' (runs \
                                   once and reports back)",
                     },
@@ -552,26 +538,22 @@ pub(crate) const FAMILIES: &[Family] = &[
                     Flag {
                         arg: "name",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "The custom role to change",
                     },
                     Flag {
                         arg: "prompt",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "The role's new definition (omit to leave it as it is)",
                     },
                     Flag {
                         arg: "tools",
                         kind: FlagKind::List,
-                        secret: false,
                         purpose: "The role's new tool subset; repeat once per tool (omit to leave \
                                   it as it is)",
                     },
                     Flag {
                         arg: "behavior",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "The role's new behaviour: 'continuous' or 'one_off' (omit to \
                                   leave it as it is)",
                     },
@@ -588,7 +570,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 flags: &[Flag {
                     arg: "name",
                     kind: FlagKind::Value,
-                    secret: false,
                     purpose: "The custom role to delete",
                 }],
             },
@@ -606,7 +587,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 flags: &[Flag {
                     arg: "workspace",
                     kind: FlagKind::Value,
-                    secret: false,
                     purpose: "One managed workspace; omit it to list every one",
                 }],
             },
@@ -617,14 +597,12 @@ pub(crate) const FAMILIES: &[Family] = &[
                     Flag {
                         arg: "name",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "The new workspace's short unique name, used in ticket ids and \
                                   the GUI",
                     },
                     Flag {
                         arg: "path",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "Absolute path to the project directory to add",
                     },
                 ],
@@ -641,7 +619,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 flags: &[Flag {
                     arg: "workspace",
                     kind: FlagKind::Value,
-                    secret: false,
                     purpose: "The managed workspace to freeze; omit it to freeze EVERY \
                               managed workspace (the fleet-wide pause — a workspace that is \
                               not ready is skipped and left untouched, which makes that result \
@@ -655,7 +632,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 flags: &[Flag {
                     arg: "workspace",
                     kind: FlagKind::Value,
-                    secret: false,
                     purpose: "The managed workspace to resume; omit it to resume EVERY \
                               managed workspace (the fleet-wide resume — a workspace that is \
                               not ready is skipped and left untouched, which makes that result \
@@ -669,13 +645,11 @@ pub(crate) const FAMILIES: &[Family] = &[
                     Flag {
                         arg: "workspace",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "One managed workspace; omit it to cover every one",
                     },
                     Flag {
                         arg: "phase",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "Narrow the listing to one ticket phase (e.g. 'queued', \
                                   'in_development', 'done'); omit it for every non-archived ticket",
                     },
@@ -688,14 +662,12 @@ pub(crate) const FAMILIES: &[Family] = &[
                     Flag {
                         arg: "ticket_id",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "The ticket's full id — '<workspace>-<number>', which already \
                                   carries its workspace (a bare number is refused)",
                     },
                     Flag {
                         arg: "full",
                         kind: FlagKind::Present,
-                        secret: false,
                         purpose: "The ticket whole and unclipped — omitted, the tool's own \
                                   default is the clipped form",
                     },
@@ -708,13 +680,11 @@ pub(crate) const FAMILIES: &[Family] = &[
                     Flag {
                         arg: "ticket_id",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "The ticket's full id — '<workspace>-<number>'",
                     },
                     Flag {
                         arg: "content",
                         kind: FlagKind::Value,
-                        secret: false,
                         purpose: "The clarification note to leave on the ticket",
                     },
                 ],
@@ -734,7 +704,6 @@ pub(crate) const FAMILIES: &[Family] = &[
             Flag {
                 arg: "message",
                 kind: FlagKind::Value,
-                secret: false,
                 purpose: "The work to hand over; make it self-contained — the addressee cannot \
                           see your conversation (required)",
             },
@@ -743,13 +712,11 @@ pub(crate) const FAMILIES: &[Family] = &[
             Flag {
                 arg: "addressee",
                 kind: FlagKind::Value,
-                secret: false,
                 purpose: crate::tools::send::ADDRESSEE_FLAG_HELP,
             },
             Flag {
                 arg: "place",
                 kind: FlagKind::Value,
-                secret: false,
                 purpose: "The folder the addressee works in: for 'manager', the managed \
                           workspace to message, by its managed name or its own folder; for \
                           'role', a managed workspace, a folder path, or 'personal:<user>'; a \
@@ -760,7 +727,6 @@ pub(crate) const FAMILIES: &[Family] = &[
             Flag {
                 arg: "branch",
                 kind: FlagKind::Value,
-                secret: false,
                 purpose: "The branch to continue or create — a worker branch's, or a custom \
                           role's own named branch (ASCII letters, digits, '_' and '-', at most \
                           32 chars)",
@@ -768,7 +734,6 @@ pub(crate) const FAMILIES: &[Family] = &[
             Flag {
                 arg: "name",
                 kind: FlagKind::Value,
-                secret: false,
                 purpose: "The name the chosen address takes: for 'role', the custom role to \
                           start (it must exist); for 'guest', the account name of the guest whose \
                           own assistant receives the message",
@@ -1015,7 +980,6 @@ pub(crate) const FAMILIES: &[Family] = &[
 const RASTER_PATH_FLAG: Flag = Flag {
     arg: "path",
     kind: FlagKind::Path,
-    secret: false,
     purpose: "The file to render — an SVG, one page of a PDF, or an HTML file inside your \
               personal workspace — or an http(s) address; resolved where this command runs, and \
               read with the owner's own authority",
@@ -1024,7 +988,6 @@ const RASTER_PATH_FLAG: Flag = Flag {
 const RASTER_PAGE_FLAG: Flag = Flag {
     arg: "page",
     kind: FlagKind::Number,
-    secret: false,
     purpose: "The 1-based page to render, for a PDF of several pages",
 };
 
@@ -1033,7 +996,6 @@ const RASTER_PAGE_FLAG: Flag = Flag {
 const OUTPUT_DIR_FLAG: Flag = Flag {
     arg: "output_dir",
     kind: FlagKind::Destination,
-    secret: false,
     purpose: "The directory the operation writes into — the produced file(s), or the one folder \
               they are all in; it must already exist, and it is the directory this command is run \
               in when it is left out",
@@ -1043,7 +1005,6 @@ const OUTPUT_DIR_FLAG: Flag = Flag {
 const DOCUMENT_FILE_NAME_FLAG: Flag = Flag {
     arg: "file_name",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "The base name of what is produced, without an extension where one is appended; a \
               free name is used, so nothing already there is overwritten",
 };
@@ -1051,7 +1012,6 @@ const DOCUMENT_FILE_NAME_FLAG: Flag = Flag {
 const DOCUMENT_FORMAT_FLAG: Flag = Flag {
     arg: "format",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "The format to write: docx, pptx, xlsx or pdf",
 };
 
@@ -1059,7 +1019,6 @@ const DOCUMENT_FORMAT_FLAG: Flag = Flag {
 const DOCUMENT_SLIDE_SIZE_FLAG: Flag = Flag {
     arg: "size",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "A pptx slide size: widescreen, standard or portrait; unnamed is the tool's own default deck",
 };
 
@@ -1067,7 +1026,6 @@ const DOCUMENT_SLIDE_SIZE_FLAG: Flag = Flag {
 const DOCUMENT_CONTENT_FLAG: Flag = Flag {
     arg: "content",
     kind: FlagKind::Structured(&["image"]),
-    secret: false,
     purpose: "The blocks to lay down, as a JSON array — one object per block, with the \
               'text'/'table'/'image'/'...' kind it names beside its own fields",
 };
@@ -1075,7 +1033,6 @@ const DOCUMENT_CONTENT_FLAG: Flag = Flag {
 const DOCUMENT_HEADER_FLAG: Flag = Flag {
     arg: "header",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "A created .docx's running header, one paragraph per line; {page} is the page \
               number and {pages} the document's page count",
 };
@@ -1083,7 +1040,6 @@ const DOCUMENT_HEADER_FLAG: Flag = Flag {
 const DOCUMENT_FOOTER_FLAG: Flag = Flag {
     arg: "footer",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "A created .docx's running footer, one paragraph per line; {page} is the page \
               number and {pages} the document's page count",
 };
@@ -1091,7 +1047,6 @@ const DOCUMENT_FOOTER_FLAG: Flag = Flag {
 const DOCUMENT_SHEETS_FLAG: Flag = Flag {
     arg: "sheets",
     kind: FlagKind::Structured(&[]),
-    secret: false,
     purpose: "The worksheets to write, as a JSON array — one object per sheet with its 'name', \
               its 'rows' and its own fields",
 };
@@ -1100,7 +1055,6 @@ const DOCUMENT_SHEETS_FLAG: Flag = Flag {
 const DOCUMENT_METADATA_FLAG: Flag = Flag {
     arg: "metadata",
     kind: FlagKind::Structured(&[]),
-    secret: false,
     purpose: "A PDF's own description, as a JSON object keyed {{pdf_metadata_fields}}; a named \
               field is set (a date is {{pdf_date_format}}), an empty string clears one, a field \
               you do not name is left as the file has it, and an existing modified date advances \
@@ -1111,14 +1065,12 @@ const DOCUMENT_METADATA_FLAG: Flag = Flag {
 const DOCUMENT_PATH_FLAG: Flag = Flag {
     arg: "path",
     kind: FlagKind::Path,
-    secret: false,
     purpose: "The input file to work on",
 };
 
 const DOCUMENT_PATHS_FLAG: Flag = Flag {
     arg: "paths",
     kind: FlagKind::PathList,
-    secret: false,
     purpose: "One input PDF, in the order it must be merged; repeat once per file, or name a \
               file holding them as a JSON array with '@<file>'",
 };
@@ -1126,7 +1078,6 @@ const DOCUMENT_PATHS_FLAG: Flag = Flag {
 const DOCUMENT_PAGES_FLAG: Flag = Flag {
     arg: "pages",
     kind: FlagKind::List,
-    secret: false,
     purpose: "One page entry: \"all\", a page, a range, or a comma list like \"1-3,5\" (\"all\" \
               stands alone); repeat once per entry, or name a file holding them as a JSON array \
               with '@<file>'; left out, every page",
@@ -1137,7 +1088,6 @@ const DOCUMENT_PAGES_FLAG: Flag = Flag {
 const IMAGE_EDITS_FLAG: Flag = Flag {
     arg: "edits",
     kind: FlagKind::Structured(&["image"]),
-    secret: false,
     purpose: EDITS_PURPOSE,
 };
 
@@ -1149,7 +1099,6 @@ const EDITS_PURPOSE: &str = "The edits to apply, as a JSON array — one object 
 const DOCUMENT_VALUES_FLAG: Flag = Flag {
     arg: "values",
     kind: FlagKind::Structured(&[]),
-    secret: false,
     purpose: "The values to write, as a JSON object keyed by placeholder name (or form field \
               name)",
 };
@@ -1157,14 +1106,12 @@ const DOCUMENT_VALUES_FLAG: Flag = Flag {
 const DOCUMENT_DEGREES_FLAG: Flag = Flag {
     arg: "degrees",
     kind: FlagKind::Number,
-    secret: false,
     purpose: "The rotation to add, in degrees (a multiple of the tool's own step)",
 };
 
 const DOCUMENT_AREA_FLAG: Flag = Flag {
     arg: "area",
     kind: FlagKind::Structured(&[]),
-    secret: false,
     purpose: "The area to keep, as a JSON object of x, y, width and height — fractions of the \
               page's visible area, from the displayed top-left",
 };
@@ -1172,63 +1119,54 @@ const DOCUMENT_AREA_FLAG: Flag = Flag {
 const DOCUMENT_TEXT_FLAG: Flag = Flag {
     arg: "text",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "The text to draw",
 };
 
 const DOCUMENT_IMAGE_FLAG: Flag = Flag {
     arg: "image",
     kind: FlagKind::Path,
-    secret: false,
     purpose: "The PNG or JPEG to place",
 };
 
 const DOCUMENT_X_FLAG: Flag = Flag {
     arg: "x",
     kind: FlagKind::Number,
-    secret: false,
     purpose: "Across the page, in points",
 };
 
 const DOCUMENT_Y_FLAG: Flag = Flag {
     arg: "y",
     kind: FlagKind::Number,
-    secret: false,
     purpose: "Down the page, in points",
 };
 
 const DOCUMENT_SIZE_FLAG: Flag = Flag {
     arg: "size",
     kind: FlagKind::Number,
-    secret: false,
     purpose: "The font size, in points",
 };
 
 const DOCUMENT_COLOR_FLAG: Flag = Flag {
     arg: "color",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "The text colour, as hex digits",
 };
 
 const DOCUMENT_STAMP_FLAG: Flag = Flag {
     arg: "stamp",
     kind: FlagKind::Present,
-    secret: false,
     purpose: "Draw a box around the text",
 };
 
 const DOCUMENT_OPACITY_FLAG: Flag = Flag {
     arg: "opacity",
     kind: FlagKind::Number,
-    secret: false,
     purpose: "Opacity from just above zero to one; unnamed is fully opaque",
 };
 
 const DOCUMENT_ROTATE_FLAG: Flag = Flag {
     arg: "rotate",
     kind: FlagKind::Number,
-    secret: false,
     purpose: "The text's own rotation, in degrees",
 };
 
@@ -1236,7 +1174,6 @@ const DOCUMENT_ROTATE_FLAG: Flag = Flag {
 const DOCUMENT_WIDTH_FLAG: Flag = Flag {
     arg: "width",
     kind: FlagKind::Number,
-    secret: false,
     purpose: "The width, in points: a picture's placed width, or the page width a resize makes",
 };
 
@@ -1244,21 +1181,18 @@ const DOCUMENT_WIDTH_FLAG: Flag = Flag {
 const DOCUMENT_HEIGHT_FLAG: Flag = Flag {
     arg: "height",
     kind: FlagKind::Number,
-    secret: false,
     purpose: "The height, in points: a picture's placed height, or the page height a resize makes",
 };
 
 const DOCUMENT_FLATTEN_FLAG: Flag = Flag {
     arg: "flatten",
     kind: FlagKind::Present,
-    secret: false,
     purpose: "Bake the fields into the page content and remove them",
 };
 
 const IMAGE_PROMPT_FLAG: Flag = Flag {
     arg: "prompt",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "The text description of the picture to produce (required)",
 };
 
@@ -1266,7 +1200,6 @@ const IMAGE_PROMPT_FLAG: Flag = Flag {
 const IMAGE_IMAGES_FLAG: Flag = Flag {
     arg: "images",
     kind: FlagKind::PathList,
-    secret: false,
     purpose: "One reference picture, by path; repeat once per picture, or name a file holding \
               them as a JSON array with '@<file>' — given any, the request is \
               picture-to-picture rather than text-to-picture",
@@ -1275,14 +1208,12 @@ const IMAGE_IMAGES_FLAG: Flag = Flag {
 const IMAGE_ASPECT_RATIO_FLAG: Flag = Flag {
     arg: "aspect_ratio",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "The aspect ratio, like '16:9', '1:1' or '4:3'",
 };
 
 const IMAGE_SIZE_FLAG: Flag = Flag {
     arg: "size",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "The picture's size — a tier like '1K'/'2K' or explicit pixels like '1024x1024'; \
               a model that cannot express the value is not sent the request",
 };
@@ -1290,14 +1221,12 @@ const IMAGE_SIZE_FLAG: Flag = Flag {
 const VIDEO_PROMPT_FLAG: Flag = Flag {
     arg: "prompt",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "The text description of the clip to produce, or of the edit to apply (required)",
 };
 
 const VIDEO_IMAGES_FLAG: Flag = Flag {
     arg: "images",
     kind: FlagKind::PathList,
-    secret: false,
     purpose: "The path of ONE local picture to start a new clip from — or, with a clip to edit, \
               of a picture guiding the edit: repeat once per picture, up to nine, or name a file \
               holding them as a JSON array with '@<file>'. A new clip's start picture is a local \
@@ -1307,7 +1236,6 @@ const VIDEO_IMAGES_FLAG: Flag = Flag {
 const VIDEO_DURATION_FLAG: Flag = Flag {
     arg: "duration",
     kind: FlagKind::Number,
-    secret: false,
     purpose: "The clip's length in seconds — a new clip's, or an edit's; the values the \
               account's own model takes are the ones it takes",
 };
@@ -1315,7 +1243,6 @@ const VIDEO_DURATION_FLAG: Flag = Flag {
 const VIDEO_RESOLUTION_FLAG: Flag = Flag {
     arg: "resolution",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "A new clip's resolution, as the model states it — refused with a clip to edit or \
               frame anchors",
 };
@@ -1323,7 +1250,6 @@ const VIDEO_RESOLUTION_FLAG: Flag = Flag {
 const VIDEO_ASPECT_RATIO_FLAG: Flag = Flag {
     arg: "aspect_ratio",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "A new clip's aspect ratio, as the model states it — refused with a clip to edit \
               or frame anchors",
 };
@@ -1331,7 +1257,6 @@ const VIDEO_ASPECT_RATIO_FLAG: Flag = Flag {
 const VIDEO_SIZE_FLAG: Flag = Flag {
     arg: "size",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "A new clip's exact size, as WxH (like '1280x720') — refused with a clip to edit \
               or frame anchors",
 };
@@ -1339,7 +1264,6 @@ const VIDEO_SIZE_FLAG: Flag = Flag {
 const VIDEO_GENERATE_AUDIO_FLAG: Flag = Flag {
     arg: "generate_audio",
     kind: FlagKind::Present,
-    secret: false,
     purpose: "Ask a new clip for an audio track, where the model offers one — omitted, the \
               model's own default applies and `=false` asks for a silent clip; refused with a \
               clip to edit or frame anchors",
@@ -1348,7 +1272,6 @@ const VIDEO_GENERATE_AUDIO_FLAG: Flag = Flag {
 const VIDEO_SEED_FLAG: Flag = Flag {
     arg: "seed",
     kind: FlagKind::Number,
-    secret: false,
     purpose: "A new clip's seed for a repeatable generation — refused with a clip to edit or \
               frame anchors",
 };
@@ -1358,7 +1281,6 @@ const VIDEO_SEED_FLAG: Flag = Flag {
 const VIDEO_URL_FLAG: Flag = Flag {
     arg: "video_url",
     kind: FlagKind::Path,
-    secret: false,
     purpose: "The clip to edit: a local path or a public https URL — given it the call edits \
               that clip; omitted, a new clip is generated; mutually exclusive with the first \
               and last frames",
@@ -1367,7 +1289,6 @@ const VIDEO_URL_FLAG: Flag = Flag {
 const VIDEO_FIRST_FRAME_FLAG: Flag = Flag {
     arg: "first_frame",
     kind: FlagKind::Path,
-    secret: false,
     purpose: "The picture to use as the exact first frame, by local path or public https URL — \
               the frame-anchor form, which excludes a clip and reference pictures",
 };
@@ -1375,7 +1296,6 @@ const VIDEO_FIRST_FRAME_FLAG: Flag = Flag {
 const VIDEO_LAST_FRAME_FLAG: Flag = Flag {
     arg: "last_frame",
     kind: FlagKind::Path,
-    secret: false,
     purpose: "The picture to use as the exact last frame, by local path or public https URL — \
               the frame-anchor form, which excludes a clip and reference pictures",
 };
@@ -1385,7 +1305,6 @@ const VIDEO_LAST_FRAME_FLAG: Flag = Flag {
 const USER_FLAG: Flag = Flag {
     arg: "user",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "The user's name",
 };
 
@@ -1393,7 +1312,6 @@ const USER_FLAG: Flag = Flag {
 const CUSTOM_TOOL_FLAG: Flag = Flag {
     arg: "tool",
     kind: FlagKind::Value,
-    secret: false,
     purpose: "The custom tool's name — a script in the 'shared' folder of your personal workspace",
 };
 
@@ -1510,9 +1428,6 @@ struct Parsed {
     /// An absent flag leaves its key ABSENT, never null — the tools tell the two
     /// apart, and `pause`/`resume` read the absent `workspace` as the fleet-wide form.
     args: serde_json::Value,
-    /// The values the `secret` flags really handed over, in order, as they
-    /// travelled: a `@<file>` secret is the FILE's content. Nothing else is sent.
-    secrets: Vec<String>,
     /// The directory the produced files must go into, exactly as the caller
     /// spelled it — `None` when the flag was left out. The DESTINATION is not a
     /// tool argument (see [`FlagKind::Destination`]): it travels beside them, and
@@ -1548,7 +1463,6 @@ fn parse_flags(
             serde_json::Value::String(action.to_string()),
         );
     }
-    let mut secrets = Vec::new();
     let mut output_dir: Option<String> = None;
     // The flags already given, so a repeat is refused rather than silently kept,
     // and the `List` entries, which become the array at the end.
@@ -1597,11 +1511,6 @@ fn parse_flags(
                         .ok_or_else(|| grammar::flag_value_missing(name))?,
                 };
                 take_value(flag, &value, &mut args, &mut lists, &mut output_dir)?;
-                if flag.secret {
-                    // A secret is what the flag handed over, never the spelling that
-                    // named it: the file form makes the FILE's content the value.
-                    secrets.extend(held_texts(flag, &args, &lists));
-                }
             }
         }
     }
@@ -1611,7 +1520,6 @@ fn parse_flags(
     }
     Ok(Tail::Call(Parsed {
         args: serde_json::Value::Object(args),
-        secrets,
         output_dir,
     }))
 }
@@ -1699,25 +1607,6 @@ fn take_value(
         FlagKind::Present => unreachable!("a switch carries no value"),
     }
     Ok(())
-}
-
-/// The texts a flag's argument now holds, as the values a secret flag really handed
-/// over — for the file forms, what the file held rather than the spelling.
-fn held_texts(
-    flag: &Flag,
-    args: &serde_json::Map<String, serde_json::Value>,
-    lists: &[(&'static str, Vec<serde_json::Value>)],
-) -> Vec<String> {
-    if let Some((_, entries)) = lists.iter().find(|(held, _)| *held == flag.arg) {
-        return entries
-            .iter()
-            .filter_map(|entry| entry.as_str().map(str::to_string))
-            .collect();
-    }
-    args.get(flag.arg)
-        .and_then(|value| value.as_str().map(str::to_string))
-        .into_iter()
-        .collect()
 }
 
 /// The JSON a `Number` flag carries: the number it is, else the text — whether the
@@ -2025,8 +1914,7 @@ fn flag_purpose(flag: &Flag) -> String {
         .replace("{{pdf_date_format}}", crate::docgen::pdf_date_format())
 }
 
-/// The flag table of a help: one width-aligned row per flag, a secret's value never
-/// echoed here because it is never echoed anywhere.
+/// The flag table of a help: one width-aligned row per flag.
 fn flag_rows<'a>(flags: impl IntoIterator<Item = &'a Flag>) -> String {
     let rows: Vec<(String, String)> = flags
         .into_iter()
@@ -2044,15 +1932,7 @@ fn flag_rows<'a>(flags: impl IntoIterator<Item = &'a Flag>) -> String {
                 FlagKind::Present => spelling.push_str("[=<true|false>]"),
                 FlagKind::Destination => spelling.push_str(" <dir>"),
             }
-            let description = if flag.secret {
-                format!(
-                    "{} — the value is never echoed or recorded",
-                    flag_purpose(flag)
-                )
-            } else {
-                flag_purpose(flag)
-            };
-            (spelling, description)
+            (spelling, flag_purpose(flag))
         })
         .collect();
     let width = rows
@@ -2182,7 +2062,6 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
     let call = CallRequest {
         tool: tool.to_string(),
         args: parsed.args,
-        secrets: parsed.secrets,
         output_dir,
     };
     let decision = verdict(
@@ -3453,32 +3332,18 @@ mod tests {
         assert_eq!(p.args["content"], serde_json::json!("not json"));
     }
 
-    /// The values of the SECRET flags — and only those — travel as secrets, kept out
-    /// of every record and echo. Which token is a value is decided by where it stands:
-    /// after a flag the next token IS the value, a leading dash and all (a script must
-    /// never read success for an operation that did not run), while where a FLAG could
-    /// stand `-h` asks for the help.
+    /// Which token is a value is decided by where it stands: after a flag the next
+    /// token IS the value, a leading dash and all (a script must never read success
+    /// for an operation that did not run), while where a FLAG could stand `-h` asks
+    /// for the help.
     #[test]
-    fn parsing_hands_secret_flag_values_over_as_secrets() {
+    fn parsing_decides_values_by_position() {
         let p = parsed("config", "setup-telegram-bot", &["--token", "NNN:AAA"]);
         assert_eq!(p.args["token"], "NNN:AAA");
-        assert_eq!(p.secrets, vec!["NNN:AAA".to_string()]);
 
-        let p = parsed(
-            "config",
-            "setup-web-search",
-            &["--provider", "exa", "--key=SEKRIT"],
-        );
-        assert_eq!(p.secrets, vec!["SEKRIT".to_string()]);
-
-        // A dash-led value is a value, and a dash-led secret a secret like any other.
+        // A dash-led value is a value.
         let p = parsed("config", "setup-telegram-bot", &["--token", "-h"]);
         assert_eq!(p.args["token"], "-h");
-        assert_eq!(
-            p.secrets,
-            vec!["-h".to_string()],
-            "a dash-led secret is a secret like any other"
-        );
         let p = parsed("workspace", "board", &["--phase", "--help"]);
         assert_eq!(p.args["phase"], "--help");
 
@@ -3594,7 +3459,7 @@ mod tests {
     /// one's is its text without one trailing line break. `./@…` escapes a value that
     /// begins with `@`, and a flag whose value names a path itself has no file form.
     /// A file it cannot use is misuse, the reason naming the FLAG, never the path; a
-    /// secret given from a file is the FILE's content, which must reach no record or echo.
+    /// value given from a file is the FILE's content.
     #[test]
     fn parsing_reads_a_value_from_a_file_the_caller_names() {
         let dir = crate::util::test::test_root().join("cli-file-values");
@@ -3672,8 +3537,7 @@ mod tests {
             "a reason must never carry a path value: {reason}"
         );
 
-        // A secret given from a file is the FILE's content: that must reach no record,
-        // echo or answer — never the spelling that named it.
+        // A value given from a file is the FILE's content, never the spelling that named it.
         let key = text.join("provider-key.txt");
         std::fs::write(&key, "sk-secret-from-a-file\n").expect("write the key");
         let from_file = format!("@{}", key.display());
@@ -3683,7 +3547,6 @@ mod tests {
             &["--provider", "exa", "--key", &from_file],
         );
         assert_eq!(p.args["key"], "sk-secret-from-a-file");
-        assert_eq!(p.secrets, vec!["sk-secret-from-a-file".to_string()]);
 
         // A flag whose value names a path itself takes no file form.
         let named = text.join("@report.pdf");
@@ -4143,7 +4006,6 @@ mod tests {
                 "place": "proj",
             })
         );
-        assert!(sent.secrets.is_empty(), "no flag of 'send' is a secret");
         assert!(
             sent.args.get("branch").is_none(),
             "an absent flag leaves no key: {}",

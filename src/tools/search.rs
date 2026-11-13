@@ -457,10 +457,6 @@ impl Tool for SearchTool {
         )
     }
 
-    fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
-        false // source code, not secrets
-    }
-
     fn side_effects(&self) -> bool {
         // The lazily git-init of a personal workspace is a one-time idempotent setup that never
         // mutates content and cannot conflict with parallel read-only tools, so search stays

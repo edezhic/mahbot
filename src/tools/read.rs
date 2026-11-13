@@ -1,6 +1,6 @@
 //! The `read` tool: line-numbered content reads, tree-sitter `symbols` and
-//! `zoom`, directory listings, credential scrubbing for sensitive paths, and
-//! the one-metadata-sniff decision that hands a document container to `tools::read_document`.
+//! `zoom`, directory listings, and the one-metadata-sniff decision that hands a
+//! document container to `tools::read_document`.
 //!
 //! Not the document converter itself — the readers live in `crate::document`
 //! and the tool-facing wrapper in `tools::read_document`; this tool only
@@ -36,50 +36,6 @@ impl ReadTool {
     #[must_use]
     pub fn general() -> Self {
         Self::new(PathAccess::Allowlisted)
-    }
-}
-
-const SENSITIVE_EXTENSIONS: &[&str] = &["cer", "crt", "env", "key", "p12", "pem", "pfx"];
-
-const SENSITIVE_FILE_NAMES: &[&str] = &[
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
-    ".git-credentials",
-    "settings.xml",
-    "settings-security.xml",
-    "gradle.properties",
-    "credentials.toml",
-];
-
-const SENSITIVE_FILE_NAME_PREFIXES: &[&str] = &["init.gradle"];
-
-#[must_use]
-fn is_sensitive_file_path(path: &str) -> bool {
-    let Some(file_name) = std::path::Path::new(path)
-        .file_name()
-        .and_then(|s| s.to_str())
-    else {
-        return true;
-    };
-    let lower = file_name.to_ascii_lowercase();
-
-    // Exact-name / prefix matches (dotfiles like `.netrc` with no extension, and
-    // credential config files like `settings.xml` / `gradle.properties`) are
-    // checked first because the rsplit_once('.') extension match below cannot classify them.
-    if SENSITIVE_FILE_NAMES.contains(&lower.as_str()) {
-        return true;
-    }
-    if SENSITIVE_FILE_NAME_PREFIXES
-        .iter()
-        .any(|p| lower.starts_with(*p))
-    {
-        return true;
-    }
-
-    match lower.rsplit_once('.') {
-        Some((name, ext)) => name == ".env" || SENSITIVE_EXTENSIONS.contains(&ext),
-        None => false,
     }
 }
 
@@ -369,14 +325,6 @@ impl Tool for ReadTool {
         execute_read(ws, args, self.access).await
     }
 
-    fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
-        // The read tool scrubs internally in `read_resolved` based on the
-        // resolved path (see `scrub_if_sensitive`) — an args-only decision here
-        // cannot see symlink targets or typo-recovered files. Returning `false`
-        // prevents the central agent-level pass from double-scrubbing.
-        false
-    }
-
     fn side_effects(&self) -> bool {
         false // read-only file inspection
     }
@@ -505,30 +453,6 @@ async fn read_image_payload(
     ))
 }
 
-/// Scrub a file-read's output when the *resolved* file is credential-bearing.
-/// (A converted document scrubs unconditionally instead: this path-based rule
-/// sees only the container's path, never the text extracted from it.)
-///
-/// Deciding here rather than from `should_scrub_output` is what makes the
-/// tier correct: `resolved_path` is canonical, so it already accounts for
-/// symlink targets and for typo recovery to a different file — neither is
-/// visible in the raw `path` argument. Directory listings are not scrubbed
-/// (file names are not secret values). Returning `false` from
-/// `should_scrub_output` prevents the central agent-level pass from
-/// double-scrubbing (same integration pattern as `ShellTool`).
-fn scrub_if_sensitive(resolved_path: &Path, body: String) -> String {
-    if is_sensitive_file_path(&resolved_path.to_string_lossy()) {
-        crate::util::scrub_credentials(&body)
-    } else {
-        body
-    }
-}
-
-fn finish_read_body(resolved_path: &Path, body: String, recovery_note: Option<&str>) -> String {
-    let body = scrub_if_sensitive(resolved_path, body);
-    super::with_recovery_note(recovery_note, body)
-}
-
 /// A media read: the timeline the product's own ffmpeg and recogniser produce, with a video's
 /// frames attached to the conversation. A video is read because it is a video, so neither the
 /// text size gate nor the text output budget applies to it.
@@ -540,7 +464,7 @@ async fn media_read(
     let (text, image_payloads) =
         crate::tools::timeline_output(reading, crate::tools::TimelinePictures::Attached).await;
     Ok(crate::tools::ToolOutput {
-        text: finish_read_body(&res.path, text, res.recovery_note.as_deref()),
+        text: super::with_recovery_note(res.recovery_note.as_deref(), text),
         image_payloads,
         text_is_content: true,
         // A timeline, not lines: the text budget would cut it mid-clip.
@@ -604,7 +528,7 @@ pub(super) async fn read_resolved(
     // The read tool returns media before it reaches here; the command line's reader does not.
     if read_mode(args) == ReadMode::Content && crate::media::is_media_path(resolved_path) {
         let reading = media_reading(resolved_path, args).await?;
-        return Ok(finish_read_body(resolved_path, reading.text, recovery_note));
+        return Ok(super::with_recovery_note(recovery_note, reading.text));
     }
     super::check_size_within(&meta, super::MAX_FILE_SIZE_BYTES, "File too large")?;
 
@@ -614,7 +538,7 @@ pub(super) async fn read_resolved(
         ReadMode::Content => execute_content(resolved_path, args).await?,
     };
 
-    Ok(finish_read_body(resolved_path, body, recovery_note))
+    Ok(super::with_recovery_note(recovery_note, body))
 }
 
 async fn recover_wildcard_path(ws: &Workspace, path: &str) -> anyhow::Result<String> {
@@ -1550,79 +1474,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_sensitive_config_is_not_denied() {
-        let (_dir, ws_path) = temp_workspace(&[("settings.xml", "<settings/>")]);
-        let result = tool()
-            .execute(
-                &Workspace::from_path(&ws_path),
-                json!({"path": "settings.xml"}),
-            )
-            .await;
-        assert!(result.is_ok(), "settings.xml should read: {result:?}");
-    }
-
-    #[tokio::test]
-    async fn read_scrubs_credential_bearing_file() {
-        let (_dir, ws_path) = temp_workspace(&[(".env", "API_KEY=sk-1234567890")]);
+    async fn read_returns_a_credential_bearing_file_verbatim() {
+        let content = "API_KEY=sk-1234567890";
+        let (_dir, ws_path) = temp_workspace(&[(".env", content)]);
         let result = tool()
             .execute(&Workspace::from_path(&ws_path), json!({"path": ".env"}))
-            .await;
-        assert!(result.is_ok(), "read should succeed: {result:?}");
-        let result = result.unwrap();
-        assert!(
-            result.contains("[REDACTED]"),
-            "credential should be redacted: {result}"
-        );
-        assert!(
-            !result.contains("sk-1234567890"),
-            "raw key must not leak: {result}"
-        );
+            .await
+            .expect("a credential-bearing file reads");
+        assert_eq!(result, format!("[1 lines total]\n1: {content}"));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn read_scrubs_symlinked_credential_file() {
+    async fn read_returns_a_symlinked_credential_file_verbatim() {
         use std::os::unix::fs::symlink;
 
-        let (_dir, ws_path) = temp_workspace(&[(".env", "API_KEY=sk-1234567890")]);
+        let content = "API_KEY=sk-1234567890";
+        let (_dir, ws_path) = temp_workspace(&[(".env", content)]);
         symlink(".env", ws_path.join("innocent.txt")).unwrap();
         let result = tool()
             .execute(
                 &Workspace::from_path(&ws_path),
                 json!({"path": "innocent.txt"}),
             )
-            .await;
-        assert!(result.is_ok(), "symlinked read should succeed: {result:?}");
-        let result = result.unwrap();
-        assert!(
-            result.contains("[REDACTED]"),
-            "symlink target should be redacted: {result}"
-        );
-        assert!(
-            !result.contains("sk-1234567890"),
-            "raw key must not leak via symlink: {result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn read_does_not_scrub_plain_file() {
-        let (_dir, ws_path) = temp_workspace(&[("notes.txt", "API_KEY=sk-1234567890")]);
-        let result = tool()
-            .execute(
-                &Workspace::from_path(&ws_path),
-                json!({"path": "notes.txt"}),
-            )
-            .await;
-        assert!(result.is_ok(), "read should succeed: {result:?}");
-        let result = result.unwrap();
-        assert!(
-            !result.contains("[REDACTED]"),
-            "plain file should not be redacted: {result}"
-        );
-        assert!(
-            result.contains("sk-1234567890"),
-            "plain file content should be verbatim: {result}"
-        );
+            .await
+            .expect("a symlinked credential file reads");
+        assert_eq!(result, format!("[1 lines total]\n1: {content}"));
     }
 
     #[tokio::test]
@@ -2188,42 +2065,6 @@ mod utils;
             output.contains("nested.txt"),
             "should list nested file: {output}"
         );
-    }
-
-    #[test]
-    fn is_sensitive_file_path_env_and_certs() {
-        assert!(is_sensitive_file_path(".env"));
-        assert!(is_sensitive_file_path("proj/.env"));
-        assert!(is_sensitive_file_path(".env.local"));
-        assert!(is_sensitive_file_path("/abs/path/.env.production"));
-        assert!(is_sensitive_file_path("secrets/local.env"));
-        assert!(is_sensitive_file_path("tls/cert.pem"));
-        assert!(is_sensitive_file_path("C:\\keys\\id_rsa.key"));
-        assert!(is_sensitive_file_path("a.pem"));
-        assert!(is_sensitive_file_path("a.key"));
-        assert!(is_sensitive_file_path("settings.xml"));
-        assert!(is_sensitive_file_path("settings-security.xml"));
-        assert!(is_sensitive_file_path("gradle.properties"));
-        assert!(is_sensitive_file_path("credentials.toml"));
-        assert!(is_sensitive_file_path(".netrc"));
-        assert!(is_sensitive_file_path(".npmrc"));
-        assert!(is_sensitive_file_path(".pypirc"));
-        assert!(is_sensitive_file_path(".git-credentials"));
-        assert!(is_sensitive_file_path("~/.m2/settings.xml"));
-        assert!(is_sensitive_file_path("init.gradle"));
-        assert!(is_sensitive_file_path("init.gradle.kts"));
-        assert!(is_sensitive_file_path("init.gradle.sh"));
-
-        assert!(!is_sensitive_file_path("src/main.rs"));
-        assert!(!is_sensitive_file_path("crates/foo/lib.rs"));
-        assert!(!is_sensitive_file_path("README.md"));
-        assert!(!is_sensitive_file_path("id_rsa.pub")); // public key, not a private key
-        assert!(!is_sensitive_file_path("notes.txt"));
-        assert!(!is_sensitive_file_path("pom.xml"));
-        assert!(!is_sensitive_file_path("build.gradle")); // project build file, not credentials
-        assert!(!is_sensitive_file_path(
-            "gradle/wrapper/gradle-wrapper.properties"
-        )); // basename-only
     }
 
     struct SymbolQueryCase {

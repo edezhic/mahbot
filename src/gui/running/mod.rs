@@ -29,8 +29,7 @@
 //! - The instrumentation is purely observational — it never affects shutdown/drain
 //!   logic and gains no cancellation semantics.
 //! - The live view shows tool arguments EXACTLY as the agent passed them —
-//!   including any secrets. A deliberate divergence from the durable logs, which
-//!   stay credential-scrubbed: this view is transient and exists for full visibility.
+//!   including any secrets. This view is transient and exists for full visibility.
 //!
 //! The page is DB-free: everything comes from those registries and snapshots, plus
 //! the dashboard's managed-workspace map (only for the "(external)" marker on

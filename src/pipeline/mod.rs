@@ -1468,9 +1468,7 @@ async fn run_parallel_agents(
                                 true,
                             )
                         } else {
-                            let reason = crate::util::scrub_credentials(
-                                &agent.failure_reason("agent produced no response"),
-                            );
+                            let reason = agent.failure_reason("agent produced no response");
                             discard_failed_first_request_session(&ticket.id, &agent).await;
                             (ParallelVerdict::NoResponse(reason), false)
                         }

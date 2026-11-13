@@ -2871,12 +2871,7 @@ impl TelegramChannel {
             })
         })
         .await
-        .with_context(|| {
-            format!(
-                "fetching {} did not finish within {bound:?}",
-                crate::util::http::redact_address(url)
-            )
-        })?
+        .with_context(|| format!("fetching {url} did not finish within {bound:?}"))?
     }
 }
 
@@ -2928,9 +2923,8 @@ async fn stream_capped(
 /// One debug line per delivered attachment: what went out, on which route, from where. A successful
 /// delivery is routine, so ordinary operation keeps no record of it — every failure still is.
 /// `file` is the name the delivery carries (path, generated name, or the address's last segment)
-/// and `source_url` that address for both remote routes; both are redacted by
-/// [`crate::util::http::redact_address`], so no query, fragment or signed credential outlives the
-/// delivery. `bytes` is what the product uploaded — `None` by address, where Telegram fetched and
+/// and `source_url` that address for both remote routes; the debug line carries both as they are.
+/// `bytes` is what the product uploaded — `None` by address, where Telegram fetched and
 /// may have re-encoded the file.
 fn record_attachment_delivery(
     chat_id: &str,
@@ -2946,8 +2940,6 @@ fn record_attachment_delivery(
             (kind.file_meta().api_method, "uploaded attachment")
         }
     };
-    let file = crate::util::http::redact_address(file);
-    let source_url = source_url.map(crate::util::http::redact_address);
     tracing::debug!(
         chat_id,
         kind = kind.label(),
@@ -3776,7 +3768,7 @@ impl Channel for TelegramChannel {
             if let Err(e) = self.send_attachment(chat_id, thread_id, attachment).await {
                 tracing::warn!(
                     error = %e,
-                    file = %crate::util::http::redact_address(&attachment.target),
+                    file = %attachment.target,
                     "Telegram: attachment delivery failed"
                 );
                 // The notice names a bounded last path component: an address's query, fragment and

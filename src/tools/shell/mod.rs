@@ -58,7 +58,6 @@ use crate::util::UnwrapPoison;
 use crate::util::excerpt::failure_excerpt;
 use crate::util::omitted_lines;
 use crate::util::push_line;
-use crate::util::scrub_credentials;
 use crate::util::strip_ansi_escapes;
 
 mod bg;
@@ -829,10 +828,9 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for TeeReader<R> {
 ///
 /// Nothing is created until the budget is crossed: it counts raw pipe bytes while the inline result
 /// is decoded, so escape-heavy output can spill although its decoded form would have fitted, the
-/// safe direction. The file holds the raw streams (neither stripped nor scrubbed) because
-/// byte-for-byte is the point; the summary built from it is scrubbed. Bytes are written from the
-/// reader's own task under one lock both streams share, so a run printing faster than the disk
-/// takes it slows its own pipes.
+/// safe direction. The file holds the raw streams, byte-for-byte as the pipes delivered them,
+/// because that is the point. Bytes are written from the reader's own task under one lock both
+/// streams share, so a run printing faster than the disk takes it slows its own pipes.
 #[derive(Clone)]
 struct CompleteOutput(std::sync::Arc<CompleteOutputInner>);
 
@@ -1640,14 +1638,14 @@ async fn leftover_result(
 
 /// Outcome of a direct program run (argv, never a shell command string), used by trigger-armed
 /// automations to decide whether a check reported anything. `output` is stdout+stderr AFTER ANSI
-/// stripping, but WITHOUT credential scrubbing and WITHOUT the shell pipeline's annotations (the
+/// stripping, WITHOUT the shell pipeline's annotations (the
 /// exit-status note, timing, spill hints). `has_output` is the wake/no-wake signal and reads the
 /// streams themselves: output that is nothing but whitespace or escape sequences is still output.
 pub(crate) struct ProgramOutcome {
     pub success: bool,
     /// How the run ended, e.g. `exit status 2` or `timed out after 600s`.
     pub detail: String,
-    /// Combined stdout+stderr, ANSI-stripped, unscrubbed.
+    /// Combined stdout+stderr, ANSI-stripped.
     pub output: String,
     pub has_output: bool,
     /// How the product intervened in this run: it never started it, its wall-clock ceiling, or its
@@ -2032,7 +2030,7 @@ fn annotate_run(
     }
 }
 
-/// Elapsed time plus the scrubbed tails of both streams, for a program run that did not complete.
+/// Elapsed time plus the tails of both streams, for a program run that did not complete.
 fn program_error_tail(elapsed: Duration, stdout: &[u8], stderr: &[u8]) -> String {
     let mut msg = format!("elapsed: {:.1}s", elapsed.as_secs_f64());
     msg.push_str(&captured_tails(stdout, stderr));
@@ -2049,8 +2047,7 @@ fn captured_tails(stdout: &[u8], stderr: &[u8]) -> String {
 }
 
 /// Both streams as captured — stdout first, then stderr on the next line when both are non-blank
-/// (never a leading blank line when one is empty). Never credential-scrubbed here: that is the
-/// caller's own step.
+/// (never a leading blank line when one is empty).
 fn raw_streams(stdout: &str, stderr: &str) -> String {
     if stderr.trim().is_empty() {
         stdout.to_string()
@@ -2062,8 +2059,8 @@ fn raw_streams(stdout: &str, stderr: &str) -> String {
 }
 
 /// Decode both raw streams ([`decode_and_strip_ansi`]) into [`raw_streams`]' reading — the two call
-/// sites are the `custom` tool, whose output the agent-level pass scrubs, and an automation's
-/// trigger, which deliberately shows a check exactly as the check produced it.
+/// sites are the `custom` tool and an automation's trigger, which deliberately shows a check exactly
+/// as the check produced it.
 fn decode_raw_streams(stdout: &[u8], stderr: &[u8]) -> String {
     raw_streams(
         &decode_and_strip_ansi(stdout),
@@ -2080,12 +2077,12 @@ fn tail_chars(s: &str, max_chars: usize) -> String {
 }
 
 /// Append the tail of an output buffer to `msg` with a label: this platform's reading of a
-/// program's output ([`decode_and_strip_ansi`]) → strip ANSI escapes → scrub credentials → truncate
-/// to [`TIMEOUT_OUTPUT_TAIL_CHARS`] characters.
+/// program's output ([`decode_and_strip_ansi`]) → strip ANSI escapes → truncate to
+/// [`TIMEOUT_OUTPUT_TAIL_CHARS`] characters.
 fn append_output_tail(msg: &mut String, label: &str, data: &[u8]) {
     if !data.is_empty() {
-        let scrubbed = strip_and_scrub(data);
-        let tail = tail_chars(&scrubbed, TIMEOUT_OUTPUT_TAIL_CHARS);
+        let decoded = decode_and_strip_ansi(data);
+        let tail = tail_chars(&decoded, TIMEOUT_OUTPUT_TAIL_CHARS);
         let _ = write!(
             msg,
             "\n{label} (last {} chars): {tail}",
@@ -2238,7 +2235,7 @@ impl ShellTool {
     }
 
     /// Return the command's own output instead of the profile's formatted, budget-bounded reading:
-    /// both streams as captured (still bounded by the pipe caps and credential-scrubbed), with no
+    /// both streams as captured (still bounded by the pipe caps), with no
     /// profile filter, line cap or spill — for a caller that decides for itself what part of the
     /// output to keep, such as the verification round's record of a failing project command
     /// ([`crate::util::excerpt`]). A timeout or a memory stop of such a run carries the
@@ -2263,7 +2260,10 @@ impl ShellTool {
         if !self.unfiltered {
             return captured_tails(stdout, stderr);
         }
-        let output = raw_streams(&strip_and_scrub(stdout), &strip_and_scrub(stderr));
+        let output = raw_streams(
+            &decode_and_strip_ansi(stdout),
+            &decode_and_strip_ansi(stderr),
+        );
         if output.trim().is_empty() {
             return String::new();
         }
@@ -2352,8 +2352,7 @@ impl ShellTool {
     /// Execute a command and return `(formatted_output, exit_code)`: `Some(0)` for success,
     /// `Some(n)` for a non-zero exit, `None` when a signal terminated the process. The output
     /// carries the `[exit status: N]` annotation for non-zero exits and signal termination — except
-    /// for an [`Self::unfiltered`] run, whose caller reads the status from the returned code — and
-    /// credentials are already scrubbed in every case.
+    /// for an [`Self::unfiltered`] run, whose caller reads the status from the returned code.
     #[expect(clippy::too_many_lines)] // orchestration: validation, engine hook, containment
     pub(crate) async fn execute_with_status(
         &self,
@@ -2709,7 +2708,7 @@ impl ShellTool {
                 let processed = if self.unfiltered {
                     // The caller reads the command's own output: both streams as captured, nothing
                     // filtered out of them.
-                    raw_streams(&scrub_credentials(&stdout), &scrub_credentials(&stderr))
+                    raw_streams(&stdout, &stderr)
                 } else {
                     process_shell_output(
                         command_str,
@@ -3394,10 +3393,6 @@ impl Tool for ShellTool {
         self.mode != ShellMode::ReadOnly
     }
 
-    fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
-        false // shell pipeline already scrubs stdout and stderr once at pipeline entry
-    }
-
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> anyhow::Result<String> {
         self.execute_with_status(ws, args)
             .await
@@ -4034,16 +4029,13 @@ fn finish_shell_output(
     elapsed: Duration,
     full_output_for_spill: Option<&str>,
 ) -> String {
-    // Both streams are credential-scrubbed once at `apply_profile_pipeline` entry, so nothing more
-    // is needed here; ShellTool overrides `should_scrub_output` to `false`, disabling the redundant
-    // agent-level scrub.
     if elapsed.as_secs_f64() >= 1.0 {
         let _ = write!(combined, "\n[took {:.1}s]", elapsed.as_secs_f64());
     }
 
     // When pre-head/tail output is available and large enough, spill the fuller version so agents
     // can `read` the complete output despite the head/tail truncation reducing inline content to a
-    // snippet. `full_output_for_spill` is already credential-scrubbed. The `pre` value is only
+    // snippet. The `pre` value is only
     // provided when output exceeds `TOOL_OUTPUT_BUDGET_BYTES` (guaranteed by
     // `apply_line_truncation`), so no length re-check is needed here.
     if let Some(pre) = full_output_for_spill {
@@ -4387,8 +4379,7 @@ fn apply_line_truncation(output: &str, profile: &Profile) -> (String, Option<Str
 }
 
 /// The full profile-based pipeline on pre-processed output. Upstream (`execute()`) has already
-/// stripped ANSI, and the pipe read cap ([`SHELL_PIPE_READ_CAP`]) bounded what was collected; both
-/// streams are scrubbed once at entry, so every path (early return and main) receives clean data.
+/// stripped ANSI, and the pipe read cap ([`SHELL_PIPE_READ_CAP`]) bounded what was collected.
 /// Early-return stages (`on_empty`) call `combine_output` only; the main path continues through
 /// `combine_output` → `finish_shell_output` (timing, spill-to-file). [`TOOL_OUTPUT_BUDGET_BYTES`]
 /// gates the head/tail truncation and the spill preview — a trigger, not a cutoff — and
@@ -4401,19 +4392,12 @@ fn apply_profile_pipeline(
     exit_code: i32,
     elapsed: Duration,
 ) -> String {
-    // Scrub both streams once at entry so every downstream path (on_empty, main) sees clean data.
-    // Scrubbing before keep_stderr filtering drops credential lines that matched a pattern —
-    // acceptable, since credentials must never appear. No later stage scrubs again: all derived
-    // output (truncated, spill) comes from this one source.
-    let stderr = scrub_credentials(stderr);
-    let output = scrub_credentials(output);
-
-    // The trailing combine_output arguments, captured once; output is already scrubbed.
+    // The trailing combine_output arguments, captured once.
     let combine =
-        |output: &str| combine_output(output, &stderr, exit_code, profile.keep_stderr.as_ref());
+        |output: &str| combine_output(output, stderr, exit_code, profile.keep_stderr.as_ref());
 
     // Stage 1: strip lines
-    let mut processed = apply_strip_lines(&output, profile);
+    let mut processed = apply_strip_lines(output, profile);
 
     // Stage 2: collapse blank lines (runs >2 → 2).
     processed = collapse_blank_lines(&processed);
@@ -4460,9 +4444,6 @@ fn apply_profile_pipeline(
 
 /// Decode raw shell output bytes into text ([`windows_text::decode`]: this platform's own reading
 /// of a program's output) and strip ANSI escape sequences.
-///
-/// This is the first step before further processing such as credential scrubbing
-/// ([`strip_and_scrub`]).
 fn decode_and_strip_ansi(data: &[u8]) -> String {
     strip_ansi_escapes(&windows_text::decode(data))
 }
@@ -4482,12 +4463,6 @@ pub(super) fn format_exit_status_note(exit_code: Option<i32>) -> String {
         Some(c) => format!("[exit status: {c}]"),
         None => "[exit status: terminated by signal]".to_string(),
     }
-}
-
-/// [`decode_and_strip_ansi`]'s reading plus credential scrubbing, for raw shell bytes on their way
-/// to display-safe text.
-fn strip_and_scrub(data: &[u8]) -> String {
-    scrub_credentials(&decode_and_strip_ansi(data))
 }
 
 fn truncate_line_width(input: &str, max_line_len: usize) -> String {
@@ -4603,9 +4578,7 @@ fn file_spill_preview(spilled: &Spilled) -> String {
 }
 
 /// Up to `len` bytes of `path` from `start`, read as the shell reads a program's output, since the
-/// file is raw bytes off the same pipes. Scrubbed like the inline result it replaces, even though
-/// the tool-output pass would scrub it again: the preview is right on its own. The file stays
-/// byte-complete.
+/// file is raw bytes off the same pipes. The file stays byte-complete.
 fn read_window(path: &Path, start: u64, len: u64) -> Option<String> {
     use std::io::{Read as _, Seek as _};
 
@@ -4613,7 +4586,7 @@ fn read_window(path: &Path, start: u64, len: u64) -> Option<String> {
     file.seek(std::io::SeekFrom::Start(start)).ok()?;
     let mut bytes = Vec::new();
     file.take(len).read_to_end(&mut bytes).ok()?;
-    Some(strip_and_scrub(&bytes))
+    Some(decode_and_strip_ansi(&bytes))
 }
 
 /// Write `bytes` to a spill file and register the path as the current call's the instant the file
@@ -4641,8 +4614,7 @@ fn write_to_spill(content: &str, filename: &str) -> Option<std::path::PathBuf> {
     Some(path)
 }
 
-/// Write output to a random spill file. No filtering: callers with credential-bearing text scrub
-/// first.
+/// Write output to a random spill file. No filtering: the bytes are written as given.
 fn spill_output(output: &str) -> Option<std::path::PathBuf> {
     let filename = crate::tools::path::format_spill_filename();
     write_to_spill(output, &filename)
@@ -5200,6 +5172,13 @@ mod tests {
                 eq: Some("[cargo: ok] (0.0s)"),
                 ..Default::default()
             },
+            ShellOutputCase {
+                name: "a credential-shaped line reaches the agent exactly as printed",
+                command: "echo test",
+                stdout: "API_KEY=sk-1234567890\n",
+                contains: &["API_KEY=sk-1234567890"],
+                ..Default::default()
+            },
         ];
         check_shell_output(cases);
     }
@@ -5591,14 +5570,7 @@ mod tests {
         assert!(out.has_output);
         assert!(out.output.contains("hi"), "got: {}", out.output);
 
-        // The literal is split so this source does not look like a credential to output scrubbers;
-        // the control below proves the scrubber rewrites it and that it reaches the automation
-        // verbatim.
         let raw = concat!("API_KEY=", "abcd1234");
-        assert!(
-            scrub_credentials(raw).contains("*[REDACTED]"),
-            "the scrubber must rewrite this value, or the pin below is vacuous"
-        );
         let out = run_program_outcome(
             ws.as_path(),
             Path::new("/bin/sh"),
@@ -5609,7 +5581,7 @@ mod tests {
         assert_eq!(
             out.output.trim(),
             raw,
-            "the check's output must reach the automation unredacted"
+            "the check's output must reach the automation verbatim"
         );
     }
 
@@ -6429,47 +6401,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pipeline_credential_scrubbing_cases() {
-        // Pipeline entry scrubs both streams, and on_empty (Stage 5) verifies scrubbing in stderr.
-        // Each case: raw credentials absent, redacted form present, pipeline content preserved.
-        let cases: &[ShellOutputCase] = &[
-            ShellOutputCase {
-                // Stage 5 (on-empty): credentials from stderr are scrubbed (via git diff's on_empty
-                // message).
-                name: "git diff on_empty scrubs credentials in stderr",
-                command: "git diff",
-                stderr: "api_key=abcdefghijklmnop12345678",
-                exit_code: 1,
-                not_contains: &["api_key=abcdefghijklmnop12345678"],
-                contains: &["api_key=abcd*[REDACTED]", "no changes"],
-                ..Default::default()
-            },
-            ShellOutputCase {
-                // Stage 5 (on-empty): credentials from stderr are scrubbed; the `warning:` prefix
-                // keeps the line past the keep_stderr filter on the failure path.
-                name: "on-empty scrubs credentials in stderr",
-                command: "tsc --noEmit",
-                stderr: "warning: api_key=abcdefghijklmnop12345678",
-                exit_code: 1,
-                not_contains: &["api_key=abcdefghijklmnop12345678"],
-                contains: &["api_key=abcd*[REDACTED]", "[tsc: ok]"],
-                ..Default::default()
-            },
-            ShellOutputCase {
-                // Main pipeline path (all stages, no early return): stdout credentials are scrubbed
-                // at entry, before any stage processes them.
-                name: "main pipeline scrubs credentials in stdout",
-                command: "echo test",
-                stdout: "API_KEY=abcdefghijklmnop12345678",
-                not_contains: &["abcdefghijklmnop12345678"],
-                contains: &["API_KEY=abcd*[REDACTED]"],
-                ..Default::default()
-            },
-        ];
-        check_shell_output(cases);
-    }
-
     /// The reduced fallback `PATH` covers the directories a developer expects (`~/.cargo/bin`,
     /// `~/.npm-global/bin`, Homebrew on macOS) and honors `$CARGO_HOME`. It is the fallback — for
     /// internal work and an unread owner environment — not the owner's own `PATH`, which replaces
@@ -6711,16 +6642,12 @@ mod tests {
         );
     }
 
-    // Scrubbing happens upstream at pipeline entry, so `finish_shell_output` receives pre-scrubbed
-    // input; these tests verify the non-scrubbing behaviour (timing, spill, idempotence).
-
     struct FinishCase {
         name: &'static str,
         combined: &'static str,
         elapsed: Duration,
         pre: Option<&'static str>,
         check: &'static [&'static str], // all must be contained in result
-        not_check: &'static [&'static str], // none must be contained
         eq: Option<&'static str>,
     }
 
@@ -6728,62 +6655,40 @@ mod tests {
     fn finish_shell_output_cases() {
         let cases: &[FinishCase] = &[
             FinishCase {
-                name: "pre-scrubbed input passes through",
-                combined: "API_KEY=abcd*[REDACTED]",
+                name: "passes input through",
+                combined: "plain output",
                 elapsed: Duration::ZERO,
                 pre: None,
-                check: &["abcd*[REDACTED]"],
-                not_check: &["abcdefghijklmnop"],
-                eq: None,
+                check: &[],
+                eq: Some("plain output"),
             },
             FinishCase {
-                name: "pre-scrubbed combined in spill path",
-                combined: "SECRET=wxyz*[REDACTED]",
+                name: "spills the pre-truncation output",
+                combined: "plain output",
                 elapsed: Duration::ZERO,
                 pre: Some("x"),
-                check: &["wxyz*[REDACTED]", "[Output saved to"],
-                not_check: &["wxyz1234abcdefgh"],
+                check: &["[Output saved to"],
                 eq: None,
             },
             FinishCase {
-                name: "preserves clean output",
-                combined: "no credentials here",
-                elapsed: Duration::ZERO,
-                pre: None,
-                check: &[],
-                not_check: &[],
-                eq: Some("no credentials here"),
-            },
-            FinishCase {
-                name: "appends elapsed timing with pre-scrubbed input",
-                combined: "API_KEY=abcd*[REDACTED]",
+                name: "appends elapsed timing",
+                combined: "plain output",
                 elapsed: Duration::from_secs(5),
                 pre: None,
-                check: &["[took 5.0s]", "abcd*[REDACTED]"],
-                not_check: &["abcdefghijklmnop"],
+                check: &["[took 5.0s]", "plain output"],
                 eq: None,
-            },
-            FinishCase {
-                name: "scrub idempotent",
-                combined: "API_KEY=abcd*[REDACTED]",
-                elapsed: Duration::ZERO,
-                pre: None,
-                check: &[],
-                not_check: &[],
-                eq: Some("API_KEY=abcd*[REDACTED]"),
             },
         ];
         for case in cases {
             // For the pre-truncation spill path: repeat the string past TOOL_OUTPUT_BUDGET_BYTES to
-            // trigger the spill in `finish_shell_output` (content already scrubbed by
-            // `apply_profile_pipeline`), and verify the spill hint is appended.
+            // trigger the spill in `finish_shell_output`, and verify the spill hint is appended.
             let pre_owned = case.pre.map(|s| s.repeat(TOOL_OUTPUT_BUDGET_BYTES + 1));
             let result = finish_shell_output(
                 case.combined.to_string(),
                 case.elapsed,
                 pre_owned.as_deref(),
             );
-            assert_contains_not_contains(case.name, &result, case.check, case.not_check);
+            assert_contains_not_contains(case.name, &result, case.check, &[]);
             if let Some(expected) = case.eq {
                 assert_eq!(result.trim(), expected, "[{}] expected eq", case.name);
             }

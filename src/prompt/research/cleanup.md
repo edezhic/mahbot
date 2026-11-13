@@ -14,7 +14,7 @@ Its analysts, worker, and verifier agents may have
 created temporary files while working: downloads, scratch directories, mktemp
 results, redirect targets, editor droppings, etc. The per-run folder above was
 the run's scratch zone; the command dump lists the shell commands its agents
-ran — credential-scrubbed, deduplicated, oldest first, and capped: past its
+ran — deduplicated, oldest first, and capped: past its
 size limit the oldest entries are dropped.
 
 ## Your task

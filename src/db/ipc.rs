@@ -222,16 +222,11 @@ const LAUNCH_UNRESTRICTED_ANSWER: &str = concat!(
     "is not taken through it"
 );
 
-/// One command-line operation: the tool the frontend addressed, its arguments, and the secrets
-/// handed over.
+/// One command-line operation: the tool the frontend addressed and its arguments.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CallRequest {
     pub tool: String,
     pub args: serde_json::Value,
-    /// The values the caller handed over as secrets: never echoed back, recorded or reported — the
-    /// instance removes them from the answer, the error text and the recorded arguments.
-    #[serde(default)]
-    pub secrets: Vec<String>,
     /// The directory the produced files must go into, resolved on the machine the command runs on
     /// by the caller that named it. The command line's own operand, never a tool argument, so no
     /// tool sees it in `args`; only the producing families send one and only the file-writing tools
@@ -1099,7 +1094,6 @@ mod tests {
             call: Some(CallRequest {
                 tool: "workspace".to_string(),
                 args: serde_json::json!({ "action": "list" }),
-                secrets: Vec::new(),
                 output_dir: None,
             }),
         })
@@ -1561,7 +1555,6 @@ mod tests {
         let call = CallRequest {
             tool: "no_such_tool".to_string(),
             args: serde_json::json!({}),
-            secrets: Vec::new(),
             output_dir: None,
         };
         match crate::db::ipc::ipc_call_with_wait(&root, &call, CALL_STORE).await {
@@ -1630,7 +1623,6 @@ mod tests {
         let call = CallRequest {
             tool: "send".to_string(),
             args: serde_json::json!({ "message": "from the command line" }),
-            secrets: Vec::new(),
             output_dir: None,
         };
         match crate::db::ipc::ipc_call_with_wait(&root, &call, CALL_STORE).await {

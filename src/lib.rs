@@ -871,7 +871,7 @@ impl Role {
 #[derive(Debug, Clone)]
 pub(crate) struct ToolCallRecord {
     pub tool_name: String,
-    /// Serialized arguments as JSON (credentials scrubbed).
+    /// Serialized arguments as JSON, capped for storage.
     pub arguments: String,
     /// Execution duration in milliseconds.
     pub duration_ms: i64,
@@ -1294,21 +1294,6 @@ pub(crate) trait Tool: Send + Sync {
             description: self.description(),
             parameters: self.parameters_schema(),
         }
-    }
-
-    /// Whether this tool's output should be scrubbed for credentials. The default is
-    /// `true` (scrub-all, via `scrub_tool_output` in `tools/mod.rs`).
-    ///
-    /// **A tool that scrubs internally or returns stored text as it is must return
-    /// `false`**, so the agent-level pass neither double-scrubs nor rewrites the answer:
-    /// shell (`apply_profile_pipeline` already scrubs stdout and stderr once at pipeline
-    /// entry), search (source code, where credential patterns are harmless and should be
-    /// shown accurately), the debug query (a stored cell is the answer), and read (which
-    /// scrubs in `read_resolved` by the *resolved* path — an args-only decision cannot
-    /// see symlink targets or typo-recovered files). `web_search` scrubs its own picture
-    /// text on that call only.
-    fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
-        true
     }
 
     /// Whether this tool has side effects that would conflict with parallel execution.

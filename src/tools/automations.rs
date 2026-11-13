@@ -1,8 +1,7 @@
 //! Automation tools — add, list, and remove the Assistant's own automations: create one that
 //! fires a notification back into its conversation when due, list the active ones, remove one.
 //!
-//! A result is a tool result like any other, so it keeps the agent-level credential scrub
-//! ([`crate::automations`]).
+//! A result is a tool result like any other.
 
 use std::fmt::Write as _;
 

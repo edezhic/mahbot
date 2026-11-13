@@ -595,7 +595,7 @@ pub(crate) struct AnalystFindings {
 /// Per-analyst outcome after extraction — three mutually-exclusive states mirroring
 /// `pipeline::ParallelVerdict`, so "no response" and "parse failure" cannot be confused.
 enum AnalystOutcome {
-    /// No response (crashed, cancelled, empty output); carries the scrubbed reason.
+    /// No response (crashed, cancelled, empty output); carries the reason.
     NoResponse(String),
     /// Agent responded and structured extraction succeeded.
     Findings {
@@ -896,7 +896,7 @@ async fn extract_findings(
                 let (agent, raw) = match run {
                     AnalyzeRun::Completed { agent, response } => (agent, response),
                     AnalyzeRun::Failed { reason } => {
-                        return AnalystOutcome::NoResponse(crate::util::scrub_credentials(&reason));
+                        return AnalystOutcome::NoResponse(reason);
                     }
                 };
                 // Nothing new starts for a cancelled round; the extraction loop re-asks

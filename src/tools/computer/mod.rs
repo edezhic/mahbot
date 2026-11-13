@@ -746,12 +746,6 @@ impl Tool for ComputerTool {
             .join("\n\n")
     }
 
-    /// Every computer output is credential-scrubbed inside the tool, so the agent-level pass must
-    /// not scrub again (mirrors the shell/read scrub-internally rule).
-    fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
-        false
-    }
-
     fn is_advertised(&self) -> bool {
         self::is_advertised()
     }
@@ -814,7 +808,7 @@ impl Tool for ComputerTool {
         }
         let delivered = result.map_err(|e| framework_next_step(&action, e))?;
         let answer = answer(delivered).await;
-        Ok(crate::util::scrub_credentials(&answer))
+        Ok(answer)
     }
 
     /// The tool's text is a real result, never a claim about an image, so annotations are
@@ -939,8 +933,8 @@ async fn dispatch(action: &ComputerAction) -> anyhow::Result<Delivered> {
     match action {
         ComputerAction::Apps {} => Ok(Delivered::Read(apps().await?)),
         ComputerAction::Windows { app } => Ok(Delivered::Read(windows(app.as_deref()).await?)),
-        // An observation spills and scrubs its own tree; every answer is scrubbed once more at the
-        // boundary, which is also where the post-action report is appended.
+        // An observation spills its own tree; every answer passes through the boundary, which is
+        // also where the post-action report is appended.
         ComputerAction::Observe {
             target,
             reference,
@@ -1610,13 +1604,10 @@ fn render_full(obs: &core::Observation, counts: core::Counts) -> String {
     output
 }
 
-/// Hand the answer to the spill budget, scrubbed first: the tree is the one result that can be
+/// Hand the answer to the spill budget: the tree is the one result that can be
 /// large enough to be written to a file instead of returned whole.
 fn spill(output: &str) -> String {
-    crate::tools::shell::try_spill_to_file(
-        crate::util::scrub_credentials(output),
-        TOOL_OUTPUT_BUDGET_BYTES,
-    )
+    crate::tools::shell::try_spill_to_file(output.to_string(), TOOL_OUTPUT_BUDGET_BYTES)
 }
 
 async fn click(

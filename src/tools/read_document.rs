@@ -3,7 +3,7 @@
 //! (extracted text inlined, or spilled when it does not fit the tool output
 //! budget, at most [`crate::document::MAX_READ_PICTURES`] extracted pictures
 //! attached as images) and the command line's (the whole text and every raster
-//! written into a folder of their own). Detection, conversion, scrubbing and the
+//! written into a folder of their own). Detection, conversion and the
 //! reader's wording are shared; only the delivery is the caller's own — the read
 //! tool attaches a bounded number of pictures and reports the rest, and the
 //! command line has no length limit at all.
@@ -91,8 +91,8 @@ enum Conversion {
     Unreadable(String),
 }
 
-/// Convert `path` into `dir` as both entrances deliver it, so detection,
-/// conversion and scrubbing are one implementation for both.
+/// Convert `path` into `dir` as both entrances deliver it, so detection and
+/// conversion are one implementation for both.
 async fn convert_reading(path: &Path, name: &str, dir: &Path) -> Conversion {
     match crate::document::convert_document_file(path, name, dir).await {
         DocOutcome::Text {
@@ -103,12 +103,7 @@ async fn convert_reading(path: &Path, name: &str, dir: &Path) -> Conversion {
             all_page_text_lost,
             page_text,
         } => Conversion::Reading(ConvertedDocument {
-            // The read tool returns `false` from `should_scrub_output`, and the
-            // scrub `read_resolved` does instead is path-based — it sees the
-            // container's path, never what was extracted from it — so this text
-            // is scrubbed here for both entrances. (The inbound route delivers
-            // the same text unscrubbed.)
-            text: crate::util::scrub_credentials(text.trim()),
+            text: text.trim().to_string(),
             images,
             notes,
             unshown,

@@ -123,7 +123,7 @@ pub(crate) fn strip_image_markers(content: &str, reason: Option<&str>) -> String
     let reason = reason.unwrap_or(REASON_FALLBACK);
     // Trim trailing punctuation from the reason so a provider message ending in "." does not
     // double up against the phrase's own period.
-    let sanitized = crate::util::truncate(&crate::util::scrub_credentials(reason), REASON_CAP);
+    let sanitized = crate::util::truncate(reason, REASON_CAP);
     let sanitized = sanitized
         .trim_end_matches(|c: char| c == '.' || c.is_whitespace())
         .to_string();
@@ -327,16 +327,6 @@ mod tests {
                 "no dangling whitespace before the phrase: {out:?}"
             );
         }
-    }
-
-    #[test]
-    fn strip_scrubs_credentials_from_reason() {
-        let content = "[IMAGE:/tmp/a.png] hi";
-        let out = strip_image_markers(content, Some("leaked API_KEY=sk-1234567890abcdef"));
-        assert!(
-            !out.contains("sk-1234567890abcdef"),
-            "credential scrubbed: {out}"
-        );
     }
 
     #[test]

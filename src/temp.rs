@@ -881,7 +881,7 @@ async fn run_temp_cleanup_and_finish(job_id: &str, ws: &Workspace, prompt: &str)
                 job = %job_id,
                 agent = %agent_id,
                 "Temp cleaner finished: {}",
-                crate::util::scrub_credentials(&report)
+                &report
             );
         }
         Err(payload) => tracing::error!(

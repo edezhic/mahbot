@@ -295,24 +295,6 @@ pub(crate) fn action_entry_schema(
     })
 }
 
-use crate::util::scrub_credentials;
-
-/// Scrub credentials from tool output, delegating the policy to the tool through
-/// [`Tool::should_scrub_output`]. A tool that scrubs its own output (the shell pipeline) or returns
-/// stored text as it stands (`mahbot_debug` cells) must return `false` to avoid double-scrubbing.
-#[must_use]
-pub(crate) fn scrub_tool_output(
-    tool: &dyn Tool,
-    call_arguments: &serde_json::Value,
-    output: &str,
-) -> String {
-    if tool.should_scrub_output(call_arguments) {
-        scrub_credentials(output)
-    } else {
-        output.to_string()
-    }
-}
-
 /// Prefix of a failed tool result — shared so the research wrap-up checks the marker this produces.
 pub(crate) const TOOL_FAILURE_MARKER: &str = "Tool call failed.";
 
@@ -349,10 +331,7 @@ pub(crate) fn format_tool_failure_feedback(
     tool_args: &serde_json::Value,
     reason: &str,
 ) -> String {
-    // `reason` arrives pre-scrubbed and is passed through; `tool_args` are scrubbed here because
-    // they are formatted for display. Scrubbing comes before the cap: redaction can lengthen the
-    // text.
-    let args = scrub_credentials(&tool_args.to_string());
+    let args = tool_args.to_string();
     let args_preview = crate::util::cut_bytes(&args, TOOL_FAILURE_ARGS_PREVIEW_BYTES);
     format!(
         "{TOOL_FAILURE_MARKER}\n\
@@ -1849,22 +1828,6 @@ mod tests {
             fault.len()
         );
         assert_eq!(crate::util::truncate_tool_output(&feedback), feedback);
-
-        // Scrubbing happens before the cap: this credential straddles the cut the cap would make.
-        let secret = "abcdefghij".repeat(10);
-        let secret_args = serde_json::json!({
-            "prompt": "x".repeat(928),
-            "token": secret,
-        });
-        let secret_feedback = format_tool_failure_feedback(tool, &secret_args, &reason);
-        assert!(
-            secret_feedback.contains("*[REDACTED]"),
-            "the credential is scrubbed before the preview is cut: {secret_feedback}"
-        );
-        assert!(
-            !secret_feedback.contains(&secret),
-            "the raw credential cannot survive: {secret_feedback}"
-        );
     }
 
     #[test]

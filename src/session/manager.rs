@@ -1309,16 +1309,12 @@ fn render_custom_role_lines(roles: &[CustomRole]) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
-/// The opening of a role's authored prompt: whitespace collapsed to single spaces,
-/// credential-scrubbed like the other admin-authored text that enters a prompt, then cut to
+/// The opening of a role's authored prompt: whitespace collapsed to single spaces, then cut to
 /// [`MAX_ROLE_EXCERPT_CHARS`] on a char boundary (a role's text may be Russian) with an ellipsis.
 /// Never a model-written summary, never the rendered launch prompt.
 fn role_prompt_excerpt(prompt: &str) -> String {
     let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-    crate::util::truncate(
-        &crate::util::scrub_credentials(&collapsed),
-        MAX_ROLE_EXCERPT_CHARS,
-    )
+    crate::util::truncate(&collapsed, MAX_ROLE_EXCERPT_CHARS)
 }
 
 /// The session-start `<workspace-structure>` picture for the user's personal folder: its immediate
@@ -1349,8 +1345,7 @@ mod tests {
     use super::*;
 
     /// The persisted automation lines the assistant sees: one statement of the timing per call, the
-    /// tool trigger's arguments verbatim (scrubbing was deliberately removed), and the custom-role
-    /// branch address.
+    /// tool trigger's arguments verbatim, and the custom-role branch address.
     #[test]
     fn automation_lines_show_trigger_and_interval() {
         let one_shot = Automation {

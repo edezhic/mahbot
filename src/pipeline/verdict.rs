@@ -32,7 +32,7 @@ use std::sync::Arc;
 
 use crate::jobs::RowStatus;
 use crate::retry::RetryExhausted;
-use crate::util::{panic_message, scrub_credentials};
+use crate::util::panic_message;
 use crate::{
     AnalysisVerdict, BlockerVerificationVerdict, ChatMessage, ChatRequest, ChatRequestMeta, Role,
     Verdict, Workspace,
@@ -369,7 +369,7 @@ pub(crate) struct AgentSlot {
 /// Map a panicked round member's [`tokio::task::JoinError`] to a contained
 /// [`ParallelVerdict::NoResponse`] (round continues fail-open).
 pub(crate) fn round_member_failed(ticket_id: &str, e: tokio::task::JoinError) -> ParallelVerdict {
-    let reason = scrub_credentials(&panic_message(&*e.into_panic()));
+    let reason = panic_message(&*e.into_panic());
     tracing::warn!(ticket = %ticket_id, %reason, "round member task failed");
     ParallelVerdict::NoResponse(reason)
 }
@@ -519,7 +519,7 @@ fn build_joint_round(stage: &'static str, results: &[ParallelVerdict]) -> JointR
             }
             ParallelVerdict::ParseFailed(f) => {
                 failures.push(JointFailure {
-                    dump: scrub_credentials(&raw_response_dump_section(f)),
+                    dump: raw_response_dump_section(f),
                 });
             }
             ParallelVerdict::BlockerVerification(_) => {}

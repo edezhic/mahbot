@@ -15,11 +15,9 @@ use crate::providers::reasoning::assistant_replay_payload;
 use crate::session::Session;
 use crate::tools::{
     ImagePayload, ToolExecutionOutcome, find_tool, format_tool_failure_feedback,
-    normalize_tool_call, scrub_tool_output,
+    normalize_tool_call,
 };
-use crate::util::{
-    MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, parse_media_marker, scrub_credentials,
-};
+use crate::util::{MEDIA_MARKER_RE, MediaMarkerKind, UnwrapPoison, parse_media_marker};
 use crate::{Agent, ChatMessage, ChatRequest, ChatResponse, Tool, ToolCall};
 
 pub(crate) mod extraction;
@@ -1436,18 +1434,17 @@ impl Agent {
 
     /// Construct a failure outcome tuple for an error reason.
     ///
-    /// Assumes `reason` may contain sensitive data; scrubs it before use in feedback
-    /// text, tracing logs and stats.
+    /// The reason is used verbatim in the feedback text and returned as the recorded
+    /// error.
     #[must_use]
     fn failure_outcome(
         call_name: &str,
         call_arguments: &serde_json::Value,
         reason: &str,
     ) -> (ToolExecutionOutcome, String) {
-        let reason = scrub_credentials(reason);
         (
             ToolExecutionOutcome {
-                output: format_tool_failure_feedback(call_name, call_arguments, &reason),
+                output: format_tool_failure_feedback(call_name, call_arguments, reason),
                 success: false,
                 // No payloads and no derivation on a failure: the flag is unread.
                 image_payloads: Vec::new(),
@@ -1456,7 +1453,7 @@ impl Agent {
                 suspended: false,
                 ends_turn: false,
             },
-            reason,
+            reason.to_string(),
         )
     }
 
@@ -1470,7 +1467,7 @@ impl Agent {
         success: bool,
         error_message: Option<String>,
     ) {
-        let arguments = crate::stats::recorded_arguments(arguments, &[]);
+        let arguments = crate::stats::recorded_arguments(arguments);
         let mut guard = self.tool_stats.lock().unwrap_poison();
         guard.push(crate::ToolCallRecord {
             tool_name,
@@ -1542,7 +1539,7 @@ impl Agent {
                         );
                         (
                             ToolExecutionOutcome {
-                                output: scrub_tool_output(tool, &tool_arguments, &output_text),
+                                output: output_text,
                                 success: true,
                                 image_payloads: result.image_payloads,
                                 text_is_content: result.text_is_content,
@@ -2792,17 +2789,12 @@ mod tests {
 
     struct TestTool {
         output: String,
-        scrub: bool,
     }
 
     #[async_trait]
     impl Tool for TestTool {
         fn name(&self) -> &'static str {
-            if self.scrub {
-                "always_scrub"
-            } else {
-                "never_scrub"
-            }
+            "test_tool"
         }
 
         fn description(&self) -> String {
@@ -2820,14 +2812,7 @@ mod tests {
         ) -> anyhow::Result<String> {
             Ok(self.output.clone())
         }
-
-        fn should_scrub_output(&self, _args: &serde_json::Value) -> bool {
-            self.scrub
-        }
     }
-
-    /// Secret-like line that `scrub_credentials` always redacts.
-    const SCRUBBABLE_LINE: &str = "API_KEY=sk-1234567890abcdef";
 
     fn make_agent(tools: Vec<Box<dyn Tool>>) -> Agent {
         make_agent_with_role(tools, crate::Role::Engineer)
@@ -2943,44 +2928,6 @@ mod tests {
         // Restore isolation: the drain flag is process-global, and the token must never
         // be fired from a test — it would cancel every parallel retry loop.
         crate::shutdown::drain_clear();
-    }
-
-    /// Shared helper: an agent with a TestTool, executed and asserted for scrubbing.
-    async fn assert_scrubbed(should_scrub: bool) {
-        let tool: Box<dyn Tool> = Box::new(TestTool {
-            output: SCRUBBABLE_LINE.into(),
-            scrub: should_scrub,
-        });
-        let name = tool.name();
-        let agent = make_agent(vec![tool]);
-        let out = agent.execute_tool(name, serde_json::json!({})).await;
-
-        assert!(out.success, "{name} should succeed");
-        if should_scrub {
-            assert!(out.output.contains("[REDACTED]"), "{name} should redact");
-            assert!(
-                !out.output.contains("abcdef"),
-                "{name} should not leak original"
-            );
-        } else {
-            assert!(
-                !out.output.contains("[REDACTED]"),
-                "{name} should not redact"
-            );
-            assert!(
-                out.output.contains(SCRUBBABLE_LINE),
-                "{name} should preserve output"
-            );
-        }
-    }
-
-    /// The scrub decision belongs to the tool: one that opts out returns its output
-    /// verbatim, one that opts in has the secret-like line redacted.
-    #[tokio::test]
-    async fn tool_output_scrubbing_follows_the_tool_setting() {
-        for should_scrub in [false, true] {
-            assert_scrubbed(should_scrub).await;
-        }
     }
 
     /// A stand-in media tool with a fixed answer, so a tool round can be driven without real
@@ -3123,7 +3070,6 @@ mod tests {
     async fn execute_tool_skips_when_cancelled() {
         let tool: Box<dyn Tool> = Box::new(TestTool {
             output: "should not run".into(),
-            scrub: false,
         });
         let name = tool.name();
         let agent = make_agent(vec![tool]);

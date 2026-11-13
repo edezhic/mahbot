@@ -24,6 +24,4 @@ A PDF's text comes page by page: a `Page <n>:` block per page with text, and a p
 
 Unaccepted tracked changes are never passed off as final text: `[ins]…[/ins]` inserted, `[del]…[/del]` deleted, `[moved-here]…[/moved-here]` and `[moved-away]…[/moved-away]` moved, and `[ins ¶]`, `[del ¶]`, `[moved-here ¶]`, `[moved-away ¶]` revise a paragraph mark; a row or cell added or removed says `(inserted)` or `(deleted)`, and `[fmt]`, `[fmt ¶]`, `[fmt section]`, `(merge revised)`, `(formatting revised)` revise formatting alone. The document opens with an `Unaccepted tracked changes: …` line counting them and naming their authors.
 
-Reading a credential-bearing file — `.env*`, a `.pem`/`.cer`/`.crt` certificate, `.key`/`.p12`/`.pfx`, or a known credential config (`.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, Maven `settings.xml`/`settings-security.xml`, Gradle `gradle.properties`/`init.gradle*`, cargo `credentials.toml`) — returns its content with the credential values masked. A secret stored under a name the masking does not recognise is returned whole.
-
 Files larger than 10 MB are rejected, except document containers, which are accepted up to 50 MB; a video or a recording is not subject to that gate.

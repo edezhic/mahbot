@@ -525,8 +525,7 @@ enum DiscoveryOutcome {
 
 /// Fold one discovery sub-run result into the aggregate outcome shared by the role,
 /// general and diagnostics sites: any error degrades `AllOk`, any fatal forces `Fatal`,
-/// and the error string is recorded (with `prefix`) for the finalize message. Scrubbed
-/// here, so agent failure chains never reach the finalize logs unscrubbed.
+/// and the error string is recorded (with `prefix`) for the finalize message.
 fn fold_discovery_result(
     outcome: &mut DiscoveryOutcome,
     errors: &mut Vec<String>,
@@ -534,7 +533,7 @@ fn fold_discovery_result(
     prefix: &str,
 ) {
     if let Err(e) = result {
-        errors.push(crate::util::scrub_credentials(&format!("{prefix}{e}")));
+        errors.push(format!("{prefix}{e}"));
         if e.kind == DiscoveryFailureKind::Fatal {
             *outcome = DiscoveryOutcome::Fatal;
         } else if *outcome == DiscoveryOutcome::AllOk {

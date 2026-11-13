@@ -366,19 +366,13 @@ async fn catalogue() -> Vec<CustomToolEntry> {
 }
 
 /// One tool's entry: its description, then its parameters in prose (name, basic type,
-/// required-ness). The admin-authored text is credential-scrubbed on the way into the
-/// prompt, like the product's other user-provided text.
+/// required-ness).
 ///
 /// The `<custom-tools>` block and a grant notice both render a tool through this, so the
 /// entry an Assistant reads in the notice is the one its list shows.
 fn render_line(tool: &CustomToolEntry) -> String {
     let mut out = String::new();
-    let _ = write!(
-        out,
-        "- {}: {}",
-        tool.name,
-        crate::util::scrub_credentials(&tool.description)
-    );
+    let _ = write!(out, "- {}: {}", tool.name, tool.description);
     if !tool.params.is_empty() {
         out.push_str(" Parameters: ");
         for (i, param) in tool.params.iter().enumerate() {
@@ -397,11 +391,7 @@ fn render_line(tool: &CustomToolEntry) -> String {
                 }
             );
             if !param.description.is_empty() {
-                let _ = write!(
-                    out,
-                    " — {}",
-                    crate::util::scrub_credentials(&param.description)
-                );
+                let _ = write!(out, " — {}", param.description);
             }
         }
         out.push('.');

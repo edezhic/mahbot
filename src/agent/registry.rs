@@ -53,12 +53,11 @@ pub enum ParentKey {
 /// One tool call in the GUI's session-ledger projection (`session_view`) — the payload of a
 /// ledger tool block, consumed by the session views and the Running Agents cards.
 ///
-/// `args` holds the arguments as STRUCTURED key-value pairs with FULL, untruncated values,
-/// deliberately NOT credential-scrubbed: the Running Agents view shows exactly what the agent
-/// passed, secrets included (the user wants complete visibility). A live-view-only
-/// divergence — durable logs and failure feedback remain scrubbed. Pairs come from the JSON
-/// argument object at decode time: strings verbatim, nested values compact-JSON-stringified,
-/// non-object arguments collapsed to a single `("args", …)` pair.
+/// `args` holds the arguments as STRUCTURED key-value pairs with FULL, untruncated values:
+/// the Running Agents view shows exactly what the agent passed, secrets included (the user
+/// wants complete visibility). Pairs come from the JSON argument object at decode time:
+/// strings verbatim, nested values compact-JSON-stringified, non-object arguments collapsed
+/// to a single `("args", …)` pair.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RunningTool {
     pub name: String,
@@ -66,8 +65,8 @@ pub(crate) struct RunningTool {
 }
 
 impl RunningTool {
-    /// Build a `RunningTool` from a decoded native-history tool call: full-unscrubbed argument
-    /// pairs from the call's JSON arguments.
+    /// Build a `RunningTool` from a decoded native-history tool call: full argument pairs from
+    /// the call's JSON arguments.
     pub(crate) fn from_tool_call(call: &crate::ToolCall) -> Self {
         Self {
             name: call.name.clone(),
@@ -137,7 +136,7 @@ struct AgentEntry {
 
 /// Flatten a tool's JSON arguments into structured key-value display pairs: object arguments
 /// become one pair per key (in iteration order), anything else collapses to a single
-/// `("args", …)` pair. Values are full and unscrubbed — see [`RunningTool`].
+/// `("args", …)` pair. Values are full — see [`RunningTool`].
 fn tool_arg_pairs(args: &serde_json::Value) -> Vec<(String, String)> {
     match args {
         serde_json::Value::Object(map) => map
@@ -646,7 +645,7 @@ mod tests {
             tool.args
                 .iter()
                 .any(|(k, v)| k == "api_key" && v == &secret),
-            "live view shows full unscrubbed values (deliberate divergence from durable logs)"
+            "live view shows full values"
         );
         assert!(
             tool.args

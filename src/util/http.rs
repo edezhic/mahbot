@@ -309,22 +309,6 @@ pub(crate) fn validate_url(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An address as a log, a chat notice or a durable record may carry it: scheme,
-/// host and path with the query and fragment dropped, so a signed URL's
-/// credentials are neither quoted back to the user nor persisted. Anything that
-/// is not an http(s) address is returned as written.
-pub(crate) fn redact_address(value: &str) -> String {
-    let Ok(mut parsed) = url::Url::parse(value) else {
-        return value.to_string();
-    };
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return value.to_string();
-    }
-    parsed.set_query(None);
-    parsed.set_fragment(None);
-    parsed.to_string()
-}
-
 /// The most hops a [`get_guarded`] fetch follows: a CDN chain is short, and a
 /// bound keeps a loop from holding the caller.
 const MAX_GUARDED_REDIRECTS: usize = 5;
@@ -346,8 +330,7 @@ pub(crate) async fn get_guarded(
 
     let mut next = url.trim().to_string();
     for _ in 0..=MAX_GUARDED_REDIRECTS {
-        validate_url(&next)
-            .with_context(|| format!("refusing to fetch {}", redact_address(&next)))?;
+        validate_url(&next).with_context(|| format!("refusing to fetch {next}"))?;
         let response = client
             .get(&next)
             .send()
@@ -367,10 +350,7 @@ pub(crate) async fn get_guarded(
             .map(|target| target.to_string())
             .context("a redirect named an address that cannot be resolved")?;
     }
-    anyhow::bail!(
-        "{} redirected more than {MAX_GUARDED_REDIRECTS} times",
-        redact_address(url)
-    )
+    anyhow::bail!("{url} redirected more than {MAX_GUARDED_REDIRECTS} times")
 }
 
 /// Build an HTTP client for large model downloads: `total_timeout` per
@@ -724,16 +704,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_address_loses_its_credentials() {
-        assert_eq!(
-            redact_address("https://cdn.example.com/clip.mp4?sig=secret&exp=1#t=3"),
-            "https://cdn.example.com/clip.mp4"
-        );
-        assert_eq!(
-            redact_address("/tmp/workspace/clip.mp4"),
-            "/tmp/workspace/clip.mp4"
-        );
+    /// A guarded fetch's refusal quotes the address exactly as the caller gave it: a signed
+    /// address keeps its query string and fragment.
+    #[tokio::test]
+    async fn a_guarded_refusal_quotes_the_address_as_given() {
+        let client = build_no_redirect_http_client(Duration::from_secs(1));
+        let url = "http://169.254.169.254/latest/meta-data?sig=abc123&exp=99#part";
+        let err = get_guarded(&client, url).await.unwrap_err();
+        assert!(err.to_string().contains(url), "{err:#}");
     }
 
     /// A non-2xx answer becomes the typed [`crate::util::error::HttpError`] carrying the

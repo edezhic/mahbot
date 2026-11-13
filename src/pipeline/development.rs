@@ -73,7 +73,7 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
                 error = %e,
                 "Engineer summary extraction failed — using raw response for ticket comment"
             );
-            return crate::util::scrub_credentials(raw);
+            return raw.to_string();
         }
     };
     let items: Vec<&str> = summary
@@ -87,7 +87,7 @@ async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
             ticket = %ticket_id,
             "Engineer summary extraction returned no usable items — using raw response for ticket comment"
         );
-        return crate::util::scrub_credentials(raw);
+        return raw.to_string();
     }
     let mut out = String::new();
     for item in items {

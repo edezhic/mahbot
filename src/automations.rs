@@ -154,8 +154,6 @@ impl StoredTrigger {
     /// `list_automations` line and the `<user-automations>` summary: the tool's name followed by
     /// its arguments, nothing but the name when it has none, and a marker when there is nothing
     /// readable to show.
-    /// The two tool-output surfaces are ordinary tool results, so the agent-level pass scrubs them;
-    /// the summary and the fired notice carry the automation's own wording and are not scrubbed.
     pub(crate) fn render(&self) -> String {
         match self {
             Self::Tool(trigger) => trigger.render(),
@@ -912,8 +910,7 @@ impl TriggerOutcome {
 /// arguments the tool does not declare refused rather than ignored — then run it in the owner's
 /// personal workspace through the managed runtime.
 ///
-/// Nothing is credential-scrubbed here: what the check produced is what the assistant is shown,
-/// and the run's own outcome alone drives the verdict ([`TriggerOutcome::from_run`]).
+/// The run's own outcome alone drives the verdict ([`TriggerOutcome::from_run`]).
 async fn run_trigger(ws: &Workspace, user: &str, trigger: &Trigger) -> TriggerOutcome {
     let call =
         match crate::tools::custom::resolve_tool_call(user, &trigger.tool, &trigger.args, true)

@@ -221,20 +221,14 @@ fn commands_from_history(history: &[crate::ChatMessage]) -> Vec<String> {
 /// each round). UNFILTERED: no zone classification, no write-intent patterns — the raw history IS
 /// the dump, and attribution is the Sanitation agent's job.
 ///
-/// Credentials are scrubbed AT COLLECTION, not only at dump-write, so the in-memory commands match
-/// the scrubbed dump form; otherwise a command re-collected after a crash-resume looks distinct
-/// from its scrubbed form and both variants accumulate. Multi-line commands don't round-trip
-/// through the line-oriented dump (a documented minor fidelity loss; the cap bounds the growth).
+/// Multi-line commands don't round-trip through the line-oriented dump (a documented minor
+/// fidelity loss; the cap bounds the growth).
 pub(crate) async fn collect_agent_shell_commands(agent_ids: &[String]) -> Vec<String> {
     let store = crate::session::store();
     let mut out = Vec::new();
     for id in agent_ids {
         let history = store.load(id).await;
-        out.extend(
-            commands_from_history(&history)
-                .into_iter()
-                .map(|c| crate::util::scrub_credentials(&c)),
-        );
+        out.extend(commands_from_history(&history));
     }
     out
 }
@@ -272,10 +266,7 @@ pub(crate) fn cap_command_dump(commands: &mut Vec<String>, cap: usize) {
     }
 }
 
-/// Write the raw command dump file INSIDE the run's per-run folder. The
-/// commands are already credential-scrubbed at collection (see
-/// [`collect_agent_shell_commands`] — the in-memory capture and the dump must
-/// match, or a crash-resume would accumulate both variants). Newest-wins,
+/// Write the raw command dump file INSIDE the run's per-run folder. Newest-wins,
 /// capped at [`COMMAND_DUMP_CAP_BYTES`]. Never creates the folder (callers
 /// ensure the run root exists); a missing folder is the normal end-state when
 /// a cancel sweep released it, so that is a debug, not a warning.
@@ -615,7 +606,7 @@ async fn run_cleanup_agent_and_finish(
         job = %job_id,
         agent = %agent_id,
         "Research cleanup finished: {}",
-        crate::util::scrub_credentials(&report)
+        &report
     );
     // Release the folder — the sole deleter of folders WITH a dump (the dump-less cancel sweep,
     // guarded by [`command_dump_exists`], is the other release point): search-engine state, folder,
@@ -1367,31 +1358,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_dump_written_matches_scrubbed_collection() {
+    async fn command_dump_is_written_verbatim_from_the_collection() {
         let td = tempfile::tempdir().unwrap();
         let run_root = td.path();
-        let secret =
-            "curl -o /tmp/out.bin \"https://api.example.com/data?api_key=SECRET_API_KEY_123\"";
-        // Credentials are scrubbed AT COLLECTION (collect_agent_shell_commands);
-        // the dump is written verbatim from that already-scrubbed capture — the
-        // two must match, or a crash-resume would accumulate both variants.
-        let commands: Vec<String> = [secret, "cat > /tmp/x"]
-            .into_iter()
-            .map(crate::util::scrub_credentials)
-            .collect();
+        let curl = "curl -o /tmp/out.bin \"https://api.example.com/data?page=2\"";
+        let commands = vec![
+            curl.to_string(),
+            "cat > /tmp/x".to_string(),
+            curl.to_string(),
+        ];
         write_command_dump(run_root, "test", &commands).await;
         let content = tokio::fs::read_to_string(run_root.join(COMMAND_DUMP_FILE))
             .await
             .unwrap();
-        assert!(content.contains("/tmp/x"));
-        assert!(
-            !content.contains("SECRET_API_KEY_123"),
-            "the scrubbed collection form is what lands in the dump"
-        );
         assert_eq!(
             content,
-            commands.join("\n") + "\n",
-            "dump written verbatim from the scrubbed capture"
+            format!("cat > /tmp/x\n{curl}\n"),
+            "the dump is the collected commands, deduped and verbatim"
         );
     }
 
