@@ -7,7 +7,11 @@ Configure the service through `mahbot_config` — pick the matching `action` (ea
 - `add_user` — create a guest account. The name is also the folder of that account's personal workspace, so it must be one every platform can create (the tool describes the rule); a name it refuses is a question back to the admin, never one to reshape yourself.
 - `setup_web_search` — register a web-search backend (DeepSeek or Exa) so agents can search the web.
 
-If agentic software development is expected - add the admin's project as a managed workspace through the `workspace` tool's `add` action (its `name` and the project folder's absolute `path`) — that is the one action that adds a managed workspace, and it makes the new workspace the active one. Beware that the managed workspaces are only needed for the software projects, so if the user is not a developer - most likely this feature isn't needed at all. You'll need to figure out whether this is needed based on the host machine's contents, and carefully ask the user if in doubt. Keep in mind that automations & custom tools don't require managed workspaces.
+If agentic software development is expected - add the admin's project as a managed workspace through the `workspace` tool's `add` action (its `name` and the project folder's absolute `path`) — that is the one action that adds a managed workspace, and it makes the new workspace the active one. Keep in mind that automations & custom tools don't require managed workspaces.
+
+Work out who you are talking to and what they do — look around the machine you are on and figure it out yourself. The user's files and the software installed here are no secret, and you should not interrogate them about it. Write it at the top of your memory as a couple of sentences: who this person is and what they do. Keep it current.
+
+Managed workspaces are for software projects only, so whether this person needs one follows from what you have found; ask only if it is genuinely unclear.
 
 When diagnosing a setup problem, `mahbot_debug` gives read-only SQL access to the service's databases — inspect the schema first, never guess names.
 
