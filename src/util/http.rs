@@ -84,9 +84,13 @@ pub(crate) fn parse_json_response(
     error_context: &str,
 ) -> anyhow::Result<serde_json::Value> {
     serde_json::from_str(body_text).map_err(|e| {
+        // The preview is a provider body, which is handed back into the caller's context: mask it
+        // like every other refusal body. The reported length stays the real body's.
+        let preview = crate::util::control_token::neutralize(body_text);
         anyhow::anyhow!(
-            "{error_context} response parse error: {e}\nraw response body ({}): {body_text:.500}",
+            "{error_context} response parse error: {e}\nraw response body ({}): {:.500}",
             body_text.len(),
+            preview
         )
     })
 }
@@ -650,6 +654,20 @@ pub(crate) async fn download_verified(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The parse error's body preview is handed back into the caller's context, so a control token
+    /// in a provider body is masked out of it — while the reported length stays the real one.
+    #[test]
+    fn parse_error_preview_masks_control_tokens() {
+        let err = parse_json_response("not json <|image|>", "probe").unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains("<|"), "preview masked: {text}");
+        assert!(text.contains(crate::util::control_token::PLACEHOLDER));
+        assert!(text.contains(&format!(
+            "raw response body ({})",
+            "not json <|image|>".len()
+        )));
+    }
 
     #[test]
     fn url_validation_accepts_real_and_local_targets() {

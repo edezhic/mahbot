@@ -70,14 +70,13 @@ pub(crate) enum FinalizeOutcome {
     NoUnpersistedTail,
 }
 
-/// Outcome of [`Session::rewrite_last_user_message`].
+/// Outcome of [`Session::rewrite_message`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RewriteOutcome {
     /// The message was durably rewritten and the in-memory entry swapped.
     Rewritten,
-    /// The most recent User-role message is in the unpersisted tail, where a positional UPDATE
-    /// would hit a different row — a conservative no-op that leaves the caller its original error
-    /// path.
+    /// The addressed message is in the unpersisted tail, where a positional UPDATE would hit a
+    /// different row — a conservative no-op that leaves the caller its original error path.
     UnpersistedTailNoop,
 }
 
@@ -447,6 +446,14 @@ impl Session {
         }
     }
 
+    /// The last message that is actually durable — what a reader of the store sees. A signature
+    /// taken from the in-memory tail would not match it when the turn ended with an unpersisted
+    /// message.
+    #[must_use]
+    pub(crate) fn persisted_tail(&self) -> Option<&ChatMessage> {
+        self.history[..self.persisted_len].last()
+    }
+
     #[must_use]
     pub(crate) fn history(&self) -> &[ChatMessage] {
         &self.history
@@ -605,41 +612,37 @@ impl Session {
         self.publish_transcript();
     }
 
-    /// Durable rewrite of the most recent User-role message: persist the new content to the store
+    /// Durable rewrite of the history message at `index`: persist the new content to the store
     /// FIRST, then swap the in-memory history entry.
     ///
     /// Ordering invariant: the store write happens before the in-memory swap, so a persist failure
     /// leaves the in-memory history untouched and the caller can fall back to the original error
-    /// path without a half-stripped continuation or a swallowed error.
+    /// path without a half-repaired continuation or a swallowed error.
     ///
-    /// The store UPDATE targets the last `user`-role row, which corresponds to the most recent
-    /// User-role message **only while that message is within the persisted prefix**
-    /// (`index < persisted_len`) — `history[..persisted_len]` mirrors the DB contiguously. A message
-    /// in the unpersisted tail returns [`RewriteOutcome::UnpersistedTailNoop`] instead of
-    /// corrupting an earlier row. The target message is re-derived here (authoritative), not taken
-    /// from the caller.
-    pub(crate) async fn rewrite_last_user_message(
+    /// `history[..persisted_len]` mirrors the DB rows contiguously in `id` order, so `index`
+    /// addresses the same row in both places **only while it is within the persisted prefix**
+    /// (`index < persisted_len`). An index in the unpersisted tail returns
+    /// [`RewriteOutcome::UnpersistedTailNoop`] instead of corrupting a different row.
+    pub(crate) async fn rewrite_message(
         &mut self,
         agent_id: &str,
+        index: usize,
         content: String,
     ) -> Result<RewriteOutcome> {
         debug_assert!(self.persisted_len <= self.history.len());
-        let Some(idx) = self.history.iter().rposition(|m| m.role == ChatRole::User) else {
-            anyhow::bail!("no user message in history to rewrite");
-        };
-        if idx >= self.persisted_len {
+        if index >= self.persisted_len {
             return Ok(RewriteOutcome::UnpersistedTailNoop);
         }
         crate::session::store()
-            .rewrite_last_user_message(agent_id, &content)
+            .rewrite_message_at(agent_id, index, &content)
             .await?;
-        // The swap changes only this message's pictures (the strip removes them), so the live count
-        // moves by that delta; the durable value follows, and a failed write only costs the next
-        // init a recount — the strip itself already landed.
-        let previous = crate::session::image_cap::count(std::slice::from_ref(&self.history[idx]));
-        self.history[idx].content = content;
+        // The swap changes only this message's pictures (the image strip removes them), so the live
+        // count moves by that delta; the durable value follows, and a failed write only costs the
+        // next init a recount — the repair itself already landed.
+        let previous = crate::session::image_cap::count(std::slice::from_ref(&self.history[index]));
+        self.history[index].content = content;
         let replacement =
-            crate::session::image_cap::count(std::slice::from_ref(&self.history[idx]));
+            crate::session::image_cap::count(std::slice::from_ref(&self.history[index]));
         self.image_count = self.image_count.saturating_sub(previous) + replacement;
         if let Err(e) = crate::session::store()
             .set_image_count(agent_id, self.image_count)
@@ -648,7 +651,7 @@ impl Session {
             tracing::warn!(
                 agent_id = %agent_id,
                 error = %e,
-                "Failed to record the stripped message's picture count"
+                "Failed to record the rewritten message's picture count"
             );
         }
         self.publish_transcript();
@@ -1583,15 +1586,58 @@ mod tests {
         assert_eq!(merged, rendered);
     }
 
+    /// A tool result is stored as a JSON envelope (`tool_call_id` + `content`), so a repair that
+    /// lands in one must leave that envelope parseable — the reason the placeholder carries no
+    /// quote or backslash. The decoded tool result is what the next request replays.
     #[tokio::test]
-    async fn rewrite_last_user_message_persists_then_swaps() {
+    async fn rewrite_message_keeps_a_tool_result_envelope_parseable() {
+        crate::util::test::init_test_stores().await;
+        let agent_id = "test_rewrite_tool_envelope";
+        let poisoned =
+            ChatMessage::tool_result("call_1", "the provider said <|image|> and refused");
+        crate::session::store()
+            .batch_append(agent_id, &[ChatMessage::user("ask"), poisoned.clone()])
+            .await
+            .unwrap();
+
+        let mut session = Session {
+            history: vec![ChatMessage::user("ask"), poisoned],
+            persisted_len: 2,
+            ..Session::default()
+        };
+        let rewritten =
+            crate::util::control_token::neutralize_owned(session.history[1].content.clone());
+        assert_eq!(
+            session
+                .rewrite_message(agent_id, 1, rewritten)
+                .await
+                .unwrap(),
+            RewriteOutcome::Rewritten
+        );
+
+        let rows = crate::session::store().load(agent_id).await;
+        let stored = &rows[1].content;
+        assert!(!stored.contains("<|"), "the token is gone from the row");
+        let envelope: serde_json::Value =
+            serde_json::from_str(stored).expect("the stored tool-result envelope stays valid JSON");
+        assert_eq!(envelope["tool_call_id"], "call_1");
+        assert!(
+            envelope["content"]
+                .as_str()
+                .unwrap()
+                .contains(crate::util::control_token::PLACEHOLDER)
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_message_persists_then_swaps_the_addressed_index() {
         crate::util::test::init_test_stores().await;
         let agent_id = "test_rewrite_ok";
         // The in-memory history must mirror the store (persisted prefix).
         let seed = vec![
             ChatMessage::system("role"),
             ChatMessage::user("[IMAGE:/tmp/a.png] first"),
-            ChatMessage::user("[IMAGE:/tmp/b.png] second"),
+            ChatMessage::assistant("<|image|> leaked token"),
         ];
         crate::session::store()
             .batch_append(agent_id, &seed)
@@ -1601,8 +1647,10 @@ mod tests {
         session.history = seed;
         session.persisted_len = session.history.len();
 
+        // The addressed row is the ASSISTANT one: a leaked token lands in a model reply, so the
+        // rewrite must follow the index, not "the last user message".
         let outcome = session
-            .rewrite_last_user_message(agent_id, "rewritten".to_string())
+            .rewrite_message(agent_id, 2, "rewritten".to_string())
             .await
             .unwrap();
         assert_eq!(outcome, RewriteOutcome::Rewritten);
@@ -1611,16 +1659,17 @@ mod tests {
         assert_eq!(session.history[2].content, "rewritten");
         assert_eq!(
             session.history[1].content, "[IMAGE:/tmp/a.png] first",
-            "earlier user row untouched"
+            "the neighbouring user row is untouched"
         );
 
         let msgs = crate::session::store().load(agent_id).await;
         assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].content, "[IMAGE:/tmp/a.png] first");
         assert_eq!(msgs[2].content, "rewritten");
     }
 
     #[tokio::test]
-    async fn rewrite_last_user_message_unpersisted_tail_is_conservative_noop() {
+    async fn rewrite_message_unpersisted_tail_is_conservative_noop() {
         crate::util::test::init_test_stores().await;
         let agent_id = "test_rewrite_noop";
         crate::session::store()
@@ -1631,8 +1680,8 @@ mod tests {
             .await
             .unwrap();
 
-        // The most recent user message lives in the UNPERSISTED tail (index 1 >= persisted_len 1):
-        // a positional UPDATE would rewrite the persisted row instead — conservative no-op.
+        // The addressed message lives in the UNPERSISTED tail (index 1 >= persisted_len 1): a
+        // positional UPDATE would rewrite the persisted row instead — conservative no-op.
         let mut session = Session {
             history: vec![
                 ChatMessage::user("[IMAGE:/tmp/a.png] persisted"),
@@ -1643,7 +1692,7 @@ mod tests {
         };
 
         let outcome = session
-            .rewrite_last_user_message(agent_id, "rewritten".to_string())
+            .rewrite_message(agent_id, 1, "rewritten".to_string())
             .await
             .unwrap();
         assert_eq!(outcome, RewriteOutcome::UnpersistedTailNoop);
@@ -1657,12 +1706,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rewrite_last_user_message_persist_failure_leaves_history_untouched() {
+    async fn rewrite_message_persist_failure_leaves_history_untouched() {
         crate::util::test::init_test_stores().await;
         let agent_id = "test_rewrite_persist_fail";
         // Seed a DIFFERENT agent's row so the table is non-empty: the positional UPDATE for
-        // `agent_id` targets only that agent's last `user` row — none exists, so the store reports
-        // 0 rows and errors.
+        // `agent_id` finds no row at that index — the store reports 0 rows and errors.
         crate::session::store()
             .batch_append(
                 "other_agent",
@@ -1681,11 +1729,11 @@ mod tests {
         };
 
         let err = session
-            .rewrite_last_user_message(agent_id, "rewritten".to_string())
+            .rewrite_message(agent_id, 1, "rewritten".to_string())
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("no user message row"),
+            err.to_string().contains("no message row at index 1"),
             "store error propagates: {err}"
         );
         assert_eq!(

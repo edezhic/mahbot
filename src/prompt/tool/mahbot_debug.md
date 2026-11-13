@@ -13,4 +13,4 @@ Validator quirks (fail-closed, by design):
 - `BEGIN`/`COMMIT`/`ROLLBACK` and other transaction control are rejected.
 - `PRAGMA` is allowed only for read-only inspection (`quick_check`, `integrity_check`, `table_info`, `table_xinfo`, index and foreign-key pragmas and the like).
 
-Output: a pipe-delimited header then one row per line; NULL → empty, Blob → lowercase hex, Text → verbatim (pipes and newlines unescaped). Results are capped at 10,000 rows with a `truncated` sentinel row; larger sets are spilled to a file, and the inline output carries a preview plus a `[view with: read <path>]` reference.
+Output: a pipe-delimited header then one row per line; NULL → empty, Blob → lowercase hex, Text → verbatim (pipes and newlines unescaped), except that a model control token in a text cell is masked to `[model-control-token]` — stored text may predate that mask, and a token read back into your context kills the session that read it. Results are capped at 10,000 rows with a `truncated` sentinel row; larger sets are spilled to a file, and the inline output carries a preview plus a `[view with: read <path>]` reference.

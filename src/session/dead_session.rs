@@ -25,8 +25,18 @@
 //! `MAX_RETRIES` after roughly six hours of adaptive backoff (first wait ~20 min, ~40 min per
 //! subsequent attempt) and is given up; a session becoming healthy is detected on the next poll
 //! cycle, when the last message is an assistant reply.
+//!
+//! Deterministic failures: a provider refusal ([`crate::retry::FailureClass::is_deterministic`] —
+//! invalid request, content rejection, guardrail) fails the same way over the same bytes, so
+//! restarting the agent on an unchanged history can only produce the same refusal. `run_agent`
+//! records the signature of the history tail at failure time
+//! ([`record_deterministic_failure`]); while the tail still matches, the poller skips the session
+//! WITHOUT consuming retry budget — it is not a transient outage, so backoff and the cap are the
+//! wrong instrument. Any new message changes the tail, drops the record, and makes the session a
+//! candidate again; a session deleted outright has its record pruned on the next cycle.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -36,7 +46,7 @@ use crate::agent::message_router::{AgentJob, MessageKind};
 use crate::agent::registry::AGENT_REGISTRY;
 use crate::session::SessionContext;
 use crate::util::UnwrapPoison;
-use crate::{ChatRole, Role};
+use crate::{ChatMessage, ChatRole, Role};
 
 /// Interval between poller cycles once the startup window has passed.
 const POLL_INTERVAL: Duration = Duration::from_mins(10);
@@ -64,16 +74,33 @@ const STALE_GRACE_PERIOD: Duration = Duration::from_mins(2);
 
 struct RetryState {
     attempt_count: u8,
-    last_attempt_at: DateTime<Utc>,
+    /// When the last recovery attempt was routed; `None` for an entry that only carries a
+    /// deterministic-failure record, which has no attempt and so no backoff.
+    last_attempt_at: Option<DateTime<Utc>>,
     backoff_minutes: i64,
+    /// Signature of the history tail at the last deterministic (refusal) failure, if any.
+    deterministic_signature: Option<u64>,
 }
 
-/// Tracks recovery attempts per agent ID, in memory only — a restart drops the tracker, which is
+impl RetryState {
+    fn fresh() -> Self {
+        Self {
+            attempt_count: 0,
+            last_attempt_at: None,
+            backoff_minutes: BASE_BACKOFF_MINUTES,
+            deterministic_signature: None,
+        }
+    }
+}
+
+/// Per-session recovery bookkeeping, in memory only — a restart drops the tracker, which is
 /// consistent with treating every session as fresh (the retry counter starts at zero).
 ///
-/// An entry appears on the first attempt (`record_attempt`), is removed by `cleanup()` when the
-/// session self-heals — the cap counts *consecutive* failures per episode — and persists once
-/// `MAX_RETRIES` is exhausted, so `should_retry` stays `false` for the rest of the daemon's life.
+/// An entry appears on the first attempt (`record_attempt`) or on a deterministic failure
+/// (`record_deterministic_failure`), is removed by `cleanup()` when the session self-heals — the
+/// cap counts *consecutive* failures per episode — and persists once `MAX_RETRIES` is exhausted, so
+/// `should_retry` stays `false` for the rest of the daemon's life. The signature is a
+/// [`std::collections::hash_map::DefaultHasher`] digest, so cross-process stability is irrelevant.
 struct DeadSessionTracker {
     inner: Mutex<HashMap<String, RetryState>>,
 }
@@ -94,8 +121,9 @@ impl DeadSessionTracker {
                 if state.attempt_count >= MAX_RETRIES {
                     return false;
                 }
-                let elapsed = (Utc::now() - state.last_attempt_at).num_minutes();
-                elapsed >= state.backoff_minutes
+                state
+                    .last_attempt_at
+                    .is_none_or(|at| (Utc::now() - at).num_minutes() >= state.backoff_minutes)
             }
             None => true,
         }
@@ -104,13 +132,11 @@ impl DeadSessionTracker {
     /// Record a recovery attempt (increments the counter, updates the backoff).
     fn record_attempt(&self, agent_id: &str) {
         let mut map = self.inner.lock().unwrap_poison();
-        let state = map.entry(agent_id.to_string()).or_insert(RetryState {
-            attempt_count: 0,
-            last_attempt_at: Utc::now(),
-            backoff_minutes: BASE_BACKOFF_MINUTES,
-        });
+        let state = map
+            .entry(agent_id.to_string())
+            .or_insert_with(RetryState::fresh);
         state.attempt_count += 1;
-        state.last_attempt_at = Utc::now();
+        state.last_attempt_at = Some(Utc::now());
         state.backoff_minutes = (state.backoff_minutes * 2).min(MAX_BACKOFF_MINUTES);
     }
 
@@ -122,10 +148,91 @@ impl DeadSessionTracker {
     fn cleanup(&self, agent_id: &str) {
         self.inner.lock().unwrap_poison().remove(agent_id);
     }
+
+    /// Remember the history tail `agent_id` failed on, when the failure class was deterministic.
+    /// A no-op for a missing tail (nothing to compare later, and a session that never recorded a
+    /// message cannot be re-sent) and for a non-user-facing agent id: the poller never restarts
+    /// those, so recording them would only grow the map with entries no reader consults.
+    pub(crate) fn record_deterministic_failure(&self, agent_id: &str, last: Option<&ChatMessage>) {
+        let Some(last) = last else {
+            return;
+        };
+        if is_non_user_facing(agent_id) {
+            return;
+        }
+        self.inner
+            .lock()
+            .unwrap_poison()
+            .entry(agent_id.to_string())
+            .or_insert_with(RetryState::fresh)
+            .deterministic_signature = Some(history_signature(last.role, &last.content));
+    }
+
+    /// Whether a recorded deterministic failure already covers this exact history tail — the
+    /// poller's skip rule. `false` when nothing was recorded (or the record was dropped): the
+    /// session is a candidate again.
+    fn unchanged_since_deterministic_failure(
+        &self,
+        agent_id: &str,
+        last_role: ChatRole,
+        tail_content: &str,
+    ) -> bool {
+        self.inner
+            .lock()
+            .unwrap_poison()
+            .get(agent_id)
+            .and_then(|state| state.deterministic_signature)
+            .is_some_and(|signature| signature == history_signature(last_role, tail_content))
+    }
+
+    /// Drop the record — the history changed, so the next attempt is a different request. An entry
+    /// that holds nothing but the record goes with it.
+    fn forget_deterministic_failure(&self, agent_id: &str) {
+        let mut map = self.inner.lock().unwrap_poison();
+        if let Some(state) = map.get_mut(agent_id) {
+            state.deterministic_signature = None;
+            if state.attempt_count == 0 {
+                map.remove(agent_id);
+            }
+        }
+    }
+
+    /// Drop records whose session no longer exists — a session deleted outright never returns to
+    /// drop its own. `live` is every eligible session this poll cycle; an entry that carries no
+    /// record (a live session's retry budget, exhausted or not) is left alone.
+    fn prune_deterministic_failures(&self, live: &HashSet<&str>) {
+        self.inner.lock().unwrap_poison().retain(|agent_id, state| {
+            state.deterministic_signature.is_none() || live.contains(agent_id.as_str())
+        });
+    }
 }
 
 static DEAD_SESSION_TRACKER: std::sync::LazyLock<DeadSessionTracker> =
     std::sync::LazyLock::new(DeadSessionTracker::new);
+
+/// [`DeadSessionTracker::record_deterministic_failure`] for the agent runner, which holds no
+/// tracker handle.
+pub(crate) fn record_deterministic_failure(agent_id: &str, last: Option<&ChatMessage>) {
+    DEAD_SESSION_TRACKER.record_deterministic_failure(agent_id, last);
+}
+
+/// The signature of one history message: its role and content. Deliberately not the whole
+/// history — the tail is what a recovery re-sends last, and any appended message changes it.
+fn history_signature(role: ChatRole, content: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // `Hash` for `str` writes the bytes plus a terminator, so role and content cannot run into each
+    // other into the same digest.
+    role.hash(&mut hasher);
+    content.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Whether the poller's SQL filter excludes this id: `manager_` plus every transient prefix,
+/// matched case-insensitively for ASCII the way Turso's `LIKE 'prefix_%'` does.
+fn is_non_user_facing(agent_id: &str) -> bool {
+    crate::session::non_user_facing_agent_id_prefixes()
+        .any(|prefix| super::starts_with_ignore_ascii_case(agent_id, prefix))
+}
 
 /// Run the dead-session recovery poller loop: once a minute for the first `STARTUP_WINDOW`, then
 /// every `POLL_INTERVAL`. The first cycle is a minute in, never immediate —
@@ -181,7 +288,7 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
         .list_sessions_with_metadata_excluding(
             &crate::session::non_user_facing_agent_id_prefixes().collect::<Vec<&str>>(),
         )
-        .await;
+        .await?;
 
     for session in &sessions {
         let agent_id = &session.agent_id;
@@ -196,10 +303,28 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
         if !is_recovery_candidate(last_role, &tail_content) {
             // An assistant reply that is not a dangling frame, or a system message, means the turn
             // is complete — the agent already responded. Clean up the retry-tracking entry so a
-            // future failure starts with a fresh budget (consecutive-failure-per-episode).
+            // future failure starts with a fresh budget (consecutive-failure-per-episode), and drop
+            // any deterministic-failure record: the session self-healed.
             DEAD_SESSION_TRACKER.cleanup(agent_id);
             continue;
         }
+        // A deterministic (refusal) failure over the SAME tail would be refused again byte for
+        // byte, so skip it without touching the budget; any new message changes the tail, which is
+        // a different request and worth one attempt (and drops the record below).
+        if DEAD_SESSION_TRACKER.unchanged_since_deterministic_failure(
+            agent_id,
+            last_role,
+            &tail_content,
+        ) {
+            tracing::debug!(
+                agent_id = %agent_id,
+                role = %last_role,
+                "Dead session recovery: unchanged history after a deterministic failure — \
+                 skipping (the same request would be refused again)"
+            );
+            continue;
+        }
+        DEAD_SESSION_TRACKER.forget_deterministic_failure(agent_id);
         // An Assistant tail is a candidate only via the dangling-frame path —
         // remember that for the pause guard below.
         let needs_pause_guard = last_role == ChatRole::Assistant;
@@ -270,34 +395,8 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
         };
 
         // Pause guard (dangling-frame resumption only)
-        // A paused workspace is a strict freeze: auto-resuming interrupted work
-        // the user explicitly paused must not happen (unpausing re-drives via
-        // the puller / next user prompt). A frozen agent is not recoverable
-        // while registered; this catches the tail it leaves after bailing.
-        // User/Tool tails stay exempt: answering a pending user prompt matches
-        // normal direct-chat behavior, which a workspace pause does not freeze.
-        // A custom role is exempt too: a workspace pause freezes only launches
-        // tied to a ticket, never a continuable branch (a custom role's or a worker branch's).
-        if needs_pause_guard && !is_continuable_branch(role, agent_id) {
-            match crate::workspace::get_by_name(&ctx.workspace_name).await {
-                Ok(Some(ws)) if ws.paused => {
-                    tracing::debug!(
-                        agent_id = %agent_id,
-                        workspace = %ctx.workspace_name,
-                        "Dead session recovery: workspace paused — skipping"
-                    );
-                    continue;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        agent_id = %agent_id,
-                        error = %e,
-                        "Dead session recovery: workspace lookup failed — skipping this cycle"
-                    );
-                    continue;
-                }
-            }
+        if needs_pause_guard && paused_workspace_blocks(agent_id, &ctx, role).await {
+            continue;
         }
 
         // Phase 2: route the recovery job (fire-and-forget mpsc send).
@@ -313,7 +412,45 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
         }
     }
 
+    // A session deleted outright never returns to drop its own record.
+    let live: HashSet<&str> = sessions
+        .iter()
+        .map(|session| session.agent_id.as_str())
+        .collect();
+    DEAD_SESSION_TRACKER.prune_deterministic_failures(&live);
+
     Ok(())
+}
+
+/// The dangling-frame pause guard: a paused workspace is a strict freeze, so auto-resuming
+/// interrupted work the owner explicitly paused must not happen (unpausing re-drives via the
+/// puller / the next user prompt). User/Tool tails stay exempt — answering a pending user prompt
+/// matches normal direct-chat behavior, which a workspace pause does not freeze — and so does a
+/// continuable branch (a custom role's or a worker branch's), since a workspace pause freezes only
+/// launches tied to a ticket. A failed workspace lookup skips the cycle.
+async fn paused_workspace_blocks(agent_id: &str, ctx: &SessionContext, role: Role) -> bool {
+    if is_continuable_branch(role, agent_id) {
+        return false;
+    }
+    match crate::workspace::get_by_name(&ctx.workspace_name).await {
+        Ok(Some(ws)) if ws.paused => {
+            tracing::debug!(
+                agent_id = %agent_id,
+                workspace = %ctx.workspace_name,
+                "Dead session recovery: workspace paused — skipping"
+            );
+            true
+        }
+        Ok(_) => false,
+        Err(e) => {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %e,
+                "Dead session recovery: workspace lookup failed — skipping this cycle"
+            );
+            true
+        }
+    }
 }
 
 /// Caller must have already called
@@ -608,7 +745,7 @@ mod tests {
         // Backdate the last attempt far past any possible backoff: the cap alone, not backoff
         // timing, must block further retries.
         if let Some(state) = tracker.inner.lock().unwrap_poison().get_mut(agent_id) {
-            state.last_attempt_at = Utc::now() - chrono::Duration::hours(24);
+            state.last_attempt_at = Some(Utc::now() - chrono::Duration::hours(24));
         }
         assert!(
             !tracker.should_retry(agent_id),
@@ -650,6 +787,98 @@ mod tests {
             tracker2.should_retry(agent_id),
             "should be fresh after simulated restart"
         );
+    }
+
+    /// A deterministic (refusal) failure over the history tail the poller still sees is skipped
+    /// without consuming retry budget — restarting would re-send the bytes the provider already
+    /// refused. Any new message changes the tail, which makes the session a candidate again; a
+    /// non-user-facing id and a missing tail record nothing at all.
+    #[test]
+    // Serialized with the poller tests: `recover_dead_sessions` prunes records whose session the
+    // test DB does not list, and this test's ids are not in it.
+    #[serial_test::serial(provider, drain)]
+    fn deterministic_failure_over_an_unchanged_tail_is_skipped() {
+        let agent_id = "test_deterministic_engineer";
+        let tail = ChatMessage::user("stuck question");
+
+        assert!(
+            !DEAD_SESSION_TRACKER.unchanged_since_deterministic_failure(
+                agent_id,
+                ChatRole::User,
+                &tail.content
+            ),
+            "no record yet — the session is recoverable"
+        );
+
+        record_deterministic_failure(agent_id, Some(&tail));
+        assert!(
+            DEAD_SESSION_TRACKER.unchanged_since_deterministic_failure(
+                agent_id,
+                ChatRole::User,
+                &tail.content
+            ),
+            "the same tail must be skipped"
+        );
+        // Skipping consumes NO retry budget: only the signature is recorded, so a later real
+        // recovery still starts with the full budget.
+        assert!(DEAD_SESSION_TRACKER.should_retry(agent_id));
+        assert_eq!(
+            DEAD_SESSION_TRACKER
+                .inner
+                .lock()
+                .unwrap_poison()
+                .get(agent_id)
+                .map(|state| state.attempt_count),
+            Some(0),
+            "the skip must not record a recovery attempt"
+        );
+
+        // A new message (or a different role) is a different request: recovered as today.
+        assert!(
+            !DEAD_SESSION_TRACKER.unchanged_since_deterministic_failure(
+                agent_id,
+                ChatRole::User,
+                "a new question"
+            ),
+            "a changed tail must be recovered"
+        );
+        assert!(
+            !DEAD_SESSION_TRACKER.unchanged_since_deterministic_failure(
+                agent_id,
+                ChatRole::Assistant,
+                &tail.content
+            ),
+            "the role is part of the signature"
+        );
+
+        // The poller drops the record once it moves past it.
+        DEAD_SESSION_TRACKER.forget_deterministic_failure(agent_id);
+        assert!(!DEAD_SESSION_TRACKER.unchanged_since_deterministic_failure(
+            agent_id,
+            ChatRole::User,
+            &tail.content
+        ));
+
+        // A non-user-facing id is never restarted by the poller, so recording it would only grow
+        // the map with an entry no reader consults.
+        for excluded in ["manager_test_det", "analyze_test_det", "ticket_test_det"] {
+            record_deterministic_failure(excluded, Some(&tail));
+            assert!(
+                !DEAD_SESSION_TRACKER.unchanged_since_deterministic_failure(
+                    excluded,
+                    ChatRole::User,
+                    &tail.content
+                ),
+                "{excluded} must not be recorded"
+            );
+        }
+        // No tail at failure time: nothing to compare a later tail against.
+        record_deterministic_failure("test_deterministic_no_tail", None);
+        assert!(!DEAD_SESSION_TRACKER.unchanged_since_deterministic_failure(
+            "test_deterministic_no_tail",
+            ChatRole::User,
+            ""
+        ));
     }
 
     // Four tests share the process-global test DB, retry tracker and agent registry, and all

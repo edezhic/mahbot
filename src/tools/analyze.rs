@@ -2089,7 +2089,7 @@ mod tests {
                     },
                 ]),
                 fake: FakeProvider::new()
-                    .err(FailureClass::NonRetryable, "insufficient balance"),
+                    .err(FailureClass::InvalidRequest, "insufficient balance"),
                 contains: &["unconsolidated — consolidation failed", "alpha", "beta", "gamma"],
                 not_contains: &[],
             },

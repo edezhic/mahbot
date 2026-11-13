@@ -5,6 +5,7 @@
 
 mod activity;
 mod compaction_dump;
+pub(crate) mod control_token_strip;
 pub mod dead_session;
 pub(crate) mod image_cap;
 pub(crate) mod image_strip;
@@ -546,27 +547,6 @@ fn session_metadata_row(row: &Row) -> Result<SessionMetadata> {
     )
 }
 
-/// Run the session-listing query body (metadata columns only, no message-table join) with an
-/// optional `WHERE` fragment. The count comes from the denormalized column (same transaction as
-/// message writes, never backfilled); the historical LEFT JOIN + GROUP BY over `sessions` was the
-/// largest repeated query in the system and is gone.
-async fn list_sessions_where(
-    conn: &db::Connection,
-    where_clause: &str,
-    params: impl IntoParams + Send + 'static,
-    warn_context: &str,
-) -> Vec<SessionMetadata> {
-    query_map_collect(
-        conn,
-        &sessions_list_sql(where_clause),
-        params,
-        session_metadata_row,
-        warn_context,
-        None,
-    )
-    .await
-}
-
 /// Decode one [`SESSION_MESSAGE_COLUMNS`] row into a [`ChatMessage`] — shared by the infallible
 /// [`SessionStore::load`] and strict [`SessionStore::load_checked`] reads.
 fn session_message_from_row(row: &Row) -> Result<ChatMessage> {
@@ -815,31 +795,37 @@ impl SessionStore {
         .await
     }
 
-    /// Rewrite the content of the most recent `user`-role message row — the durable half of the
-    /// input-image-rejection strip ([`crate::session::image_strip`]). A single-row positional
-    /// UPDATE: the caller's in-memory "most recent user message" corresponds to this row only while
-    /// that message is within the persisted prefix; the in-memory guard lives in
-    /// [`crate::session::Session::rewrite_last_user_message`].
+    /// Rewrite the content of the history row at `index` — the durable half of the history repairs
+    /// ([`crate::session::image_strip`], [`crate::session::control_token_strip`]). A single-row
+    /// positional UPDATE: `history[..persisted_len]` mirrors the rows contiguously in `id` order, so
+    /// an index into that prefix addresses the same row here and in memory. The prefix guard lives
+    /// in [`crate::session::Session::rewrite_message`].
     ///
-    /// Errors when no `user`-role row exists (0 rows affected), so a caller that believes it found
+    /// Errors when no row sits at `index` (0 rows affected), so a caller that believes it addressed
     /// one learns the write did not land.
-    pub(crate) async fn rewrite_last_user_message(
+    ///
+    /// The positional addressing inherits `truncate_from`'s precedent: it is exact only while no
+    /// concurrent truncation lands between detection and this UPDATE — a GUI `truncate_from` would
+    /// shift the row at `index` and this rewrite would land on its neighbour.
+    pub(crate) async fn rewrite_message_at(
         &self,
         agent_id: &str,
+        index: usize,
         content: &str,
     ) -> Result<()> {
+        let offset = i64::try_from(index).context("message index does not fit in i64")?;
         let tx = self.conn.begin_tx().await?;
         let changed = tx
             .execute(
                 "UPDATE sessions SET content = ?1 WHERE agent_id = ?2 AND id = (
-                    SELECT MAX(id) FROM sessions WHERE agent_id = ?2 AND role = 'user'
+                    SELECT id FROM sessions WHERE agent_id = ?2 ORDER BY id ASC LIMIT 1 OFFSET ?3
                 )",
-                params![content, agent_id],
+                params![content, agent_id, offset],
             )
             .await?;
         tx.commit().await?;
         if changed == 0 {
-            anyhow::bail!("no user message row to rewrite for agent {agent_id}");
+            anyhow::bail!("no message row at index {index} to rewrite for agent {agent_id}");
         }
         Ok(())
     }
@@ -1047,33 +1033,43 @@ impl SessionStore {
     }
 
     /// The full session list, infallible by contract: whatever could be read is returned (a query
-    /// error yields an empty list). For readers with no person in front of them — the exclusion
-    /// helper's no-prefix case, where an empty list is a safe input — and for tests; the Sessions
-    /// page reads [`Self::list_sessions_with_metadata_checked`], which renders a failed read as a
-    /// failure.
+    /// error yields an empty list). Test-only — every production reader needs a failed read to be
+    /// visible and uses [`Self::list_sessions_with_metadata_checked`] instead.
+    #[cfg(test)]
     pub(crate) async fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
-        list_sessions_where(&self.conn, "", (), "list sessions").await
+        query_map_collect(
+            &self.conn,
+            &sessions_list_sql(""),
+            (),
+            session_metadata_row,
+            "list sessions",
+            None,
+        )
+        .await
     }
 
-    /// Strict [`Self::list_sessions_with_metadata`]: a query error or the first undecodable row is
-    /// returned as an `Err`, because the Sessions list must render a failed read as a failure. The
-    /// trade is deliberate and total: one undecodable row replaces the whole read rather than
-    /// silently shortening the list.
+    /// The strict full session list: a query error or the first undecodable row is returned as an
+    /// `Err`, because the Sessions page must render a failed read as a failure. The trade is
+    /// deliberate and total: one undecodable row replaces the whole read rather than silently
+    /// shortening the list.
     pub(crate) async fn list_sessions_with_metadata_checked(&self) -> Result<Vec<SessionMetadata>> {
         self.conn
             .query_map_strict(&sessions_list_sql(""), (), session_metadata_row)
             .await
     }
 
-    /// Like [`list_sessions_with_metadata`], but excludes sessions whose `agent_id` starts with any
-    /// of the given prefixes (`"manager_"`, `"ticket_"`, …) via parameterised `NOT LIKE ?N`
-    /// placeholders — no string interpolation into SQL.
-    async fn list_sessions_with_metadata_excluding(
+    /// Like [`Self::list_sessions_with_metadata_checked`], but excludes sessions whose `agent_id`
+    /// starts with any of the given prefixes (`"manager_"`, `"ticket_"`, …) via parameterised
+    /// `NOT LIKE ?N` placeholders — no string interpolation into SQL.
+    ///
+    /// Strict, unlike the plain list: the dead-session poller prunes its records against this list,
+    /// so a failed read must not look like "no sessions".
+    pub(crate) async fn list_sessions_with_metadata_excluding(
         &self,
         exclude_prefixes: &[&str],
-    ) -> Vec<SessionMetadata> {
+    ) -> Result<Vec<SessionMetadata>> {
         if exclude_prefixes.is_empty() {
-            return self.list_sessions_with_metadata().await;
+            return self.list_sessions_with_metadata_checked().await;
         }
 
         let where_clause = exclude_prefixes
@@ -1088,13 +1084,13 @@ impl SessionStore {
             .map(|p| db::Value::Text(format!("{p}%")))
             .collect();
 
-        list_sessions_where(
-            &self.conn,
-            &format!("WHERE {where_clause}"),
-            params,
-            "list sessions (excluding prefixes)",
-        )
-        .await
+        self.conn
+            .query_map_strict(
+                &sessions_list_sql(&format!("WHERE {where_clause}")),
+                params,
+                session_metadata_row,
+            )
+            .await
     }
 
     /// Lightweight query: role and raw content of the session's last message row (`None` for an
@@ -1944,7 +1940,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_store_rewrite_last_user_message_targets_only_user_rows() {
+    async fn session_store_rewrite_message_at_targets_the_addressed_index() {
         crate::util::test::init_test_stores().await;
         let k = unique_key();
         store()
@@ -1953,27 +1949,38 @@ mod tests {
                 &[
                     ChatMessage::system("role"),
                     ChatMessage::user("[IMAGE:/tmp/a.png] earlier user"),
+                    ChatMessage::assistant("middle row is assistant"),
                     ChatMessage::user("[IMAGE:/tmp/b.png] last user"),
-                    ChatMessage::assistant("last row is assistant"),
                 ],
             )
             .await
             .unwrap();
         store()
-            .rewrite_last_user_message(&k, "rewritten")
+            .rewrite_message_at(&k, 2, "rewritten")
             .await
             .unwrap();
         let msgs = store().load(&k).await;
         assert_eq!(msgs[0].content, "role", "the system row is untouched");
         assert_eq!(
             msgs[1].content, "[IMAGE:/tmp/a.png] earlier user",
-            "an earlier user row is untouched"
+            "a neighbouring row is untouched"
         );
         assert_eq!(
             msgs[2].content, "rewritten",
-            "last USER row rewritten, not the trailing assistant row"
+            "the ASSISTANT row at the addressed index is rewritten, not the last user row"
         );
-        assert_eq!(msgs[3].content, "last row is assistant");
+        assert_eq!(msgs[3].content, "[IMAGE:/tmp/b.png] last user");
+
+        // An index past the end addresses no row: 0 rows changed is an error, so a caller that
+        // believes it found a target learns the write did not land.
+        let err = store()
+            .rewrite_message_at(&k, 9, "rewritten")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no message row at index 9"),
+            "out-of-range index errors: {err}"
+        );
     }
 
     /// The baseline lives and dies with its session: it reads back verbatim, the session's delete
@@ -2480,7 +2487,8 @@ mod tests {
         // Excluding manager_ + every transient prefix → only the direct session remains.
         let excluded = store
             .list_sessions_with_metadata_excluding(&excluded_prefixes)
-            .await;
+            .await
+            .unwrap();
         let excluded_ids: Vec<&str> = excluded.iter().map(|s| s.agent_id.as_str()).collect();
         assert!(
             excluded_ids.contains(&direct_id.as_str()),

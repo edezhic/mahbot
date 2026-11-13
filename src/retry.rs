@@ -15,6 +15,12 @@
 //! a failed attempt (the extraction re-prompt, repair-round instructions, synthesis feedback),
 //! which extends the cached prefix.
 //!
+//! A terminal class — [`FailureClass::InvalidRequest`], [`FailureClass::ContentRejection`],
+//! [`FailureClass::Guardrail`] — ends the loop after the FIRST attempt: the same bytes would be
+//! refused the same way, so retrying burns the budget for nothing (see
+//! [`FailureClass::is_retryable`]). Transport, timeout, overload, truncation and empty responses
+//! keep retrying.
+//!
 //! Four policies, snapshotted once at operation start ([`RetryPolicy`]). All share the same
 //! mechanics: ±25% jitter on the SLEEP ONLY (never on request bytes); Retry-After honoured, clamped
 //! [5000 ms, 60000 ms]; shutdown-abortable. They differ only in attempt counts and backoff — no
@@ -231,11 +237,15 @@ fn compute_sleep_ms(schedule_ms: u64, retry_after_ms: Option<u64>) -> u64 {
 // `ContradictionAgents`/`ValidationOther` carry repair-validation semantics on the shared
 // provider-failure path: retryable, and only ever produced by the grouping core. `TruncatedOutput`
 // marks an output-token-limit truncation (finish_reason "length") — retryable with shorten
-// feedback.
+// feedback. The terminal split (`InvalidRequest`/`ContentRejection`/`Guardrail`) exists so a
+// rejection the provider will repeat for the same bytes stops after one attempt instead of burning
+// the whole budget: `Parse` used to absorb them all, which made every 2xx-with-an-error-body
+// request look like a transient malformed envelope.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FailureClass {
-    /// Network/transport error (connection reset, timeouts, 5xx, 429).
+    /// Network/transport error (connection reset, timeouts, 5xx, 429) — overload and upstream
+    /// unavailability included; all retryable.
     Transport,
     /// Server truncated the response envelope: body-read error or content-length mismatch (the
     /// "error reading response body" / "EOF while parsing" defect class).
@@ -258,8 +268,14 @@ pub(crate) enum FailureClass {
     TruncatedOutput,
     /// Provider returned an empty text response.
     NoResponse,
-    /// Permanent client error (auth, quota, invalid model, tool schema).
-    NonRetryable,
+    /// The request itself is unacceptable: auth, invalid model, tool schema, context length,
+    /// billing/quota exhaustion. Terminal — the same bytes fail the same way.
+    InvalidRequest,
+    /// The provider refused the request's *content* (content inspection, a leaked control token, a
+    /// content-policy violation). Terminal.
+    ContentRejection,
+    /// The provider's guardrail/safety layer refused to answer. Terminal.
+    Guardrail,
     /// Global shutdown fired mid-operation.
     Shutdown,
 }
@@ -267,7 +283,19 @@ pub(crate) enum FailureClass {
 impl FailureClass {
     #[must_use]
     pub(crate) const fn is_retryable(self) -> bool {
-        !matches!(self, Self::NonRetryable | Self::Shutdown)
+        !matches!(
+            self,
+            Self::InvalidRequest | Self::ContentRejection | Self::Guardrail | Self::Shutdown
+        )
+    }
+
+    /// Whether re-sending the same request on the same history is pointless — the split the
+    /// dead-session poller needs before it restarts an agent that already failed this way. Derived
+    /// from [`Self::is_retryable`] so the two can never drift; a shutdown is not a verdict on the
+    /// request.
+    #[must_use]
+    pub(crate) const fn is_deterministic(self) -> bool {
+        !self.is_retryable() && !matches!(self, Self::Shutdown)
     }
 
     #[must_use]
@@ -283,7 +311,9 @@ impl FailureClass {
             Self::ValidationOther => "validation_other",
             Self::TruncatedOutput => "truncated_output",
             Self::NoResponse => "no_response",
-            Self::NonRetryable => "non_retryable",
+            Self::InvalidRequest => "invalid_request",
+            Self::ContentRejection => "content_rejection",
+            Self::Guardrail => "guardrail",
             Self::Shutdown => "shutdown",
         }
     }
@@ -637,12 +667,66 @@ mod tests {
         assert!(FailureClass::TruncatedEnvelope.is_retryable());
         assert!(FailureClass::Parse.is_retryable());
         assert!(FailureClass::OutOfRangeScore.is_retryable());
-        assert!(!FailureClass::NonRetryable.is_retryable());
+        assert!(!FailureClass::InvalidRequest.is_retryable());
+        assert!(!FailureClass::ContentRejection.is_retryable());
+        assert!(!FailureClass::Guardrail.is_retryable());
         assert!(!FailureClass::Shutdown.is_retryable());
         assert_eq!(
             FailureClass::TruncatedEnvelope.label(),
             "truncated_envelope"
         );
+        assert_eq!(FailureClass::InvalidRequest.label(), "invalid_request");
+        assert_eq!(FailureClass::ContentRejection.label(), "content_rejection");
+        assert_eq!(FailureClass::Guardrail.label(), "guardrail");
+        // Exactly the three provider refusals are deterministic: the same bytes are refused again,
+        // which is what the dead-session poller keys on. Shutdown is terminal but not deterministic
+        // (a later attempt is a new run, not the same refused request).
+        for class in [
+            FailureClass::InvalidRequest,
+            FailureClass::ContentRejection,
+            FailureClass::Guardrail,
+        ] {
+            assert!(class.is_deterministic(), "{class:?} must be deterministic");
+        }
+        for class in [
+            FailureClass::Transport,
+            FailureClass::TruncatedEnvelope,
+            FailureClass::Parse,
+            FailureClass::NoResponse,
+            FailureClass::Shutdown,
+        ] {
+            assert!(!class.is_deterministic(), "{class:?} is not deterministic");
+        }
+    }
+
+    /// A terminal class stops the loop after ONE attempt: the provider would refuse the same bytes
+    /// again, so burning the 13-attempt budget (ten minutes plus billing) is pure loss.
+    #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
+    async fn a_terminal_class_stops_after_one_attempt() {
+        for class in [
+            FailureClass::InvalidRequest,
+            FailureClass::ContentRejection,
+            FailureClass::Guardrail,
+        ] {
+            let mut fake = crate::util::test::FakeProvider::new();
+            for _ in 0..crate::retry::DEFAULT_RETRY_MAX_ATTEMPTS {
+                fake = fake.err(class, "the provider refused this request");
+            }
+            let fake = std::sync::Arc::new(fake.ok("must never be reached"));
+            let _provider_guard = crate::util::test::install_fake_provider(fake.clone());
+            let request =
+                crate::providers::test_request(vec![crate::ChatMessage::user("hi")], None);
+            let err = agent_chat(request, &RetryPolicy::current())
+                .await
+                .expect_err("a terminal class must fail the operation");
+            assert_eq!(err.final_class, class);
+            assert_eq!(
+                fake.request_fingerprints.lock().unwrap().len(),
+                1,
+                "{class:?} must not be retried"
+            );
+        }
     }
 
     #[tokio::test]

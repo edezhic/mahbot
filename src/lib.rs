@@ -1413,7 +1413,16 @@ pub(crate) trait Tool: Send + Sync {
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display, strum::EnumString,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    strum::Display,
+    strum::EnumString,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "lowercase")]
@@ -1578,6 +1587,9 @@ pub(crate) struct ChatRequestMeta {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ChatRequest {
+    /// Conversation to send. A provider must never let a model control token in any of this
+    /// text reach its endpoint — see [`crate::util::control_token`]; the OpenAI-compatible
+    /// provider applies the substitution at its single outbound boundary.
     pub messages: Vec<ChatMessage>,
     pub tools: Option<Vec<ToolSpec>>,
     pub model: String,
@@ -1603,6 +1615,9 @@ pub(crate) trait Provider: Send + Sync {
     ///
     /// - **No provider-internal retries** — exactly one HTTP request; the outer loop is
     ///   the single retry authority.
+    /// - **No model control token leaves the process** — every text channel of the request is
+    ///   neutralized at the outbound boundary ([`crate::util::control_token`]); a token that
+    ///   reaches an endpoint is refused, and the refusal is sticky in the session history.
     /// - **Idle-timeout semantics** — the 600 s idle timeout
     ///   ([`crate::retry::DEFAULT_IDLE_TIMEOUT`]) bounds the TTFB wait and each
     ///   body-read chunk wait, resetting while data flows; a stalled connection

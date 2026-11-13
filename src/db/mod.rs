@@ -306,12 +306,17 @@ pub(crate) struct ReadonlyRows {
 ///
 /// Text is not escaped, so a pipe or a newline inside a value breaks the row shape;
 /// that and the empty cell are both visible through the `mahbot_debug` output.
+///
+/// Model control tokens are masked out of text cells: the debug surface hands stored text back
+/// verbatim to whoever asked, and a refusal body recorded before the mask existed still carries
+/// the token that kills a session which reads it. Masking on read is the only cure that does not
+/// rewrite the live store.
 pub(crate) fn format_cell(v: &Value) -> String {
     match v {
         Value::Null => String::new(),
         Value::Integer(i) => i.to_string(),
         Value::Real(f) => f.to_string(),
-        Value::Text(t) => t.clone(),
+        Value::Text(t) => crate::util::control_token::neutralize_owned(t.clone()),
         Value::Blob(b) => crate::util::hex_string(b),
     }
 }
@@ -6363,5 +6368,24 @@ mod tests {
             repair_ticket_title_fts_runtime(&conn).await,
             TicketTitleFtsRuntimeRepair::Healthy
         ));
+    }
+
+    /// The debug surface hands stored text back verbatim to whoever asked, so a control token in a cell
+    /// — a refusal body recorded before the mask existed — is masked on READ. Rewriting the live store
+    /// is forbidden, so this is the only cure for the records already there.
+    #[test]
+    fn format_cell_masks_model_control_tokens_in_text_cells() {
+        let placeholder = crate::util::control_token::PLACEHOLDER;
+        assert_eq!(
+            format_cell(&Value::Text("a body with <|image|> inside".to_string())),
+            format!("a body with {placeholder} inside")
+        );
+        assert_eq!(format_cell(&Value::Integer(7)), "7");
+        assert_eq!(format_cell(&Value::Null), "");
+        // A marker shape is not a token: the debug surface still prints media markers verbatim.
+        assert_eq!(
+            format_cell(&Value::Text("[IMAGE:/tmp/a.png]".to_string())),
+            "[IMAGE:/tmp/a.png]"
+        );
     }
 }

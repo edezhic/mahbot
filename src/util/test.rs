@@ -262,7 +262,7 @@ impl FakeProvider {
     #[must_use]
     pub(crate) fn err_http(self, status: u16, body: &str) -> Self {
         let msg = format!("OpenRouter API error ({status}): {body}");
-        self.err(crate::retry::FailureClass::NonRetryable, &msg)
+        self.err(crate::retry::FailureClass::InvalidRequest, &msg)
     }
 }
 

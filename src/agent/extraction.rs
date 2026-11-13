@@ -280,14 +280,14 @@ mod tests {
     async fn non_retryable_error_propagates_immediately() {
         let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
         let fake = Arc::new(FakeProvider::new().err(
-            crate::retry::FailureClass::NonRetryable,
+            crate::retry::FailureClass::InvalidRequest,
             "insufficient balance",
         ));
         let result = extract_with(fake).await;
         let failure = result.expect_err("non-retryable must abort");
         assert_eq!(
             failure.final_class,
-            crate::retry::FailureClass::NonRetryable
+            crate::retry::FailureClass::InvalidRequest
         );
         assert_eq!(failure.failures.len(), 1, "single call, no retries");
     }

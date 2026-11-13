@@ -76,14 +76,18 @@ impl std::fmt::Display for ScopedCallError {
 
 impl std::error::Error for ScopedCallError {}
 
-/// Map a provider [`ErrorClass`] to a granular [`FailureClass`]. Retryable
-/// errors refine to [`FailureClass::TruncatedEnvelope`] when the response
-/// envelope was truncated mid-read (the defect class this hardening targets);
-/// a non-retryable status (auth, quota) still aborts immediately.
+/// Map a provider [`ErrorClass`] to a granular [`FailureClass`]. The terminal reasons keep their
+/// identity (`invalid_request` / `content_rejection` / `guardrail`) so the failure trail says why a
+/// request was abandoned instead of collapsing every refusal into one label; retryable errors refine
+/// to [`FailureClass::TruncatedEnvelope`] when the response envelope was truncated mid-read (the
+/// defect class this hardening targets), and stay [`FailureClass::Transport`] otherwise — overload,
+/// timeout and upstream unavailability included.
 #[must_use]
 pub(crate) fn failure_class(class: error_class::ErrorClass, truncated: bool) -> FailureClass {
     match class {
-        error_class::ErrorClass::NonRetryable => FailureClass::NonRetryable,
+        error_class::ErrorClass::InvalidRequest => FailureClass::InvalidRequest,
+        error_class::ErrorClass::ContentRejection => FailureClass::ContentRejection,
+        error_class::ErrorClass::Guardrail => FailureClass::Guardrail,
         error_class::ErrorClass::Retryable if truncated => FailureClass::TruncatedEnvelope,
         error_class::ErrorClass::Retryable => FailureClass::Transport,
     }

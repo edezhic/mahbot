@@ -1077,7 +1077,7 @@ async fn first_request_failure_discards_only_empty_round_sessions() {
     let mut fake = crate::util::test::FakeProvider::new();
     for _ in 0..6 {
         fake = fake.err(
-            crate::retry::FailureClass::NonRetryable,
+            crate::retry::FailureClass::InvalidRequest,
             "provider balance exhausted",
         );
     }
@@ -1171,7 +1171,7 @@ async fn engineer_provider_failure_leaves_no_comment_and_keeps_the_session() {
         let mut fake = crate::util::test::FakeProvider::new();
         for _ in 0..3 {
             fake = fake.err(
-                crate::retry::FailureClass::NonRetryable,
+                crate::retry::FailureClass::InvalidRequest,
                 "provider balance exhausted",
             );
         }
@@ -2860,7 +2860,7 @@ async fn verification_provider_failure_leaves_no_comment_and_resets() {
     let mut fake = crate::util::test::FakeProvider::new();
     for _ in 0..20 {
         fake = fake.err(
-            crate::retry::FailureClass::NonRetryable,
+            crate::retry::FailureClass::InvalidRequest,
             "provider balance exhausted",
         );
     }
@@ -3559,5 +3559,121 @@ async fn unsettled_or_frozen_workspace_skips_claims_and_dispatch() {
         expect_ticket_phase(store, &id).await,
         TicketPhase::Analysis,
         "a ready, unpaused workspace must claim its aged backlog ticket",
+    );
+}
+
+/// A model control token must not survive into the board: the ticket description and every comment
+/// are masked at the one insert each passes through, because both are read back into other agents'
+/// prompts.
+#[tokio::test]
+async fn board_text_masks_model_control_tokens_on_write() {
+    let _guard = STORE_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/token_ws", "token_ws").await;
+
+    let id = crate::util::test::TicketBuilder::new(store, &ws)
+        .title("a title with <|image|> inside")
+        .desc("a description with <|image|> inside")
+        .create()
+        .await
+        .unwrap();
+    store
+        .add_comment(&id, "engineer", "a comment with <|image|> inside")
+        .await
+        .unwrap();
+
+    // Read the stored columns directly: the read paths mask too, so going through them would pass
+    // even with the write-side mask deleted.
+    let placeholder = crate::util::control_token::PLACEHOLDER;
+    let ticket_row = store
+        .conn
+        .query(
+            "SELECT title, description FROM tickets WHERE id = ?1",
+            crate::db::params![id.as_str()],
+        )
+        .await
+        .unwrap();
+    let title: String = ticket_row[0].get(0).unwrap();
+    let description: String = ticket_row[0].get(1).unwrap();
+    for (label, text) in [("title", &title), ("description", &description)] {
+        assert!(!text.contains("<|"), "{label} stored unmasked: {text}");
+        assert!(
+            text.contains(placeholder),
+            "{label} stored unmasked: {text}"
+        );
+    }
+
+    let comment_row = store
+        .conn
+        .query(
+            "SELECT content FROM ticket_comments WHERE ticket_id = ?1",
+            crate::db::params![id.as_str()],
+        )
+        .await
+        .unwrap();
+    let comment: String = comment_row[0].get(0).unwrap();
+    assert!(
+        !comment.contains("<|"),
+        "comment stored unmasked: {comment}"
+    );
+    assert!(comment.contains(placeholder), "comment stored unmasked");
+}
+
+/// Comments recorded before the mask existed are still poisoned, so the read masks too — this is
+/// the one read the GUI board, the phase prompts and the resume catch-up all go through.
+#[tokio::test]
+async fn board_comments_mask_model_control_tokens_on_read() {
+    let (store, _dir) = crate::open_test_store!(BoardStore, "board");
+    let ws = ws_named("token-read-ws");
+    let id = make_ticket(&store, &ws, "pre-mask ticket", TicketPhase::Backlog).await;
+
+    // Write a poisoned row the way the pre-mask product did: straight to the table.
+    store
+        .conn
+        .execute(
+            "INSERT INTO ticket_comments (id, ticket_id, role, content, created_at) \
+             VALUES ('c1', ?1, 'analyst', ?2, ?3)",
+            crate::db::params![
+                id.as_str(),
+                "a refusal body with <|image|> inside",
+                crate::db::now()
+            ],
+        )
+        .await
+        .unwrap();
+
+    let comments = store.get_comments(&id).await.unwrap();
+    assert_eq!(comments.len(), 1);
+    assert!(!comments[0].content.contains("<|"));
+    assert!(
+        comments[0]
+            .content
+            .contains(crate::util::control_token::PLACEHOLDER)
+    );
+
+    // The ticket's own text is rendered into every phase prompt, so the same read-time mask applies.
+    store
+        .conn
+        .execute(
+            "UPDATE tickets SET title = ?1, description = ?2 WHERE id = ?3",
+            crate::db::params![
+                "title with <|image|>",
+                "description with <|image|>",
+                id.as_str()
+            ],
+        )
+        .await
+        .unwrap();
+    let ticket = expect_ticket(&store, &id).await;
+    assert!(
+        !ticket.title.contains("<|"),
+        "title masked: {}",
+        ticket.title
+    );
+    assert!(
+        !ticket.description.contains("<|"),
+        "description masked: {}",
+        ticket.description
     );
 }

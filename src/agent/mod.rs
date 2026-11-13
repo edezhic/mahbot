@@ -1148,32 +1148,19 @@ impl Agent {
                 notify.notify_one();
             }
 
-            // Provider input-image content-inspection rejection: strip the markers from
-            // the most recent user message (durable-first) and continue — the next round
-            // re-runs `llm_call` as part of the NORMAL loop. No retry guard: once the
-            // message carries no image marker, a failure takes the normal path.
-            //
-            // The leader-stagger signal has already fired, so the stripped leader's next
-            // request diverges from its followers' byte-stable prefix — fail-open, and
-            // moot for direct chat (management rounds never send images). The retried
-            // call re-runs the tool-round-0 `notify_one`, but the stagger's single waiter
-            // has consumed it: the extra permit is dropped, no follower released twice.
-            // The downcast is taken into a local first — `anyhow::Chain` is not `Send`
-            // and must not be held across the await (a Send-bound spawned task).
-            let image_rejection = llm_result.as_ref().err().and_then(|e| {
+            // The downcast is taken into a local first — `anyhow::Chain` is not `Send` and must
+            // not be held across the await (a Send-bound spawned task).
+            let retry_exhaustion = llm_result.as_ref().err().and_then(|e| {
                 e.chain()
                     .find_map(|cause| cause.downcast_ref::<crate::retry::RetryExhausted>())
             });
-            if let Some(exhausted) = image_rejection
-                && self.strip_rejected_input_image(exhausted).await
+            // History repairs for a refusal class: an input-image rejection strips the image from
+            // the most recent user message, a content refusal neutralizes leaked control tokens.
+            // Each reports `false` when nothing changed, so a no-op cannot skip `tool_rounds += 1`.
+            if let Some(exhausted) = retry_exhaustion
+                && (self.strip_rejected_input_image(exhausted).await
+                    || self.neutralize_leaked_control_tokens(exhausted).await)
             {
-                tracing::info!(
-                    agent_id = %self.agent_id,
-                    role = %self.role,
-                    tool_rounds,
-                    "Stripped provider-rejected input image from the most recent user \
-                     message — continuing the normal loop"
-                );
                 continue;
             }
 
@@ -1645,70 +1632,113 @@ impl Agent {
         Ok(response)
     }
 
-    /// Detect a provider input-image content-inspection rejection and durably strip the
-    /// image from the most recent user message. `true` when the strip applied, `false`
-    /// for a conservative no-op (the original error path stands).
+    /// Apply a history repair through the session store, one row at a time: `true` when at least
+    /// one row's content actually changed.
     ///
-    /// Persist ordering: the store rewrite completes before the in-memory swap, so a
-    /// persist failure leaves the session untouched and the LLM error propagates.
-    /// Telemetry: the rejected attempt already recorded its `non_retryable` row; the
-    /// corrected call records its own success row.
+    /// The no-loop guard lives here: the caller `continue`s only on `true`, and `continue` skips
+    /// `tool_rounds += 1`, so a repair that changes nothing must report `false` or the loop spins
+    /// unbounded. A row whose text is already the target text is skipped, and so is a row in the
+    /// unpersisted tail (a positional UPDATE would hit a different row).
+    ///
+    /// Persist-before-swap: [`crate::session::Session::rewrite_message`] writes the row before
+    /// swapping the in-memory copy, so a persist failure leaves the session untouched and the
+    /// caller's original error path stands.
+    async fn rewrite_history_rows(&mut self, rewrites: Vec<(usize, String)>, what: &str) -> bool {
+        let mut rewritten = 0usize;
+        for (index, content) in rewrites {
+            if self.session.history()[index].content == content {
+                tracing::debug!(
+                    agent_id = %self.agent_id,
+                    role = %self.role,
+                    index,
+                    what,
+                    "History repair produced no change — treating as a no-op"
+                );
+                continue;
+            }
+            match self
+                .session
+                .rewrite_message(&self.agent_id, index, content)
+                .await
+            {
+                Ok(crate::session::RewriteOutcome::Rewritten) => rewritten += 1,
+                Ok(crate::session::RewriteOutcome::UnpersistedTailNoop) => {
+                    tracing::debug!(
+                        agent_id = %self.agent_id,
+                        role = %self.role,
+                        index,
+                        what,
+                        "Repair target is in the unpersisted tail — conservative no-op"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        agent_id = %self.agent_id,
+                        role = %self.role,
+                        index,
+                        what,
+                        error = %e,
+                        "Failed to persist a history repair — keeping the original error path"
+                    );
+                }
+            }
+        }
+        if rewritten == 0 {
+            return false;
+        }
+        tracing::info!(
+            agent_id = %self.agent_id,
+            role = %self.role,
+            what,
+            count = rewritten,
+            "Repaired the session history — continuing the normal loop"
+        );
+        true
+    }
+
+    /// Detect a provider input-image content-inspection rejection and durably strip the image from
+    /// the most recent user message, then let the normal loop continue — the next round re-runs
+    /// `llm_call`, and once the message carries no image marker a failure takes the normal path.
+    ///
+    /// The leader-stagger signal has already fired, so the stripped leader's next request diverges
+    /// from its followers' byte-stable prefix — fail-open, and moot for direct chat (management
+    /// rounds never send images). The retried call re-runs the tool-round-0 `notify_one`, but the
+    /// stagger's single waiter has consumed it: the extra permit is dropped, no follower released
+    /// twice.
     async fn strip_rejected_input_image(
         &mut self,
         exhausted: &crate::retry::RetryExhausted,
     ) -> bool {
-        let Some(idx) = crate::session::image_strip::detect_input_image_rejection(
+        let Some(index) = crate::session::image_strip::detect_input_image_rejection(
             exhausted,
             self.session.history(),
         ) else {
             return false;
         };
         let reason = crate::session::image_strip::extract_provider_reason(exhausted);
-        // Invariant guard: detection and the strip share one marker predicate, so a
-        // detected rejection always changes the content. If they drift — a malformed
-        // `[IMAGE:` passes detection but the regex leaves it verbatim — a no-change
-        // rewrite would report `Rewritten`, the loop `continue` would skip
-        // `tool_rounds += 1`, and retries unbounded. Treat it as a non-strip.
-        let content = {
-            let original = &self.session.history()[idx].content;
-            let stripped =
-                crate::session::image_strip::strip_image_markers(original, reason.as_deref());
-            if stripped == *original {
-                tracing::warn!(
-                    agent_id = %self.agent_id,
-                    role = %self.role,
-                    "Input-image rejection detected but stripping produced no change — \
-                     treating as a non-strip (normal failure path)"
-                );
-                return false;
-            }
-            stripped
-        };
-        match self
-            .session
-            .rewrite_last_user_message(&self.agent_id, content)
+        let stripped = crate::session::image_strip::strip_image_markers(
+            &self.session.history()[index].content,
+            reason.as_deref(),
+        );
+        self.rewrite_history_rows(vec![(index, stripped)], "input image strip")
             .await
-        {
-            Ok(crate::session::RewriteOutcome::Rewritten) => true,
-            Ok(crate::session::RewriteOutcome::UnpersistedTailNoop) => {
-                tracing::info!(
-                    agent_id = %self.agent_id,
-                    role = %self.role,
-                    "Input-image rejection detected but the most recent user message is in the \
-                     unpersisted tail — conservative no-op, normal failure path applies"
-                );
-                false
-            }
-            Err(e) => {
-                tracing::error!(
-                    agent_id = %self.agent_id,
-                    role = %self.role,
-                    error = %e,
-                    "Failed to persist stripped user message — keeping the original error path"
-                );
-                false
-            }
+    }
+
+    /// Neutralize every leaked model control token in the history after a provider refusal of the
+    /// request's content, rewriting each token-bearing row durably.
+    async fn neutralize_leaked_control_tokens(
+        &mut self,
+        exhausted: &crate::retry::RetryExhausted,
+    ) -> bool {
+        let rewrites = crate::session::control_token_strip::leaked_token_rewrites(
+            exhausted,
+            self.session.history(),
+        );
+        if rewrites.is_empty() {
+            return false;
         }
+        self.rewrite_history_rows(rewrites, "control token neutralize")
+            .await
     }
 
     /// Bounded continuation recovery for the reasoning-only-stop class (empty content, no
@@ -2618,6 +2648,18 @@ pub(crate) async fn run_agent(
             // a generic placeholder.
             agent.failure = Some(format!("{e:#}"));
             agent.failure_class = failure_class_from_error(&e);
+            // A refusal class fails the same way over the same bytes: remember the durable history
+            // tail so the dead-session poller can tell "the history changed, one restart is worth
+            // it" from "restarting would re-send exactly what was just refused".
+            if agent
+                .failure_class
+                .is_some_and(crate::retry::FailureClass::is_deterministic)
+            {
+                crate::session::dead_session::record_deterministic_failure(
+                    &agent.agent_id,
+                    agent.session.persisted_tail(),
+                );
+            }
             let classification = failure_classification(&agent, Some(&e));
             agent.run_failure = Some(if is_cooperative_stop(classification) {
                 crate::RunFailure::CooperativeStop
@@ -2844,7 +2886,7 @@ mod tests {
         // .context, not string flattening — so the granular FailureClass survives.
         let exhausted = crate::retry::RetryExhausted::with_last_raw(
             vec![],
-            crate::retry::FailureClass::NonRetryable,
+            crate::retry::FailureClass::InvalidRequest,
             None,
         );
         let err = anyhow::Error::new(exhausted).context("LLM call exhausted retry budget");
@@ -2854,7 +2896,7 @@ mod tests {
         let agent = make_agent(vec![]);
         assert_eq!(
             failure_classification(&agent, Some(&err)),
-            "non_retryable",
+            "invalid_request",
             "RetryExhausted final_class must be recovered from the chain",
         );
 
@@ -4068,7 +4110,7 @@ mod tests {
         let fake = std::sync::Arc::new(
             FakeProvider::new()
                 .ok_reasoning_only("thinking 1", Some("stop"))
-                .err(crate::retry::FailureClass::NonRetryable, "invalid model"),
+                .err(crate::retry::FailureClass::InvalidRequest, "invalid model"),
         );
         let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
         let _provider_guard = install_fake_provider(provider);
@@ -4081,7 +4123,7 @@ mod tests {
             .expect("RetryExhausted must survive in the error chain");
         assert_eq!(
             exhausted.final_class,
-            crate::retry::FailureClass::NonRetryable,
+            crate::retry::FailureClass::InvalidRequest,
             "non-retryable class survives to the terminal error"
         );
         assert_eq!(
@@ -4681,6 +4723,119 @@ mod tests {
                 .content
                 .contains("rejected by the provider's content-inspection check"),
             "phrase present after a single strip"
+        );
+    }
+
+    /// A provider refusal over a history carrying a leaked control token is repaired durably and the
+    /// normal loop continues: the second round succeeds and the persisted history no longer holds a
+    /// token. The token sits in an ASSISTANT reply, which is where a model emits one — and which the
+    /// old "most recent user message" rewrite could never reach.
+    #[tokio::test]
+    #[serial_test::serial(active_models, provider, drain)] // seeds the process-global catalog caches + process-global fake provider + shutdown drain flag
+    async fn leaked_control_token_in_a_reply_is_neutralized_and_the_round_continues() {
+        crate::util::test::init_test_stores().await;
+        seed_empty_catalogs();
+        let _policy_guard = install_test_retry_policy(crate::retry::tiny_test_policy());
+
+        let agent_id = "e2e_assistant_leaked_token";
+        // A previous turn left a control token in a model reply: it is persisted, so every later
+        // request re-sends it and the provider refuses the content.
+        let mut seed = crate::session::Session::default();
+        seed.persist_messages(
+            agent_id,
+            &[
+                ChatMessage::system("role description"),
+                ChatMessage::user("what is this?"),
+                ChatMessage::assistant("it is an <|image|> token"),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .err(
+                    crate::retry::FailureClass::ContentRejection,
+                    "Input data may not contain model control tokens.",
+                )
+                .ok("Recovered: the token is gone."),
+        );
+        let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+        let _provider_guard = install_fake_provider(provider);
+
+        let mut agent = make_agent_with_role(vec![], crate::Role::Assistant);
+        agent.agent_id = agent_id.to_string();
+        let resp = agent
+            .work(&["and now?"], false)
+            .await
+            .expect("a leaked token must not fail the run wholesale");
+        assert_eq!(resp, "Recovered: the token is gone.");
+
+        // The repaired history reached the model on the retry.
+        let messages = fake.request_messages.lock().unwrap().clone();
+        assert_eq!(messages.len(), 2, "refused attempt + normal-loop retry");
+        assert!(
+            messages[0].contains("<|image|>"),
+            "the refused request still carried the token"
+        );
+        assert!(
+            !messages[1].contains("<|"),
+            "the retried request carries no token at all"
+        );
+
+        let history = crate::session::store().load(agent_id).await;
+        assert!(
+            history.iter().all(|m| !m.content.contains("<|")),
+            "the token is durably gone from the session: {history:?}"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|m| m.content.contains(crate::util::control_token::PLACEHOLDER)),
+            "the reply is preserved with the placeholder in the token's place"
+        );
+    }
+
+    /// A token that sits only in the UNPERSISTED tail cannot be rewritten positionally (a store
+    /// UPDATE would hit a different row), so the repair reports no rewrite and the original failure
+    /// propagates — the loop must not `continue`, which would skip `tool_rounds += 1` and retry
+    /// forever.
+    #[tokio::test]
+    async fn leaked_token_in_the_unpersisted_tail_keeps_the_original_failure() {
+        crate::util::test::init_test_stores().await;
+
+        let agent_id = "e2e_assistant_leaked_token_tail";
+        let mut agent = make_agent_with_role(vec![], crate::Role::Assistant);
+        agent.agent_id = agent_id.to_string();
+        // Memory only: `push_messages_unpersisted` is the path a failed store append takes.
+        agent.session.push_messages_unpersisted(&[
+            ChatMessage::system("role description"),
+            ChatMessage::assistant("it is an <|image|> token"),
+        ]);
+
+        let inner = anyhow::anyhow!("Input data may not contain model control tokens.");
+        let exhausted = crate::retry::RetryExhausted::with_last_raw(
+            vec![crate::retry::RetryFailureRecord::new_simple(
+                crate::retry::FailureClass::ContentRejection,
+                &inner,
+                None,
+            )],
+            crate::retry::FailureClass::ContentRejection,
+            None,
+        );
+
+        assert!(
+            !agent.neutralize_leaked_control_tokens(&exhausted).await,
+            "an unpersisted tail is a no-op, so the loop must not continue"
+        );
+        assert_eq!(
+            agent.session.history()[1].content,
+            "it is an <|image|> token",
+            "in-memory history untouched"
+        );
+        assert!(
+            crate::session::store().load(agent_id).await.is_empty(),
+            "nothing was written for a tail the store never saw"
         );
     }
 

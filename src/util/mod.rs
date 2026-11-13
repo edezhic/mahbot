@@ -1,4 +1,5 @@
 pub(crate) mod catalog_cache;
+pub(crate) mod control_token;
 pub(crate) mod desktop_entry;
 pub(crate) mod disk;
 #[cfg(target_os = "linux")]
@@ -631,13 +632,15 @@ pub(crate) fn log_join_failures(
 /// omission marker it inserts is additional to this number (see [`truncate_sandwich`]).
 pub(crate) const FAILURE_DETAIL_CAP: usize = 24_000;
 
-/// Canonical scrub+truncate failure-comment detail: scrub secrets, then sandwich-truncate at
-/// [`FAILURE_DETAIL_CAP`], so dumps rendered here keep one ordering and cap. Some adjacent sites
-/// deliberately diverge — scrub-only early-returns, a truncate-then-scrub raw dump — and are
-/// intentionally not unified here.
+/// Canonical mask+scrub+truncate failure-comment detail: mask model control tokens, scrub secrets,
+/// then sandwich-truncate at [`FAILURE_DETAIL_CAP`], so dumps rendered here keep one ordering and
+/// cap. The mask runs before the cut, so a truncation can never leave half a token behind. Some
+/// adjacent sites deliberately diverge — scrub-only early-returns, a truncate-then-scrub raw dump —
+/// and are intentionally not unified here.
 #[must_use]
 pub(crate) fn failure_detail(text: &str, label: &str) -> String {
-    truncate_sandwich(&scrub_credentials(text), FAILURE_DETAIL_CAP, label)
+    let text = control_token::neutralize(text);
+    truncate_sandwich(&scrub_credentials(text.as_ref()), FAILURE_DETAIL_CAP, label)
 }
 
 /// The line a line-count cut puts in place of the lines it dropped — `"... (N lines omitted)"`, the

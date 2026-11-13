@@ -47,8 +47,8 @@ const PHRASE_ASSET: &str = "context/image_rejected.md";
 /// the most recent User-role message when the strip should fire (`None` = no strip).
 ///
 /// The **full** trail (all recorded attempts) must contain the content-inspection code AND the
-/// image-specific fragment: a 400-class rejection is
-/// [`crate::failure_class::FailureClass::NonRetryable`] in practice, so there is usually one
+/// image-specific fragment: the rejection is terminal
+/// ([`crate::retry::FailureClass::ContentRejection`] in practice), so there is usually one
 /// record, but scanning all of them keeps the rule correct if a retryable attempt ever precedes the
 /// rejection. The most recent User-role message must carry at least one IMAGE marker
 /// [`strip_image_markers`] will actually strip — the two share one predicate
@@ -172,11 +172,11 @@ mod tests {
     fn trail(error_chain: &str) -> RetryExhausted {
         RetryExhausted::with_last_raw(
             vec![RetryFailureRecord::new_simple(
-                FailureClass::NonRetryable,
+                FailureClass::InvalidRequest,
                 &anyhow::anyhow!("{error_chain}"),
                 None,
             )],
-            FailureClass::NonRetryable,
+            FailureClass::InvalidRequest,
             None,
         )
     }

@@ -13,7 +13,8 @@ use std::time::Duration;
 ///
 /// [`HttpError::status`] and [`HttpError::body`] are available to classifiers via
 /// `err.downcast_ref::<HttpError>()`. Errors from third-party or non-HTTP sources arrive without
-/// this wrapper and are classified as retryable by default.
+/// this wrapper and are classified as retryable by default. Build one through [`HttpError::new`] /
+/// [`HttpError::from_response`] so the body is masked (see [`crate::util::control_token`]).
 #[derive(Debug)]
 pub struct HttpError {
     pub status: u16,
@@ -23,6 +24,21 @@ pub struct HttpError {
 }
 
 impl HttpError {
+    /// Build one from an already-read status and body, masking model control tokens.
+    ///
+    /// The body is a provider's error envelope, and it is handed back into the caller's context
+    /// (agent failure text, `llm_failures` trail, ticket comment) — so the mask happens once, here,
+    /// for every path that builds an `HttpError`. A token in a body must not re-infect the session
+    /// that reads it.
+    #[must_use]
+    pub fn new(status: u16, body: String, context: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: crate::util::control_token::neutralize_owned(body),
+            context: context.into(),
+        }
+    }
+
     /// Build a [`HttpError`] from a `reqwest::Response`, consuming it and extracting status and
     /// body.
     pub async fn from_response(response: reqwest::Response, context: impl Into<String>) -> Self {
@@ -37,11 +53,7 @@ impl HttpError {
             );
             String::new()
         });
-        Self {
-            status,
-            body,
-            context,
-        }
+        Self::new(status, body, context)
     }
 }
 
@@ -100,5 +112,19 @@ mod tests {
         assert_eq!(parse_retry_after_value("abc"), None);
         assert_eq!(parse_retry_after_value(""), None);
         assert_eq!(parse_retry_after_value("  5  "), Some(5000));
+    }
+
+    /// A refusal body is handed back into the caller's context, so a control token inside it is
+    /// masked at construction — the one place every `HttpError` passes through.
+    #[test]
+    fn a_built_http_error_masks_control_tokens_in_its_body() {
+        let err = HttpError::new(
+            400,
+            r#"{"error":{"message":"text contains <|image|> which is not allowed"}}"#.to_string(),
+            "OpenRouter",
+        );
+        assert!(!err.body.contains("<|"));
+        assert!(err.body.contains(crate::util::control_token::PLACEHOLDER));
+        assert!(!err.to_string().contains("<|"));
     }
 }

@@ -470,11 +470,12 @@ impl From<anyhow::Error> for DiscoveryRunError {
 /// [`crate::retry::RetryExhausted`] class decides provider-vs-genuine; everything else is
 /// fatal. Panics never reach here (see [`spawn_panic_guarded`]).
 ///
-/// `NonRetryable` is transient because it covers auth 401/403, invalid-model and
-/// tool-schema 400s — all config-fixable, so the workspace must wait in Pending for the
-/// user rather than go terminal, and the escalating cooldown bounds the retry rate.
-/// `Parse`/validation is fatal: the provider answered, so the defect is ours. `error` is
-/// the raw error when the call site has one; the typed class `run_agent` captured takes precedence.
+/// `InvalidRequest`/`ContentRejection`/`Guardrail` are transient because the first covers auth
+/// 401/403, invalid-model and tool-schema 400s — all config-fixable, so the workspace must wait in
+/// Pending for the user rather than go terminal, and the escalating cooldown bounds the retry rate
+/// — and the other two are refusals a repaired or shortened request can clear. `Parse`/validation
+/// is fatal: the provider answered, so the defect is ours. `error` is the raw error when the call
+/// site has one; the typed class `run_agent` captured takes precedence.
 fn classify_discovery_failure(
     agent: &crate::Agent,
     error: Option<&anyhow::Error>,
@@ -496,7 +497,9 @@ fn classify_discovery_failure(
         | crate::retry::FailureClass::TruncatedEnvelope
         | crate::retry::FailureClass::NoResponse
         | crate::retry::FailureClass::TruncatedOutput
-        | crate::retry::FailureClass::NonRetryable
+        | crate::retry::FailureClass::InvalidRequest
+        | crate::retry::FailureClass::ContentRejection
+        | crate::retry::FailureClass::Guardrail
         | crate::retry::FailureClass::Shutdown => DiscoveryFailureKind::Transient,
         crate::retry::FailureClass::Parse
         | crate::retry::FailureClass::OutOfRangeScore
@@ -2461,7 +2464,9 @@ mod tests {
             crate::retry::FailureClass::TruncatedEnvelope,
             crate::retry::FailureClass::NoResponse,
             crate::retry::FailureClass::TruncatedOutput,
-            crate::retry::FailureClass::NonRetryable, // auth / quota / invalid model
+            crate::retry::FailureClass::InvalidRequest, // auth / quota / invalid model
+            crate::retry::FailureClass::ContentRejection, // repaired or shortened, it may pass
+            crate::retry::FailureClass::Guardrail,
             crate::retry::FailureClass::Shutdown,
         ] {
             assert_eq!(

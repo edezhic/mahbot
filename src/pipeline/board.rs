@@ -625,14 +625,18 @@ impl BoardStore {
     ) -> Result<()> {
         let now = db::now();
         let prereqs_json = serde_json::to_string(&params.prerequisites)?;
+        // Model control tokens are masked out at the one insert every ticket passes through: the
+        // title and description are read back into other agents' prompts.
+        let title = crate::util::control_token::neutralize(&params.title);
+        let description = crate::util::control_token::neutralize(&params.description);
         tx.execute(
             "INSERT INTO tickets (id, title, description, phase, workspace_name, \
              created_at, updated_at, prerequisites, supersedes, reporter, priority, label) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             db::params![
                 ticket_id,
-                params.title.as_str(),
-                params.description.as_str(),
+                title.as_ref(),
+                description.as_ref(),
                 params.phase.as_ref(),
                 params.workspace_name.as_str(),
                 now.as_str(),
@@ -835,10 +839,16 @@ impl BoardStore {
         let prerequisites_raw: String = row.get(COL_TICKET_PREREQUISITES)?;
         let prerequisites = parse_prereqs(&prerequisites_raw)
             .with_context(|| format!("Failed to parse prerequisites for ticket {id}"))?;
+        // Every ticket read goes through here, and the title and description are rendered into
+        // every phase prompt: a control token recorded before the write-side mask existed is masked
+        // out on the way to the agent that would otherwise carry it into its session.
+        let title = crate::util::control_token::neutralize_owned(row.get(COL_TICKET_TITLE)?);
+        let description =
+            crate::util::control_token::neutralize_owned(row.get(COL_TICKET_DESCRIPTION)?);
         Ok(Ticket {
             id,
-            title: row.get(COL_TICKET_TITLE)?,
-            description: row.get(COL_TICKET_DESCRIPTION)?,
+            title,
+            description,
             phase: row
                 .get::<String>(COL_TICKET_PHASE)?
                 .parse::<TicketPhase>()?,
@@ -1377,12 +1387,16 @@ impl BoardStore {
     /// resumed deterministic stage session (engineer/sanitation) injects outstanding comments at
     /// the empty-message resume point.
     pub async fn add_comment(&self, ticket_id: &str, role: &str, content: &str) -> Result<()> {
+        // Masked once, here: the same text is persisted AND routed into the context of every
+        // running agent on the ticket.
+        let content = crate::util::control_token::neutralize(content);
         crate::db::with_tx(&self.conn, ticket_id, "add comment", async |tx| {
-            Self::add_comment_tx(tx, ticket_id, role, content).await
+            Self::add_comment_tx(tx, ticket_id, role, content.as_ref()).await
         })
         .await?;
 
-        self.route_comment_to_agents(ticket_id, role, content).await;
+        self.route_comment_to_agents(ticket_id, role, content.as_ref())
+            .await;
 
         Ok(())
     }
@@ -1460,23 +1474,29 @@ impl BoardStore {
         }
     }
 
-    /// Transactional [`add_comment`](Self::add_comment): inserts the comment and bumps
-    /// `updated_at`, without committing or rollback. It does NOT route the comment to running
-    /// agents — every current caller is a post-agent phase where none runs; a mid-execution
-    /// caller must use `add_comment` or call
+    /// Transactional [`add_comment`](Self::add_comment): masks `content` and inserts the comment,
+    /// without committing, routing or rollback. It does NOT route the comment to running agents —
+    /// every current caller is a post-agent phase where none runs; a mid-execution caller must use
+    /// `add_comment` or call
     /// [`route_comment_to_agents`](Self::route_comment_to_agents) after the commit.
+    ///
+    /// Masking here is the write half of the ticket-comment rule: a comment is read back into other
+    /// agents' prompts and into the GUI, so a token an agent copied out of a refusal body must not
+    /// travel any further. `add_comment` masks before routing and passes the result in — the second
+    /// pass is a borrow, not a rewrite.
     pub(crate) async fn add_comment_tx(
         tx: &TxGuard<'_>,
         ticket_id: &str,
         role: &str,
         content: &str,
     ) -> Result<()> {
+        let content = crate::util::control_token::neutralize(content);
         let comment_id = crate::generate_id();
         let now = db::now();
         tx.execute(
             "INSERT INTO ticket_comments (id, ticket_id, role, content, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            db::params![comment_id, ticket_id, role, content, now.as_str()],
+            db::params![comment_id, ticket_id, role, content.as_ref(), now.as_str()],
         )
         .await?;
         tx.execute(
@@ -1487,6 +1507,12 @@ impl BoardStore {
         Ok(())
     }
 
+    /// Every comment on a ticket, oldest first.
+    ///
+    /// Model control tokens are masked out of the content on READ as well as on write: a comment
+    /// recorded before the mask existed is still poisoned, and this is the one read every consumer
+    /// goes through — the GUI board, the pipeline's phase prompts and the resume catch-up that
+    /// injects outstanding comments into a running agent.
     pub async fn get_comments(&self, ticket_id: &str) -> Result<Vec<TicketComment>> {
         let sql = format!(
             "SELECT {COMMENT_COLUMNS} FROM ticket_comments WHERE ticket_id = ?1 ORDER BY created_at ASC"
@@ -1496,7 +1522,9 @@ impl BoardStore {
         for row in rows {
             comments.push(TicketComment {
                 role: row.get(COL_COMMENT_ROLE)?,
-                content: row.get(COL_COMMENT_CONTENT)?,
+                content: crate::util::control_token::neutralize_owned(
+                    row.get::<String>(COL_COMMENT_CONTENT)?,
+                ),
                 created_at: row.get(COL_COMMENT_CREATED_AT)?,
             });
         }

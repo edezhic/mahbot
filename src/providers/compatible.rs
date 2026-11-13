@@ -5,6 +5,7 @@
 use crate::providers::reasoning;
 use crate::providers::{ScopedCallError, ensure_chat_completions_url, provider_routing_json};
 use crate::retry::{FailureClass, RetryFailureRecord};
+use crate::util::control_token;
 use crate::util::error::{HttpError, retry_after_header};
 use crate::util::json::try_repair_json;
 use crate::{
@@ -321,6 +322,72 @@ struct NativeMessage {
     reasoning: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_details: Option<serde_json::Value>,
+}
+
+impl NativeMessage {
+    /// Rewrite every text channel this message can carry, so a model control token that reached
+    /// the session history — a reply, a tool result, replayed reasoning — never leaves the product.
+    ///
+    /// `ImageUrl` payloads are deliberately untouched: they are base64 data URIs, not text a model
+    /// can inject a token into. A tool call's `arguments` is a JSON *string*; the replacement is
+    /// plain ASCII, so rewriting inside it leaves the string valid JSON.
+    fn neutralize(&mut self) {
+        match &mut self.content {
+            Some(MessageContent::Text(text)) => control_token::neutralize_in_place(text),
+            Some(MessageContent::Parts(parts)) => {
+                for part in parts {
+                    if let MessagePart::Text { text } = part {
+                        control_token::neutralize_in_place(text);
+                    }
+                }
+            }
+            Some(MessageContent::Null) | None => {}
+        }
+
+        if let Some(tool_calls) = &mut self.tool_calls {
+            for call in tool_calls {
+                if let Some(arguments) = call
+                    .function
+                    .as_mut()
+                    .and_then(|function| function.arguments.as_mut())
+                {
+                    control_token::neutralize_in_place(arguments);
+                }
+            }
+        }
+
+        for text in [&mut self.reasoning_content, &mut self.reasoning]
+            .into_iter()
+            .flatten()
+        {
+            control_token::neutralize_in_place(text);
+        }
+        if let Some(details) = &mut self.reasoning_details {
+            control_token::neutralize_json(details);
+        }
+    }
+}
+
+impl ChatCompletionRequest {
+    /// Neutralize every free-text channel in the outbound body: message content, tool-call
+    /// arguments, replayed reasoning, and the whole tool catalogue. The catalogue goes through
+    /// [`control_token::neutralize_json`] rather than a per-field walk, so a tool `description`
+    /// and every string in its `parameters` schema are covered even when the schema shape drifts.
+    ///
+    /// `model`, `tool_choice` and the flattened `extra` map are deliberately untouched: they are
+    /// config-derived identifiers and enum values, never text a model wrote.
+    #[must_use]
+    fn neutralized(mut self) -> Self {
+        for message in &mut self.messages {
+            message.neutralize();
+        }
+        if let Some(tools) = &mut self.tools {
+            for tool in tools {
+                control_token::neutralize_json(tool);
+            }
+        }
+        self
+    }
 }
 
 /// Parse `[IMAGE:…]` markers from content, returning cleaned text and extracted
@@ -701,6 +768,10 @@ impl OpenAiCompatibleProvider {
     ///
     /// The request payload is fixed; timeout semantics live with the caller
     /// (chat has no total timeout, warmup applies a per-request timeout).
+    ///
+    /// Every text channel passes through [`ChatCompletionRequest::neutralized`] here — the single
+    /// outbound boundary. The substitution is deterministic and idempotent, so the retry ladder's
+    /// byte-identical-prefix / prompt-cache guarantee (see the [`crate::retry`] module docs) holds.
     fn build_http_request_with_client(
         &self,
         client: &Client,
@@ -757,7 +828,8 @@ impl OpenAiCompatibleProvider {
             tool_choice: tool_specs.as_ref().map(|_| "auto".to_string()),
             tools: tool_specs,
             extra,
-        };
+        }
+        .neutralized();
 
         let url = ensure_chat_completions_url(&self.base_url);
         let builder = client.post(url).json(&payload);
@@ -1058,6 +1130,10 @@ impl Provider for OpenAiCompatibleProvider {
             return Err(scoped_http_error(self, response, idle_timeout).await);
         }
 
+        // Read before the body is consumed: a 429 delivered inside a 2xx body keeps its
+        // Retry-After.
+        let retry_after_ms = retry_after_header(response.headers());
+
         let (body_bytes, read_failure) = match read_body_idle(response, idle_timeout).await {
             BodyReadOutcome::Complete(bytes) => (bytes, None),
             BodyReadOutcome::Failed {
@@ -1077,6 +1153,11 @@ impl Provider for OpenAiCompatibleProvider {
         let native_response: ApiChatResponse = match serde_json::from_str(&body_str) {
             Ok(native) => native,
             Err(e) => {
+                // A provider may report a failure in the body of a 2xx response (see
+                // `provider_error_call`); that is a rejection, not a malformed envelope.
+                if let Some(err) = provider_error_call(self, &body_str, retry_after_ms) {
+                    return Err(err);
+                }
                 // Content-length vs actual comparison: equal ⇒ the server
                 // finalized a short body; shorter ⇒ framing anomaly (truncated
                 // envelope — the same defect class as body-read errors).
@@ -1090,11 +1171,20 @@ impl Provider for OpenAiCompatibleProvider {
                     "{} chat completions parse error: {e}; body ({}): {:.500}",
                     self.name,
                     body_str.len(),
-                    body_str
+                    // The preview is a provider body: mask it like every other refusal body.
+                    control_token::neutralize(&body_str)
                 );
                 return Err(scoped_metadata_error(err, class, &body_str, None));
             }
         };
+
+        // An envelope with an empty `choices` array can still carry the provider's error object;
+        // classify it instead of falling through to `NoResponse`.
+        if native_response.choices.is_empty()
+            && let Some(err) = provider_error_call(self, &body_str, retry_after_ms)
+        {
+            return Err(err);
+        }
 
         self.finalize_response(&model, native_response)
     }
@@ -1137,11 +1227,7 @@ async fn scoped_http_error(
     };
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
 
-    let http_err = HttpError {
-        status,
-        body: body.clone(),
-        context: provider.name.clone(),
-    };
+    let http_err = HttpError::new(status, body.clone(), provider.name.clone());
     let inner = anyhow::Error::from(http_err);
     let body_read_failed = message.is_some();
     let inner = match message {
@@ -1157,6 +1243,48 @@ async fn scoped_http_error(
         body_read_failed,
     );
     scoped_metadata_error(inner, class, &body, retry_after_ms)
+}
+
+/// Recognize a provider error object carried inside a 2xx response body.
+///
+/// OpenRouter documents that once the provider has sent response headers, every later failure is
+/// reported in the body with status 200 — e.g. `{"error":{"code":400,"message":"…"}}`. The typed
+/// [`ApiChatResponse`] parse fails on that shape (it requires `choices`), so without this check the
+/// failure becomes [`FailureClass::Parse`] and the retry ladder burns every attempt — roughly ten
+/// minutes plus billing — on a rejection that can never succeed.
+///
+/// `None` when the body is not JSON or carries no non-null top-level `error`, which keeps the
+/// existing truncation/parse/no-response classification for ordinary bodies.
+#[must_use]
+fn provider_error_call(
+    provider: &OpenAiCompatibleProvider,
+    body: &str,
+    retry_after_ms: Option<u64>,
+) -> Option<ScopedCallError> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error").filter(|error| !error.is_null())?;
+
+    // Prefer the provider's own numeric status; a code outside the HTTP error range (or a string
+    // code) is not a status, so fall back to what the body's vocabulary implies.
+    let status = error
+        .get("code")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|code| u16::try_from(code).ok())
+        .filter(|code| (400..=599).contains(code))
+        .unwrap_or_else(|| crate::providers::error_class::implied_status(body));
+
+    let inner = anyhow::Error::from(HttpError::new(
+        status,
+        body.to_string(),
+        provider.name.clone(),
+    ))
+    .context(format!(
+        "{} reported an error inside a successful (2xx) response body",
+        provider.name
+    ));
+    let class =
+        crate::providers::failure_class(crate::providers::error_class::classify_err(&inner), false);
+    Some(scoped_metadata_error(inner, class, body, retry_after_ms))
 }
 
 #[cfg(test)]
@@ -1192,28 +1320,13 @@ mod tests {
         request.provider_order = Some("deepseek".to_string());
         request.reasoning_effort = Some("xhigh".to_string());
 
-        let body = |p: &OpenAiCompatibleProvider, request: &ProviderChatRequest| {
-            let req = p
-                .build_http_request_with_client(p.http_client(), request)
-                .build()
-                .expect("request builds");
-            String::from_utf8(
-                req.body()
-                    .expect("full body")
-                    .as_bytes()
-                    .expect("bytes")
-                    .to_vec(),
-            )
-            .expect("utf8 body")
-        };
-
         // Default endpoint → routing block present, reasoning_effort present.
         let or_provider = OpenAiCompatibleProvider::new(
             "OpenRouter",
             crate::config::DEFAULT_PROVIDER_ENDPOINT,
             Some("sk-or"),
         );
-        let or_body = body(&or_provider, &request);
+        let or_body = serialized_body(&or_provider, &request);
         assert!(
             or_body.contains("\"provider\""),
             "default endpoint must send the provider block: {or_body}"
@@ -1230,7 +1343,7 @@ mod tests {
         // Default endpoint without routing sends no provider block at all.
         let mut no_routing = test_request(vec![ChatMessage::user("hello")], None);
         no_routing.provider_order = None;
-        let no_routing_body = body(&or_provider, &no_routing);
+        let no_routing_body = serialized_body(&or_provider, &no_routing);
         assert!(
             !no_routing_body.contains("\"provider\""),
             "no provider block when provider_order is unset: {no_routing_body}"
@@ -1241,7 +1354,7 @@ mod tests {
         // The 'test' model matches no family → fallback → xhigh→max.
         let custom_provider =
             OpenAiCompatibleProvider::new("Custom endpoint", "http://localhost:8080/v1", None);
-        let custom_body = body(&custom_provider, &request);
+        let custom_body = serialized_body(&custom_provider, &request);
         assert!(
             !custom_body.contains("\"provider\""),
             "custom endpoint must not receive the OpenRouter routing block: {custom_body}"
@@ -1254,6 +1367,189 @@ mod tests {
             !custom_body.contains("xhigh"),
             "custom endpoints must not receive the untranslated effort: {custom_body}"
         );
+    }
+
+    /// Serialize a chat request through the real builder, so assertions run on the exact bytes a
+    /// provider would receive.
+    fn serialized_body(
+        provider: &OpenAiCompatibleProvider,
+        request: &ProviderChatRequest,
+    ) -> String {
+        let req = provider
+            .build_http_request_with_client(provider.http_client(), request)
+            .build()
+            .expect("request builds");
+        String::from_utf8(
+            req.body()
+                .expect("full body")
+                .as_bytes()
+                .expect("bytes")
+                .to_vec(),
+        )
+        .expect("utf8 body")
+    }
+
+    /// A request whose every free-text channel carries a synthetic control token: user content,
+    /// assistant content and replayed reasoning, tool-call arguments, a tool result, a tool
+    /// description, and a nested parameter description.
+    fn control_token_request() -> ProviderChatRequest {
+        let assistant_frame = serde_json::json!({
+            "content": "answer <|image|>",
+            "reasoning_content": "thinking <|image|>",
+            "tool_calls": [{
+                "id": "call_1",
+                "name": "probe",
+                "arguments": { "note": "arg <|image|>" },
+            }],
+        })
+        .to_string();
+        let messages = vec![
+            ChatMessage::user("hello <|image|>"),
+            ChatMessage::assistant(assistant_frame),
+            ChatMessage::tool_result("call_1", "result <|image|>"),
+        ];
+        let tools = vec![ToolSpec {
+            name: "probe".to_string(),
+            description: "desc <|image|>".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "note": { "type": "string", "description": "nested <|image|>" }
+                }
+            }),
+        }];
+        test_request(messages, Some(tools))
+    }
+
+    /// The builder is the single outbound boundary: no text channel may carry a control token, and
+    /// the rewrite must leave the body valid JSON (the tool-call arguments string included).
+    #[test]
+    fn outbound_request_neutralizes_every_text_channel() {
+        let provider =
+            OpenAiCompatibleProvider::new("Test", "http://localhost:8080/v1", Some("sk-test"));
+        let body = serialized_body(&provider, &control_token_request());
+
+        assert!(
+            !body.contains("<|"),
+            "no control token may leave the product: {body}"
+        );
+        assert_eq!(
+            body.matches(control_token::PLACEHOLDER).count(),
+            7,
+            "every text channel must be rewritten: {body}"
+        );
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).expect("the neutralized body stays valid JSON");
+        let arguments = parsed["messages"][1]["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("tool-call arguments are a JSON string");
+        serde_json::from_str::<serde_json::Value>(arguments)
+            .expect("neutralized arguments stay valid JSON");
+    }
+
+    /// The substitution is deterministic and idempotent, so rebuilding a request yields the same
+    /// bytes (prompt-cache prefix) and re-neutralizing an already-neutralized body is a no-op.
+    #[test]
+    fn outbound_neutralization_is_idempotent_and_byte_stable() {
+        let provider = OpenAiCompatibleProvider::new("Test", "http://localhost:8080/v1", None);
+        let request = control_token_request();
+
+        assert_eq!(
+            serialized_body(&provider, &request),
+            serialized_body(&provider, &request),
+            "the retry ladder must re-send byte-identical bodies"
+        );
+
+        let payload = || ChatCompletionRequest {
+            model: request.model.clone(),
+            messages: OpenAiCompatibleProvider::convert_messages_for_native(&request.messages),
+            max_tokens: request.max_tokens,
+            tools: OpenAiCompatibleProvider::convert_tool_specs(request.tools.as_deref()),
+            tool_choice: Some("auto".to_string()),
+            extra: serde_json::Map::new(),
+        };
+        let once = serde_json::to_string(&payload().neutralized()).expect("serializes");
+        let twice =
+            serde_json::to_string(&payload().neutralized().neutralized()).expect("serializes");
+        assert_eq!(
+            once, twice,
+            "neutralizing an already-neutralized body changes nothing"
+        );
+    }
+
+    /// A provider error object inside a 2xx body is a rejection, not a malformed envelope: the
+    /// class must be terminal for content refusals and retryable for upstream failures.
+    #[test]
+    fn provider_error_call_classifies_an_error_object_inside_a_2xx_body() {
+        let provider = OpenAiCompatibleProvider::new("Test", "http://localhost:8080/v1", None);
+
+        let content = provider_error_call(
+            &provider,
+            r#"{"error":{"code":400,"message":"image special token is not allowed"}}"#,
+            None,
+        )
+        .expect("an in-body error is a call failure");
+        assert_eq!(content.class, FailureClass::ContentRejection);
+
+        let transport = provider_error_call(
+            &provider,
+            r#"{"error":{"code":503,"message":"upstream unavailable"}}"#,
+            None,
+        )
+        .expect("an in-body error is a call failure");
+        assert_eq!(transport.class, FailureClass::Transport);
+
+        let guardrail = provider_error_call(
+            &provider,
+            r#"{"error":{"code":403,"message":"blocked by guardrail"}}"#,
+            None,
+        )
+        .expect("an in-body error is a call failure");
+        assert_eq!(guardrail.class, FailureClass::Guardrail);
+
+        // No code of its own: only a content rejection is inferred from the wording, so a body that
+        // merely names a guardrail is an output-production failure and keeps retrying.
+        let uncoded = provider_error_call(
+            &provider,
+            r#"{"error":{"message":"blocked by guardrail"}}"#,
+            None,
+        )
+        .expect("an in-body error is a call failure");
+        assert_eq!(uncoded.class, FailureClass::Transport);
+
+        assert!(
+            provider_error_call(
+                &provider,
+                r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+                None
+            )
+            .is_none(),
+            "a plain success body is not an error"
+        );
+        assert!(
+            provider_error_call(&provider, "not json at all", None).is_none(),
+            "a non-JSON body is not an error envelope"
+        );
+    }
+
+    /// The error body is handed back into the failure trail, so [`HttpError::new`] masks a control
+    /// token before the chain is built — and the Retry-After header survives an in-body 429.
+    #[test]
+    fn provider_error_call_masks_control_tokens_in_the_failure_trail() {
+        let provider = OpenAiCompatibleProvider::new("Test", "http://localhost:8080/v1", None);
+        let body = r#"{"error":{"code":400,"message":"image special token <|image|> rejected"}}"#;
+        let rejection = provider_error_call(&provider, body, Some(5_000)).expect("in-body error");
+
+        assert_eq!(rejection.class, FailureClass::ContentRejection);
+        assert_eq!(rejection.record.retry_after_ms, Some(5_000));
+        let chain = format!("{:#}", rejection.inner);
+        assert!(
+            !chain.contains("<|"),
+            "the body is masked at HttpError construction: {chain}"
+        );
+        assert!(!rejection.record.error_chain.contains("<|"));
+        assert!(chain.contains(control_token::PLACEHOLDER));
     }
 
     /// Full model-family × effort translation table for custom endpoints
