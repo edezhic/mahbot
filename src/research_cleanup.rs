@@ -126,34 +126,65 @@ pub(crate) async fn release_run_folder(job_id: &str) {
 /// Shared results-archive location `<storage_root>/research/results/{job_id}.md` — the writer and
 /// the cancel sweep must agree on it, or a cancel deletes the wrong file (or nothing).
 pub(crate) fn results_archive_path(job_id: &str) -> Option<PathBuf> {
+    Some(results_dir()?.join(format!("{job_id}.md")))
+}
+
+/// The companion detail file next to the answer: `<storage_root>/research/results/{job_id}.detail.md`.
+/// It holds everything the run produced; the answer refers to it by this path.
+pub(crate) fn detail_archive_path(job_id: &str) -> Option<PathBuf> {
+    Some(results_dir()?.join(format!("{job_id}.detail.md")))
+}
+
+fn results_dir() -> Option<PathBuf> {
     let root = config::CONFIG
         .try_storage_root()
         .or_else(|| config::default_config_dir().ok());
-    Some(
-        root?
-            .join("research")
-            .join("results")
-            .join(format!("{job_id}.md")),
-    )
+    Some(root?.join("research").join("results"))
 }
 
-/// Write the run's archived result (delivered result, including partial terminalizations) to the
-/// shared results-archive location. Overwrites idempotently on resume; a failed write is fail-open,
-/// never blocking terminalization. The storage root comes from CONFIG when set (test stores point
-/// it at a temp dir, so no test writes into the real `~/.mahbot`), else the default config dir.
+/// Write the run's archived answer to the shared results-archive location. Overwrites idempotently
+/// on resume; a failed write is fail-open, never blocking terminalization. The storage root comes
+/// from CONFIG when set (test stores point it at a temp dir, so no test writes into the real
+/// `~/.mahbot`), else the default config dir.
 pub(crate) async fn write_results_md(job_id: &str, result: &str) {
-    let Some(path) = results_archive_path(job_id) else {
-        tracing::warn!(job = %job_id, "results.md skipped — no config dir");
-        return;
+    let content = format!("# Research {job_id}\n\n## Result\n\n{result}\n");
+    let _ = write_archive(job_id, "results.md", results_archive_path(job_id), &content).await;
+}
+
+/// Write the run's detail file next to the answer — the untrimmed findings, sources, verification,
+/// worker-round output and run bookkeeping the answer defers to. Empty content writes nothing.
+/// Returns the path actually written: the answer refers to the detail file only when this is
+/// `Some`, so a failed write can never leave the answer pointing at a file that does not exist.
+pub(crate) async fn write_detail_md(job_id: &str, detail: &str) -> Option<PathBuf> {
+    if detail.trim().is_empty() {
+        return None;
+    }
+    write_archive(job_id, "detail.md", detail_archive_path(job_id), detail).await
+}
+
+/// Write one archive file, returning the path on success. Fail-open: a missing config dir or a
+/// failed write only warns — terminalization is never blocked by it.
+async fn write_archive(
+    job_id: &str,
+    label: &str,
+    path: Option<PathBuf>,
+    content: &str,
+) -> Option<PathBuf> {
+    let Some(path) = path else {
+        tracing::warn!(job = %job_id, %label, "run artifact skipped — no config dir");
+        return None;
     };
     let dir = path
         .parent()
         .expect("archive path always ends in a file name");
-    let content = format!("# Research {job_id}\n\n## Result\n\n{result}\n");
-    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-        tracing::warn!(job = %job_id, error = %e, "results.md: failed to create archive dir");
+    if let Err(e) = tokio::fs::create_dir_all(dir).await {
+        tracing::warn!(job = %job_id, %label, error = %e, "failed to create the archive dir");
+        None
     } else if let Err(e) = tokio::fs::write(&path, content).await {
-        tracing::warn!(job = %job_id, error = %e, "Failed to write results.md — run result not archived");
+        tracing::warn!(job = %job_id, %label, error = %e, "run artifact not archived");
+        None
+    } else {
+        Some(path)
     }
 }
 
@@ -274,6 +305,38 @@ pub(crate) async fn read_command_dump(run_root: &Path) -> Vec<String> {
         Ok(content) => content.lines().map(str::to_string).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// Filename of the worker-round reports inside a run folder. Written there rather than into the
+/// job-state blob (like the command dump): a worker response can be large and the blob is rewritten
+/// at every round checkpoint.
+const WORKER_REPORTS_FILE: &str = "worker-reports.json";
+
+/// Write the worker-round reports ("what was tested in practice") into the run folder. Never creates
+/// the folder (callers ensure the run root exists); a missing folder is the normal end-state when a
+/// cancel sweep released it, so that is a debug, not a warning.
+pub(crate) async fn write_worker_reports(run_root: &Path, job_id: &str, reports: &[String]) {
+    let path = run_root.join(WORKER_REPORTS_FILE);
+    let content = serde_json::to_string(reports).unwrap_or_default();
+    if let Err(e) = tokio::fs::write(&path, content).await {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            tracing::debug!(job = %job_id, "worker-report write skipped — run folder already released (normal end-state)");
+        } else {
+            tracing::warn!(job = %job_id, error = %e, "Failed to write worker reports — the detail file loses what was tested in practice");
+        }
+    }
+}
+
+/// Read the worker-round reports back from the run folder. Crash-resume hook:
+/// `ResearchState.worker_reports` is serde-skip, so a resumed run would otherwise lose them from the
+/// detail file. Missing/unreadable file → empty (fresh run or OS-swept folder — fail-open).
+pub(crate) async fn read_worker_reports(run_root: &Path) -> Vec<String> {
+    let path = run_root.join(WORKER_REPORTS_FILE);
+    tokio::fs::read_to_string(&path)
+        .await
+        .ok()
+        .and_then(|content| serde_json::from_str(&content).ok())
+        .unwrap_or_default()
 }
 
 /// Dedicated task prompt for the research-cleanup Sanitation agent.
@@ -1442,6 +1505,21 @@ mod tests {
         assert!(
             !run_root.exists(),
             "write_command_dump must not create the missing run folder (NotFound is the normal end-state)"
+        );
+    }
+
+    /// The worker-round reports survive a crash through the run folder (the state blob skips them).
+    #[tokio::test]
+    async fn worker_reports_roundtrip_through_the_run_folder() {
+        let job_id = "worker_reports_roundtrip_1";
+        let run_root = ensure_run_root(job_id).await;
+        let reports = vec!["first report".to_string(), "second report".to_string()];
+        write_worker_reports(&run_root, job_id, &reports).await;
+        assert_eq!(read_worker_reports(&run_root).await, reports);
+        let _ = tokio::fs::remove_dir_all(run_root_path(job_id)).await;
+        assert!(
+            read_worker_reports(&run_root_path(job_id)).await.is_empty(),
+            "a released run folder reads as no reports (fail-open)"
         );
     }
 

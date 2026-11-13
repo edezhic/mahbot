@@ -1,0 +1,1 @@
+Your previous answer was truncated by the output limit — produce a SHORTER, more compressed version. Keep every load-bearing claim and its source, but tighten the prose so the whole answer fits within the limit.

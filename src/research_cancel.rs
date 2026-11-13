@@ -4,7 +4,7 @@
 //!
 //! A manual cancel from the Running Agents page is a DISTINCT, PERMANENT stop: unlike the
 //! shutdown/drain abort (the run stays alive and resumes at boot), a manual cancel stops the run so
-//! it can never resume, re-dispatch, or deliver a report. The run folder is the cleanup intent: the
+//! it can never resume, re-dispatch, or deliver an answer. The run folder is the cleanup intent: the
 //! ORCHESTRATOR's cancelled-exit path owns dump finalization, cleanup dispatch and folder release;
 //! the GUI/abandon action only fires the signal, and sweeps rows itself only when no orchestrator
 //! is alive to observe it.
@@ -50,7 +50,7 @@ pub(crate) async fn cancel_research_run(job_id: &str) {
 ///   exists at any time).
 /// - the run folder ONLY when it has NO command dump: a folder holding `commands.dump` carries the
 ///   cleanup intent, which must survive for the cleanup tail (or the periodic temp cleaner).
-/// - the results.md archive.
+/// - the results archive and its companion detail file.
 ///
 /// Idempotent and safe concurrently — every statement is a no-op on missing rows. The tx is the
 /// only fallible part; folder/archive failures are logged, never fatal.
@@ -133,18 +133,29 @@ async fn hand_off_rows(job_id: &str, ws: &Workspace) -> Result<Option<String>, S
     Ok(Some(prompt))
 }
 
-/// Delete the run's results.md archive. Fail-open: a leftover archive is a bounded race with a
-/// racing terminalize write (the accepted envelope-race class — the file is never routed to any
-/// session).
+/// Delete the run's results archive AND its companion detail file. Fail-open: a leftover archive is
+/// a bounded race with a racing terminalize write (the accepted envelope-race class — the files are
+/// never routed to any session).
 async fn delete_results_archive(job_id: &str) {
-    let Some(path) = crate::research_cleanup::results_archive_path(job_id) else {
-        return;
-    };
-    match tokio::fs::remove_file(&path).await {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            tracing::warn!(job = %job_id, error = %e, "results.md archive deletion failed — left on disk");
+    for (label, path) in [
+        (
+            "results.md",
+            crate::research_cleanup::results_archive_path(job_id),
+        ),
+        (
+            "detail.md",
+            crate::research_cleanup::detail_archive_path(job_id),
+        ),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(job = %job_id, error = %e, "{label} archive deletion failed — left on disk");
+            }
         }
     }
 }
@@ -175,7 +186,7 @@ mod tests {
     enum Report {
         /// No envelope, no archive.
         None,
-        /// The pending envelope plus the `results.md` archive.
+        /// The pending envelope plus the `results.md` archive and its `detail.md` companion.
         Persisted,
     }
 
@@ -184,6 +195,7 @@ mod tests {
         id: &'static str,
         root: PathBuf,
         archive: PathBuf,
+        detail: PathBuf,
     }
 
     impl Seeded {
@@ -275,6 +287,7 @@ mod tests {
                 }
             }
             let archive = crate::research_cleanup::results_archive_path(id).unwrap();
+            let detail = crate::research_cleanup::detail_archive_path(id).unwrap();
             if matches!(report, Report::Persisted) {
                 // The router's own persist: the envelope is the production serialization, never a
                 // hand-written copy.
@@ -301,8 +314,14 @@ mod tests {
                     .await
                     .unwrap();
                 tokio::fs::write(&archive, "archive").await.unwrap();
+                tokio::fs::write(&detail, "detail").await.unwrap();
             }
-            Self { id, root, archive }
+            Self {
+                id,
+                root,
+                archive,
+                detail,
+            }
         }
 
         /// How many rows `table` holds for this run: a count, not a presence flag, because a
@@ -350,6 +369,7 @@ mod tests {
         );
         assert!(!run.root.exists(), "run folder removed");
         assert!(!run.archive.exists(), "results.md archive removed");
+        assert!(!run.detail.exists(), "detail.md archive removed");
 
         let run = Seeded::terminalized(
             "research_cancel_terminal_1",
@@ -368,6 +388,7 @@ mod tests {
         );
         assert!(!run.root.exists());
         assert!(!run.archive.exists());
+        assert!(!run.detail.exists(), "detail.md archive removed");
     }
 
     /// A folder WITH a command dump is the run's cleanup intent: the sweep removes the jobs/pending
@@ -396,6 +417,7 @@ mod tests {
             "command dump survives"
         );
         assert!(!run.archive.exists(), "results.md archive removed");
+        assert!(!run.detail.exists(), "detail.md archive removed");
     }
 
     /// The handoff with a live command dump: research + roster transition atomically to a
@@ -467,6 +489,7 @@ mod tests {
             "command dump survives — cleanup intent preserved"
         );
         assert!(!run.archive.exists(), "results.md archive removed");
+        assert!(!run.detail.exists(), "detail.md archive removed");
     }
 
     /// A handoff with NO command dump has nothing to clean: it delegates to the sweep and returns
