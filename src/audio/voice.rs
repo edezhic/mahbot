@@ -4021,10 +4021,7 @@ mod tests {
         assert_buffers_cleared(&ctx);
 
         // Full-specific: state flags reset.
-        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
-        {
-            assert_eq!(ctx.wake.vad_threshold, VAD_THRESHOLD);
-        }
+        assert_eq!(ctx.wake.vad_threshold, VAD_THRESHOLD);
         assert!(!ctx.auto_start_pending);
         assert!(ctx.recording.is_none());
 
@@ -4064,10 +4061,7 @@ mod tests {
         assert_buffers_cleared(&ctx);
 
         // Soft preserves these.
-        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
-        {
-            assert_eq!(ctx.wake.vad_threshold, saved_threshold);
-        }
+        assert_eq!(ctx.wake.vad_threshold, saved_threshold);
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.recording, saved_recording);
 
@@ -4084,10 +4078,7 @@ mod tests {
 
         assert_buffers_cleared(&ctx);
 
-        #[expect(clippy::float_cmp)] // exact reset/const comparison — bit-deterministic
-        {
-            assert_eq!(ctx.wake.vad_threshold, VAD_THRESHOLD);
-        }
+        assert_eq!(ctx.wake.vad_threshold, VAD_THRESHOLD);
         assert_eq!(ctx.auto_start_pending, saved_auto_start);
         assert_eq!(ctx.recording, saved_recording);
 

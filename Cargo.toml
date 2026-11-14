@@ -12,8 +12,9 @@ keywords = ["ai", "agent"]
 categories = ["development-tools"]
 rust-version = "1.96"
 resolver = "2"
-# `scripts/` is a dev-only asset; never ship it to crates.io.
-exclude = [".DS_Store", "scripts"]
+# `scripts/` is a dev-only asset and `rust-toolchain.toml` names this
+# repository's own compiler; neither belongs to the package the registry builds.
+exclude = [".DS_Store", "scripts", "rust-toolchain.toml"]
 
 [features]
 # Audio dev marker: logs every wake-word score the engine's decision produced.

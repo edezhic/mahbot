@@ -1850,7 +1850,7 @@ pub(crate) fn portal_uri_to_path(uri: &str) -> Result<PathBuf, anyhow::Error> {
     };
     while i < bytes.len() {
         if bytes[i] == b'%' {
-            let hex = bytes.get(i + 1..i + 3).ok_or_else(&bad_escape)?;
+            let hex = bytes.get(i + 1..i + 3).ok_or_else(bad_escape)?;
             let hex = std::str::from_utf8(hex).map_err(|_| bad_escape())?;
             let byte = u8::from_str_radix(hex, 16).map_err(|_| bad_escape())?;
             out.push(byte);

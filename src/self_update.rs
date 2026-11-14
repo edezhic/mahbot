@@ -2849,7 +2849,8 @@ mod tests {
     /// builds it, so one contract is spelled in four files that nothing else in the tree
     /// reads — drift would otherwise be invisible. Pinned: the repository, the two URL
     /// shapes, the asset name [`asset_name`] builds against the workflow's own list of six
-    /// files, the install location all three share, and the version file's location.
+    /// files, the install location all three share, the version file's location, and the
+    /// compiler both release jobs install against the version `rust-toolchain.toml` names.
     #[test]
     fn test_the_release_contract_is_spelled_the_same_everywhere() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2937,6 +2938,39 @@ mod tests {
                 workflow.contains(&format!("\"{spelled}\"")),
                 "release.yml must publish {spelled}"
             );
+        }
+
+        // The compiler is one fact in three places: the workflow's installation points
+        // and the toolchain file every local build and diagnostic run resolves. The file
+        // is not part of the published package, so only a run from a packaged crate —
+        // what `Cargo.toml.orig` alone marks — may lack it.
+        match std::fs::read_to_string(root.join("rust-toolchain.toml")) {
+            Ok(toolchain) => {
+                let channel = toolchain
+                    .lines()
+                    .filter_map(|line| line.split_once('='))
+                    .find(|(key, _)| key.trim() == "channel")
+                    .and_then(|(_, value)| value.trim().strip_prefix('"')?.strip_suffix('"'))
+                    .expect("rust-toolchain.toml names a channel");
+                let installs: Vec<&str> = workflow
+                    .lines()
+                    .filter_map(|line| line.trim().strip_prefix("uses: dtolnay/rust-toolchain@"))
+                    .collect();
+                assert!(
+                    installs.len() >= 2,
+                    "both release jobs install the toolchain"
+                );
+                for installed in installs {
+                    assert_eq!(
+                        installed, channel,
+                        "the release legs must build with the pinned compiler"
+                    );
+                }
+            }
+            Err(error) => assert!(
+                root.join("Cargo.toml.orig").exists(),
+                "rust-toolchain.toml is part of the tree: {error}"
+            ),
         }
     }
 

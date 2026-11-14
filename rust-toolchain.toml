@@ -1,0 +1,11 @@
+# The compiler every build in this checkout uses: a local shell, the ticket
+# pipeline's diagnostics, and the release legs (`.github/workflows/release.yml`
+# installs the same version). Pinned rather than following `stable`, because
+# `turso_core` 0.8.3 stops compiling on 1.100.0 — the stabilised allocator API
+# gives `Vec` an inherent `new_in` that shadows the extension trait its
+# full-text-search feature calls through — and no stable `turso` newer than 0.8.3
+# exists. Raise this only with a `turso_core` that builds on the newer compiler,
+# never below `rust-version`.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]

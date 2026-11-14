@@ -7,7 +7,10 @@
 #![allow(
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
-    clippy::doc_markdown
+    clippy::doc_markdown,
+    // `assert!(x.is_empty())` is the clearer form; the lint's rewrite spells the
+    // empty value out as `[] as [T; 0]`.
+    clippy::assert_is_empty
 )]
 
 // One agent's work loop, tool rounds, role metadata and running-agent registry.
