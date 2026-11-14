@@ -60,7 +60,7 @@ iced_term = "0.8.0"
 # published, checksummed artifact rather than a sibling checkout's working tree.
 # Exact on purpose: a range over a pre-release also admits later releases of the
 # same series. The family it depends on rides the same release, held by Cargo.lock.
-mahbot-inference = "=0.2.18-mahbot.2"
+mahbot-inference = "=0.2.18-mahbot.3"
 # Microphone capture (`crate::audio::voice`): the platform's own host API —
 # CoreAudio, WASAPI, ALSA. The ALSA backend needs `libasound2-dev` (pkg-config
 # `alsa`) to build on Linux.
@@ -439,6 +439,8 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.mahbot-rlx-driver]
 opt-level = 3
+[profile.dev.package.mahbot-rlx-fastmath]
+opt-level = 3
 [profile.dev.package.mahbot-rlx-flow]
 opt-level = 3
 [profile.dev.package.mahbot-rlx-fusion]
@@ -451,19 +453,23 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.mahbot-rlx-ir]
 opt-level = 3
+[profile.dev.package.mahbot-rlx-libm]
+opt-level = 3
+[profile.dev.package.mahbot-rlx-linux-ref]
+opt-level = 3
 [profile.dev.package.mahbot-rlx-macros]
 opt-level = 3
 [profile.dev.package.mahbot-rlx-mlx-io]
-opt-level = 3
-[profile.dev.package.mahbot-rlx-nemo]
 opt-level = 3
 [profile.dev.package.mahbot-rlx-opt]
 opt-level = 3
 [profile.dev.package.mahbot-rlx-pkg]
 opt-level = 3
+[profile.dev.package.mahbot-rlx-pocketfft]
+opt-level = 3
 [profile.dev.package.mahbot-rlx-runtime]
 opt-level = 3
-[profile.dev.package.mahbot-rlx-torch-ckpt]
+[profile.dev.package.mahbot-rlx-search]
 opt-level = 3
 [profile.dev.package.mahbot-rlx-unfuse]
 opt-level = 3
