@@ -44,7 +44,6 @@ use std::path::{Path, PathBuf};
 use anyhow::bail;
 use serde_json::json;
 
-use crate::util::UnwrapPoison;
 use crate::util::lock::InstanceLockState;
 
 mod classify;
@@ -805,12 +804,13 @@ async fn dry_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) ->
 /// `0` when the artifacts were written and the run was not aborted at run level; `1`
 /// on a hard failure or a run-level abort (spend cap / outer deadline / auth /
 /// quota) — the partial report is still written first. `2` is not used here.
+///
+/// The run log gains one `bench [tag] stopped: …` line per endpoint that stops before its ladder
+/// ends ([`run::StopLine`]); a panicked task keeps its untagged warning and gains that line.
 // One long sequential orchestration; splitting it would obscure the step ordering.
 #[expect(clippy::too_many_lines)]
 async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -> i32 {
-    use std::sync::Mutex;
     use std::time::Duration;
-    use tokio_util::sync::CancellationToken;
 
     let preamble = match run_preamble(opts, budget).await {
         Ok(p) => p,
@@ -880,12 +880,10 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         }
     };
 
-    let ctx = std::sync::Arc::new(run::RunContext {
-        budget: run::RunBudget::new(opts.cap_usd, bundle.per_provider_guard),
-        abort: CancellationToken::new(),
-        abort_reason: Mutex::new(None),
-        deadline: run_started + Duration::from_secs(run::RUN_DEADLINE_MINS * 60),
-    });
+    let ctx = std::sync::Arc::new(run::RunContext::new(
+        run::RunBudget::new(opts.cap_usd, bundle.per_provider_guard),
+        run_started + Duration::from_secs(run::RUN_DEADLINE_MINS * 60),
+    ));
 
     let mut tasks = tokio::task::JoinSet::new();
     for (idx, &endpoint_idx) in selected.iter().enumerate() {
@@ -898,6 +896,9 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         let ladder = opts.ladder_secs.clone();
         let ctx = std::sync::Arc::clone(&ctx);
         tasks.spawn(async move {
+            // Covers the whole endpoint task — the stagger wait included — so an endpoint whose
+            // task dies without a result still says so, at the moment it dies.
+            let mut stop_line = run::StopLine::new(endpoint.tag.clone());
             let stagger =
                 Duration::from_millis(u64::try_from(200 * idx).unwrap_or(u64::MAX).min(1000));
             tokio::time::sleep(stagger).await;
@@ -911,6 +912,7 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
                 &ladder,
                 &ctx,
                 run_started,
+                &mut stop_line,
             )
             .await
         });
@@ -929,7 +931,10 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
     })
     .await;
     if join.is_err() {
-        ctx.abort(format!("outer {}-minute deadline", run::OUTER_TIMEOUT_MINS));
+        ctx.abort(
+            run::AbortCause::OuterTimeout,
+            format!("outer {}-minute deadline", run::OUTER_TIMEOUT_MINS),
+        );
         while let Some(res) = tasks.join_next().await {
             match res {
                 Ok(run) => provider_runs.push(run),
@@ -938,7 +943,7 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         }
     }
 
-    let abort_reason = ctx.abort_reason.lock().unwrap_poison().clone();
+    let abort_reason = ctx.abort_reason();
     let aborted = abort_reason.is_some();
 
     let finished_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);

@@ -40,6 +40,10 @@
 //! - **Response-cache detection**: a `hit` in `x-openrouter-cache-status` means OpenRouter
 //!   answered from its response cache without exercising the model — re-sent once after a short
 //!   delay, and marked Invalid (`"response_cache"`) if it persists.
+//! - **Stop lines**: for an endpoint whose ladder did NOT run to its end, the run log carries one
+//!   `bench [tag] stopped: <reason>` line ([`StopReason`]), written by that endpoint's own task
+//!   ([`StopLine`]) at the moment it stops. The condition is "did not complete its ladder", not
+//!   the truncation flag: a final-rung guard or cap trip is a complete ladder and gets no line.
 //!
 //! `run_provider` is driven by the full-run scheduler in [`crate::bench_openrouter`] and returns
 //! a [`ProviderRun`] carrying the tag and the derived cache-hold result.
@@ -50,13 +54,14 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 
 use crate::bench_openrouter::classify::{
     CacheClassification, cache_hold_result, classify_round, expected_cached_for_round,
     is_truncated, truncated_result, verify_pinned,
 };
 use crate::bench_openrouter::discovery::EndpointInfo;
-use crate::util::UnwrapPoison;
+use crate::util::{UnwrapPoison, print_stderr};
 
 /// Whole-run deadline (minutes). The orchestrator derives the per-provider deadline from the
 /// run start plus this constant and stores it in [`RunContext::deadline`]; the executor races
@@ -573,23 +578,153 @@ impl RunBudget {
     }
 }
 
+/// Why an endpoint's ladder stopped before its last rung.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StopReason {
+    /// A warmup round failed: the round's own error class — `transport`/`timeout` for a request
+    /// that never landed, `http_4xx`/`http_5xx`/`rate_limited`/`parse` for an HTTP or body
+    /// failure, `auth`/`quota` for a refusal. Naming the class is what keeps a transport failure
+    /// and a timeout, or a refusal and an HTTP error, from reading alike.
+    WarmupFailed(String),
+    /// This endpoint's own spend crossed the per-provider guard: its ladder stops, the run goes
+    /// on.
+    SpendGuardTripped,
+    /// The total cap was crossed: this endpoint's ladder stops and the run aborts.
+    SpendCapTripped,
+    /// [`RUN_DEADLINE_MINS`] fired.
+    RunDeadlineReached,
+    /// The run-level abort token fired — another endpoint's cap trip or refusal, or the outer
+    /// timeout. Names the cause class, never the abort's recorded reason.
+    RunAborted(AbortCause),
+    /// The endpoint's task died (a panic or a cancelled task) without a result.
+    TaskDied,
+}
+
+impl StopReason {
+    /// The stop line: the same stream and the same `bench [tag]` prefix as the per-rung lines,
+    /// with a shape of its own (`stopped: …`, never `rung …`) so a reader that counts rung lines
+    /// is unaffected.
+    #[must_use]
+    fn line(&self, tag: &str) -> String {
+        format!("bench [{tag}] stopped: {}", self.describe())
+    }
+
+    /// Plain and factual — the class of the stop, never a verdict on the endpoint.
+    #[must_use]
+    fn describe(&self) -> String {
+        match self {
+            Self::WarmupFailed(class) => format!("warmup failed ({class})"),
+            Self::SpendGuardTripped => "per-provider spend guard tripped".to_string(),
+            Self::SpendCapTripped => "total spend cap tripped".to_string(),
+            Self::RunDeadlineReached => "run deadline reached".to_string(),
+            Self::RunAborted(cause) => format!("run aborted ({})", cause.as_str()),
+            Self::TaskDied => "task died without a result".to_string(),
+        }
+    }
+}
+
+/// The class of a run-level abort — what a stop line names in place of the abort's recorded
+/// reason, which carries a dollar amount and the aborting endpoint's tag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AbortCause {
+    SpendCap,
+    AuthRefused,
+    QuotaRefused,
+    OuterTimeout,
+}
+
+impl AbortCause {
+    /// The cause of a warmup refusal, `None` for every other class: a transport, timeout, HTTP or
+    /// parse failure gates only that endpoint's ladder and never aborts the run.
+    #[must_use]
+    fn refusal(class: &str) -> Option<Self> {
+        match class {
+            "auth" => Some(Self::AuthRefused),
+            "quota" => Some(Self::QuotaRefused),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SpendCap => "total spend cap",
+            Self::AuthRefused => "auth refusal",
+            Self::QuotaRefused => "quota refusal",
+            Self::OuterTimeout => "outer timeout",
+        }
+    }
+}
+
 pub(crate) struct RunContext {
-    pub budget: RunBudget,
-    pub abort: tokio_util::sync::CancellationToken,
-    pub abort_reason: std::sync::Mutex<Option<String>>,
-    pub deadline: Instant,
+    budget: RunBudget,
+    deadline: Instant,
+    abort: CancellationToken,
+    /// The FIRST run-level abort: one record holding the cause class (for the stop lines) and the
+    /// human reason (for the report), so the two cannot disagree.
+    abort_record: std::sync::Mutex<Option<AbortRecord>>,
+}
+
+struct AbortRecord {
+    cause: AbortCause,
+    reason: String,
 }
 
 impl RunContext {
-    /// Abort the whole run: cancel the abort token (every ladder sleep races it) and record
-    /// `reason`. The first cause wins, so a provider that crosses the cap and then fails its
+    #[must_use]
+    pub(crate) fn new(budget: RunBudget, deadline: Instant) -> Self {
+        Self {
+            budget,
+            deadline,
+            abort: CancellationToken::new(),
+            abort_record: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Abort the whole run: record `cause` and `reason`, then cancel the token every ladder sleep
+    /// races. The record goes first, so a ladder that wakes on the token always reads the cause
+    /// it names; the first cause wins, so a provider that crosses the cap and then fails its
     /// warmup cannot rename the run's cause.
-    pub(crate) fn abort(&self, reason: String) {
-        self.abort.cancel();
-        self.abort_reason
+    pub(crate) fn abort(&self, cause: AbortCause, reason: String) {
+        self.abort_record
             .lock()
             .unwrap_poison()
-            .get_or_insert(reason);
+            .get_or_insert(AbortRecord { cause, reason });
+        self.abort.cancel();
+    }
+
+    #[must_use]
+    fn is_aborted(&self) -> bool {
+        self.abort.is_cancelled()
+    }
+
+    /// Resolves when the run-level abort fires.
+    async fn aborted(&self) {
+        self.abort.cancelled().await;
+    }
+
+    /// The abort's human reason, for the report — never for a stop line.
+    #[must_use]
+    pub(crate) fn abort_reason(&self) -> Option<String> {
+        self.abort_record
+            .lock()
+            .unwrap_poison()
+            .as_ref()
+            .map(|r| r.reason.clone())
+    }
+
+    /// The stop reason for a ladder cut by the run-level abort: the cause class only.
+    #[must_use]
+    fn abort_stop(&self) -> StopReason {
+        // `abort` records the cause before cancelling the token and is the only canceller.
+        let cause = self
+            .abort_record
+            .lock()
+            .unwrap_poison()
+            .as_ref()
+            .map(|r| r.cause)
+            .expect("an abort records its cause before cancelling the token");
+        StopReason::RunAborted(cause)
     }
 }
 
@@ -630,9 +765,62 @@ impl ProviderRun {
     }
 }
 
+/// Writes an endpoint's stop line when its task ends without finishing its ladder.
+///
+/// Armed pessimistically as [`StopReason::TaskDied`] and disarmed by [`Self::complete`], so one
+/// place covers every exit — a panic, a cancelled task, an early return — and the line is written
+/// by the endpoint's own task, at the moment it stops.
+pub(crate) struct StopLine {
+    tag: String,
+    reason: Option<StopReason>,
+}
+
+impl StopLine {
+    /// Arm the guard for `tag`: it writes "task died" unless [`Self::stop`] or [`Self::complete`]
+    /// settles it.
+    #[must_use]
+    pub(crate) fn new(tag: String) -> Self {
+        Self {
+            tag,
+            reason: Some(StopReason::TaskDied),
+        }
+    }
+
+    /// Record why the endpoint stopped; written when the guard drops.
+    fn stop(&mut self, reason: StopReason) {
+        self.reason = Some(reason);
+    }
+
+    /// The ladder ran to its last rung: no line.
+    fn complete(&mut self) {
+        self.reason = None;
+    }
+
+    /// The line the guard will write, `None` once the ladder completed.
+    #[must_use]
+    fn pending(&self) -> Option<String> {
+        self.reason.as_ref().map(|reason| reason.line(&self.tag))
+    }
+}
+
+impl Drop for StopLine {
+    fn drop(&mut self) {
+        if let Some(line) = self.pending() {
+            print_stderr(&line);
+        }
+    }
+}
+
+/// The one stop decision: only a ladder that did not reach its last rung reports a reason.
+#[must_use]
+fn stop_reason(completed: bool, stop: Option<StopReason>) -> Option<StopReason> {
+    stop.filter(|_| !completed)
+}
+
 /// Run one provider's warmup + TTL ladder. Never panics on provider behavior: every failure
 /// degrades to a `not measured` row (a warmup or transport failure), a truncated row (the warmup
-/// alone tripped the spend guard or cap), or a ladder-derived bucket.
+/// alone tripped the spend guard or cap), or a ladder-derived bucket. `stop_line` is settled on
+/// every path, so an early return has to name its cause.
 #[expect(
     clippy::too_many_arguments,     // the full protocol inputs; bundled would obscure the call site
     clippy::too_many_lines,         // one long sequential protocol implementation
@@ -649,6 +837,7 @@ pub(crate) async fn run_provider(
     ladder_secs: &[u64],
     context: &RunContext,
     run_started: Instant,
+    stop_line: &mut StopLine,
 ) -> ProviderRun {
     let tag = endpoint.tag.clone();
 
@@ -660,12 +849,13 @@ pub(crate) async fn run_provider(
     // other error class skips this provider's ladder without touching the run
     // token (no wasted W2 + ladder spend).
     if let Some(class) = outcome_w1.error_class.as_deref() {
-        if class == "auth" || class == "quota" {
-            context.abort(format!("warmup failed ({class}); provider '{tag}'"));
+        stop_line.stop(StopReason::WarmupFailed(class.to_string()));
+        if let Some(cause) = AbortCause::refusal(class) {
+            context.abort(cause, format!("warmup failed ({class}); provider '{tag}'"));
             tracing::debug!(tag = %tag, class, "provider aborted during warmup");
-            return ProviderRun::not_measured(tag);
+        } else {
+            tracing::debug!(tag = %tag, class, "provider failed warmup; skipping ladder");
         }
-        tracing::debug!(tag = %tag, class, "provider failed warmup; skipping ladder");
         return ProviderRun::not_measured(tag);
     }
 
@@ -700,7 +890,7 @@ pub(crate) async fn run_provider(
         + usage_from(outcome_w2.envelope.as_ref()).cost.unwrap_or(0.0);
     let (over_guard, over_cap) = context.budget.record(&tag, w_cost);
     if over_cap {
-        context.abort(context.budget.cap_exceeded_reason());
+        context.abort(AbortCause::SpendCap, context.budget.cap_exceeded_reason());
     }
 
     // W2 failure gates the ladder symmetrically with W1: auth/quota abort the whole run; any
@@ -708,8 +898,9 @@ pub(crate) async fn run_provider(
     // mis-scale every classification and burn the full ladder on likely-failing rounds). A
     // failed warmup is `not measured` whatever the budget says — its ladder never started.
     if let Some(class) = outcome_w2.error_class.as_deref() {
-        if class == "auth" || class == "quota" {
-            context.abort(format!("warmup failed ({class}); provider '{tag}'"));
+        stop_line.stop(StopReason::WarmupFailed(class.to_string()));
+        if let Some(cause) = AbortCause::refusal(class) {
+            context.abort(cause, format!("warmup failed ({class}); provider '{tag}'"));
             tracing::debug!(tag = %tag, class, "provider aborted during warmup 2");
         } else {
             tracing::debug!(tag = %tag, class, "provider failed warmup 2; skipping ladder");
@@ -720,6 +911,11 @@ pub(crate) async fn run_provider(
     // Both warmups succeeded but their cost alone tripped the budget: the ladder ends before
     // its first rung with no observed drop, so the row is truncated, not "not measured".
     if over_cap || over_guard {
+        stop_line.stop(if over_cap {
+            StopReason::SpendCapTripped
+        } else {
+            StopReason::SpendGuardTripped
+        });
         return ProviderRun::ladder_never_ran(tag);
     }
 
@@ -728,11 +924,15 @@ pub(crate) async fn run_provider(
     let mut classifications: Vec<CacheClassification> = Vec::new();
     let mut nominal_gaps: Vec<f64> = Vec::new();
     let mut round0_prompt_tokens: Option<u64> = None;
+    // Why the loop broke; `None` when it never did. Every break names its cause.
+    let mut ladder_stop: Option<StopReason> = None;
     for r in 0..rounds {
-        if context.abort.is_cancelled() {
+        if context.is_aborted() {
+            ladder_stop = Some(context.abort_stop());
             break;
         }
         if Instant::now() >= context.deadline {
+            ladder_stop = Some(StopReason::RunDeadlineReached);
             break;
         }
 
@@ -862,10 +1062,12 @@ pub(crate) async fn run_provider(
 
         let (over_guard, over_cap) = context.budget.record(&tag, round_billed);
         if over_guard {
+            ladder_stop = Some(StopReason::SpendGuardTripped);
             break;
         }
         if over_cap {
-            context.abort(context.budget.cap_exceeded_reason());
+            context.abort(AbortCause::SpendCap, context.budget.cap_exceeded_reason());
+            ladder_stop = Some(StopReason::SpendCapTripped);
             break;
         }
 
@@ -887,9 +1089,11 @@ pub(crate) async fn run_provider(
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(ladder_secs[r])) => {}
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(context.deadline)) => {
+                    ladder_stop = Some(StopReason::RunDeadlineReached);
                     break;
                 }
-                _ = context.abort.cancelled() => {
+                _ = context.aborted() => {
+                    ladder_stop = Some(context.abort_stop());
                     break;
                 }
             }
@@ -900,8 +1104,8 @@ pub(crate) async fn run_provider(
     // Derived, never tracked: every iteration that starts pushes exactly one classification, so
     // the ladder ran to its last rung iff the count matches. A guard or cap that trips on the
     // LAST rung therefore cannot mark a complete ladder truncated, and a future `break` needs no
-    // bookkeeping. The flag and the bucket's suffix then come from the one predicate, so a row
-    // can never be marked without saying so (or vice versa).
+    // bookkeeping for the flag. The flag and the bucket's suffix then come from the one predicate,
+    // so a row can never be marked without saying so (or vice versa).
     let completed = classifications.len() == rounds;
     let truncated = is_truncated(completed, &classifications);
     let cache_hold_bucket =
@@ -914,6 +1118,12 @@ pub(crate) async fn run_provider(
         truncated,
         "provider run finished"
     );
+
+    // Settled last, so the guard still says "task died" if anything above panics.
+    match stop_reason(completed, ladder_stop) {
+        Some(reason) => stop_line.stop(reason),
+        None => stop_line.complete(),
+    }
 
     ProviderRun {
         tag,
@@ -1124,21 +1334,18 @@ mod tests {
     }
 
     /// The run's cause is the first one recorded: a provider that crosses the cap and then fails
-    /// its warmup must not rename the abort.
+    /// its warmup must not rename the abort. The cause class is recorded with the reason, so the
+    /// stop line that names the class and the report that names the reason cannot disagree.
     #[test]
     fn the_first_abort_reason_wins() {
-        let ctx = RunContext {
-            budget: RunBudget::new(1.0, 0.5),
-            abort: tokio_util::sync::CancellationToken::new(),
-            abort_reason: std::sync::Mutex::new(None),
-            deadline: Instant::now(),
-        };
-        ctx.abort("spend cap exceeded".to_string());
-        ctx.abort("warmup failed (auth)".to_string());
-        assert!(ctx.abort.is_cancelled(), "an abort cancels the token");
+        let ctx = RunContext::new(RunBudget::new(1.0, 0.5), Instant::now());
+        ctx.abort(AbortCause::SpendCap, "spend cap exceeded".to_string());
+        ctx.abort(AbortCause::AuthRefused, "warmup failed (auth)".to_string());
+        assert!(ctx.is_aborted(), "an abort cancels the token");
+        assert_eq!(ctx.abort_reason().as_deref(), Some("spend cap exceeded"));
         assert_eq!(
-            ctx.abort_reason.lock().unwrap_poison().as_deref(),
-            Some("spend cap exceeded")
+            ctx.abort_stop(),
+            StopReason::RunAborted(AbortCause::SpendCap)
         );
     }
 
@@ -1154,5 +1361,174 @@ mod tests {
         let unmeasured = ProviderRun::not_measured("acme".to_string());
         assert!(!unmeasured.truncated);
         assert_eq!(unmeasured.cache_hold_bucket, "not measured");
+    }
+
+    /// The stop decision is "did not complete its ladder", never the truncation flag: a guard or
+    /// cap trip on the FINAL rung breaks the loop with a reason but the ladder ran to its end, and
+    /// a ladder cut by the deadline after an early drop is not truncated yet never finished.
+    #[test]
+    fn the_stop_decision_is_an_unfinished_ladder() {
+        // A reason alongside a complete ladder — the final-rung guard or cap trip.
+        assert_eq!(stop_reason(true, Some(StopReason::SpendGuardTripped)), None);
+        assert_eq!(stop_reason(true, Some(StopReason::SpendCapTripped)), None);
+        assert_eq!(stop_reason(true, None), None, "a finished ladder is quiet");
+        // An unfinished ladder always gets its reason back, whatever it is.
+        for (_, reason) in every_stop_reason() {
+            assert_eq!(
+                stop_reason(false, Some(reason.clone())),
+                Some(reason.clone()),
+                "an unfinished ladder reports {reason:?}"
+            );
+        }
+        // The two must not be confused. An early drop settles the bucket, so a ladder afterwards
+        // cut by the deadline is NOT truncated — and it still never finished, so it gets its line.
+        let dropped_then_cut = [CacheClassification::Drop, CacheClassification::Invalid];
+        assert!(
+            !is_truncated(false, &dropped_then_cut)
+                && stop_reason(false, Some(StopReason::RunDeadlineReached)).is_some(),
+            "an early drop cut by the deadline is not truncated, yet never finished its ladder"
+        );
+        // And a full ladder whose final rung tripped the guard is complete and quiet.
+        assert!(
+            !is_truncated(true, &[CacheClassification::Hit; 3])
+                && stop_reason(true, Some(StopReason::SpendGuardTripped)).is_none(),
+            "a final-rung guard trip on a complete ladder gets no line"
+        );
+    }
+
+    /// Every stop reason with the exact text its line must carry — the vocabulary the tests pin.
+    fn every_stop_reason() -> Vec<(&'static str, StopReason)> {
+        vec![
+            (
+                "warmup failed (transport)",
+                StopReason::WarmupFailed("transport".to_string()),
+            ),
+            (
+                "warmup failed (timeout)",
+                StopReason::WarmupFailed("timeout".to_string()),
+            ),
+            (
+                "warmup failed (auth)",
+                StopReason::WarmupFailed("auth".to_string()),
+            ),
+            (
+                "warmup failed (quota)",
+                StopReason::WarmupFailed("quota".to_string()),
+            ),
+            (
+                "warmup failed (http_5xx)",
+                StopReason::WarmupFailed("http_5xx".to_string()),
+            ),
+            (
+                "per-provider spend guard tripped",
+                StopReason::SpendGuardTripped,
+            ),
+            ("total spend cap tripped", StopReason::SpendCapTripped),
+            ("run deadline reached", StopReason::RunDeadlineReached),
+            (
+                "run aborted (total spend cap)",
+                StopReason::RunAborted(AbortCause::SpendCap),
+            ),
+            (
+                "run aborted (auth refusal)",
+                StopReason::RunAborted(AbortCause::AuthRefused),
+            ),
+            (
+                "run aborted (quota refusal)",
+                StopReason::RunAborted(AbortCause::QuotaRefused),
+            ),
+            (
+                "run aborted (outer timeout)",
+                StopReason::RunAborted(AbortCause::OuterTimeout),
+            ),
+            ("task died without a result", StopReason::TaskDied),
+        ]
+    }
+
+    /// Each stop reason's line: the per-endpoint prefix and stream of the rung lines, the class of
+    /// the stop as its own text, and nothing measured. A warmup failure names its class, so a
+    /// transport failure and a timeout (or a refusal and an HTTP error) never read alike.
+    #[test]
+    fn the_stop_line_names_the_tag_and_the_class() {
+        let tag = "acme/fp8";
+        for (text, reason) in every_stop_reason() {
+            let line = reason.line(tag);
+            assert_eq!(line, format!("bench [{tag}] stopped: {text}"));
+            assert!(!line.contains(" rung "), "not a rung line: {line}");
+        }
+    }
+
+    /// An aborted run's stop line names the cause class only: the abort's recorded reason holds a
+    /// dollar amount and the aborting endpoint's tag, and neither may reach the line.
+    #[test]
+    fn an_abort_stop_line_drops_the_dollar_amount_and_the_foreign_tag() {
+        let ctx = RunContext::new(RunBudget::new(1.0, 0.5), Instant::now());
+        ctx.abort(
+            AbortCause::SpendCap,
+            "spend cap exceeded ($1.2345 > $1.0000)".to_string(),
+        );
+        let line = ctx.abort_stop().line("acme/fp8");
+        assert_eq!(
+            line,
+            "bench [acme/fp8] stopped: run aborted (total spend cap)"
+        );
+        assert!(!line.contains('$'), "{line}");
+
+        let ctx = RunContext::new(RunBudget::new(1.0, 0.5), Instant::now());
+        ctx.abort(
+            AbortCause::AuthRefused,
+            "warmup failed (auth); provider 'other/endpoint'".to_string(),
+        );
+        let line = ctx.abort_stop().line("acme/fp8");
+        assert_eq!(line, "bench [acme/fp8] stopped: run aborted (auth refusal)");
+        assert!(!line.contains("other/endpoint"), "{line}");
+        // The report still carries the full reason.
+        assert_eq!(
+            ctx.abort_reason().as_deref(),
+            Some("warmup failed (auth); provider 'other/endpoint'")
+        );
+    }
+
+    /// Only a refusal aborts the run; every other warmup class gates that endpoint's ladder alone.
+    #[test]
+    fn only_a_refusal_aborts_the_run() {
+        assert_eq!(AbortCause::refusal("auth"), Some(AbortCause::AuthRefused));
+        assert_eq!(AbortCause::refusal("quota"), Some(AbortCause::QuotaRefused));
+        for class in [
+            "transport",
+            "timeout",
+            "http_4xx",
+            "http_5xx",
+            "rate_limited",
+            "parse",
+        ] {
+            assert_eq!(
+                AbortCause::refusal(class),
+                None,
+                "{class} gates one endpoint"
+            );
+        }
+    }
+
+    /// The guard is armed pessimistically: a task that dies (a panic, a cancellation) writes its
+    /// line, a settled stop writes the reason it recorded, and a completed ladder writes nothing.
+    #[test]
+    fn the_stop_guard_is_armed_as_a_death_until_the_ladder_settles() {
+        let armed = StopLine::new("acme/fp8".to_string());
+        assert_eq!(
+            armed.pending().as_deref(),
+            Some("bench [acme/fp8] stopped: task died without a result")
+        );
+
+        let mut stopped = StopLine::new("acme/fp8".to_string());
+        stopped.stop(StopReason::RunDeadlineReached);
+        assert_eq!(
+            stopped.pending().as_deref(),
+            Some("bench [acme/fp8] stopped: run deadline reached")
+        );
+
+        let mut completed = StopLine::new("acme/fp8".to_string());
+        completed.complete();
+        assert_eq!(completed.pending(), None, "a completed ladder is quiet");
     }
 }
