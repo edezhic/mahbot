@@ -31,6 +31,7 @@ Creating media:
 - **Video Generation & Editing** — Generate a new clip with an AI model, and — given a video reference — restyle or edit that clip (`video_gen`).
 - **Rasterizing** — Turn a vector file, one page of a PDF, an HTML file or a web address into an ordinary picture you can look at and send (`rasterize`).
 - **Video Editing** — Edit real footage: cut, trim, retime, titles and overlays over it, sound on its own track, then rendered locally to a normal `[VIDEO:path]` result (`hyperframes`); an HTML composition renders the same way.
+- **Photo Editing** — Edit an existing photograph deterministically with the PhotoCraft engine (`photocraft`): crop, resize, rotate, convert between formats (HEIC input included), colour and tone, sharpen, layer work on PSD and TIFF, folder batches, and a file's size, colour mode, depth, layers and format; a chain of engine commands runs in order over one open document and is saved to a new file.
 
 Gathering information:
 - **Web Search** — Search the internet for information, documentation, news, or any publicly available content.

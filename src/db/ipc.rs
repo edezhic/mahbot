@@ -15,8 +15,8 @@
 //! [`crate::window_requests`]).
 //!
 //! The compatibility rule is why the operation rides the old frame: an operation frame carries a
-//! magic `store` value — the generation its family declares ([`CALL_STORE`] /
-//! [`CALL_STORE_BASE`] / [`CALL_STORE_VIDEO`]), never a store name — so a product that does not
+//! magic `store` value — the generation its family declares ([`CALL_STORE`] / [`CALL_STORE_BASE`] /
+//! [`CALL_STORE_VIDEO`] / [`CALL_STORE_PHOTO`]), never a store name — so a product that does not
 //! know it parses the frame as a diagnostic query and refuses it as an unknown store: an honest
 //! "this product does not serve that here" rather than a protocol complaint. A new frame type
 //! could be parsed as something else and answered misleadingly; a superset of the old frame is the
@@ -188,9 +188,9 @@ pub(crate) struct IpcRequest {
     pub call: Option<CallRequest>,
 }
 
-/// The protocol value a family ADDED to the channel carries: a product built before the family
-/// refuses the frame as an unknown store — the environment's class, and the truth (nothing ran) —
-/// instead of answering a call it cannot carry out.
+/// The value carried by the families the channel's second generation added: a product built before
+/// them refuses the frame as an unknown store — the environment's class, and the truth (nothing
+/// ran) — instead of answering a call it cannot carry out.
 pub(crate) const CALL_STORE: &str = "cli2";
 
 /// The value every family the channel has already served carries: any product that knows the
@@ -203,8 +203,17 @@ pub(crate) const CALL_STORE_BASE: &str = "cli";
 /// whose surface CHANGED carries a value of its own for the same reason a new family does.
 pub(crate) const CALL_STORE_VIDEO: &str = "cli3";
 
+/// The value the photograph family carries, added after the channel had served that second
+/// generation: a product built before it refuses the frame as an unknown store.
+pub(crate) const CALL_STORE_PHOTO: &str = "cli4";
+
 /// Every protocol value this build serves — one per generation of the command line's surface.
-pub(crate) const CALL_STORES: &[&str] = &[CALL_STORE, CALL_STORE_BASE, CALL_STORE_VIDEO];
+pub(crate) const CALL_STORES: &[&str] = &[
+    CALL_STORE,
+    CALL_STORE_BASE,
+    CALL_STORE_VIDEO,
+    CALL_STORE_PHOTO,
+];
 
 /// The store value a second launch's frame names: not a store, and nothing is queried — the frame
 /// asks whether this copy is taking launches, and nothing of the product raises the window on a

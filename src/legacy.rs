@@ -30,8 +30,7 @@
 //!   created is a delivered picture inside the caller's `out_dir`.
 
 use crate::document::{
-    DELIVERABLE_IMAGE_EXTENSIONS, DRAWING_EXTENSIONS, DocOutcome, SkipReason, SkippedImages,
-    ensure_out_dir, write_picture,
+    DRAWING_EXTENSIONS, DocOutcome, SkipReason, SkippedImages, ensure_out_dir, write_picture,
 };
 use crate::reader_output::{
     DOC_COMMENTS, DOC_ENDNOTES, DOC_FOOTNOTES, DOC_HEADERS_FOOTERS, NO_VALUES, TEXT_BOX, Unshown,
@@ -390,7 +389,7 @@ fn write_pictures<'a>(
     for (slot, image) in images().iter().enumerate() {
         let file_name = format!("image_{}.{}", slot + 1, image.format.extension());
         let named = Path::new(&file_name);
-        if !crate::util::has_extension(named, DELIVERABLE_IMAGE_EXTENSIONS) {
+        if !crate::util::has_extension(named, crate::util::DELIVERABLE_IMAGE_EXTENSIONS) {
             if crate::util::has_extension(named, DRAWING_EXTENSIONS) {
                 unshown.add(UnshownKind::Drawing, 1);
             } else {

@@ -239,9 +239,9 @@ use crate::tools::{
     AddAutomationTool, AddCommentTool, Addressee, AnalyzeDepth, AnalyzeTool, ChromeTool,
     ComputerTool, CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool, FilesTool,
     GetTicketTool, HyperframesTool, ImageGenTool, ListAutomationsTool, ListTicketsTool,
-    MahbotConfigTool, MahbotDebugTool, RasterizeTool, ReadTool, RemoveAutomationTool,
-    ReportGapTool, SearchArchivedTicketsTool, SearchTool, SendTool, ShellMode, ShellTool,
-    SleepTool, UpdateTicketTool, VideoGenTool, WebSearchTool, WorkspaceTool,
+    MahbotConfigTool, MahbotDebugTool, PhotocraftTool, RasterizeTool, ReadTool,
+    RemoveAutomationTool, ReportGapTool, SearchArchivedTicketsTool, SearchTool, SendTool,
+    ShellMode, ShellTool, SleepTool, UpdateTicketTool, VideoGenTool, WebSearchTool, WorkspaceTool,
 };
 
 /// Tools in the admin Assistant's set that a custom role is never offered or built: the `computer`
@@ -325,6 +325,9 @@ impl Role {
             // the access.
             Box::new(DocumentTool::new(file_access)),
             Box::new(HyperframesTool::new(file_access)),
+            // PhotoCraft takes no access: it holds no boundary on a path, for the admin and a
+            // guest alike, so it is built without one.
+            Box::new(PhotocraftTool),
         ];
         // A guest's Assistant has no shell, so arranging its own files needs a tool of its own.
         if !is_admin {
@@ -980,6 +983,10 @@ mod tests {
             ("computer", admin_assistant),
             ("custom", any_assistant),
             ("document", any_assistant),
+            // PhotoCraft holds no path boundary, so its access rule is the whole gate: every
+            // Assistant — the admin's and a guest's — and no pipeline role, whose work is the ticket
+            // rather than the owner's own pictures.
+            ("photocraft", any_assistant),
             ("files", guest_assistant),
             ("report_gap", guest_assistant),
             ("sleep", assistant_or_manager),
@@ -1005,6 +1012,10 @@ mod tests {
         assert!(
             !Role::custom_role_tool_catalog().contains(&"say"),
             "a custom role must not be offered the voice"
+        );
+        assert!(
+            Role::custom_role_tool_catalog().contains(&"photocraft"),
+            "a custom role's base must hold `photocraft`"
         );
     }
 

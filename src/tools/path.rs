@@ -4,11 +4,13 @@
 //! built: the guest Assistant's workspace-only frame, the pipeline roles' read
 //! allowlist (temp files, dependency caches) and the admin Assistant's unrestricted access.
 //!
-//! Two product rules hold whatever the level: the service's own live stores are refused by
-//! location ([`StoreFile`]) for every read and every write, and a write never puts a directory
-//! where the workspace keeps its memory ([`refuse_memory_directory`]). A write is also refused
-//! inside a managed workspace, but that rule binds only the unrestricted writer
-//! ([`unrestricted_write_refusal`]).
+//! Two product rules hold for every tool that resolves or writes a path here: the service's own live
+//! stores are refused by location ([`StoreFile`]) for every read and every write, and a write never
+//! puts a directory where the workspace keeps its memory ([`refuse_memory_directory`]). A write is
+//! also refused inside a managed workspace, but that rule binds only the unrestricted writer
+//! ([`unrestricted_write_refusal`]). The photo tool resolves through
+//! [`resolve_tool_path_with_base`] alone, so none of the three applies to it: its paths are
+//! unrestricted for every caller, by an owner-approved decision.
 
 use anyhow::Context;
 use std::path::{Path, PathBuf};
@@ -23,8 +25,10 @@ pub(crate) enum PathAccess {
     /// (dependency caches, SDK headers, temp roots, spill files). Writes have no extra
     /// allowed paths, so this reads as [`Self::Workspace`] for them.
     Allowlisted,
-    /// The admin Assistant: any path the shell could name, minus the two places the
-    /// product keeps to itself (see [`StoreFile`] and [`unrestricted_write_refusal`]).
+    /// The admin Assistant: any path the shell could name, minus the two places the product keeps to
+    /// itself (see [`StoreFile`] and [`unrestricted_write_refusal`]). The photo tool names this level
+    /// for every caller but resolves through [`resolve_tool_path_with_base`] alone, so neither
+    /// refusal is applied to it.
     Unrestricted,
 }
 
@@ -1214,10 +1218,10 @@ fn is_path_safe_for_workspace(path: &str, workspace_root: &Path) -> bool {
 
 /// Resolve a user path segment against `workspace_root`.
 ///
-/// A bare `~` means the workspace root — except for the admin's Assistant, whose `~` is the
+/// A bare `~` means the workspace root — except for [`PathAccess::Unrestricted`], whose `~` is the
 /// shell's: the user's home directory, bare or with a path under it. `~user` is refused there
 /// rather than answered with `$HOME/user`, which is not the file the shell would name.
-fn resolve_tool_path_with_base(
+pub(crate) fn resolve_tool_path_with_base(
     path: &str,
     workspace_root: &Path,
     access: PathAccess,

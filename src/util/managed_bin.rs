@@ -397,6 +397,44 @@ pub(crate) enum WhenMissing {
     Skip,
 }
 
+/// How long a swap waits before its first retry at an idle copy, and the ceiling that wait doubles
+/// up to: a run may last for minutes, and a swap waiting on one must not become a poll loop of its
+/// own.
+const SWAP_RETRY: Duration = Duration::from_millis(100);
+const SWAP_RETRY_CEILING: Duration = Duration::from_secs(2);
+
+/// Take a managed copy exclusively for the rename that replaces it, waiting for the runs that hold
+/// it without getting in the way of the runs that start while it waits: tokio's `RwLock` serves a
+/// queued writer before later readers, so an install that simply awaited the write guard would
+/// hold every run issued during a refresh behind the run already going. A swap only replaces a copy
+/// nobody is reading, so it is taken by retrying. `in_use` is the caller's own lock, held shared by
+/// every run of its tool.
+pub(crate) async fn swap_when_idle(
+    in_use: &'static tokio::sync::RwLock<()>,
+) -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    let mut wait = SWAP_RETRY;
+    loop {
+        if let Ok(guard) = in_use.try_write() {
+            return guard;
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(SWAP_RETRY_CEILING);
+    }
+}
+
+/// The reason a start-time install reports when the policy hands it no release: the copy's version
+/// could not be read and the lookup that would have supplied one has just refused.
+const NO_RELEASE: &str =
+    "the installed copy's version could not be read and the newest release could not be looked up";
+
+/// The release a start-time install was handed, or the reason there is none: the policy passes
+/// `None` only when a copy whose version could not be read met a release that could not be looked
+/// up, so nothing was compared — there is no version to install and the lookup has just refused,
+/// and the reason is reported rather than asked for a second time.
+pub(crate) fn release_or_reason(release: Option<Release>) -> Result<Release, String> {
+    release.ok_or_else(|| NO_RELEASE.to_string())
+}
+
 /// Bring one of the product's own tools to the newest release. `present` reports whether the tool's
 /// own directory holds an executable copy — it decides whether anything is compared at all and,
 /// after a failure, what the host is left with. An absent (or non-executable) copy is installed
@@ -486,6 +524,25 @@ pub(crate) fn extract_single_file_tar_gz(
     Ok(path)
 }
 
+/// Extract the one member at `member`'s own path in a tar.gz — `bin/tool` under whatever top-level
+/// directory the archive wraps its tree in, beside anything else that merely shares the name — and
+/// place it at `<dir>/<its file name>`, answering that path.
+pub(crate) fn extract_member_tar_gz(
+    archive: &Path,
+    dir: &Path,
+    member: &str,
+) -> Result<PathBuf, String> {
+    let path = sole(extract_tar_gz(
+        archive,
+        dir,
+        &[member],
+        &[],
+        index_of_member,
+    )?);
+    set_executable(&path)?;
+    Ok(path)
+}
+
 /// Extract the single `file_name` binary from a zip release archive into `dir` and return its path.
 pub(crate) fn extract_single_file_zip(
     archive: &Path,
@@ -503,17 +560,30 @@ fn sole(mut paths: Vec<PathBuf>) -> PathBuf {
 }
 
 /// Extract every name in `required`, and every `optional` name the archive carries, from a tar.gz
-/// into `dir`, returning the required names' paths in that order. An entry is matched by file name
-/// at any depth but always written to `<dir>/<name>`, so a nested vendor layout still lands
-/// correctly; `Err` names the first required name that is not there as a regular file, while a
-/// missing optional name is not written. Files land as the archive carried them — a caller
-/// extracting programs beside text makes them executable itself. Failure messages name the
-/// operation and the io kind, never a path.
+/// into `dir`, returning the required names' paths in that order — [`extract_tar_gz`] with entries
+/// matched by file name at any depth.
 pub(crate) fn extract_named_files_tar_gz(
     archive: &Path,
     dir: &Path,
     required: &[&str],
     optional: &[&str],
+) -> Result<Vec<PathBuf>, String> {
+    extract_tar_gz(archive, dir, required, optional, index_of)
+}
+
+/// [`extract_named_files_tar_gz`]'s body: `matched` decides which entry a name picks, and every
+/// name is written to `<dir>/<its file name>` whatever the entry's own internal path — a nested
+/// vendor layout still lands correctly, and a member named by its archive path is flattened into
+/// `dir` rather than into a tree under it. `Err` names the first required name that is not there as
+/// a regular file, while a missing optional name is not written. Files land as the archive carried
+/// them — a caller extracting programs beside text makes them executable itself. Failure messages
+/// name the operation and the io kind, never a path.
+fn extract_tar_gz(
+    archive: &Path,
+    dir: &Path,
+    required: &[&str],
+    optional: &[&str],
+    matched: fn(&Path, &[&str]) -> Option<usize>,
 ) -> Result<Vec<PathBuf>, String> {
     let file = fs::File::open(archive)
         .map_err(|e| format!("the release archive could not be opened ({})", e.kind()))?;
@@ -538,11 +608,13 @@ pub(crate) fn extract_named_files_tar_gz(
         if !entry.header().entry_type().is_file() {
             continue;
         }
-        let Some(index) = index_of(&path, &names) else {
+        let Some(index) = matched(&path, &names) else {
             continue;
         };
         let name = names[index];
-        let out_path = dir.join(name);
+        // The entry lands at `<dir>/<its own file name>`: a member named by its archive path
+        // (`bin/tool`) is still placed at the root, never in a tree under it.
+        let out_path = dir.join(Path::new(name).file_name().unwrap_or(OsStr::new(name)));
         // `unpack` writes exactly to `out_path` (the entry's internal path is ignored).
         entry.unpack(&out_path).map_err(|e| {
             format!(
@@ -686,6 +758,14 @@ fn names_with_optional<'a>(required: &[&'a str], optional: &[&'a str]) -> Vec<&'
 fn index_of(path: &Path, names: &[&str]) -> Option<usize> {
     let file_name = path.file_name()?;
     names.iter().position(|name| file_name == OsStr::new(name))
+}
+
+/// The position in `members` an entry's own archive path ends at — the rule an archive needs when
+/// its tree is wrapped in a top-level directory and may carry a second file of the same name
+/// elsewhere, such as a completion script beside the program it completes. `bin/tool` matches
+/// `pkg/bin/tool` (and `./bin/tool`), never `share/bash-completion/completions/tool`.
+fn index_of_member(path: &Path, members: &[&str]) -> Option<usize> {
+    members.iter().position(|member| path.ends_with(member))
 }
 
 /// The required names' paths, read off the front of `extracted`, or the one sentence naming the

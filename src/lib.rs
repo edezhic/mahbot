@@ -64,6 +64,9 @@ pub mod ffmpeg;
 pub(crate) mod media;
 // HyperFrames, the HTML renderer: installed by the managed bun, run with its own browser.
 pub mod hyperframes;
+// PhotoCraft, the vendor's headless image editor: the product's managed copy and the chain
+// runner that drives it.
+pub mod photocraft;
 
 // A standalone benchmark for OpenRouter models, run outside the product.
 pub mod bench_openrouter;

@@ -2,18 +2,21 @@
 //!
 //! A family here is no second implementation: `mahbot config …`,
 //! `mahbot workspace …`, `mahbot send …` and the producing families (`document`,
-//! `image`, `video`, `rasterize`, plus the document family's own `read`) carry
+//! `image`, `video`, `rasterize`, `photocraft`, plus the document family's own `read`) carry
 //! the operation into the live instance, where the very tool an agent calls runs
 //! it — the same validation and limits, and the same immediate effect on the
 //! product (a `send` hands its message to an agent one-way). No store is opened
 //! or written here, so there is no second writer and no second copy of any rule.
 //!
 //! A producing family adds a destination — the COMMAND LINE's own operand, never
-//! a tool argument ([`FlagKind::Destination`]), refused where the product's own
-//! cleanup would later empty it ([`resolve_output_dir`]) — and takes the
-//! CALLER's paths: relative to this command's directory, `~` against home, a
-//! reference file that is missing or unreadable refused as misuse before
-//! anything is sent ([`caller_path`], [`resolve_embedded_paths`]).
+//! a tool argument ([`FlagKind::Destination`]), on the operations that write into
+//! it, and refused where the product's own cleanup would later empty it
+//! ([`resolve_output_dir`]). It is the FALLBACK for the place an operation writes
+//! into, so an operation whose own output flag ([`FlagKind::Output`]) always names
+//! where its files go declares none. A family also takes the CALLER's paths:
+//! relative to this command's directory, `~` against home, a reference file that is
+//! missing or unreadable refused as misuse before anything is sent ([`caller_path`],
+//! [`resolve_embedded_paths`]).
 //!
 //! Also here: the readiness signal and its waiter, the execution entry point
 //! ([`instance`]), the family registry, the command table ([`entry_point`]), argv
@@ -67,6 +70,9 @@ Usage:
   mahbot rasterize [flags]
                          Turn a file into an ordinary picture with the RUNNING
                          product's rasterizer
+  mahbot photocraft <operation> [flags]
+                         Edit photographs and other images with the RUNNING
+                         product's PhotoCraft engine
 
 Options:
   -h, --help             Print this help and exit
@@ -286,9 +292,14 @@ fn fold_one_generation(args: &mut serde_json::Value) {
 }
 
 /// Whether this family's operations produce FILES — derived from the flags the
-/// registry already carries rather than stated a second time: every operation of a
-/// producing family carries the destination flag ([`FlagKind::Destination`]) and no
-/// other family carries one anywhere, which is what the registry test holds.
+/// registry already carries rather than stated a second time: a producing family has
+/// the destination flag ([`FlagKind::Destination`]) on at least one operation, and no
+/// other family carries one anywhere, which is what the registry test holds. Which
+/// operation carries it is that operation's own business: the destination is the
+/// FALLBACK for the place an operation writes into, so one that writes no file of its
+/// own (`photocraft commands`) declares none, and so does one whose own flag
+/// ([`FlagKind::Output`]) always names where its files go (`photocraft batch`) —
+/// neither advertises a destination it would ignore.
 #[must_use]
 fn produces_files(family: &Family) -> bool {
     match family.surface {
@@ -341,7 +352,8 @@ pub(crate) struct Flag {
 /// kinds that say so ([`Self::has_file_form`]) — `@<file>` IS what that file
 /// holds. A kind whose value names a path also RESOLVES it (see [`caller_path`]):
 /// a `Path` its one value, a `PathList` every entry, a `Structured` every string
-/// the fields it carries name.
+/// the fields it carries name — and an `UncheckedPath` and an `Output` too, minus
+/// the proof that the path is there.
 pub(crate) enum FlagKind {
     /// One value per occurrence: `--name bob`, read as text or — like the kinds
     /// below — taken from a FILE by writing `@<file>`.
@@ -354,6 +366,13 @@ pub(crate) enum FlagKind {
     /// that is the caller's misuse, while a URL is left to the product.
     /// No `@<file>` form: the value already names the file.
     Path,
+    /// One path per occurrence that NEED NOT BE THERE YET — a destination the
+    /// operation creates (`--output new.png`), or a folder whose contents are its
+    /// input. Resolved exactly as [`Path`](Self::Path) is; only the proof is
+    /// absent, because a path that is not there yet is the ordinary case and
+    /// whether it is usable is the tool's to judge.
+    /// No `@<file>` form: the value already names the path.
+    UncheckedPath,
     /// One NUMBER per occurrence (`--duration 8`). A value that is no JSON number
     /// travels as the text it is, so the tool's own refusal — not this
     /// frontend's — is what the caller gets: whether a value is acceptable is the
@@ -385,6 +404,11 @@ pub(crate) enum FlagKind {
     /// spellable — an argument left out is the tool's own default, which is not
     /// `false` where the default is the provider's (a video's `--generate-audio`).
     Present,
+    /// The operation's OWN output flag: one path per occurrence naming where its produced files go
+    /// (`--output new.png`), resolved exactly as [`UncheckedPath`](Self::UncheckedPath) is. A call
+    /// that gives it takes the place from it, so the destination ([`Destination`](Self::Destination))
+    /// is only the fallback for a call that leaves it out.
+    Output,
     /// The destination of the files the operation produces — the command line's
     /// OWN operand, and the single flag no tool reads: the exception the whole
     /// registry turns on (see the module docs). No `@<file>` form: it names a
@@ -397,9 +421,10 @@ impl FlagKind {
     ///
     /// The kinds whose value can be long or structured — a text, a list, a
     /// structure — have it, so a caller is never capped by the command line's own
-    /// length. [`Path`](Self::Path) and [`Destination`](Self::Destination) do not:
-    /// their value names the file (or directory) itself. [`Number`](Self::Number)
-    /// and [`Present`](Self::Present) do not either: neither carries text.
+    /// length. [`Path`](Self::Path), [`UncheckedPath`](Self::UncheckedPath),
+    /// [`Output`](Self::Output) and [`Destination`](Self::Destination) do not: their
+    /// value names the file (or directory) itself. [`Number`](Self::Number) and
+    /// [`Present`](Self::Present) do not either: neither carries text.
     #[must_use]
     const fn has_file_form(&self) -> bool {
         matches!(
@@ -975,6 +1000,53 @@ pub(crate) const FAMILIES: &[Family] = &[
         purpose: "Turn a file into an ordinary picture with the running product's own rasterizer",
         surface: Surface::Standalone(&[RASTER_PATH_FLAG, RASTER_PAGE_FLAG, OUTPUT_DIR_FLAG]),
     },
+    Family {
+        word: "photocraft",
+        tool: "photocraft",
+        // A family this build added: a product built before it does not know this value, so the
+        // frame is refused as an unknown store — nothing ran — rather than answered as a failed
+        // operation by a build that serves no such tool.
+        protocol: crate::db::ipc::CALL_STORE_PHOTO,
+        purpose: "Edit an existing image with the running product's own PhotoCraft engine",
+        surface: Surface::Operations(&[
+            Operation {
+                action: Some("commands"),
+                purpose: "List the vendor commands a chain can name, optionally narrowed",
+                flags: &[PHOTOCRAFT_FILTER_FLAG],
+            },
+            Operation {
+                action: Some("inspect"),
+                purpose: "Report a document's size, colour mode, depth, layers and the format its \
+                          name gives",
+                flags: &[PHOTOCRAFT_INPUT_FLAG],
+            },
+            Operation {
+                action: Some("run"),
+                purpose: "Run a chain of vendor commands over one document — or over a new canvas \
+                          named by --canvas — into a new file",
+                flags: &[
+                    PHOTOCRAFT_INPUT_FLAG,
+                    PHOTOCRAFT_CANVAS_FLAG,
+                    PHOTOCRAFT_OUTPUT_FLAG,
+                    PHOTOCRAFT_CHAIN_FLAG,
+                    OUTPUT_DIR_FLAG,
+                ],
+            },
+            Operation {
+                action: Some("batch"),
+                purpose: "Run one chain over every document in a folder, writing the results into \
+                          the folder --output names",
+                flags: &[
+                    PHOTOCRAFT_INPUT_FLAG,
+                    PHOTOCRAFT_OUTPUT_FLAG,
+                    PHOTOCRAFT_CHAIN_FLAG,
+                    PHOTOCRAFT_FORMAT_FLAG,
+                    PHOTOCRAFT_QUALITY_FLAG,
+                    PHOTOCRAFT_TIFF_LAYERS_FLAG,
+                ],
+            },
+        ]),
+    },
 ];
 
 const RASTER_PATH_FLAG: Flag = Flag {
@@ -998,7 +1070,8 @@ const OUTPUT_DIR_FLAG: Flag = Flag {
     kind: FlagKind::Destination,
     purpose: "The directory the operation writes into — the produced file(s), or the one folder \
               they are all in; it must already exist, and it is the directory this command is run \
-              in when it is left out",
+              in when it is left out. An operation whose own flag names the output takes it from \
+              there instead",
 };
 
 /// The base name of what it produces — every document operation carries it.
@@ -1300,6 +1373,70 @@ const VIDEO_LAST_FRAME_FLAG: Flag = Flag {
               the frame-anchor form, which excludes a clip and reference pictures",
 };
 
+/// The one input most operations act on — a document, or the folder a batch processes.
+const PHOTOCRAFT_INPUT_FLAG: Flag = Flag {
+    arg: "input",
+    kind: FlagKind::UncheckedPath,
+    purpose: "The document to work on, or with a batch the folder to process",
+};
+
+/// Where a run writes its file, or the folder a batch writes into — the operation's own output, so a
+/// call that gives it takes the place from it and the destination is only the fallback.
+const PHOTOCRAFT_OUTPUT_FLAG: Flag = Flag {
+    arg: "output",
+    kind: FlagKind::Output,
+    purpose: "The file to write, which must not already exist, or with a batch the folder to \
+              write into",
+};
+
+/// The vendor command chain — one object per step, its id beside its params.
+const PHOTOCRAFT_CHAIN_FLAG: Flag = Flag {
+    arg: "chain",
+    kind: FlagKind::Structured(&[]),
+    purpose: "The commands to run, as a JSON array — one object per step with its 'command' id \
+              ('filter.sharpen.smartSharpen', 'layer.newAdjustmentLayer.curves') and its \
+              'params'; the 'commands' operation lists the registry, and '@<file>' reads the \
+              array from a file",
+};
+
+/// The new document a `run` starts from instead of opening one.
+const PHOTOCRAFT_CANVAS_FLAG: Flag = Flag {
+    arg: "canvas",
+    kind: FlagKind::Structured(&[]),
+    purpose: "Start from a new document with these JSON parameters instead of opening --input, like \
+              '{\"width\": 800, \"height\": 600}'; a fresh output for one is PNG",
+};
+
+/// The `commands` operation's narrowing text.
+const PHOTOCRAFT_FILTER_FLAG: Flag = Flag {
+    arg: "filter",
+    kind: FlagKind::Value,
+    purpose: "Text to narrow the command registry by; a narrowed answer adds each match's parameter \
+              documentation",
+};
+
+/// A batch's output extension.
+const PHOTOCRAFT_FORMAT_FLAG: Flag = Flag {
+    arg: "format",
+    kind: FlagKind::Value,
+    purpose: "The extension to write, like 'jpg' or 'png'; with no --chain it is what a folder-wide \
+              conversion writes",
+};
+
+/// A batch's encoder quality.
+const PHOTOCRAFT_QUALITY_FLAG: Flag = Flag {
+    arg: "quality",
+    kind: FlagKind::Number,
+    purpose: "The encoder quality, 1 to 100",
+};
+
+/// A batch's layered TIFF output.
+const PHOTOCRAFT_TIFF_LAYERS_FLAG: Flag = Flag {
+    arg: "tiff_layers",
+    kind: FlagKind::Present,
+    purpose: "Keep layers in TIFF output — a `format` of tif or tiff keeps them anyway",
+};
+
 /// The `user` argument of the grant actions, shared by `grant-tool` and
 /// `revoke-tool` so the two cannot describe it differently.
 const USER_FLAG: Flag = Flag {
@@ -1498,6 +1635,8 @@ fn parse_flags(
             }
             FlagKind::Value
             | FlagKind::Path
+            | FlagKind::UncheckedPath
+            | FlagKind::Output
             | FlagKind::Number
             | FlagKind::List
             | FlagKind::PathList
@@ -1557,6 +1696,9 @@ fn take_value(
         }
         FlagKind::Path => {
             args.insert(arg, serde_json::Value::String(caller_path(flag, value)?));
+        }
+        FlagKind::UncheckedPath | FlagKind::Output => {
+            args.insert(arg, serde_json::Value::String(resolved_path(value)));
         }
         FlagKind::Number => {
             args.insert(arg, number_or_text(value));
@@ -1624,32 +1766,49 @@ fn bool_switch_misuse(name: &str) -> String {
     format!("flag '--{name}' is a switch: write it bare for true, or '--{name}=false' for false")
 }
 
-/// A path a flag names, as the caller meant it and checked.
-///
-/// `~` expands against the home directory and a relative path resolves in the
-/// directory this command was run in — the product's working directory is another
-/// one, so a path sent on as written would name a different file. The reference
-/// material must be THERE, readable and a REGULAR file: the product reads it with
-/// no timeout, so a pipe with no writer or an endless device would hold the daemon
-/// forever. Missing or unreadable is misuse, judged from metadata alone before
-/// anything is sent, so the refusal cannot block; a URL is left to the product.
+/// Whether a value is no path of this command's to resolve: empty, or an http(s) address. It travels
+/// as written, and the tool says why it cannot use it.
+fn names_no_path(value: &str) -> bool {
+    value.is_empty() || crate::util::is_http_url(value)
+}
+
+/// A path a flag names, resolved the way every path this command line sends is: `~` expands against
+/// the home directory and a relative path resolves in the directory this command was run in — the
+/// product's working directory is another one, so a path sent on as written would name a different
+/// file. A value that names no path of this command's to resolve travels as written.
+fn resolved_path(value: &str) -> String {
+    if names_no_path(value) {
+        return value.to_string();
+    }
+    resolve_against_cwd(value)
+}
+
+/// [`resolved_path`]'s one resolution rule, for a value already known to name a path.
+fn resolve_against_cwd(value: &str) -> String {
+    let expanded = crate::util::expand_tilde(value);
+    if expanded.is_absolute() {
+        expanded.to_string_lossy().into_owned()
+    } else {
+        // No working directory to resolve against: the value travels as the
+        // caller wrote it, and the product says why it cannot open it.
+        std::env::current_dir().map_or_else(
+            |_| value.to_string(),
+            |here| here.join(expanded).to_string_lossy().into_owned(),
+        )
+    }
+}
+
+/// A REFERENCE path a flag names, as the caller meant it and checked: resolved
+/// like every path ([`resolve_against_cwd`]), and the reference material must be THERE,
+/// readable and a REGULAR file. The product reads it with no timeout, so a pipe
+/// with no writer or an endless device would hold the daemon forever. Missing or
+/// unreadable is misuse, judged from metadata alone before anything is sent, so
+/// the refusal cannot block; a URL is left to the product.
 fn caller_path(flag: &Flag, value: &str) -> Result<String, String> {
-    if value.is_empty() || crate::util::is_http_url(value) {
+    if names_no_path(value) {
         return Ok(value.to_string());
     }
-    let path = {
-        let expanded = crate::util::expand_tilde(value);
-        if expanded.is_absolute() {
-            expanded.to_string_lossy().into_owned()
-        } else {
-            // No working directory to resolve against: the value travels as the
-            // caller wrote it, and the product says why it cannot open it.
-            std::env::current_dir().map_or_else(
-                |_| value.to_string(),
-                |here| here.join(expanded).to_string_lossy().into_owned(),
-            )
-        }
-    };
+    let path = resolve_against_cwd(value);
     let spelling = flag_spelling(flag.arg);
     let unreadable = |spelling: &str| {
         format!("flag '--{spelling}' names a reference file that is not there or cannot be read")
@@ -1824,7 +1983,8 @@ const VALUE_FILE_HELP: &str = "\nValues:\n  A text value, a list or a structure 
      from a FILE by writing `@<file>`: a text value is the file's whole text (without one trailing \
      line break), while a list and a structure must hold JSON there. Write `./@…` for a value that \
      itself begins with `@` — the `./` is dropped and no file is read. A flag whose value names a \
-     file or a directory itself (`--path`, `--output-dir`) takes no file form.\n";
+     file or a directory itself — any path flag, `--path` and `--output-dir` among them — takes no \
+     file form.\n";
 
 /// What a producing family's help adds to the tool's own flags: where produced
 /// files go, and how the caller's paths are read — shared by every help of such a
@@ -1836,13 +1996,14 @@ fn producing_help() -> String {
     out.push_str(&flag_rows(std::iter::once(&OUTPUT_DIR_FLAG)));
     out.push_str(
         "\nThe names are this command's own: a free one is chosen so nothing already there is \
-         overwritten, and an operation producing several files puts all of them there. The \
-         product's own data directory and its temporary areas are refused, because the product's \
-         own cleanup would take a file left there.\n\nPaths:\n  Every path this command takes as a \
-         flag — the destination, a reference file, and every path a value carries, a structured \
-         value's own included — is resolved where this command runs: a relative one in the \
-         directory it was run in, and `~` against your home directory; a reference file must be \
-         there and readable.\n",
+         overwritten, and an operation producing several files puts all of them there — unless a \
+         flag of the operation names the output itself, whose own description states the rule. The \
+         destination is refused when it is the product's own data directory or one of its temporary \
+         areas, because the product's own cleanup would take a file left there.\n\nPaths:\n  Every \
+         path this command takes as a flag — the destination, a reference file, and every path a \
+         value carries, a structured value's own included — is resolved where this command runs: a \
+         relative one in the directory it was run in, and `~` against your home directory. A path \
+         that names a reference file must be there and readable.\n",
     );
     out
 }
@@ -1878,9 +2039,9 @@ fn family_help(family: &Family) -> String {
                 out.push_str(&producing_help());
             }
             out.push_str(if produces_files(family) {
-                "\nFlags:\n  The one flag every operation takes is the destination above; every \
-                 other flag belongs to the operation whose argument it names.\n\n  -h, --help  \
-                 Print this help and exit\n"
+                "\nFlags:\n  The destination above is the fallback for an operation that does not \
+                 name its own output; every other flag belongs to the operation whose argument it \
+                 names.\n\n  -h, --help  Print this help and exit\n"
             } else {
                 "\nFlags:\n  None are common to every operation: a flag belongs to the operation \
                  whose argument it names.\n\n  -h, --help  Print this help and exit\n"
@@ -1922,7 +2083,9 @@ fn flag_rows<'a>(flags: impl IntoIterator<Item = &'a Flag>) -> String {
             let mut spelling = format!("--{}", flag_spelling(flag.arg));
             match flag.kind {
                 FlagKind::Value => spelling.push_str(" <value>"),
-                FlagKind::Path => spelling.push_str(" <path>"),
+                FlagKind::Path | FlagKind::UncheckedPath | FlagKind::Output => {
+                    spelling.push_str(" <path>");
+                }
                 FlagKind::Number => spelling.push_str(" <number>"),
                 FlagKind::List => spelling.push_str(" <value> (repeatable; empty clears the list)"),
                 FlagKind::PathList => {
@@ -1971,7 +2134,11 @@ fn operation_help(family: &Family, operation: &Operation) -> String {
         family.word, word, operation.purpose
     );
     let _ = write!(out, "\nUsage: mahbot {} {} [flags]\n", family.word, word);
-    if produces_files(family) {
+    if operation
+        .flags
+        .iter()
+        .any(|flag| matches!(flag.kind, FlagKind::Destination))
+    {
         out.push_str(&producing_help());
     }
     out.push_str("\nFlags:\n");
@@ -1987,12 +2154,12 @@ fn operation_help(family: &Family, operation: &Operation) -> String {
 ///
 /// The product's answer goes to STDOUT exactly as it worded it; everything this
 /// command says on its own goes to STDERR, help to stdout, and the exit code is
-/// what a script reads ([`Exit`]). A producing family's destination is resolved
-/// HERE, before the environment is probed: it is misuse this command judges by
-/// itself, so nothing is sent.
+/// what a script reads ([`Exit`]). An operation's destination is resolved HERE —
+/// and only when that operation writes into it — before the environment is probed:
+/// it is misuse this command judges by itself, so nothing is sent.
 pub async fn run(cli: Cli, args: &[String]) -> i32 {
     let family = cli.0;
-    let mut parsed = match family.surface {
+    let (mut parsed, flags) = match family.surface {
         Surface::Operations(operations) => {
             let Some(named) = args.first().map(String::as_str) else {
                 return misuse(family, "no operation was given");
@@ -2008,7 +2175,7 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
                 return misuse(family, &format!("unknown operation '{named}'"));
             };
             match parse_flags(operation.action, named, operation.flags, &args[1..]) {
-                Ok(Tail::Call(parsed)) => parsed,
+                Ok(Tail::Call(parsed)) => (parsed, operation.flags),
                 // A `-h` where a flag could stand is this operation's help — the rule
                 // the browser-automation command follows too, turning a would-be usage
                 // error into help. Where a VALUE stands it is that value instead (see
@@ -2025,7 +2192,7 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
         // product refuses it as the missing message — a failed operation, since this
         // frontend never judges what the tool requires.
         Surface::Standalone(flags) => match parse_flags(None, family.word, flags, args) {
-            Ok(Tail::Call(parsed)) => parsed,
+            Ok(Tail::Call(parsed)) => (parsed, flags),
             Ok(Tail::Help) => {
                 crate::util::print_stdout(&family_help(family));
                 return Exit::Ok.code();
@@ -2041,15 +2208,11 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
         fold_one_generation(&mut parsed.args);
     }
 
-    // The destination, like the words: a producing family writes where the caller
-    // says, and a place it cannot write into is misuse, judged before the probe.
-    let output_dir = if produces_files(family) {
-        match resolve_output_dir(parsed.output_dir.as_deref()) {
-            Ok(dir) => Some(dir),
-            Err(reason) => return misuse(family, &reason),
-        }
-    } else {
-        None
+    // The destination, like the words: an operation that writes into it takes it from
+    // there, and a place it cannot write into is misuse, judged before the probe.
+    let output_dir = match destination(flags, &parsed) {
+        Ok(dir) => dir,
+        Err(reason) => return misuse(family, &reason),
     };
 
     // These commands act ON the running product and cannot run otherwise, so the
@@ -2134,6 +2297,24 @@ fn misuse(family: &Family, reason: &str) -> i32 {
     crate::util::print_stderr(&format!("mahbot {}: {reason}", family.word));
     crate::util::print_stderr(&format!("run 'mahbot {} -h' for usage.", family.word));
     Exit::Usage.code()
+}
+
+/// The directory this call's produced files go into, or `None` when it needs none. The destination is
+/// the FALLBACK for the place an operation writes into: it is resolved only for an operation that
+/// carries it ([`FlagKind::Destination`]), and only when the call left that operation's own output
+/// flag ([`FlagKind::Output`]) out — a call that named its output takes the place from there. So
+/// nothing is resolved, and nothing can be refused, for a directory that would never be used.
+fn destination(flags: &[Flag], parsed: &Parsed) -> Result<Option<String>, String> {
+    let names_its_own = flags
+        .iter()
+        .any(|flag| matches!(flag.kind, FlagKind::Output) && parsed.args.get(flag.arg).is_some());
+    let writes_into_it = flags
+        .iter()
+        .any(|flag| matches!(flag.kind, FlagKind::Destination));
+    if !writes_into_it || names_its_own {
+        return Ok(None);
+    }
+    resolve_output_dir(parsed.output_dir.as_deref()).map(Some)
 }
 
 /// Resolve a producing command's destination — the `--output-dir` value, or the
@@ -2785,7 +2966,9 @@ mod tests {
     fn fillable_types(kind: &FlagKind) -> &'static [&'static str] {
         match kind {
             // One string, so it fills a string argument — a path being one it resolves.
-            FlagKind::Value | FlagKind::Path => &["string"],
+            FlagKind::Value | FlagKind::Path | FlagKind::UncheckedPath | FlagKind::Output => {
+                &["string"]
+            }
             FlagKind::Number => &["integer", "number"],
             // Entries, as an array — each one a path for a path list.
             FlagKind::List | FlagKind::PathList => &["array"],
@@ -2802,6 +2985,8 @@ mod tests {
         match kind {
             FlagKind::Value => "Value",
             FlagKind::Path => "Path",
+            FlagKind::UncheckedPath => "UncheckedPath",
+            FlagKind::Output => "Output",
             FlagKind::Number => "Number",
             FlagKind::List => "List",
             FlagKind::PathList => "PathList",
@@ -2907,7 +3092,7 @@ mod tests {
     /// argument's type — swept per OPERATION, so a flag is judged against its own
     /// operation. The ONE exception is the destination ([`FlagKind::Destination`]),
     /// the command line's own operand: the one flag not looked up among the tool's
-    /// arguments, carried by every operation of a producing family and nothing else.
+    /// arguments, carried by the operations whose own output flag is optional.
     #[test]
     fn flags_stay_tied_to_the_tools_own_arguments() {
         let mut file_fields = 0usize;
@@ -2987,21 +3172,30 @@ mod tests {
                     );
                 }
             }
-            // Every operation of a producing family carries the destination, exactly one.
+            // The destination is the fallback for an operation that does not name its own output: a
+            // producing family carries at least one, and no operation carries more than one.
+            for line in &lines {
+                let carried = line
+                    .flags
+                    .iter()
+                    .filter(|flag| matches!(flag.kind, FlagKind::Destination))
+                    .count();
+                assert!(
+                    carried <= 1,
+                    "'mahbot {}' carries {carried} destination flags where at most one names the \
+                     directory the operation writes into",
+                    line.called
+                );
+            }
             if produces_files(family) {
-                for line in &lines {
-                    let carried = line
+                assert!(
+                    lines.iter().any(|line| line
                         .flags
                         .iter()
-                        .filter(|flag| matches!(flag.kind, FlagKind::Destination))
-                        .count();
-                    assert_eq!(
-                        carried, 1,
-                        "'mahbot {}' carries {carried} destination flags where a producing \
-                         family's every operation carries one",
-                        line.called
-                    );
-                }
+                        .any(|flag| matches!(flag.kind, FlagKind::Destination))),
+                    "'mahbot {}' produces files, so one of its operations carries the destination",
+                    family.word
+                );
             }
         }
         // The reverse direction has to have found every one of them, or it would hold
@@ -3103,6 +3297,16 @@ mod tests {
             vec!["video"],
             "the family whose surface changed after the channel had served it"
         );
+        let added: Vec<&str> = FAMILIES
+            .iter()
+            .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE_PHOTO)
+            .map(|cli| cli.word)
+            .collect();
+        assert_eq!(
+            added,
+            vec!["photocraft"],
+            "the family added after the channel had served its second generation"
+        );
     }
 
     /// The instance serves a tool by NAME only when a family publishes it, so the
@@ -3166,14 +3370,31 @@ mod tests {
                     );
                 }
             }
-            // A producing family states the destination in BOTH helps, from the registry.
+            // A producing family states the destination wherever it applies: the family help always,
+            // and an operation's own help exactly when that operation carries one — an operation
+            // whose own flag always names where its files go must not advertise a destination it
+            // would ignore.
             if produces_files(family) {
-                for help in &helps {
-                    assert!(
-                        help.contains("--output-dir <dir>"),
-                        "'mahbot {}' produces files without stating the destination in a help",
-                        family.word
-                    );
+                assert!(
+                    helps[0].contains("--output-dir <dir>"),
+                    "'mahbot {}' produces files without stating the destination in its help",
+                    family.word
+                );
+                if let Surface::Operations(operations) = family.surface {
+                    for (operation, help) in operations.iter().zip(&helps[1..]) {
+                        let carries = operation
+                            .flags
+                            .iter()
+                            .any(|flag| matches!(flag.kind, FlagKind::Destination));
+                        assert_eq!(
+                            help.contains("--output-dir <dir>"),
+                            carries,
+                            "'mahbot {} {}': the destination row must appear exactly when the \
+                             operation carries it",
+                            family.word,
+                            operation_word(family, operation)
+                        );
+                    }
                 }
             }
         }
@@ -3639,6 +3860,145 @@ mod tests {
         assert_eq!(p.args["file_name"], "report");
         let p = parsed("image", "gen", &["--prompt", "a cat by a window"]);
         assert_eq!(p.args["prompt"], "a cat by a window");
+    }
+
+    /// A path that need not exist yet — the photocraft family's, whose `run` output and `batch`
+    /// folders are destinations rather than references — resolves exactly where the command runs,
+    /// and demands nothing of the filesystem: the tool judges what it was handed.
+    #[test]
+    fn a_destination_path_need_not_exist_and_resolves_where_the_command_runs() {
+        let here = std::env::current_dir().expect("a working directory");
+        let relative = |name: &str| here.join(name).to_string_lossy().into_owned();
+
+        let p = parsed(
+            "photocraft",
+            "run",
+            &["--input", "Cargo.toml", "--output", "out.png"],
+        );
+        assert_eq!(p.args["output"], relative("out.png"));
+        // The input of a batch is a folder, so it takes the same unchecked resolution.
+        let p = parsed(
+            "photocraft",
+            "batch",
+            &["--input", "photos", "--output", "out", "--format", "png"],
+        );
+        assert_eq!(p.args["input"], relative("photos"));
+        assert_eq!(p.args["output"], relative("out"));
+        // An http(s) address is no path to resolve, in either kind.
+        let p = parsed(
+            "photocraft",
+            "inspect",
+            &["--input", "https://example.com/a.png"],
+        );
+        assert_eq!(p.args["input"], "https://example.com/a.png");
+        // An absolute path and `~` are resolved the same way here as everywhere.
+        let absolute = relative("plate.psd");
+        let p = parsed("photocraft", "inspect", &["--input", &absolute]);
+        assert_eq!(p.args["input"], absolute);
+        if let Ok(home) = std::env::var("HOME") {
+            let p = parsed("photocraft", "run", &["--output", "~/out.png"]);
+            assert_eq!(
+                p.args["output"],
+                std::path::Path::new(&home)
+                    .join("out.png")
+                    .to_string_lossy()
+                    .into_owned()
+            );
+        }
+    }
+
+    /// The destination is the fallback for the place an operation writes into, and it is resolved only
+    /// where it would be used: an operation that writes no file of its own carries none, one whose own
+    /// output flag always names where its files go carries none, and one whose own flag is optional
+    /// takes the place from it when it is given — so a directory this command could not write into is
+    /// no refusal for any of them.
+    #[test]
+    fn a_destination_is_resolved_only_for_the_operation_that_writes_into_it() {
+        let flags = |word: &str| -> &'static [Flag] {
+            let cli = super::family("photocraft").expect("the photocraft family");
+            let family = cli.0;
+            let Surface::Operations(operations) = family.surface else {
+                panic!("photocraft lists its operations");
+            };
+            operations
+                .iter()
+                .find(|operation| super::operation_word(family, operation) == word)
+                .expect("the operation")
+                .flags
+        };
+        // Neither of these writes a file, so no destination is resolved for them.
+        let p = parsed("photocraft", "commands", &[]);
+        assert!(
+            destination(flags("commands"), &p)
+                .expect("nothing is judged")
+                .is_none()
+        );
+        let p = parsed("photocraft", "inspect", &["--input", "Cargo.toml"]);
+        assert!(
+            destination(flags("inspect"), &p)
+                .expect("nothing is judged")
+                .is_none()
+        );
+        // A batch's own flag always names the folder it writes into, so it carries no destination.
+        let p = parsed(
+            "photocraft",
+            "batch",
+            &["--input", "src", "--output", "out", "--format", "png"],
+        );
+        assert!(
+            destination(flags("batch"), &p)
+                .expect("nothing is judged")
+                .is_none()
+        );
+        // `run` names its file itself when it is given one: the destination would never be used.
+        let p = parsed(
+            "photocraft",
+            "run",
+            &["--input", "Cargo.toml", "--output", "out.png"],
+        );
+        assert!(
+            destination(flags("run"), &p)
+                .expect("nothing is judged")
+                .is_none()
+        );
+        // Without it, a fresh file lands in the destination, which is where this command runs.
+        let p = parsed("photocraft", "run", &["--input", "Cargo.toml"]);
+        assert!(
+            destination(flags("run"), &p)
+                .expect("the working directory is the destination")
+                .is_some(),
+            "a fresh output needs a directory"
+        );
+        // A place the product keeps for itself is refused only where it would be used: with the
+        // output named by the operation's own flag, the same place is never resolved.
+        let governed = std::env::temp_dir();
+        if governed.is_dir() {
+            let named = governed.to_string_lossy().into_owned();
+            let p = parsed(
+                "photocraft",
+                "run",
+                &[
+                    "--input",
+                    "Cargo.toml",
+                    "--output",
+                    "out.png",
+                    "--output-dir",
+                    &named,
+                ],
+            );
+            assert!(
+                destination(flags("run"), &p)
+                    .expect("nothing is judged")
+                    .is_none()
+            );
+            let p = parsed(
+                "photocraft",
+                "run",
+                &["--input", "Cargo.toml", "--output-dir", &named],
+            );
+            let reason = destination(flags("run"), &p).expect_err("a governed place is refused");
+            assert!(reason.contains("temporary area"), "{reason}");
+        }
     }
 
     /// The picture family's flat flags become the one generation it asks for: the

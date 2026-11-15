@@ -30,12 +30,6 @@ const NODE_MODULES: &str = "node_modules";
 
 const RELEASE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// How long a swap waits before its first retry at an idle package, and the ceiling that wait
-/// doubles up to: a render may run for minutes, and a swap waiting on one must not become a
-/// poll loop of its own.
-const SWAP_RETRY: Duration = Duration::from_millis(100);
-const SWAP_RETRY_CEILING: Duration = Duration::from_secs(2);
-
 static INSTALLING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Held shared by every run and exclusively while an install replaces the tree, so a release
@@ -150,26 +144,10 @@ pub(super) async fn ensure_installed() -> Result<(), String> {
     install(&version).await.map(|_| ())
 }
 
-/// Take the package exclusively for the rename that replaces it, waiting for the runs that
-/// hold it without getting in the way of the runs that start while it waits: tokio's `RwLock`
-/// serves a queued writer before later readers, so an install that simply awaited the write
-/// guard would make every render issued during a refresh wait for the render already running.
-/// A swap only replaces a tree nobody is reading, so it is taken by retrying.
-async fn swap_when_idle() -> tokio::sync::RwLockWriteGuard<'static, ()> {
-    let mut wait = SWAP_RETRY;
-    loop {
-        if let Ok(guard) = IN_USE.try_write() {
-            return guard;
-        }
-        tokio::time::sleep(wait).await;
-        wait = (wait * 2).min(SWAP_RETRY_CEILING);
-    }
-}
-
 /// Install `version` with the product's own bun and answer the entry point it left.
 /// Serialized by [`INSTALLING`], and exclusive against running renders only for the rename
 /// that replaces the live tree — a download takes its own time without holding anything a
-/// render waits on ([`swap_when_idle`]).
+/// render waits on ([`managed_bin::swap_when_idle`]).
 async fn install(version: &Version) -> Result<PathBuf, String> {
     let _installing = INSTALLING.lock().await;
     // Another call may have installed this very version while this one queued.
@@ -213,7 +191,7 @@ async fn install(version: &Version) -> Result<PathBuf, String> {
     }
     // Only now is anything a run reads replaced, by the shared managed-binary swap — one
     // rename, or a rename-aside when a tree is already there.
-    let _swap = swap_when_idle().await;
+    let _swap = managed_bin::swap_when_idle(&IN_USE).await;
     managed_bin::place_staged_tree(&staged, &dir.join(NODE_MODULES))?;
     entry().ok_or_else(|| NO_ENTRY.to_string())
 }
@@ -229,16 +207,9 @@ pub(super) async fn refresh_on_start() {
         || entry().is_some(),
         start_probe,
         newest_release,
-        async |release| match release {
-            Some(release) => install(&release.version).await,
-            // The one case the policy passes `None` in: a copy whose manifest does
-            // not parse together with a registry that would not answer, so nothing
-            // was compared. There is no version to install and the registry has
-            // just refused, so the reason is reported instead of asked for twice.
-            None => Err(
-                "the copy's version is unreadable and the newest release could not be looked up"
-                    .to_string(),
-            ),
+        async |release| {
+            let release = managed_bin::release_or_reason(release)?;
+            install(&release.version).await
         },
         managed_bin::WhenMissing::Skip,
     )

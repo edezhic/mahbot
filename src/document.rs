@@ -978,16 +978,10 @@ pub(crate) enum SkipReason {
     Oversized,
 }
 
-/// Extensions of the pictures this pipeline delivers: an embedded picture of one of these
-/// formats is written through to `out_dir` verbatim. Every other format would need a
-/// transcoding the readings avoid, and a reading names it instead. Shared by the OOXML arms'
-/// media walk and the legacy arms' picture list, so the two cannot drift.
-pub(crate) const DELIVERABLE_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
-
 /// Extensions of the embedded media that are vector drawings rather than pixels: a reading
-/// names them as the drawings they are. Like [`DELIVERABLE_IMAGE_EXTENSIONS`] it is asked of a
-/// file name and shared by both readers, because both meet it — a package as a media part's
-/// name, a legacy file as a BLIP record type's.
+/// names them as the drawings they are. Like [`crate::util::DELIVERABLE_IMAGE_EXTENSIONS`] it is
+/// asked of a file name and shared by both readers, because both meet it — a package as a media
+/// part's name, a legacy file as a BLIP record type's.
 pub(crate) const DRAWING_EXTENSIONS: &[&str] = &["emf", "wmf", "svg", "pict"];
 
 /// The images already written for the document: image XObject identities plus the form

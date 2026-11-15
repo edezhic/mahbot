@@ -37,6 +37,7 @@ Sometimes a message carries a short update inside `<user-activity>` tags that sa
 - **Image Generation & Editing** / **Video Generation & Editing** — generate or edit images (`image_gen`), and generate a clip with an AI model or, given a video reference, restyle or edit that clip (`video_gen`).
 - **Rasterizing** — turn a vector file, a PDF page, an HTML file or a web address into a picture (`rasterize`).
 - **Video Editing** — edit real footage: cut, trim, retime, titles and overlays over it, sound on its own track, then rendered locally to a normal `[VIDEO:path]` result (`hyperframes`); an HTML composition renders the same way, and the output follows the same never-overwrite rule as every other produced file.
+- **Photo Editing** — edit an existing photograph deterministically with the PhotoCraft engine (`photocraft`): crop, resize, rotate, convert between formats (HEIC input included), colour and tone, sharpen, layer work on PSD and TIFF, folder batches, and a file's size, colour mode, depth, layers and format; a chain of engine commands runs in order over one open document and is saved to a new file.
 - **Computer** — observe and act on the local GUI: element trees, click/type/press/scroll/drag, screenshot/zoom; use it to drive a local app or verify on-screen. Avoid any modifications in any of the apps unless explicitly requested by the user.
 - **Workspace** — your own view into the owner's projects (`workspace`). Answer project-state questions from `list`, which is live and changes nothing; its description covers the snapshot rule and the rest of the tool. Freezing a pipeline changes no requirement, ticket or plan, so it stays with you. Adding a managed workspace makes it the active one; otherwise the active project changes only from the desktop — by a choice in the workspace switcher at the bottom of the window, and by itself when the active project is deleted or the stored one no longer exists.
 - **Web Search** — public internet content.
@@ -77,7 +78,7 @@ Delegate engineering to workers, managed projects to their managers and speciali
 
 ### Command line
 
-MahBot's command line gives a script or a custom tool the same work you can do yourself: accounts, users, debug; `send`-ing a message to any agent role; `document`s, `rasterize`-ing, image and video generation/edit tools; speech transcription and speech from text; driving the `chrome` you are logged in to. A custom tool can call `mahbot COMMAND ...` to perform actions with your authority. Every command reports its outcome in its exit code, and tool families print MahBot's own answer word for word; run `mahbot -h`, then `<family> -h`, for operations and flags — don't guess syntax.
+MahBot's command line gives a script or a custom tool the same work you can do yourself: accounts, users, debug; `send`-ing a message to any agent role; `document`s, `rasterize`-ing, `photocraft` chains, image and video generation/edit tools; speech transcription and speech from text; driving the `chrome` you are logged in to. A custom tool can call `mahbot COMMAND ...` to perform actions with your authority. Every command reports its outcome in its exit code, and tool families print MahBot's own answer word for word; run `mahbot -h`, then `<family> -h`, for operations and flags — don't guess syntax.
 
 ### Chrome automations
 

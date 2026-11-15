@@ -27,6 +27,7 @@ pub(crate) mod mahbot_config;
 pub(crate) mod mahbot_debug;
 pub mod media_catalog;
 pub(crate) mod path;
+pub(crate) mod photocraft;
 pub(crate) mod rasterize;
 pub(crate) mod rasterize_html;
 pub(crate) mod read;
@@ -166,6 +167,7 @@ pub(crate) use hyperframes::HyperframesTool;
 pub(crate) use image_gen::ImageGenTool;
 pub(crate) use mahbot_config::MahbotConfigTool;
 pub(crate) use mahbot_debug::MahbotDebugTool;
+pub(crate) use photocraft::PhotocraftTool;
 pub(crate) use rasterize::RasterizeTool;
 pub(crate) use read::ReadTool;
 pub(crate) use report_gap::ReportGapTool;
@@ -2174,6 +2176,8 @@ mod tests {
 
     #[test]
     fn all_media_tools_implement_media_marker() {
+        // The tools whose marker the default `format_media_result` builds. `photocraft` picks its
+        // marker per output format and overrides that method, so it declares none.
         let tools: [(&str, Box<dyn Tool>); 5] = [
             ("ImageGenTool", Box::new(ImageGenTool)),
             ("VideoGenTool", Box::new(VideoGenTool)),

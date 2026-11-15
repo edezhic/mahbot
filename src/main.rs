@@ -413,6 +413,12 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::ffmpeg::install_on_start().await;
     });
 
+    // The vendor's newest release, installed on first use and refreshed at start; a failure is
+    // recorded and retried, never removing a working copy.
+    spawn_cancellable(&mut tasks, &shutdown_token, "photocraft-install", async {
+        mahbot::photocraft::install_on_start().await;
+    });
+
     // Installed from the npm registry on first use and brought to the newest release at start.
     // A failure is recorded and retried, never removing a working copy.
     spawn_cancellable(&mut tasks, &shutdown_token, "hyperframes-refresh", async {

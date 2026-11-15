@@ -1209,6 +1209,15 @@ pub(crate) const AUDIO_EXTENSIONS: &[&str] = &[
 /// codecs — plus heic/heif, passed to the provider unmangled (never locally decoded).
 pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic", "heif"];
 
+/// Extensions of the pictures the product DELIVERS as pictures: a produced file of one of these
+/// formats travels to the user as one, and an embedded picture of one is written through to the
+/// document reader's output verbatim. Every other format would need a transcoding the readings
+/// avoid, and a reading names it instead. Asked of a produced picture's own name by every tool that
+/// delivers one — the photo tool's marker among them — and of an embedded picture's name by the
+/// document readers, so the set cannot drift. [`IMAGE_EXTENSIONS`] is the wider set of what can be
+/// read.
+pub(crate) const DELIVERABLE_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+
 /// The product-level cap on one file wherever the product bounds one: the composer's attach limit,
 /// the read tool's document-container cap and the document tool's input cap. Not a transfer limit.
 pub(crate) const FILE_MAX_BYTES: u64 = 50 * 1024 * 1024;
@@ -1241,11 +1250,20 @@ pub(crate) fn telegram_staging_dir_name(chat_id: &str, message_id: i64) -> Strin
     format!("msg_{chat_id}_{message_id}")
 }
 
+/// A path's extension in the one form every format decision compares: lowercased, and `None` when
+/// the name carries none — a trailing dot included, which [`std::path::Path::extension`] reports as
+/// an empty one.
 #[must_use]
-pub(crate) fn has_extension(path: &std::path::Path, table: &[&str]) -> bool {
+pub(crate) fn extension_of(path: &std::path::Path) -> Option<String> {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| table.contains(&ext.to_ascii_lowercase().as_str()))
+        .map(str::to_ascii_lowercase)
+        .filter(|ext| !ext.is_empty())
+}
+
+#[must_use]
+pub(crate) fn has_extension(path: &std::path::Path, table: &[&str]) -> bool {
+    extension_of(path).is_some_and(|ext| table.contains(&ext.as_str()))
 }
 
 #[must_use]

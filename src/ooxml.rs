@@ -14,8 +14,7 @@
 
 use crate::docgen::ppt_marks;
 use crate::document::{
-    DELIVERABLE_IMAGE_EXTENSIONS, DRAWING_EXTENSIONS, DocOutcome, SkipReason, SkippedImages,
-    ensure_out_dir, write_picture,
+    DRAWING_EXTENSIONS, DocOutcome, SkipReason, SkippedImages, ensure_out_dir, write_picture,
 };
 use crate::reader_output::{
     Unshown, UnshownKind, slide_comments_header, slide_header, slide_notes_header, text_block,
@@ -1031,7 +1030,10 @@ fn write_media_parts<R: Read + Seek>(
         // Only the entry's file name is used: a crafted `../..` entry must
         // never escape `out_dir`.
         let file_name = crate::util::neutralized_name(crate::util::file_name_or_path(&entry));
-        if !crate::util::has_extension(Path::new(&file_name), DELIVERABLE_IMAGE_EXTENSIONS) {
+        if !crate::util::has_extension(
+            Path::new(&file_name),
+            crate::util::DELIVERABLE_IMAGE_EXTENSIONS,
+        ) {
             match package_media(&file_name) {
                 PackageMedia::Image => skipped.add(SkipReason::Unsupported),
                 PackageMedia::Unshown(kind) => unshown.add(kind, 1),
