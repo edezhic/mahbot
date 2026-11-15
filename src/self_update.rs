@@ -2974,12 +2974,14 @@ mod tests {
         }
     }
 
-    /// The changelog's filter as it ships — the awk program read out of the workflow — keeps
-    /// every subject except version bumps, blank titles and `[maint] ` commits; the samples
-    /// are built from the same label tokens the commit path writes.
+    /// The changelog step as it ships — the awk program read out of the workflow — groups the
+    /// subjects it keeps into `Features:` and `Fixes:`, drops the pipeline's leading marker from
+    /// each bullet, and keeps every subject otherwise: only version bumps, blank titles and
+    /// `[maint] ` commits are left out. The samples are built from the same label tokens the
+    /// commit path writes.
     #[cfg(unix)]
     #[test]
-    fn test_the_changelog_skips_maint_commits() {
+    fn test_the_changelog_groups_features_and_fixes() {
         use crate::pipeline::board::TicketLabel;
         use std::io::Write as _;
 
@@ -2994,35 +2996,77 @@ mod tests {
             .map(|(program, _)| program)
             .expect("the changelog step holds its awk program");
 
+        let run = |subjects: &[String]| -> String {
+            let mut child = std::process::Command::new("awk")
+                .arg(program)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("awk runs on unix hosts");
+            child
+                .stdin
+                .take()
+                .expect("stdin is piped")
+                .write_all(subjects.join("\n").as_bytes())
+                .expect("write the subjects");
+            let output = child.wait_with_output().expect("the filter runs");
+            assert!(output.status.success(), "awk rejected the workflow program");
+            String::from_utf8(output.stdout).expect("utf-8 output")
+        };
+
         let label = |label: TicketLabel, title: &str| format!("{}{title}", label.commit_prefix());
-        let subjects = [
+        let feat = |title: &str| label(TicketLabel::Feat, title);
+        let fix = |title: &str| label(TicketLabel::Fix, title);
+        let maint = |title: &str| label(TicketLabel::Maint, title);
+
+        // A mixed range: maintenance work and the version bump are gone, the pipeline's markers
+        // are gone from the bullets, a bracket inside a title survives, and an unmarked or
+        // differently-cased title is ordinary text under `Fixes:`.
+        let mixed = [
             "Bump version to 1.2.3".to_string(),
-            label(TicketLabel::Maint, "Remove the dead helper"),
-            label(TicketLabel::Feat, "Add the real fix"),
+            maint("Remove the dead helper"),
+            feat("Add the real fix"),
             String::new(),
             "Document the [maint] prefix".to_string(),
-            label(TicketLabel::Maint, "Rename the helper"),
-            label(TicketLabel::Fix, "Fix the second bug"),
+            maint("Rename the helper"),
+            fix("Fix the second bug"),
+            "[Feat] A capitalised marker is text".to_string(),
         ];
-        let mut child = std::process::Command::new("awk")
-            .arg(program)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("awk runs on unix hosts");
-        child
-            .stdin
-            .take()
-            .expect("stdin is piped")
-            .write_all(subjects.join("\n").as_bytes())
-            .expect("write the subjects");
-        let output = child.wait_with_output().expect("the filter runs");
-        assert!(output.status.success(), "awk rejected the workflow program");
-        assert_eq!(
-            String::from_utf8(output.stdout).expect("utf-8 output"),
-            "### Changelog\n\n* [feat] Add the real fix\n* Document the [maint] prefix\n\
-             * [fix] Fix the second bug\n",
-        );
+        // One section alone leaves the other out entirely, and an unmarked title is never
+        // dropped: it is not a claimed feature, so it sits under `Fixes:`.
+        let features_only = [feat("First feature"), feat("Second feature")];
+        let fixes_only = [fix("First fix"), "A hand-written title".to_string()];
+        let unmarked_only = ["A hand-written title".to_string()];
+        let nothing = [
+            "Bump version to 1.2.3".to_string(),
+            maint("Tidy up"),
+            String::new(),
+        ];
+
+        let cases: [(&[String], &str); 5] = [
+            (
+                &mixed,
+                "### Changelog\n\nFeatures:\n* Add the real fix\n\nFixes:\n\
+                 * Document the [maint] prefix\n* Fix the second bug\n\
+                 * [Feat] A capitalised marker is text\n",
+            ),
+            (
+                &features_only,
+                "### Changelog\n\nFeatures:\n* First feature\n* Second feature\n",
+            ),
+            (
+                &fixes_only,
+                "### Changelog\n\nFixes:\n* First fix\n* A hand-written title\n",
+            ),
+            (
+                &unmarked_only,
+                "### Changelog\n\nFixes:\n* A hand-written title\n",
+            ),
+            (&nothing, ""),
+        ];
+        for (subjects, expected) in cases {
+            assert_eq!(run(subjects), expected, "subjects {subjects:?}");
+        }
     }
 
     /// The floors are one fact told by machinery that must agree: the install command, the

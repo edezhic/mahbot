@@ -41,14 +41,18 @@
 #                such file
 #   licences:    LICENSE-MIT and LICENSE-APACHE, beside every release
 #
-# Every release also carries a body: a `### Changelog` heading over the titles of the
-# commits made since the last ordinary release, oldest first, one bullet per commit,
-# with the machine's own version bumps and the maintenance (`[maint] `) commits left
-# out. A release with no title to list has
-# an empty body, heading and all. That same text is published as `changelog.txt` when
-# it is not empty, and an empty asset is never uploaded: GitHub refuses one, and the
-# product reads an absent file exactly like an empty list. Everything the updater
-# needs is therefore reachable by URL alone.
+# Every release also carries a body: a `### Changelog` heading, then a `Features:`
+# section and a `Fixes:` section over the titles of the commits made since the last
+# ordinary release, oldest first and one bullet per commit inside its section, with
+# the machine's own version bumps and the maintenance (`[maint] `) commits left out.
+# A bullet is the title as written, with the pipeline's leading `[feat] `/`[fix] `
+# marker dropped; an entry carrying no marker is not a claimed feature and is listed
+# under `Fixes:`, so no entry is dropped. A section with nothing in it is left out,
+# and a release with no title to list has an empty body, heading and all. That same
+# text is published as `changelog.txt` when it is not empty, and an empty asset is
+# never uploaded: GitHub refuses one, and the product reads an absent file exactly
+# like an empty list. Everything the updater needs is therefore reachable by URL
+# alone.
 #
 # Nothing becomes visible before all six files have arrived, and then all of it
 # does at once: the files go onto a draft first and the draft is flipped visible in
@@ -287,10 +291,11 @@ jobs:
           done
           [ "$missing" -eq 0 ]
 
-      # What the release says changed: a `### Changelog` heading over every commit
-      # title since the last ordinary release, oldest first, one bullet per commit.
-      # Built before the draft is touched, so a failure here leaves an existing draft
-      # of this mark exactly as it was.
+      # What the release says changed: a `### Changelog` heading, then `Features:` and
+      # `Fixes:` sections over the commit titles since the last ordinary release,
+      # oldest first and one bullet per commit within its section. Built before the
+      # draft is touched, so a failure here leaves an existing draft of this mark
+      # exactly as it was.
       - name: Build the changelog
         run: |
           set -euo pipefail
@@ -311,22 +316,41 @@ jobs:
           )"
 
           # The machine's own version bumps are what the release does, not what it
-          # says changed, and `[maint] ` commits are code tidying rather than
-          # product changes (that prefix is written by the sanitation commit path
-          # from the ticket's label); every other title is kept exactly as it is
-          # written — a pipeline commit already leads with its `[feat] `/`[fix] `
-          # label — and becomes one bullet. A commit with no title at all (`NF`
-          # zero) becomes no bullet, so the list cannot pick up a blank entry.
-          # `%s` is the title folded onto a single line, so a title written over
-          # several lines is still one bullet here. With nothing kept the file
-          # stays empty: the heading belongs to the list, not to the release.
+          # says changed, and `[maint] ` commits are code tidying rather than product
+          # changes (that prefix is written by the sanitation commit path from the
+          # ticket's label); every other title is kept and becomes one bullet. The
+          # pipeline writes `[feat] ` or `[fix] ` at the front of a title, and that
+          # exact lowercase marker is dropped from the bullet so it reads as written —
+          # a bracket anywhere else in a title, or a marker of another case or
+          # spacing, is part of the text and stays. A feature is a title explicitly
+          # marked as one, so an unmarked title (a hand-made commit, or one from
+          # before the markers existed) is listed under `Fixes:` and never dropped. A
+          # commit with no title at all (`NF` zero) becomes no bullet, so the list
+          # cannot pick up a blank entry. `%s` is the title folded onto a single line,
+          # so a title written over several lines is still one bullet here. A section
+          # with nothing in it is left out, and with nothing kept the file stays
+          # empty: the heading belongs to the list, not to the release. The program
+          # stays within what any POSIX awk runs, because the release runner's own
+          # awk is the one that executes it.
           git log --reverse --pretty=format:%s "$base..$TAG" \
-            | awk '!/^Bump version to / && !/^\[maint\] / && NF { item[kept++] = "* " $0 }
-                   END {
-                     if (kept == 0) exit
-                     print "### Changelog\n"
-                     for (i = 0; i < kept; i++) print item[i]
-                   }' > "$RUNNER_TEMP/changelog.txt"
+            | awk '
+                /^Bump version to / || /^\[maint\] / || !NF { next }
+                /^\[feat\] / { sub(/^\[feat\] /, ""); feat[n_feat++] = "* " $0; next }
+                /^\[fix\] / { sub(/^\[fix\] /, ""); fix[n_fix++] = "* " $0; next }
+                { fix[n_fix++] = "* " $0 }
+                END {
+                  if (n_feat + n_fix == 0) exit
+                  print "### Changelog\n"
+                  if (n_feat) {
+                    print "Features:"
+                    for (i = 0; i < n_feat; i++) print feat[i]
+                  }
+                  if (n_fix) {
+                    if (n_feat) print ""
+                    print "Fixes:"
+                    for (i = 0; i < n_fix; i++) print fix[i]
+                  }
+                }' > "$RUNNER_TEMP/changelog.txt"
 
       - name: Prepare the draft
         run: |
