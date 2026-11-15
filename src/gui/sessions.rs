@@ -130,6 +130,9 @@ struct CachedSessionItem {
     msg_count_label: Option<String>,
     /// Pre-formatted compact token count (the Running Agents format).
     token_label: Option<String>,
+    /// Last activity — the value the time column shows and the list orders by. A synthesised row
+    /// (a run that has not stored its first message) carries the run's start.
+    last_activity: chrono::DateTime<chrono::Utc>,
     timestamp_label: String,
     activity: SessionActivity,
 }
@@ -197,14 +200,15 @@ fn custom_role_title(name: &str, identifier: Option<&str>) -> String {
 
 /// The session list's rows, in display order.
 ///
-/// A working agent's session is pinned to the top for as long as it runs (ordered by run start, so
-/// the block stays still) and settles into its last-activity place once it stops: a run in progress
-/// must never be lost below the fold, and the list is not re-sorted mid-run. A paused (frozen)
-/// agent is not working, so its row keeps its normal place.
+/// A working agent's session is pinned into a leading block for as long as it runs, so a run in
+/// progress is never lost below the fold; the block boundary is deliberate, so a pinned row with
+/// older activity still sits above a fresher idle row. Both blocks are ordered by last activity,
+/// freshest first — the value each row's time column shows — with the agent id breaking ties. A
+/// paused (frozen) agent is not working, so its row keeps its idle place.
 ///
 /// A registered agent whose first message is not stored yet gets a synthesised row from what the
-/// registry knows. Rows are keyed by `agent_id`, so it is replaced by the stored one as soon as the
-/// first message lands.
+/// registry knows, ordered by the run's start: the time that row displays. Rows are keyed by
+/// `agent_id`, so it is replaced by the stored one as soon as the first message lands.
 fn session_rows(
     sessions: &[SessionMetadata],
     agents: &[crate::agent::registry::AgentHandle],
@@ -214,7 +218,7 @@ fn session_rows(
         .iter()
         .map(|handle| (handle.agent_id.as_str(), handle))
         .collect();
-    let mut rows: Vec<ListRow> = Vec::with_capacity(sessions.len() + agents.len());
+    let mut rows: Vec<CachedSessionItem> = Vec::with_capacity(sessions.len() + agents.len());
     for session in sessions {
         let handle = live.remove(session.agent_id.as_str());
         let activity = session_activity(handle);
@@ -224,27 +228,21 @@ fn session_rows(
             .filter(|n| !n.is_empty())
             .or_else(|| session.workspace_name.as_deref().filter(|n| !n.is_empty()))
             .unwrap_or("");
-        rows.push(ListRow {
-            pinned_at: pinned_at(handle, activity),
+        rows.push(CachedSessionItem {
+            agent_id: session.agent_id.clone(),
+            role: session
+                .role
+                .as_deref()
+                .and_then(|r| r.parse::<crate::Role>().ok()),
+            title: crate::util::truncate(name, CARD_TITLE_MAX_CHARS),
+            workspace_name: session.workspace_name.clone().filter(|n| !n.is_empty()),
+            custom_role: session.custom_role.clone(),
+            custom_identifier: session.custom_identifier.clone(),
+            msg_count_label: Some(format!("{} msgs", session.message_count)),
+            token_label: session.token_length.map(theme::format_compact_tokens),
             last_activity: session.last_activity,
-            row: CachedSessionItem {
-                agent_id: session.agent_id.clone(),
-                role: session
-                    .role
-                    .as_deref()
-                    .and_then(|r| r.parse::<crate::Role>().ok()),
-                title: crate::util::truncate(name, CARD_TITLE_MAX_CHARS),
-                workspace_name: session.workspace_name.clone().filter(|n| !n.is_empty()),
-                custom_role: session.custom_role.clone(),
-                custom_identifier: session.custom_identifier.clone(),
-                msg_count_label: Some(format!("{} msgs", session.message_count)),
-                token_label: session.token_length.map(theme::format_compact_tokens),
-                timestamp_label: theme::format_relative_time(
-                    &session.last_activity.to_rfc3339(),
-                    now,
-                ),
-                activity,
-            },
+            timestamp_label: theme::format_relative_time(&session.last_activity.to_rfc3339(), now),
+            activity,
         });
     }
     for handle in live.into_values() {
@@ -254,42 +252,29 @@ fn session_rows(
             .as_deref()
             .and_then(crate::users::personal_user_name)
             .unwrap_or(handle.workspace_name.as_str());
-        rows.push(ListRow {
-            pinned_at: pinned_at(Some(handle), activity),
+        rows.push(CachedSessionItem {
+            agent_id: handle.agent_id.clone(),
+            role: handle.role.parse::<crate::Role>().ok(),
+            title: crate::util::truncate(title, CARD_TITLE_MAX_CHARS),
+            workspace_name,
+            custom_role: None,
+            custom_identifier: None,
+            msg_count_label: None,
+            token_label: None,
             last_activity: handle.started_at,
-            row: CachedSessionItem {
-                agent_id: handle.agent_id.clone(),
-                role: handle.role.parse::<crate::Role>().ok(),
-                title: crate::util::truncate(title, CARD_TITLE_MAX_CHARS),
-                workspace_name,
-                custom_role: None,
-                custom_identifier: None,
-                msg_count_label: None,
-                token_label: None,
-                timestamp_label: theme::format_relative_time(&handle.started_at.to_rfc3339(), now),
-                activity,
-            },
+            timestamp_label: theme::format_relative_time(&handle.started_at.to_rfc3339(), now),
+            activity,
         });
     }
-    // A running row sorts by the run's start; the rest keep last-activity order (a
-    // synthesised row's start stands in for activity).
-    rows.sort_by(|a, b| match (a.pinned_at, b.pinned_at) {
-        (Some(x), Some(y)) => x.cmp(&y).then_with(|| a.row.agent_id.cmp(&b.row.agent_id)),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => b
-            .last_activity
-            .cmp(&a.last_activity)
-            .then_with(|| a.row.agent_id.cmp(&b.row.agent_id)),
+    // Descending on both keys: pinned rows first, then freshest activity first.
+    let pinned = |row: &CachedSessionItem| row.activity == SessionActivity::Working;
+    rows.sort_by(|a, b| {
+        pinned(b)
+            .cmp(&pinned(a))
+            .then_with(|| b.last_activity.cmp(&a.last_activity))
+            .then_with(|| a.agent_id.cmp(&b.agent_id))
     });
-    rows.into_iter().map(|ListRow { row, .. }| row).collect()
-}
-
-struct ListRow {
-    row: CachedSessionItem,
-    /// Start of the run the row is pinned for; `None` when it keeps its last-activity place.
-    pinned_at: Option<chrono::DateTime<chrono::Utc>>,
-    last_activity: chrono::DateTime<chrono::Utc>,
+    rows
 }
 
 fn session_activity(handle: Option<&crate::agent::registry::AgentHandle>) -> SessionActivity {
@@ -298,16 +283,6 @@ fn session_activity(handle: Option<&crate::agent::registry::AgentHandle>) -> Ses
         Some(_) => SessionActivity::Working,
         None => SessionActivity::Idle,
     }
-}
-
-/// The pin key of a row: the start of the run it is pinned for, `None` when it is not pinned.
-fn pinned_at(
-    handle: Option<&crate::agent::registry::AgentHandle>,
-    activity: SessionActivity,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    handle
-        .filter(|_| activity == SessionActivity::Working)
-        .map(|handle| handle.started_at)
 }
 
 /// The root a transcript's relative `[FILE:…]` markers resolve against: the conversation's
@@ -1446,6 +1421,185 @@ mod tests {
         }
     }
 
+    fn agent(
+        agent_id: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::agent::registry::AgentHandle {
+        crate::agent::registry::AgentHandle {
+            agent_id: agent_id.to_string(),
+            role: "engineer".to_string(),
+            ticket_id: None,
+            workspace_path: "/ws/ws".to_string(),
+            workspace_name: "ws".to_string(),
+            parent_key: None,
+            parent_label: None,
+            started_at,
+            generation: 0,
+            activity: None,
+            paused: false,
+        }
+    }
+
+    fn ordered_ids(rows: &[CachedSessionItem]) -> Vec<&str> {
+        rows.iter().map(|row| row.agent_id.as_str()).collect()
+    }
+
+    /// A fixture clock: `ago` is minutes before the test's "now", and `rows` renders the list with
+    /// the local form of that same instant, which the time labels are formatted against.
+    struct Clock(chrono::DateTime<chrono::Utc>);
+
+    impl Clock {
+        fn new() -> Self {
+            Self(chrono::Utc::now())
+        }
+
+        fn local(&self) -> chrono::DateTime<chrono::Local> {
+            self.0.into()
+        }
+
+        fn ago(&self, minutes: i64) -> chrono::DateTime<chrono::Utc> {
+            self.0 - chrono::Duration::minutes(minutes)
+        }
+
+        fn rows(
+            &self,
+            sessions: &[SessionMetadata],
+            agents: &[crate::agent::registry::AgentHandle],
+        ) -> Vec<CachedSessionItem> {
+            session_rows(sessions, agents, self.local())
+        }
+    }
+
+    #[test]
+    fn running_sessions_are_ordered_by_last_activity_above_the_idle_ones() {
+        let clock = Clock::new();
+        // Three running sessions whose run starts and last activities disagree row by row, so
+        // run-start order and activity order cannot coincide.
+        let sessions = [
+            metadata("idle-fresh", clock.ago(0)),
+            metadata("idle-old", clock.ago(30)),
+            metadata("alpha", clock.ago(3)),
+            metadata("bravo", clock.ago(1)),
+            metadata("charlie", clock.ago(2)),
+        ];
+        let agents = [
+            agent("alpha", clock.ago(1)),
+            agent("bravo", clock.ago(2)),
+            agent("charlie", clock.ago(3)),
+        ];
+        let rows = clock.rows(&sessions, &agents);
+
+        assert_eq!(
+            ordered_ids(&rows),
+            ["bravo", "charlie", "alpha", "idle-fresh", "idle-old"]
+        );
+        let activities: Vec<SessionActivity> = rows.iter().map(|row| row.activity).collect();
+        assert_eq!(
+            activities,
+            [
+                SessionActivity::Working,
+                SessionActivity::Working,
+                SessionActivity::Working,
+                SessionActivity::Idle,
+                SessionActivity::Idle
+            ]
+        );
+        // The block boundary is the accepted shape: a pinned row with older activity still sits
+        // above a fresher idle row.
+        assert!(rows[2].last_activity < rows[3].last_activity);
+        for row in &rows {
+            assert_eq!(
+                row.timestamp_label,
+                theme::format_relative_time(&row.last_activity.to_rfc3339(), clock.local()),
+                "{}: a row orders by the value it shows",
+                row.agent_id
+            );
+        }
+    }
+
+    #[test]
+    fn a_running_agent_without_a_stored_session_is_ordered_by_the_time_it_shows() {
+        let clock = Clock::new();
+        let sessions = [
+            metadata("stored-fresh", clock.ago(2)),
+            metadata("stored-stale", clock.ago(20)),
+        ];
+        let agents = [
+            agent("stored-fresh", clock.ago(5)),
+            agent("live", clock.ago(10)),
+            agent("stored-stale", clock.ago(30)),
+        ];
+        let rows = clock.rows(&sessions, &agents);
+
+        assert_eq!(
+            ordered_ids(&rows),
+            ["stored-fresh", "live", "stored-stale"],
+            "activity leads, not the run start"
+        );
+        let live = rows.iter().find(|row| row.agent_id == "live").unwrap();
+        assert_eq!(live.last_activity, clock.ago(10));
+        assert_eq!(
+            live.timestamp_label,
+            theme::format_relative_time(&clock.ago(10).to_rfc3339(), clock.local()),
+            "the synthesised row shows the value it orders by"
+        );
+    }
+
+    #[test]
+    fn a_paused_agent_keeps_its_last_activity_place() {
+        let clock = Clock::new();
+        let sessions = [
+            metadata("paused-stored", clock.ago(10)),
+            metadata("idle", clock.ago(0)),
+        ];
+        // A paused run with a stored session, and one the registry alone knows about.
+        let mut stored = agent("paused-stored", clock.ago(0));
+        stored.paused = true;
+        let mut live = agent("paused-live", clock.ago(4));
+        live.paused = true;
+        let rows = clock.rows(&sessions, &[stored, live]);
+
+        assert_eq!(ordered_ids(&rows), ["idle", "paused-live", "paused-stored"]);
+        let activities: Vec<SessionActivity> = rows.iter().map(|row| row.activity).collect();
+        assert_eq!(
+            activities,
+            [
+                SessionActivity::Idle,
+                SessionActivity::Paused,
+                SessionActivity::Paused
+            ]
+        );
+    }
+
+    #[test]
+    fn equal_activity_breaks_on_agent_id_in_both_blocks() {
+        let clock = Clock::new();
+        let same = clock.ago(5);
+        // Every row shares one last activity. `c`/`d` run over stored rows; `y`/`z` are runs with
+        // no stored row yet, so they are gathered from the registry's unordered map.
+        let sessions = [
+            metadata("b", same),
+            metadata("a", same),
+            metadata("d", same),
+            metadata("c", same),
+        ];
+        let agents = [
+            agent("d", clock.ago(0)),
+            agent("c", clock.ago(0)),
+            agent("z", same),
+            agent("y", same),
+        ];
+        let rows = clock.rows(&sessions, &agents);
+
+        assert_eq!(ordered_ids(&rows), ["c", "d", "y", "z", "a", "b"]);
+        let again = clock.rows(&sessions, &agents);
+        assert_eq!(
+            ordered_ids(&rows),
+            ordered_ids(&again),
+            "an unchanged state renders in an unchanged order"
+        );
+    }
+
     #[test]
     fn a_bodyless_assistant_row_is_skipped_but_labelled_roles_keep_it() {
         let expanded = HashSet::new();
@@ -1594,6 +1748,7 @@ mod tests {
             custom_identifier: None,
             msg_count_label: None,
             token_label: None,
+            last_activity: chrono::Utc::now(),
             timestamp_label: String::new(),
             activity: SessionActivity::Idle,
         }
