@@ -16,10 +16,13 @@
 //!    `FreeVariant` > `ContextTooSmall`/`ContextUnknown` > `Status(raw)`.
 //! 4. Healthy set H is filtered by cost outlier: est > 3×median is dropped (`Outlier`) unless
 //!    dropping would leave fewer than 3 — then the cheapest dropped outliers are re-admitted.
-//! 5. Target count `n = max(3, ceil(0.8 × H.len()))`; the cheapest n of the filtered pool are
-//!    selected. When `H.len() < 3` all of H is selected and padded with the cheapest excluded
-//!    candidates to exactly 3 (`Padding`). When an allowlist restricts to exactly 1–2 endpoints
-//!    those are benchmarked as-is and NO padding happens.
+//! 5. Target count `n = min(20, max(3, ceil(0.8 × H.len())))` — the [`MAX_SELECTED_ENDPOINTS`]
+//!    ceiling caps a large pool (48 healthy → 20, not 39). An explicit provider allowlist is
+//!    exempt from the ceiling (a thirty-entry allowlist selects twenty-four). The cheapest n of
+//!    the filtered pool are selected. When `H.len() < 3` all of H is selected and padded with
+//!    the cheapest excluded candidates to exactly 3 (`Padding`). When an allowlist restricts to
+//!    exactly 1–2 endpoints those are benchmarked as-is and NO padding happens. The per-provider
+//!    spend guard `cap × 2 / max(1, selected)` follows the selection.
 //! 6. `ceil(0.8H) <= H` for H >= 3 makes "never more than the healthy count" automatic.
 //! 7. The plan builder orders selected providers by est cost ascending.
 
@@ -27,18 +30,55 @@ use std::fmt;
 
 use super::discovery::{EndpointInfo, Pricing, parse_price};
 
-/// Fraction of total tokens served from the prompt cache (validated mix).
-pub(crate) const VALIDATED_MIX_CACHED: f64 = 0.977;
+/// Fraction of total tokens served from the prompt cache (98/1/1 usage mix).
+pub(crate) const USAGE_MIX_CACHED: f64 = 0.98;
 /// Fraction of total tokens billed as uncached prompt input.
-pub(crate) const VALIDATED_MIX_INPUT: f64 = 0.014;
+pub(crate) const USAGE_MIX_INPUT: f64 = 0.01;
 /// Fraction of total tokens billed as completion output.
-pub(crate) const VALIDATED_MIX_OUTPUT: f64 = 0.009;
+pub(crate) const USAGE_MIX_OUTPUT: f64 = 0.01;
+
+/// Hard ceiling on the number of endpoints one run benchmarks. Most discovered endpoints are
+/// therefore never attempted, which is what the report's per-row `selected` flag disambiguates:
+/// "never selected" and "selected but failed" both read `not measured`. An explicit provider
+/// allowlist is exempt.
+pub(crate) const MAX_SELECTED_ENDPOINTS: usize = 20;
+
+/// Blended per-token price for one provider: `cached_share×cache_read + input_share×prompt +
+/// output_share×completion`. The ONE place the usage blend is computed: [`estimate_cost`] applies
+/// it to a token volume, and [`usage_mix_json`] publishes the same constants, so the artifact can
+/// never disagree with the math.
+#[must_use]
+pub(crate) fn blended_price_per_token(cache_read: f64, prompt: f64, completion: f64) -> f64 {
+    USAGE_MIX_CACHED * cache_read + USAGE_MIX_INPUT * prompt + USAGE_MIX_OUTPUT * completion
+}
+
+/// The usage mix as a self-describing JSON object, taken from the same constants the cost math
+/// uses.
+#[must_use]
+pub(crate) fn usage_mix_json() -> serde_json::Value {
+    serde_json::json!({
+        "cached": USAGE_MIX_CACHED,
+        "input": USAGE_MIX_INPUT,
+        "output": USAGE_MIX_OUTPUT,
+    })
+}
+
+/// The input price a cached prompt token is billed at — the advertised cache-read price, or the
+/// full prompt price where none is advertised — and whether that fallback stood in. The ONE place
+/// the rule is decided: [`estimate_cost`] flags the fallback, the report's static price does not.
+#[must_use]
+pub(crate) fn cache_read_price(pricing: &Pricing, prompt: f64) -> (f64, bool) {
+    match pricing.input_cache_read.as_deref().and_then(parse_price) {
+        Some(cache_read) => (cache_read, false),
+        None => (prompt, true),
+    }
+}
 
 /// Blended per-provider cost estimate for a whole benchmark run: the blended price is
-/// `cached_share×cache_read + input_share×prompt + output_share×completion`, with per-request
-/// fees added once per request. A provider advertising no `input_cache_read` price is billed at
-/// the full prompt price and says so in `flags`. Missing price fields contribute 0; market-level
-/// reductions are already in the listed prices.
+/// [`blended_price_per_token`], with per-request fees added once per request. A provider
+/// advertising no `input_cache_read` price is billed at the full prompt price and says so in
+/// `flags`. Missing price fields contribute 0. No discount factor is applied anywhere — the
+/// listed prices are already net of any advertised discount.
 #[must_use]
 // usize→f64 is exact for request counts far below 2^53; cost math needs floats.
 #[expect(clippy::cast_precision_loss)]
@@ -48,14 +88,12 @@ pub(crate) fn estimate_cost(
     requests: usize,
     flags: &mut Vec<String>,
 ) -> f64 {
-    let cache_read = if let Some(p) = price.input_cache_read.as_deref().and_then(parse_price) {
-        p
-    } else {
+    let prompt = price.prompt.as_deref().and_then(parse_price).unwrap_or(0.0);
+    let (cache_read, fallback) = cache_read_price(price, prompt);
+    if fallback {
         flags
             .push("no cache-read price advertised; estimate assumes full prompt price".to_string());
-        price.prompt.as_deref().and_then(parse_price).unwrap_or(0.0)
-    };
-    let prompt = price.prompt.as_deref().and_then(parse_price).unwrap_or(0.0);
+    }
     let completion = price
         .completion
         .as_deref()
@@ -67,9 +105,7 @@ pub(crate) fn estimate_cost(
         .and_then(parse_price)
         .unwrap_or(0.0);
 
-    let blended = VALIDATED_MIX_CACHED * cache_read
-        + VALIDATED_MIX_INPUT * prompt
-        + VALIDATED_MIX_OUTPUT * completion;
+    let blended = blended_price_per_token(cache_read, prompt, completion);
     blended * total_tokens + request * requests as f64
 }
 
@@ -185,7 +221,10 @@ fn classify_endpoint(
 }
 
 /// Select benchmark providers per the selection rules (see module docs): one
-/// [`SelectionDecision`] per input, in parallel.
+/// [`SelectionDecision`] per input, in parallel. `allowlist` restricts the candidate pool to the
+/// tags it names, so an allowlist naming no tag selects nothing; an empty `--providers` never
+/// reaches here as `Some` ([`BenchOptions::parse`] turns it into `None`), which is what keeps it
+/// from switching the ceiling off.
 #[must_use]
 pub(crate) fn select_providers(
     input: &[SelectionInput],
@@ -250,8 +289,8 @@ pub(crate) fn select_providers(
         }
     }
 
-    // Rule 5: target n = max(3, ceil(0.8 × H.len())); cheapest n of the pool.
-    let n = selection_target(healthy.len());
+    // Rule 5: the cheapest n of the filtered pool.
+    let n = selection_target(healthy.len(), allowlist.is_none());
     for &idx in pool.iter().take(n) {
         decisions[idx] = SelectionDecision {
             selected: true,
@@ -282,13 +321,12 @@ pub(crate) fn select_providers(
 /// `input`, so candidates carry their input index.
 fn candidate_indices(input: &[SelectionInput], allowlist: Option<&[String]>) -> Vec<usize> {
     match allowlist {
-        Some(wl) if !wl.is_empty() => input
+        Some(tags) => input
             .iter()
             .enumerate()
-            .filter(|(_, i)| wl.iter().any(|t| t == &i.endpoint.tag))
+            .filter(|(_, i)| tags.contains(&i.endpoint.tag))
             .map(|(idx, _)| idx)
             .collect(),
-        Some(_) => Vec::new(),
         None => (0..input.len()).collect(),
     }
 }
@@ -341,28 +379,38 @@ fn pad_to_three(
 }
 
 /// Target selection count: `max(3, ceil(0.8 × healthy))`, never more than the healthy count for
-/// H >= 3. H == 0 → 0 is special-cased separately.
+/// H >= 3. `cap_applies` clamps it to [`MAX_SELECTED_ENDPOINTS`] — an explicit provider allowlist
+/// turns the clamp off, so the user's list decides. H == 0 → 0 is special-cased separately.
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
-fn selection_target(healthy_count: usize) -> usize {
-    (3usize).max((healthy_count as f64 * 0.8).ceil() as usize)
+fn selection_target(healthy_count: usize, cap_applies: bool) -> usize {
+    let n = (3usize).max((healthy_count as f64 * 0.8).ceil() as usize);
+    if cap_applies {
+        n.min(MAX_SELECTED_ENDPOINTS)
+    } else {
+        n
+    }
 }
 
-/// Effective selection target: 0 when nothing is healthy, the allowlist size for a short (1-2
-/// entry) allowlist, else the count rule.
+/// Effective selection target: 0 when nothing is healthy, the match count for a short (1-2
+/// matched) allowlist, else the count rule — clamped to [`MAX_SELECTED_ENDPOINTS`] only when no
+/// allowlist was given (`allowlist_matches.is_none()`), matching [`select_providers`].
 #[must_use]
 pub(crate) fn effective_target_count(
     healthy_count: usize,
     allowlist_matches: Option<usize>,
 ) -> usize {
-    match (healthy_count, allowlist_matches) {
-        (0, _) => 0,
-        (_, Some(m)) if m > 0 && m <= 2 => m,
-        _ => selection_target(healthy_count),
+    match allowlist_matches {
+        // A 1-2 match allowlist is benchmarked as-is, healthy or not, so the count rule (and its
+        // zero-healthy arm) does not apply to it.
+        Some(m) if m > 0 && m <= 2 => m,
+        _ if healthy_count == 0 => 0,
+        None => selection_target(healthy_count, true),
+        Some(_) => selection_target(healthy_count, false),
     }
 }
 
@@ -450,7 +498,7 @@ mod tests {
         assert!(!is_free_variant(""));
     }
 
-    /// The estimate blends the validated mix and adds the per-request fee; a provider with no
+    /// The estimate blends the 98/1/1 usage mix and adds the per-request fee; a provider with no
     /// advertised cache-read price is billed at the full prompt price and flags it.
     #[test]
     fn estimate_cost_cases() {
@@ -464,7 +512,7 @@ mod tests {
         let est = estimate_cost(&priced, 1000.0, 4, &mut flags);
         assert!(flags.is_empty(), "cache-read price present → no flag");
         let expected =
-            (0.977 * 0.000_000_2 + 0.014 * 0.000_002 + 0.009 * 0.000_008) * 1000.0 + 0.0005 * 4.0;
+            (0.98 * 0.000_000_2 + 0.01 * 0.000_002 + 0.01 * 0.000_008) * 1000.0 + 0.0005 * 4.0;
         assert!((est - expected).abs() < 1e-12);
 
         let unpriced_cache = Pricing {
@@ -478,8 +526,30 @@ mod tests {
         assert_eq!(flags.len(), 1);
         assert!(flags[0].contains("no cache-read price advertised"));
         // All cached tokens billed at the full prompt price.
-        let expected = (0.977 + 0.014) * 0.000_002 * 1000.0 + 0.009 * 0.000_008 * 1000.0;
+        let expected = (0.98 + 0.01) * 0.000_002 * 1000.0 + 0.01 * 0.000_008 * 1000.0;
         assert!((est - expected).abs() < 1e-12);
+    }
+
+    /// The 98/1/1 mix at scale: one billion tokens with the three prices, no per-request fee.
+    /// The artifact's usage-mix object carries the same three constants.
+    #[test]
+    fn estimate_cost_uses_the_98_1_1_mix() {
+        let priced = Pricing {
+            prompt: Some("0.000001".to_string()),
+            completion: Some("0.000002".to_string()),
+            request: Some("0".to_string()),
+            input_cache_read: Some("0.0000001".to_string()),
+        };
+        let mut flags = Vec::new();
+        let est = estimate_cost(&priced, 1e9, 0, &mut flags);
+        assert!(flags.is_empty());
+        let expected = 1e9 * (0.98 * 1e-7 + 0.01 * 1e-6 + 0.01 * 2e-6);
+        assert!((est - expected).abs() < 1e-9, "est {est} vs {expected}");
+
+        let mix = usage_mix_json();
+        assert_eq!(mix["cached"], 0.98);
+        assert_eq!(mix["input"], 0.01);
+        assert_eq!(mix["output"], 0.01);
     }
 
     /// The gate and cost rules through `select_providers`: an outlier is dropped while the rest are
@@ -491,7 +561,8 @@ mod tests {
             inputs: Vec<SelectionInput>,
             /// Index → the reason recorded for it.
             reasons: &'static [(usize, Option<ExclusionReason>)],
-            selected: usize,
+            /// The indices the case must select, in order.
+            selected: &'static [usize],
         }
         let mut outlier_inputs = Vec::new();
         for i in 0..8 {
@@ -504,7 +575,7 @@ mod tests {
                 inputs: outlier_inputs,
                 // target = max(3, ceil(0.8×8)) = 7; the outlier (>3×median) is dropped.
                 reasons: &[(7, Some(ExclusionReason::Outlier(100.0)))],
-                selected: 7,
+                selected: &[0, 1, 2, 3, 4, 5, 6],
             },
             Case {
                 name: "padded to three",
@@ -514,7 +585,7 @@ mod tests {
                     input(ep("bad", 200_000, "-10"), 3.0),
                 ],
                 reasons: &[(2, Some(ExclusionReason::Padding))],
-                selected: 3,
+                selected: &[0, 1, 2],
             },
             Case {
                 name: "context excluded",
@@ -531,17 +602,18 @@ mod tests {
                     (0, Some(ExclusionReason::ContextTooSmall(32_000))),
                     (1, Some(ExclusionReason::ContextUnknown)),
                 ],
-                selected: 4,
+                selected: &[2, 3, 4, 5],
             },
         ];
         for case in &cases {
             let decisions = select_providers(&case.inputs, 128_000, None);
-            assert_eq!(
-                decisions.iter().filter(|d| d.selected).count(),
-                case.selected,
-                "case {}: selected count",
-                case.name
-            );
+            let selected: Vec<usize> = decisions
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.selected)
+                .map(|(idx, _)| idx)
+                .collect();
+            assert_eq!(selected, case.selected, "case {}: selected", case.name);
             for &(index, ref expected) in case.reasons {
                 assert_eq!(
                     decisions[index].reason, *expected,
@@ -552,18 +624,20 @@ mod tests {
         }
     }
 
-    /// The target count and the allowlist that overrides it: nothing healthy means nothing
-    /// selected, otherwise `max(3, ceil(0.8 × healthy))` — except that a 1–2 entry allowlist is
-    /// benchmarked as-is, while a 0-match allowlist falls back to the count rule.
+    /// `effective_target_count`'s three arms — zero healthy, the 1–2 entry allowlist measured
+    /// as-is, and the count rule (capped without an allowlist) — plus the allowlist through
+    /// `select_providers`.
     #[test]
     fn allowlist_and_target_count() {
         assert_eq!(effective_target_count(0, None), 0);
-        assert_eq!(effective_target_count(0, Some(2)), 0);
+        // The 1-2 entry allowlist is measured regardless of health, so its target is its size.
+        assert_eq!(effective_target_count(0, Some(2)), 2);
         assert_eq!(effective_target_count(5, None), 4);
         assert_eq!(effective_target_count(20, None), 16);
+        assert_eq!(effective_target_count(48, None), 20);
+        assert_eq!(effective_target_count(30, Some(30)), 24);
         assert_eq!(effective_target_count(1, Some(2)), 2);
         assert_eq!(effective_target_count(10, Some(1)), 1);
-        assert_eq!(effective_target_count(10, Some(0)), 8);
 
         let mut inputs = Vec::new();
         for i in 0..4 {
@@ -579,6 +653,44 @@ mod tests {
         let decisions = select_providers(&inputs, 128_000, Some(&wl));
         assert_eq!(decisions.iter().filter(|d| d.selected).count(), 1);
         assert!(decisions[0].selected);
+    }
+
+    /// The twenty-endpoint ceiling: a large healthy pool is clamped, a small one is not, and an
+    /// explicit allowlist keeps its own count.
+    #[test]
+    fn selection_ceiling_caps_the_pool() {
+        let healthy_pool = |n: usize| -> Vec<SelectionInput> {
+            (0..n)
+                .map(|i| {
+                    let cost = u32::try_from(i).expect("test pool fits u32") + 1;
+                    input(ep(&format!("p{i}"), 200_000, "0"), f64::from(cost))
+                })
+                .collect()
+        };
+        let selected = |inputs: &[SelectionInput], allowlist: Option<&[String]>| {
+            select_providers(inputs, 128_000, allowlist)
+                .iter()
+                .filter(|d| d.selected)
+                .count()
+        };
+
+        // 48 healthy → 0.8×48 = 39 clamped to 20.
+        assert_eq!(selected(&healthy_pool(48), None), MAX_SELECTED_ENDPOINTS);
+        // 30 healthy → 24 clamped to 20.
+        assert_eq!(selected(&healthy_pool(30), None), 20);
+        // 25 healthy → exactly 20.
+        assert_eq!(selected(&healthy_pool(25), None), 20);
+        // 5 healthy → 4, no cap in play.
+        assert_eq!(selected(&healthy_pool(5), None), 4);
+        // An allowlist that names no tag matches nothing. `--providers ""` never reaches the
+        // selection as `Some` (parse turns it into `None`), so it cannot exempt a run from the
+        // ceiling either.
+        assert_eq!(selected(&healthy_pool(48), Some(&[])), 0);
+
+        // A thirty-entry allowlist of healthy endpoints keeps the count rule: 0.8×30 = 24.
+        let pool = healthy_pool(30);
+        let allowlist: Vec<String> = (0..30).map(|i| format!("p{i}")).collect();
+        assert_eq!(selected(&pool, Some(&allowlist)), 24);
     }
 
     /// The planned spend: the estimate sums every selected provider (padded ones included) and

@@ -3,9 +3,13 @@
 //! Each ladder round compares the provider's reported cached tokens against what a full cache
 //! hold would produce ([`expected_cached_for_round`]) and buckets the result
 //! ([`classify_round`]); the per-round classifications collapse into one cache-TTL bucket
-//! ([`ttl_bucket`] + [`format_bucket`]). [`cache_hold_result`] turns the raw observations and
-//! the ladder classifications into the report's three-outcome vocabulary ("does not cache" /
-//! TTL bucket / "not measured").
+//! ([`ttl_bucket`] + [`format_bucket`]) and, through [`cache_hold_result`], into the report's
+//! outcome vocabulary: "does not cache", a TTL bucket, "not measured", or one of
+//! [`truncated_result`]'s two truncation forms. When a row counts as truncated is
+//! [`is_truncated`]'s rule; the formatter that spells it is [`truncated_result`]'s.
+//!
+//! [`format_duration`] is the single duration formatter — the summary's ladder line and the
+//! bucket labels call it, so `3600` can never read `60m` in one place and `1h` in the other.
 //!
 //! Pure math — no I/O.
 
@@ -57,6 +61,15 @@ pub(crate) fn classify_round(cached: u64, expected_cached: u64) -> CacheClassifi
     } else {
         CacheClassification::Partial
     }
+}
+
+/// True for the classifications that establish a cache hold: a round that observed the expected
+/// cached prefix, wholly or partly.
+const fn holds(class: CacheClassification) -> bool {
+    matches!(
+        class,
+        CacheClassification::Hit | CacheClassification::Partial
+    )
 }
 
 /// Collapse the per-round classifications into one TTL bucket string.
@@ -115,7 +128,7 @@ fn ttl_bucket(classifications: &[CacheClassification], nominal_gaps_secs: &[f64]
         }
         // Walk back from k−1 to the nearest round that established a hold.
         for (j, (c, _)) in ladder.iter().enumerate().take(k).rev() {
-            if matches!(c, CacheClassification::Hit | CacheClassification::Partial) {
+            if holds(*c) {
                 return format_bucket(ladder[j].1, ladder[k].1);
             }
         }
@@ -126,7 +139,7 @@ fn ttl_bucket(classifications: &[CacheClassification], nominal_gaps_secs: &[f64]
     // No Drop: walk back to the LAST round that established a hold; trailing
     // Invalid/NotSupported rounds were unmeasured and must not inflate the bucket.
     for (j, (c, _)) in ladder.iter().enumerate().rev() {
-        if matches!(c, CacheClassification::Hit | CacheClassification::Partial) {
+        if holds(*c) {
             return format_bucket(ladder[j].1, f64::INFINITY);
         }
     }
@@ -134,15 +147,69 @@ fn ttl_bucket(classifications: &[CacheClassification], nominal_gaps_secs: &[f64]
     "not measured".to_string()
 }
 
+/// True iff the ladder ended before its last rung without an observed drop — the only case where
+/// the answer could still have changed. [`crate::bench_openrouter::run::run_provider`] sets the
+/// report row's truncation flag from this same predicate, so the flag and the suffix cannot
+/// disagree.
+#[must_use]
+pub(crate) fn is_truncated(
+    ladder_completed: bool,
+    classifications: &[CacheClassification],
+) -> bool {
+    !ladder_completed && !classifications.contains(&CacheClassification::Drop)
+}
+
+/// Suffix marking a row whose ladder was cut short before its last rung (deadline, run abort,
+/// per-provider spend guard or cap). Appended by [`truncated_result`] and nowhere else; the
+/// report must not re-derive it.
+const LADDER_TRUNCATION_SUFFIX: &str = " (ladder truncated)";
+
+/// The truncation form of a ladder that ended before its last rung without an observed drop:
+/// `≥{gap}` for the highest rung at which cached tokens were still observed, `not measured` when
+/// no rung observed any — a cut-short ladder can never claim `"does not cache"`, which is a
+/// statement about the whole ladder. The 0 s probe is a rung like any other, so a hold seen only
+/// there reads `≥0s`.
+///
+/// Takes only the two arrays it reads, so a caller whose ladder never ran (both empty) needs no
+/// invented observations.
+#[must_use]
+pub(crate) fn truncated_result(
+    classifications: &[CacheClassification],
+    nominal_gaps_secs: &[f64],
+) -> String {
+    // The highest holding rung, not the last one: a custom ladder need not be sorted.
+    let held_gap = classifications
+        .iter()
+        .zip(nominal_gaps_secs)
+        .filter(|(class, _)| holds(**class))
+        .map(|(_, gap)| *gap)
+        .max_by(f64::total_cmp);
+    held_gap.map_or_else(
+        || format!("not measured{LADDER_TRUNCATION_SUFFIX}"),
+        |gap| format!("≥{}{LADDER_TRUNCATION_SUFFIX}", format_duration(gap)),
+    )
+}
+
 /// The cache-hold result for a provider: `"not measured"` when no ladder round ran or none
 /// measured anything, `"does not cache"` when no round ever reported non-zero cached tokens,
 /// otherwise the TTL bucket derived from the ladder.
+///
+/// `ladder_completed == false` means the ladder was cut short (deadline, run abort, per-provider
+/// spend guard or cap). Such a row is truncated unless a [`CacheClassification::Drop`] was
+/// observed — a drop settles the bucket, so it is reported as-is; the truncation forms are
+/// [`truncated_result`]'s.
 #[must_use]
 pub(crate) fn cache_hold_result(
     any_cached_observation: bool,
     classifications: &[CacheClassification],
     nominal_gaps_secs: &[f64],
+    ladder_completed: bool,
 ) -> String {
+    // Truncated rows report only what the run actually saw. An observed drop is not truncated:
+    // the walk-back already brackets the TTL from both sides.
+    if is_truncated(ladder_completed, classifications) {
+        return truncated_result(classifications, nominal_gaps_secs);
+    }
     if classifications.is_empty() {
         return "not measured".to_string();
     }
@@ -193,10 +260,13 @@ fn format_bucket(lo: f64, hi: f64) -> String {
 }
 
 /// Human duration: `0s`, `{s}s` (<60s), `{m}m` (<3600s), `{h}h` (else), all rounded.
+///
+/// The one duration formatter for the bench: bucket labels and the summary's ladder line both
+/// go through it, so `3600` is `1h` in both places.
 #[must_use]
 // Inputs are non-negative gap seconds; round-then-truncate is the intent.
 #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn format_duration(secs: f64) -> String {
+pub(crate) fn format_duration(secs: f64) -> String {
     if secs == 0.0 {
         "0s".to_string()
     } else if secs < 60.0 {
@@ -250,7 +320,8 @@ mod tests {
     fn ttl_bucket_derivation() {
         use CacheClassification as C;
         // Ladder-only arrays; the first entry is the gap-0 probe.
-        // 1. Drop at index 2; the nearest prior Hit is at gap 5 → (5s, 30s].
+        // 1. Drop at index 2; the nearest prior Hit is at gap 5 → (5s, 30s]. The trailing Hit
+        //    was still walked and does not move the settled bucket.
         let classes = [C::Hit, C::Hit, C::Drop, C::Hit];
         let gaps = [0.0, 5.0, 30.0, 120.0];
         assert_eq!(ttl_bucket(&classes, &gaps), "(5s, 30s]");
@@ -325,42 +396,168 @@ mod tests {
         let classes = [C::Hit, C::Drop, C::Hit];
         let gaps = [0.0, 0.0, 30.0];
         assert_eq!(ttl_bucket(&classes, &gaps), "immediate drop");
+
+        // 16. The full default ladder held to its last rung: the one-hour hold is distinguishable
+        //     from the half-hour one (case 2). The trailing Hit after case 1's Drop is walked and
+        //     never changes the settled bucket, which is why a drop needs no early stop.
+        let classes = [C::Hit; 8];
+        let gaps = [0.0, 5.0, 30.0, 120.0, 300.0, 600.0, 1800.0, 3600.0];
+        assert_eq!(ttl_bucket(&classes, &gaps), "≥1h");
     }
 
     #[test]
     fn cache_hold_result_outcomes() {
         use CacheClassification as C;
         // (a) No ladder round ran → not measured.
-        assert_eq!(cache_hold_result(true, &[], &[]), "not measured");
-        assert_eq!(cache_hold_result(false, &[], &[]), "not measured");
+        assert_eq!(cache_hold_result(true, &[], &[], true), "not measured");
+        assert_eq!(cache_hold_result(false, &[], &[], true), "not measured");
 
         // (b) No round ever reported cached tokens → does not cache, even though the ladder
         //     rounds were usable (the streamlake mislabel regression).
         let classes = [C::Drop, C::NotSupported, C::Drop];
         let gaps = [0.0, 5.0, 30.0];
-        assert_eq!(cache_hold_result(false, &classes, &gaps), "does not cache");
+        assert_eq!(
+            cache_hold_result(false, &classes, &gaps, true),
+            "does not cache"
+        );
 
         // (a') Fail closed: an all-Invalid ladder measured nothing, and the zero-cache gate
         //      must not label it "does not cache" on a W2-only zero sample.
         let classes = [C::Invalid, C::Invalid, C::Invalid];
         let gaps = [0.0, 5.0, 30.0];
-        assert_eq!(cache_hold_result(false, &classes, &gaps), "not measured");
+        assert_eq!(
+            cache_hold_result(false, &classes, &gaps, true),
+            "not measured"
+        );
 
         // (b') Mixed: usable Drop rounds exist, but zero cache evidence across them.
         let classes = [C::Invalid, C::Drop, C::Invalid];
         let gaps = [0.0, 5.0, 30.0];
-        assert_eq!(cache_hold_result(false, &classes, &gaps), "does not cache");
+        assert_eq!(
+            cache_hold_result(false, &classes, &gaps, true),
+            "does not cache"
+        );
 
         // (c) Cached observations exist → the TTL bucket from the ladder.
         let classes = [C::Hit, C::Hit, C::Drop];
         let gaps = [0.0, 5.0, 30.0];
-        assert_eq!(cache_hold_result(true, &classes, &gaps), "(5s, 30s]");
+        assert_eq!(cache_hold_result(true, &classes, &gaps, true), "(5s, 30s]");
 
         // (d) Cache evidence exists but the ladder measured no expected hold (every usable
         //     round NotSupported) → the hold itself was never measured.
         let classes = [C::NotSupported, C::NotSupported, C::NotSupported];
         let gaps = [0.0, 5.0, 30.0];
-        assert_eq!(cache_hold_result(true, &classes, &gaps), "not measured");
+        assert_eq!(
+            cache_hold_result(true, &classes, &gaps, true),
+            "not measured"
+        );
+    }
+
+    /// A cut-short ladder reports only what it observed: the lower bound with the truncation
+    /// suffix when a hold was seen, `not measured (ladder truncated)` otherwise — never
+    /// `does not cache` and never a bare `not measured`. An observed drop settles the row, so
+    /// it keeps its ordinary bucket and takes no suffix.
+    #[test]
+    fn cache_hold_result_truncated_ladder() {
+        use CacheClassification as C;
+        // Held through the 1800s rung, cut before the 3600s rung → the lower bound stands. The
+        // two arrays are always pushed in lockstep, so the cut-short ladder carries 7 of the 8
+        // default rungs.
+        let classes = [C::Hit; 7];
+        let gaps = [0.0, 5.0, 30.0, 120.0, 300.0, 600.0, 1800.0];
+        assert_eq!(
+            cache_hold_result(true, &classes, &gaps, false),
+            "≥30m (ladder truncated)"
+        );
+
+        // No rung ever established a hold → nothing to report about the hold.
+        let classes = [C::Invalid, C::Invalid, C::Invalid];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(
+            cache_hold_result(false, &classes, &gaps, false),
+            "not measured (ladder truncated)"
+        );
+
+        // Cached observations existed, but every usable round was NotSupported → the cut-short
+        // ladder must not claim "does not cache".
+        let classes = [C::NotSupported, C::NotSupported, C::NotSupported];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(
+            cache_hold_result(true, &classes, &gaps, false),
+            "not measured (ladder truncated)"
+        );
+
+        // Zero-cache evidence and a cut-short ladder → still no negative claim.
+        let classes = [C::NotSupported, C::Invalid, C::NotSupported];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(
+            cache_hold_result(false, &classes, &gaps, false),
+            "not measured (ladder truncated)"
+        );
+
+        // No ladder round ran at all, yet the ladder was reported as cut short.
+        assert_eq!(
+            cache_hold_result(true, &[], &[], false),
+            "not measured (ladder truncated)"
+        );
+
+        // A hold seen only at the 0 s probe: the probe is a ladder rung, so it bounds the hold at
+        // `≥0s` rather than claiming nothing was measured.
+        let classes = [C::Hit, C::Invalid, C::Invalid];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(
+            cache_hold_result(true, &classes, &gaps, false),
+            "≥0s (ladder truncated)"
+        );
+
+        // A custom ladder need not be sorted: the bound is the highest holding rung, not the last
+        // one, so a 0-gap rung above a real one cannot discard the real bound.
+        let classes = [C::Hit, C::Hit, C::Hit, C::Invalid];
+        let gaps = [0.0, 5.0, 0.0, 30.0];
+        assert_eq!(
+            cache_hold_result(true, &classes, &gaps, false),
+            "≥5s (ladder truncated)"
+        );
+
+        // An observed drop settles the bucket: the row is not truncated and takes no suffix.
+        let classes = [C::Hit, C::Hit, C::Drop];
+        let gaps = [0.0, 5.0, 30.0];
+        assert_eq!(cache_hold_result(true, &classes, &gaps, false), "(5s, 30s]");
+
+        // A drop at the 0s probe is an immediate drop, suffix-free.
+        let classes = [C::Drop, C::Invalid];
+        let gaps = [0.0, 5.0];
+        assert_eq!(
+            cache_hold_result(true, &classes, &gaps, false),
+            "immediate drop"
+        );
+    }
+
+    /// The summary's ladder line and the bucket labels share one formatter, so the same gap can
+    /// never render `60m` in one place and `1h` in the other.
+    #[test]
+    fn ladder_line_and_bucket_labels_agree() {
+        for (secs, label) in [
+            (120.0, "2m"),
+            (300.0, "5m"),
+            (600.0, "10m"),
+            (1800.0, "30m"),
+            (3600.0, "1h"),
+        ] {
+            assert_eq!(format_duration(secs), label, "format_duration({secs})");
+            assert_eq!(
+                format_bucket(secs, f64::INFINITY),
+                format!("≥{label}"),
+                "format_bucket({secs}, ∞)"
+            );
+        }
+        // The remaining forms are unchanged: 0s, sub-minute seconds, ≤ and (lo, hi].
+        assert_eq!(format_duration(0.0), "0s");
+        assert_eq!(format_duration(5.0), "5s");
+        assert_eq!(format_duration(59.4), "59s");
+        assert_eq!(format_bucket(0.0, 0.0), "0s");
+        assert_eq!(format_bucket(0.0, 5.0), "≤5s");
+        assert_eq!(format_bucket(300.0, 600.0), "(5m, 10m]");
     }
 
     #[test]

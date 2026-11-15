@@ -65,9 +65,6 @@ pub(crate) fn release_repo() -> &'static str {
         .trim_end_matches('/')
 }
 
-/// The `User-Agent` every GitHub API request needs: it answers `403` without one.
-const GITHUB_USER_AGENT: &str = concat!("mahbot/", env!("CARGO_PKG_VERSION"));
-
 /// How many releases one page of a listing holds. The streams share the repository's listing with
 /// the product's own releases, so this is what a caller counts a page's entries against to know it
 /// is last.
@@ -113,7 +110,7 @@ pub(crate) async fn release_page(
     let url = format!("{url}{separator}per_page={LISTING_PAGE_SIZE}&page={page}");
     let response = download_client()?
         .get(&url)
-        .header(reqwest::header::USER_AGENT, GITHUB_USER_AGENT)
+        .header(reqwest::header::USER_AGENT, crate::util::http::USER_AGENT)
         .timeout(METADATA_TIMEOUT)
         .send()
         .await

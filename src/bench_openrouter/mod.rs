@@ -9,12 +9,21 @@
 //!
 //! `--dry-run` runs the full discovery (models catalog, requested-model endpoints,
 //! key envelope) and cost-based provider selection, then emits the canonical plan
-//! JSON with ZERO chat-completions calls. The default mode adds the TTL-ladder
-//! executor: one tokio task per selected provider runs the warmup + ladder rounds
-//! against the pinned endpoint, and the run writes report.json / summary.md /
-//! providers.json / manifest.json under `<output-dir>/bench-openrouter/<run-ts>/`
-//! plus a `latest/` mirror. The report lists, per provider, the static price and
-//! the cache-hold result ("does not cache" / TTL hold bucket / "not measured").
+//! JSON with ZERO chat-completions calls and no privacy fetch. The default mode adds
+//! the TTL-ladder executor: one tokio task per selected provider runs the warmup +
+//! ladder rounds against the pinned endpoint, and the run writes report.json /
+//! summary.md / providers.json / manifest.json under
+//! `<output-dir>/bench-openrouter/<run-ts>/` plus a `latest/` mirror. The report
+//! lists, per discovered endpoint, its static price per 1B tokens, the cache-hold
+//! result ("does not cache" / TTL hold bucket / "not measured" / one of the two
+//! truncation forms), whether it was selected for measurement, and whether using it
+//! needs a non-default data-sharing setting.
+//!
+//! A full default ladder ([`run::DEFAULT_LADDER_SECS`], top rung one hour) sleeps for
+//! the sum of its gaps — well over an hour and a half — plus request overhead, so the
+//! run takes hours of wall clock and is meant to be started detached;
+//! [`run::RUN_DEADLINE_MINS`] bounds it and [`run::OUTER_TIMEOUT`] bounds the process,
+//! with the difference left for a request already in flight when the deadline fires.
 //!
 //! Without `--output-dir` the default is `~/.mahbot/benchmarks/<model-slug>/` — a
 //! per-model folder from the model id ([`model_slug`]) — so parallel runs of
@@ -40,6 +49,7 @@ use crate::util::lock::InstanceLockState;
 
 mod classify;
 mod discovery;
+mod privacy;
 pub(crate) mod report;
 pub(crate) mod run;
 mod select;
@@ -170,7 +180,7 @@ impl BenchOptions {
         let mut model: Option<String> = None;
         let mut api_key: Option<String> = None;
         let mut cap_usd = 2.00;
-        let mut ladder_secs: Vec<u64> = vec![0, 5, 30, 120, 300, 600, 1800];
+        let mut ladder_secs: Vec<u64> = run::DEFAULT_LADDER_SECS.to_vec();
         let mut providers: Option<Vec<String>> = None;
         let mut prefix_chars: usize = 64_000;
         let mut output_dir: Option<PathBuf> = None;
@@ -200,13 +210,15 @@ impl BenchOptions {
                 }
                 "--providers" => {
                     let v = next_value(args, &mut i, inline, "--providers")?;
-                    providers = Some(
-                        v.split(',')
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                            .collect(),
-                    );
+                    // An empty list names no tag, so it is no allowlist at all: `--providers ""`
+                    // must not silently exempt the run from the twenty-endpoint ceiling.
+                    let tags: Vec<String> = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                        .collect();
+                    providers = (!tags.is_empty()).then_some(tags);
                 }
                 "--prefix-chars" => {
                     let v = next_value(args, &mut i, inline, "--prefix-chars")?;
@@ -513,10 +525,15 @@ pub async fn run_cli() -> i32 {
 }
 
 /// Shared by `--help` (stdout) and usage errors (stderr). Built rather than a constant
-/// so the read-limit knob is printed from its own name
-/// ([`crate::db::read_limit::ENV`]) and cannot drift from the knob it bounds.
+/// so the read-limit knob and the default ladder are printed from their own definitions and
+/// cannot drift from what the run uses.
 fn usage() -> String {
     let knob = crate::db::read_limit::ENV;
+    let ladder: Vec<String> = run::DEFAULT_LADDER_SECS
+        .iter()
+        .map(u64::to_string)
+        .collect();
+    let sleeps: u64 = run::DEFAULT_LADDER_SECS.iter().sum();
     format!(
         "\
 mahbot bench-openrouter — OpenRouter provider benchmark
@@ -526,11 +543,21 @@ Usage:
 
 Two modes:
   --dry-run   Discovery + selection + plan JSON to stdout. ZERO chat calls.
-  (default)   Full run: TTL ladder over the selected providers, then writes
+  (default)   Full run: TTL ladder over the selected endpoints, then writes
               report.json / summary.md / providers.json / manifest.json to
               <output-dir>/bench-openrouter/<run-ts>/ with a latest/ mirror.
               Without --output-dir, <output-dir> is per model:
               ~/.mahbot/benchmarks/<model-slug>/ (see --output-dir below).
+
+A full ladder takes well over an hour of wall clock — the default ladder alone
+sleeps {sleeps} s — so run it detached, where a caller's own time limit cannot
+kill it mid-ladder:
+  POSIX:   nohup mahbot bench-openrouter --model <slug> > bench.log 2>&1 &
+  Windows: start /b mahbot bench-openrouter --model <slug>
+`nohup ... &` survives the terminal closing, not a caller that kills its whole
+process group — only a genuinely detached spawn (a double fork; macOS has no
+setsid) outlives that.
+The run deadline is {} min; a ladder cut short by it is reported as truncated.
 
 Flags:
   --model <slug>         Model id to benchmark. Resolution: --model, env
@@ -541,9 +568,9 @@ Flags:
                          stores only '***' for its value.
   --cap-usd <f64>        Total cost cap in USD (default: 2.00). Also sets the
                          per-provider guard (cap x2 / selected count).
-  --ladder <csv>         Inactivity-gap ladder in seconds (default:
-                         0,5,30,120,300,600,1800).
+  --ladder <csv>         Inactivity-gap ladder in seconds (default: {}).
   --providers <csv>      Provider tag allowlist (e.g. streamlake/fp8,deepseek/auto).
+                         An allowlist is exempt from the twenty-endpoint ceiling.
   --prefix-chars <usize> Estimated prompt prefix size in characters (default: 64000).
   --output-dir <dir>     Exact report output directory override. Default:
                          ~/.mahbot/benchmarks/<model-slug>/ — a per-model
@@ -563,10 +590,13 @@ Config-store reads:
   its fallback — a read that never returns ends this command at the limit.
 
 Exit codes:
-  0  Success. In a full run, the artifacts (report.json / summary.md /
-     providers.json / manifest.json) are complete; each provider's result is
-     its static price and cache-hold bucket ('does not cache', a TTL hold like
-     '(5s, 30s]', or 'not measured').
+  0  Success: the artifacts were written and the run was not aborted at run
+     level. Each endpoint row is its static price per 1B tokens, its cache-hold
+     bucket ('does not cache', a TTL hold like '(5s, 30s]' or '≥1h', 'not
+     measured', or a truncation form '≥X (ladder truncated)' / 'not measured
+     (ladder truncated)') and whether using it needs a non-default data-sharing
+     setting. A run whose rows are marked truncated still exits 0: truncation
+     is carried by the artifacts, not by the exit code.
   1  Hard failure (bad key, unaffordable estimate, discovery failure, lock
      held, artifact write failure). A full-run abort (spend cap / deadline /
      auth / quota) still writes the partial report before exiting 1.
@@ -577,41 +607,56 @@ as '***' in manifest.json; providers.json marks the key payload redacted.
 
 Not implemented (design-only): --from-plan, --max-gap-min, --all-endpoints,
 the streaming probe, and the /generation audit.
-"
+",
+        run::RUN_DEADLINE_MINS,
+        ladder.join(","),
     )
 }
 
-/// Model-level capabilities resolved from the discovery catalog: the reasoning effort the run will
-/// request and which request parameters the model advertises support for.
-pub(crate) struct ModelConfig {
-    reasoning_effort_used: Option<String>,
-    supports_tools: bool,
-    supports_tool_choice: bool,
-    supports_reasoning_effort: bool,
+/// The requested model resolved against the discovery catalog. One lookup serves the plan's
+/// `model` block, the run's request parameters and the privacy page, so no two of them can read a
+/// different entry.
+pub(crate) struct ResolvedModel {
+    /// The catalog id the requested model matched, or the requested id when the catalog has none.
+    pub id: String,
+    pub canonical_slug: Option<String>,
+    pub name: Option<String>,
+    pub context_length: Option<i64>,
+    /// The reasoning effort the run requests: the LAST (lowest) supported effort, or `"low"` for a
+    /// model advertising reasoning without a supported-efforts list.
+    pub reasoning_effort_used: Option<String>,
+    pub supports_tools: bool,
+    pub supports_tool_choice: bool,
+    pub supports_reasoning_effort: bool,
 }
 
-/// The reasoning effort picks the LAST (lowest) supported effort; a model advertising
-/// reasoning without a supported-efforts list falls back to `"low"`.
-fn resolve_model_config(snapshot: &DiscoverySnapshot, model: &str) -> ModelConfig {
-    let catalog_entry = snapshot.catalog.iter().find(|e| e.id == model);
-    let reasoning_effort_used = catalog_entry
-        .as_ref()
-        .and_then(|e| e.reasoning.as_ref())
-        .map(|r| {
-            r.supported_efforts
-                .as_ref()
-                .and_then(|efforts| efforts.last().cloned())
-                .unwrap_or_else(|| "low".to_string())
-        });
-    let supported_parameters = catalog_entry
-        .as_ref()
-        .and_then(|e| e.supported_parameters.as_ref())
-        .map_or::<&[String], _>(&[], Vec::as_slice);
-    ModelConfig {
-        reasoning_effort_used,
-        supports_tools: supported_parameters.iter().any(|p| p == "tools"),
-        supports_tool_choice: supported_parameters.iter().any(|p| p == "tool_choice"),
-        supports_reasoning_effort: supported_parameters.iter().any(|p| p == "reasoning_effort"),
+impl ResolvedModel {
+    fn resolve(snapshot: &DiscoverySnapshot, requested: &str) -> Self {
+        let entry = snapshot.catalog.iter().find(|e| e.id == requested);
+        let supported_parameters = entry
+            .and_then(|e| e.supported_parameters.as_ref())
+            .map_or::<&[String], _>(&[], Vec::as_slice);
+        Self {
+            id: entry.map_or_else(|| requested.to_string(), |e| e.id.clone()),
+            canonical_slug: entry.and_then(|e| e.canonical_slug.clone()),
+            name: entry.and_then(|e| e.name.clone()),
+            context_length: entry.and_then(|e| e.context_length),
+            reasoning_effort_used: entry.and_then(|e| e.reasoning.as_ref()).map(|r| {
+                r.supported_efforts
+                    .as_ref()
+                    .and_then(|efforts| efforts.last().cloned())
+                    .unwrap_or_else(|| "low".to_string())
+            }),
+            supports_tools: supported_parameters.iter().any(|p| p == "tools"),
+            supports_tool_choice: supported_parameters.iter().any(|p| p == "tool_choice"),
+            supports_reasoning_effort: supported_parameters.iter().any(|p| p == "reasoning_effort"),
+        }
+    }
+
+    /// The identifier the model page is fetched from: the canonical slug when the catalog names
+    /// one, else the resolved id.
+    fn page_id(&self) -> &str {
+        self.canonical_slug.as_deref().unwrap_or(&self.id)
     }
 }
 
@@ -660,16 +705,16 @@ fn build_selection(opts: &BenchOptions, snapshot: &DiscoverySnapshot) -> Selecti
 }
 
 /// Everything the dry-run plan and the full-run executor need from the shared preamble: resolved
-/// key, discovery snapshot, model config, and selection.
+/// key, discovery snapshot, resolved model, and selection.
 struct RunPreamble {
     key: String,
     key_source: &'static str,
     snapshot: DiscoverySnapshot,
-    model_config: ModelConfig,
+    model: ResolvedModel,
     bundle: SelectionBundle,
 }
 
-/// Key resolution → discovery → model config → selection → affordability preflight.
+/// Key resolution → discovery → model resolution → selection → affordability preflight.
 /// Returns the hard/usage error the callers turn into an exit code.
 async fn run_preamble(
     opts: &BenchOptions,
@@ -680,7 +725,7 @@ async fn run_preamble(
     let snapshot = discover(&client, &opts.model)
         .await
         .map_err(|e| CliError::Hard(format!("{e:#}")))?;
-    let model_config = resolve_model_config(&snapshot, &opts.model);
+    let model = ResolvedModel::resolve(&snapshot, &opts.model);
     let bundle = build_selection(opts, &snapshot);
     if let Some(msg) = affordability_preflight(&snapshot, bundle.total_est) {
         return Err(CliError::Hard(msg));
@@ -689,7 +734,7 @@ async fn run_preamble(
         key,
         key_source,
         snapshot,
-        model_config,
+        model,
         bundle,
     })
 }
@@ -737,7 +782,7 @@ async fn dry_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) ->
         key: _,
         key_source,
         snapshot,
-        model_config,
+        model,
         bundle,
     } = preamble;
 
@@ -745,15 +790,8 @@ async fn dry_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) ->
         opts,
         snapshot: &snapshot,
         key_source,
-        reasoning_effort_used: model_config.reasoning_effort_used,
-        supports_tools: model_config.supports_tools,
-        supports_tool_choice: model_config.supports_tool_choice,
-        supports_reasoning_effort: model_config.supports_reasoning_effort,
-        inputs: &bundle.inputs,
-        flags: &bundle.flags,
-        decisions: &bundle.decisions,
-        total_est: bundle.total_est,
-        per_provider_guard: bundle.per_provider_guard,
+        model: &model,
+        bundle: &bundle,
     });
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -782,9 +820,26 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         key,
         key_source,
         snapshot,
-        model_config,
+        model: resolved,
         bundle,
     } = preamble;
+
+    // A run with nothing to measure exits before the lock, the privacy fetch and the output
+    // directory: it would spend up to the page timeout on artifacts it can never write.
+    let selected: Vec<usize> = bundle
+        .decisions
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.selected)
+        .map(|(i, _)| i)
+        .collect();
+    if selected.is_empty() {
+        eprintln!(
+            "Error: no providers selected for model '{}' — nothing to benchmark (the dry-run plan shows why)",
+            opts.model
+        );
+        return 1;
+    }
 
     let _run_lock = match report::acquire_run_lock(&opts.output_dir) {
         Ok(file) => file,
@@ -793,6 +848,18 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
             return 1;
         }
     };
+
+    // The privacy fetch runs once, after discovery and before the run starts, so every artifact
+    // written on any exit path already carries a privacy source value. It is fail-soft: a dead or
+    // reshaped page yields the explicit unavailable snapshot, never a failed run.
+    let endpoint_tags: Vec<String> = snapshot
+        .endpoints
+        .data
+        .endpoints
+        .iter()
+        .map(|ep| ep.tag.clone())
+        .collect();
+    let privacy = privacy::resolve(resolved.page_id(), &endpoint_tags).await;
 
     let run_started = std::time::Instant::now();
     let run_ts = chrono::Utc::now();
@@ -820,20 +887,6 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         deadline: run_started + Duration::from_secs(run::RUN_DEADLINE_MINS * 60),
     });
 
-    let selected: Vec<usize> = bundle
-        .decisions
-        .iter()
-        .enumerate()
-        .filter(|(_, d)| d.selected)
-        .map(|(i, _)| i)
-        .collect();
-    if selected.is_empty() {
-        eprintln!(
-            "Error: no providers selected for model '{}' — nothing to benchmark (the dry-run plan shows why)",
-            opts.model
-        );
-        return 1;
-    }
     let mut tasks = tokio::task::JoinSet::new();
     for (idx, &endpoint_idx) in selected.iter().enumerate() {
         let endpoint = snapshot.endpoints.data.endpoints[endpoint_idx].clone();
@@ -841,7 +894,7 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         let key = key.clone();
         let model = opts.model.clone();
         let base = base.clone();
-        let reasoning_effort = model_config.reasoning_effort_used.clone();
+        let reasoning_effort = resolved.reasoning_effort_used.clone();
         let ladder = opts.ladder_secs.clone();
         let ctx = std::sync::Arc::clone(&ctx);
         tasks.spawn(async move {
@@ -864,7 +917,7 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
     }
 
     let mut provider_runs: Vec<run::ProviderRun> = Vec::new();
-    let join = tokio::time::timeout(Duration::from_hours(1), async {
+    let join = tokio::time::timeout(run::OUTER_TIMEOUT, async {
         while let Some(res) = tasks.join_next().await {
             match res {
                 Ok(run) => provider_runs.push(run),
@@ -876,7 +929,7 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
     })
     .await;
     if join.is_err() {
-        ctx.abort("outer 60-minute deadline".to_string());
+        ctx.abort(format!("outer {}-minute deadline", run::OUTER_TIMEOUT_MINS));
         while let Some(res) = tasks.join_next().await {
             match res {
                 Ok(run) => provider_runs.push(run),
@@ -914,10 +967,12 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
         &meta,
         &snapshot.endpoints.data.endpoints,
         &provider_runs,
+        &bundle.decisions,
+        &privacy,
         &run_dir,
     );
     let summary_md = report::build_summary_md(&meta, &report_json);
-    let providers_json = report::providers_snapshot_json(&snapshot);
+    let providers_json = report::providers_snapshot_json(&snapshot, &privacy);
     let manifest = report::build_manifest(
         &std::env::args().collect::<Vec<_>>(),
         opts,
@@ -970,19 +1025,13 @@ pub(crate) struct PlanData<'a> {
     pub opts: &'a BenchOptions,
     pub snapshot: &'a DiscoverySnapshot,
     pub key_source: &'a str,
-    pub reasoning_effort_used: Option<String>,
-    pub supports_tools: bool,
-    pub supports_tool_choice: bool,
-    pub supports_reasoning_effort: bool,
-    pub inputs: &'a [SelectionInput],
-    pub flags: &'a [Vec<String>],
-    pub decisions: &'a [SelectionDecision],
-    pub total_est: f64,
-    pub per_provider_guard: f64,
+    pub model: &'a ResolvedModel,
+    pub bundle: &'a SelectionBundle,
 }
 
 /// 2 warmup rounds (no gap) + one ladder round per entry plus one: the ladder lists
-/// inactivity GAPS between rounds, so a 7-entry ladder is 2 + 8 = 10 requests.
+/// inactivity GAPS between rounds, so a gap list of N entries makes [`WARMUP_ROUNDS`] + N + 1
+/// requests.
 #[must_use]
 pub(crate) fn rounds_per_provider(ladder_secs: &[u64]) -> usize {
     WARMUP_ROUNDS + ladder_secs.len() + 1
@@ -1002,10 +1051,10 @@ pub(crate) fn build_plan(data: &PlanData<'_>) -> serde_json::Value {
     let opts = data.opts;
     let snapshot = data.snapshot;
     let endpoints = &snapshot.endpoints.data.endpoints;
-    let decisions = data.decisions;
-    let inputs = data.inputs;
+    let decisions = data.bundle.decisions.as_slice();
+    let inputs = data.bundle.inputs.as_slice();
 
-    let providers = provider_entries(endpoints, decisions, inputs, data.flags);
+    let providers = provider_entries(endpoints, decisions, inputs, &data.bundle.flags);
 
     let selected_count = decisions.iter().filter(|d| d.selected).count();
     let padding_count = decisions
@@ -1013,33 +1062,36 @@ pub(crate) fn build_plan(data: &PlanData<'_>) -> serde_json::Value {
         .filter(|d| matches!(d.reason, Some(ExclusionReason::Padding)))
         .count();
     let healthy_count = decisions.iter().filter(|d| d.is_healthy()).count();
-    let allowlist_matches = opts.providers.as_ref().map(|wl| {
-        wl.iter()
-            .filter(|t| inputs.iter().any(|i| i.endpoint.tag == **t))
+    // Endpoints the allowlist matches, not allowlist entries: a repeated tag is one endpoint.
+    // `BenchOptions::parse` already turned an empty `--providers` into `None`, so an allowlist
+    // here always names something.
+    let allowlist_matches = opts.providers.as_ref().map(|tags| {
+        inputs
+            .iter()
+            .filter(|i| tags.contains(&i.endpoint.tag))
             .count()
     });
     let target_count = effective_target_count(healthy_count, allowlist_matches);
 
     let rounds = rounds_per_provider(&opts.ladder_secs);
     let total_delay_secs: u64 = opts.ladder_secs.iter().sum();
-    let within_cap = data.total_est <= opts.cap_usd;
+    let within_cap = data.bundle.total_est <= opts.cap_usd;
 
-    let catalog_entry = snapshot.catalog.iter().find(|e| e.id == opts.model);
-    let resolved_id = catalog_entry.map_or_else(|| opts.model.clone(), |e| e.id.clone());
+    let model = data.model;
 
     json!({
         "mode": "dry-run",
         "timestamp": crate::db::now(),
         "model": {
             "requested": opts.model,
-            "resolved_id": resolved_id,
-            "canonical_slug": catalog_entry.as_ref().and_then(|e| e.canonical_slug.clone()),
-            "name": catalog_entry.as_ref().and_then(|e| e.name.clone()),
-            "context_length": catalog_entry.as_ref().and_then(|e| e.context_length),
-            "reasoning_effort_used": data.reasoning_effort_used,
-            "supports_tools": data.supports_tools,
-            "supports_tool_choice": data.supports_tool_choice,
-            "supports_reasoning_effort": data.supports_reasoning_effort,
+            "resolved_id": model.id,
+            "canonical_slug": model.canonical_slug,
+            "name": model.name,
+            "context_length": model.context_length,
+            "reasoning_effort_used": model.reasoning_effort_used,
+            "supports_tools": model.supports_tools,
+            "supports_tool_choice": model.supports_tool_choice,
+            "supports_reasoning_effort": model.supports_reasoning_effort,
         },
         "key": {
             "source": data.key_source,
@@ -1073,9 +1125,9 @@ pub(crate) fn build_plan(data: &PlanData<'_>) -> serde_json::Value {
             "concurrent_providers": selected_count,
         },
         "cost": {
-            "total_est_usd": data.total_est,
+            "total_est_usd": data.bundle.total_est,
             "cap_usd": opts.cap_usd,
-            "per_provider_guard_usd": data.per_provider_guard,
+            "per_provider_guard_usd": data.bundle.per_provider_guard,
             "within_cap": within_cap,
         },
         "request_count": selected_count * rounds,
@@ -1120,9 +1172,7 @@ fn provider_entries(
                 "context_length": ep.context_length,
                 "selected": decision.selected,
                 "selection_reason": selection_reason,
-                "static_price_usd_per_m": crate::bench_openrouter::report::static_price_usd_per_m(
-                    ep.pricing.as_ref(),
-                ),
+                "static_price_usd_per_1b": report::static_price_usd_per_1b(ep.pricing.as_ref()),
                 "flags": flags[i],
             })
         })
@@ -1236,9 +1286,9 @@ mod tests {
             model: "acme/model-1".to_string(),
             api_key: Some("sk-or-secret-key".to_string()),
             cap_usd: 2.0,
-            // Default 7-entry ladder (7 gaps between 8 ladder rounds) →
-            // rounds = 2 warmup + 8 = 10 requests per provider.
-            ladder_secs: vec![0, 5, 30, 120, 300, 600, 1800],
+            // The production default ladder, so the request count comes from
+            // `rounds_per_provider` rather than a fixture.
+            ladder_secs: run::DEFAULT_LADDER_SECS.to_vec(),
             providers: None,
             prefix_chars: 64_000,
             output_dir: PathBuf::from("/tmp/benchmarks"),
@@ -1246,27 +1296,18 @@ mod tests {
         }
     }
 
-    /// Build the selection pipeline outputs (owned) from a snapshot, so the
-    /// test can hold references for the [`PlanData`] lifetime. Uses the real
-    /// shared [`build_selection`] so the test exercises the production path.
-    fn selection_outputs(
-        opts: &BenchOptions,
-        snapshot: &DiscoverySnapshot,
-    ) -> (
-        Vec<SelectionInput>,
-        Vec<Vec<String>>,
-        Vec<SelectionDecision>,
-        f64,
-        f64,
-    ) {
+    /// Build the plan the way `dry_run` does, so a test never assembles `PlanData` by hand. Uses
+    /// the real shared [`build_selection`], so the test exercises the production path.
+    fn plan_for(opts: &BenchOptions, snapshot: &DiscoverySnapshot) -> serde_json::Value {
         let bundle = build_selection(opts, snapshot);
-        (
-            bundle.inputs,
-            bundle.flags,
-            bundle.decisions,
-            bundle.total_est,
-            bundle.per_provider_guard,
-        )
+        let model = ResolvedModel::resolve(snapshot, &opts.model);
+        build_plan(&PlanData {
+            opts,
+            snapshot,
+            key_source: "env",
+            model: &model,
+            bundle: &bundle,
+        })
     }
 
     #[test]
@@ -1274,23 +1315,7 @@ mod tests {
         let opts = test_options();
         let snapshot = test_snapshot();
         let rounds = rounds_per_provider(&opts.ladder_secs);
-        let (inputs, flags, decisions, total_est, per_provider_guard) =
-            selection_outputs(&opts, &snapshot);
-        let data = PlanData {
-            opts: &opts,
-            snapshot: &snapshot,
-            key_source: "env",
-            reasoning_effort_used: Some("low".to_string()),
-            supports_tools: true,
-            supports_tool_choice: true,
-            supports_reasoning_effort: true,
-            inputs: &inputs,
-            flags: &flags,
-            decisions: &decisions,
-            total_est,
-            per_provider_guard,
-        };
-        let plan = build_plan(&data);
+        let plan = plan_for(&opts, &snapshot);
 
         assert_eq!(plan["mode"], "dry-run");
         // Exactly the specified top-level keys.
@@ -1317,10 +1342,12 @@ mod tests {
             assert!(object.contains_key(k), "missing top-level key {k}");
         }
 
-        // request_count == selected × rounds (2 warmup + 8 ladder rounds for
-        // the default 7-gap ladder).
-        let selected_count = decisions.iter().filter(|d| d.selected).count();
-        assert_eq!(plan["request_count"], (selected_count * rounds) as u64);
+        // request_count == selected × rounds (2 warmup + 9 ladder rounds for
+        // the default eight-gap ladder).
+        let selected_count = plan["selection"]["selected_count"]
+            .as_u64()
+            .expect("the plan carries selection.selected_count");
+        assert_eq!(plan["request_count"], selected_count * rounds as u64);
 
         // providers array mirrors every endpoint once.
         let providers = plan["providers"].as_array().expect("providers array");
@@ -1335,7 +1362,7 @@ mod tests {
             .iter()
             .take_while(|p| p["selected"] == true)
             .map(|p| {
-                p["static_price_usd_per_m"]
+                p["static_price_usd_per_1b"]
                     .as_f64()
                     .expect("selected providers carry a static price")
             })
@@ -1395,5 +1422,132 @@ mod tests {
                 "--model {model} must be rejected: its benchmark folder name is unusable"
             );
         }
+    }
+
+    /// A snapshot with `n` identical healthy endpoints: equal prices, so no cost outlier and the
+    /// count rule alone decides the selection.
+    fn snapshot_with(n: usize) -> DiscoverySnapshot {
+        let endpoints: Vec<serde_json::Value> = (0..n)
+            .map(|i| {
+                serde_json::json!({
+                    "tag": format!("acme-{i}/fp8"),
+                    "name": format!("Acme {i}"),
+                    "provider_name": format!("Acme {i}"),
+                    "status": "0",
+                    "context_length": 200_000,
+                    "pricing": {
+                        "prompt": "0.000002",
+                        "completion": "0.000008",
+                        "request": "0",
+                        "input_cache_read": "0.0000002",
+                    },
+                })
+            })
+            .collect();
+        let mut snapshot = test_snapshot();
+        snapshot.endpoints = serde_json::from_value(serde_json::json!({"data": {
+            "endpoints": endpoints,
+        }}))
+        .expect("endpoints fixture");
+        snapshot
+    }
+
+    /// The plan's selection follows the same capped rule as the run, and its per-endpoint entry
+    /// uses the report's price name and per-1B scale — a plan cannot advertise a target the run
+    /// would not use, and it carries no privacy field (it performs no privacy fetch).
+    #[test]
+    fn plan_selection_is_capped_and_priced_per_billion() {
+        let opts = test_options();
+        let snapshot = snapshot_with(48);
+        let rounds = rounds_per_provider(&opts.ladder_secs);
+        assert_eq!(rounds, 11, "2 warmup + 9 ladder rounds");
+        let plan = plan_for(&opts, &snapshot);
+
+        assert_eq!(plan["selection"]["healthy_count"], 48);
+        assert_eq!(plan["selection"]["target_count"], 20);
+        assert_eq!(plan["selection"]["selected_count"], 20);
+        assert_eq!(plan["schedule"]["rounds_per_provider"], 11);
+        assert_eq!(plan["request_count"], 20 * rounds);
+
+        let entry = &plan["providers"][0];
+        assert_eq!(entry["selected"], true);
+        assert_eq!(entry["static_price_usd_per_1b"], 296.0);
+        assert!(entry.get("static_price_usd_per_m").is_none());
+
+        // No privacy fetch, so no privacy field anywhere in the plan.
+        for key in ["privacy", "privacy_source"] {
+            assert!(plan.get(key).is_none(), "the plan carries no {key}");
+        }
+        for entry in plan["providers"].as_array().expect("providers array") {
+            assert!(entry.get("privacy_opt_in_required").is_none());
+        }
+    }
+
+    /// The plan's allowlist branch: an explicit allowlist keeps the 80% rule without the ceiling,
+    /// so the plan states the count the run will use. An empty `--providers` is no allowlist
+    /// (parse normalizes it), so the ceiling stays on.
+    #[test]
+    fn plan_allowlist_keeps_the_count_rule_without_the_ceiling() {
+        let snapshot = snapshot_with(30);
+        let allowlist: Vec<String> = (0..30).map(|i| format!("acme-{i}/fp8")).collect();
+        let mut opts = test_options();
+        opts.providers = Some(allowlist.clone());
+        let plan = plan_for(&opts, &snapshot);
+        assert_eq!(plan["selection"]["allowlist"], json!(allowlist));
+        assert_eq!(plan["selection"]["healthy_count"], 30);
+        assert_eq!(plan["selection"]["target_count"], 24);
+        assert_eq!(plan["selection"]["selected_count"], 24);
+
+        // The same pool with no allowlist is capped.
+        opts.providers = None;
+        let plan = plan_for(&opts, &snapshot);
+        assert_eq!(plan["selection"]["target_count"], 20);
+        assert_eq!(plan["selection"]["selected_count"], 20);
+    }
+
+    /// An empty `--providers` names no tag, so it is no allowlist — otherwise it would silently
+    /// exempt the run from the twenty-endpoint ceiling.
+    #[test]
+    fn an_empty_provider_list_is_no_allowlist() {
+        let budget = crate::db::read_limit::Budget::start();
+        let parse = |providers: &str| {
+            BenchOptions::parse(
+                &[
+                    "--model".to_string(),
+                    "acme/model-1".to_string(),
+                    "--providers".to_string(),
+                    providers.to_string(),
+                ],
+                &budget,
+            )
+            .expect("a valid parse")
+        };
+        assert!(parse(" , ").providers.is_none());
+        assert_eq!(
+            parse("a,,b").providers.as_deref(),
+            Some(&["a".to_string(), "b".to_string()][..])
+        );
+    }
+
+    /// The help prints the ladder default and the run deadline from the constants that define
+    /// them, and names a concrete detached invocation for both platforms — a run this long only
+    /// survives a caller's own time limit when it is started that way.
+    #[test]
+    fn usage_prints_the_run_shape_and_a_detached_invocation() {
+        let text = usage();
+        let ladder: Vec<String> = run::DEFAULT_LADDER_SECS
+            .iter()
+            .map(u64::to_string)
+            .collect();
+        assert!(
+            text.contains(&ladder.join(",")),
+            "the ladder default comes from the constant: {text}"
+        );
+        assert!(
+            text.contains(&format!("{} min", run::RUN_DEADLINE_MINS)),
+            "the deadline comes from its own constant: {text}"
+        );
+        assert!(text.contains("nohup mahbot bench-openrouter"), "{text}");
+        assert!(text.contains("start /b mahbot bench-openrouter"), "{text}");
     }
 }

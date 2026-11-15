@@ -9,6 +9,11 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// The product's ordinary outbound client identity, shared by the two clients that must present
+/// one: the GitHub API (which answers `403` without a `User-Agent`) and the OpenRouter model-page
+/// fetch.
+pub(crate) const USER_AGENT: &str = concat!("mahbot/", env!("CARGO_PKG_VERSION"));
+
 /// Install the ring crypto provider for rustls.
 ///
 /// reqwest 0.13's `rustls-no-provider` feature leaves the process without a default

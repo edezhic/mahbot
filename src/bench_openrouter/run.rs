@@ -16,17 +16,25 @@
 //! - **Cache-hold predicate**: a provider "does not cache" ONLY when its raw cached tokens are
 //!   zero across warmup-2 and every ladder round (warmup-1 is cross-run contaminated). Any
 //!   non-zero observation means it caches, and the bucket comes from the ladder. Providers that
-//!   failed to run are "not measured".
-//! - **TTL ladder**: a list of inactivity GAPS between rounds (a 7-entry ladder = 8 rounds);
-//!   each round re-sends the grown conversation after its gap and compares the reported cached
-//!   tokens against the full-hold expectation.
+//!   failed to run are "not measured"; a ladder cut short before its last rung without an
+//!   observed drop is reported as truncated (see [`crate::bench_openrouter::classify`]).
+//! - **TTL ladder**: a list of inactivity GAPS between rounds — a gap list of N entries opens
+//!   N + 1 ladder rounds ([`crate::bench_openrouter::rounds_per_provider`] adds the warmups).
+//!   Each round re-sends the grown conversation after its gap and compares the reported cached
+//!   tokens against the full-hold expectation. Every selected endpoint walks the WHOLE configured
+//!   ladder: there is no early stop on a drop, because endpoints are measured concurrently (the
+//!   run lasts as long as the slowest endpoint) and a dropped endpoint's bucket is already
+//!   settled.
 //! - **Bounded non-jittered retries**: at most 3 attempts per round; sleeps are fixed and NEVER
 //!   jittered — jitter would corrupt the gap measurement.
 //! - **Spend accounting**: per-round billed cost accumulates against a per-provider guard and a
 //!   total cap ([`RunBudget`]); the guard stops this provider's ladder, the cap aborts the run.
 //! - **Deadline + abort**: [`RUN_DEADLINE_MINS`] caps the run, and the per-provider deadline and
 //!   the run-level abort token race every ladder sleep, so a stalled provider cannot hang the
-//!   bench.
+//!   bench. A full default ladder needs well over an hour of wall clock; the orchestrator wraps
+//!   the whole run in [`OUTER_TIMEOUT`] ([`OUTER_TIMEOUT_MINS`]), which is deliberately larger
+//!   than the deadline: an in-flight request is not raced against the deadline and can overshoot
+//!   it, so a clean truncation must not become a killed run.
 //! - **Pinning verification**: the serving provider is checked against the endpoint's names; a
 //!   drift is retried once and then marked Invalid (`"pin_drift"`).
 //! - **Response-cache detection**: a `hit` in `x-openrouter-cache-status` means OpenRouter
@@ -45,15 +53,34 @@ use serde_json::json;
 
 use crate::bench_openrouter::classify::{
     CacheClassification, cache_hold_result, classify_round, expected_cached_for_round,
-    verify_pinned,
+    is_truncated, truncated_result, verify_pinned,
 };
 use crate::bench_openrouter::discovery::EndpointInfo;
 use crate::util::UnwrapPoison;
 
 /// Whole-run deadline (minutes). The orchestrator derives the per-provider deadline from the
 /// run start plus this constant and stores it in [`RunContext::deadline`]; the executor races
-/// it and never computes it.
-pub(crate) const RUN_DEADLINE_MINS: u64 = 55;
+/// it and never computes it. A full default ladder ([`DEFAULT_LADDER_SECS`]) spends the sum of
+/// its gaps asleep, plus every round's request overhead on top, so the deadline has to leave
+/// real room above that sum — the budget test pins the floor.
+pub(crate) const RUN_DEADLINE_MINS: u64 = 130;
+
+/// Outer timeout (minutes) for the whole run, applied by the orchestrator around the provider
+/// tasks. Declared independently of [`RUN_DEADLINE_MINS`] on purpose: the margin is the
+/// headroom for a request that is already in flight when the deadline fires — in-flight
+/// requests are not raced against the deadline and may overshoot it by their own timeout, and
+/// a clean truncation must not turn into a killed run.
+pub(crate) const OUTER_TIMEOUT_MINS: u64 = 160;
+
+/// [`OUTER_TIMEOUT_MINS`] as the orchestrator's timeout value.
+pub(crate) const OUTER_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_mins(OUTER_TIMEOUT_MINS);
+
+/// Default inactivity-gap ladder (seconds). The top rung is one hour, so an endpoint that keeps
+/// a prompt cache for a full hour is distinguishable from one that holds half an hour; the gaps
+/// are the waits BETWEEN rounds, and [`crate::bench_openrouter::rounds_per_provider`] turns the
+/// list into the request count. `BenchOptions::parse` takes its default from here.
+pub(crate) const DEFAULT_LADDER_SECS: &[u64] = &[0, 5, 30, 120, 300, 600, 1800, 3600];
 
 const CHAT_COMPLETIONS_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 
@@ -555,32 +582,57 @@ pub(crate) struct RunContext {
 
 impl RunContext {
     /// Abort the whole run: cancel the abort token (every ladder sleep races it) and record
-    /// `reason`.
+    /// `reason`. The first cause wins, so a provider that crosses the cap and then fails its
+    /// warmup cannot rename the run's cause.
     pub(crate) fn abort(&self, reason: String) {
         self.abort.cancel();
-        *self.abort_reason.lock().unwrap_poison() = Some(reason);
+        self.abort_reason
+            .lock()
+            .unwrap_poison()
+            .get_or_insert(reason);
     }
 }
 
 pub(crate) struct ProviderRun {
     pub tag: String,
     pub cache_hold_bucket: String,
+    /// True iff the ladder ended before its last rung without an observed drop, i.e. exactly
+    /// when `cache_hold_bucket` carries the classify module's truncation suffix — both come from
+    /// [`is_truncated`].
+    pub truncated: bool,
 }
 
 impl ProviderRun {
-    /// A provider that never produced a measured cache-hold result (failed to run, skipped the
-    /// ladder, or was aborted before it).
+    /// A provider that never produced a usable response (warmup or transport failure): `not
+    /// measured`, and not a truncated row — its ladder was never going to run.
     #[must_use]
-    fn not_measured(tag: String) -> Self {
+    pub(crate) fn not_measured(tag: String) -> Self {
         Self {
             tag,
             cache_hold_bucket: "not measured".to_string(),
+            truncated: false,
+        }
+    }
+
+    /// A provider whose warmups succeeded but whose ladder never ran (the warmup alone tripped the
+    /// spend guard or the total cap): the ladder ended before its first rung with no observed drop,
+    /// so the answer could still have changed. The row reads `not measured (ladder truncated)` —
+    /// never a bare `not measured`, which would claim the endpoint produced nothing usable. Built
+    /// through the same predicate and formatter as every other truncated row, so the suffix cannot
+    /// drift.
+    #[must_use]
+    pub(crate) fn ladder_never_ran(tag: String) -> Self {
+        Self {
+            tag,
+            cache_hold_bucket: truncated_result(&[], &[]),
+            truncated: is_truncated(false, &[]),
         }
     }
 }
 
 /// Run one provider's warmup + TTL ladder. Never panics on provider behavior: every failure
-/// degrades to a [`ProviderRun::not_measured`] result or a ladder-derived bucket.
+/// degrades to a `not measured` row (a warmup or transport failure), a truncated row (the warmup
+/// alone tripped the spend guard or cap), or a ladder-derived bucket.
 #[expect(
     clippy::too_many_arguments,     // the full protocol inputs; bundled would obscure the call site
     clippy::too_many_lines,         // one long sequential protocol implementation
@@ -640,33 +692,35 @@ pub(crate) async fn run_provider(
         vec![w2_cached]
     };
 
-    // Warmup spend counts against the budget: the cap covers ALL billed usage
-    // (billed usage.cost accumulated against the cap), not just
-    // ladder rounds. A provider whose warmup alone exceeds its guard is
-    // pathological — record it and skip the ladder.
+    // Warmup spend counts against the budget: the cap covers ALL billed usage, not just ladder
+    // rounds. The record — and the cap abort it can trigger — happens BEFORE the W2 gate: a run
+    // that has crossed its cap must cancel the other providers' ladder sleeps whatever this
+    // provider's row ends up saying.
     let w_cost = usage_from(outcome_w1.envelope.as_ref()).cost.unwrap_or(0.0)
         + usage_from(outcome_w2.envelope.as_ref()).cost.unwrap_or(0.0);
     let (over_guard, over_cap) = context.budget.record(&tag, w_cost);
     if over_cap {
         context.abort(context.budget.cap_exceeded_reason());
-        return ProviderRun::not_measured(tag);
-    }
-    if over_guard {
-        return ProviderRun::not_measured(tag);
     }
 
-    // W2 failure gates the ladder symmetrically with W1: auth/quota abort
-    // the whole run; any other error class skips this provider's ladder
-    // (running it with base_cached=0 would mis-scale every classification and
-    // burn the full ladder on likely-failing rounds).
+    // W2 failure gates the ladder symmetrically with W1: auth/quota abort the whole run; any
+    // other error class skips this provider's ladder (running it with base_cached=0 would
+    // mis-scale every classification and burn the full ladder on likely-failing rounds). A
+    // failed warmup is `not measured` whatever the budget says — its ladder never started.
     if let Some(class) = outcome_w2.error_class.as_deref() {
         if class == "auth" || class == "quota" {
             context.abort(format!("warmup failed ({class}); provider '{tag}'"));
             tracing::debug!(tag = %tag, class, "provider aborted during warmup 2");
-            return ProviderRun::not_measured(tag);
+        } else {
+            tracing::debug!(tag = %tag, class, "provider failed warmup 2; skipping ladder");
         }
-        tracing::debug!(tag = %tag, class, "provider failed warmup 2; skipping ladder");
         return ProviderRun::not_measured(tag);
+    }
+
+    // Both warmups succeeded but their cost alone tripped the budget: the ladder ends before
+    // its first rung with no observed drop, so the row is truncated, not "not measured".
+    if over_cap || over_guard {
+        return ProviderRun::ladder_never_ran(tag);
     }
 
     let rounds = ladder_secs.len() + 1;
@@ -674,7 +728,6 @@ pub(crate) async fn run_provider(
     let mut classifications: Vec<CacheClassification> = Vec::new();
     let mut nominal_gaps: Vec<f64> = Vec::new();
     let mut round0_prompt_tokens: Option<u64> = None;
-
     for r in 0..rounds {
         if context.abort.is_cancelled() {
             break;
@@ -844,18 +897,28 @@ pub(crate) async fn run_provider(
     }
 
     let any_cached = cached_observations.iter().any(|&c| c > 0);
-    let cache_hold_bucket = cache_hold_result(any_cached, &classifications, &nominal_gaps);
+    // Derived, never tracked: every iteration that starts pushes exactly one classification, so
+    // the ladder ran to its last rung iff the count matches. A guard or cap that trips on the
+    // LAST rung therefore cannot mark a complete ladder truncated, and a future `break` needs no
+    // bookkeeping. The flag and the bucket's suffix then come from the one predicate, so a row
+    // can never be marked without saying so (or vice versa).
+    let completed = classifications.len() == rounds;
+    let truncated = is_truncated(completed, &classifications);
+    let cache_hold_bucket =
+        cache_hold_result(any_cached, &classifications, &nominal_gaps, completed);
 
     tracing::debug!(
         tag = %tag,
         elapsed_ms = run_started.elapsed().as_millis(),
         cache_hold_bucket = %cache_hold_bucket,
+        truncated,
         "provider run finished"
     );
 
     ProviderRun {
         tag,
         cache_hold_bucket,
+        truncated,
     }
 }
 
@@ -1033,5 +1096,63 @@ mod tests {
             classify_http_error(reqwest::StatusCode::BAD_REQUEST),
             Some("http_4xx")
         );
+    }
+
+    /// The budget arithmetic of the default ladder: eight gaps, the sum of their sleeps, eleven
+    /// requests per endpoint (2 warmup + 9 ladder rounds, via the production count), and enough
+    /// deadline above that plus the overhead margin for the run to finish instead of being killed.
+    #[test]
+    fn default_ladder_budget_fits_the_deadline() {
+        assert_eq!(DEFAULT_LADDER_SECS.len(), 8, "eight gaps");
+        let sleeps: u64 = DEFAULT_LADDER_SECS.iter().sum();
+        assert_eq!(sleeps, 6455, "sum of the default ladder gaps");
+        assert_eq!(
+            crate::bench_openrouter::rounds_per_provider(DEFAULT_LADDER_SECS),
+            11,
+            "2 warmup + 9 ladder rounds"
+        );
+
+        // The deadline must leave real room above the sleeps: eleven requests' worth of
+        // overhead (the slowest stored run spent ~306 s over ten) has to fit inside it.
+        let margin = RUN_DEADLINE_MINS * 60 - sleeps;
+        assert!(
+            margin >= 900,
+            "the deadline leaves {margin} s of overhead above the ladder sleeps"
+        );
+        const { assert!(RUN_DEADLINE_MINS >= 130) };
+        const { assert!(OUTER_TIMEOUT_MINS >= RUN_DEADLINE_MINS + 30) };
+    }
+
+    /// The run's cause is the first one recorded: a provider that crosses the cap and then fails
+    /// its warmup must not rename the abort.
+    #[test]
+    fn the_first_abort_reason_wins() {
+        let ctx = RunContext {
+            budget: RunBudget::new(1.0, 0.5),
+            abort: tokio_util::sync::CancellationToken::new(),
+            abort_reason: std::sync::Mutex::new(None),
+            deadline: Instant::now(),
+        };
+        ctx.abort("spend cap exceeded".to_string());
+        ctx.abort("warmup failed (auth)".to_string());
+        assert!(ctx.abort.is_cancelled(), "an abort cancels the token");
+        assert_eq!(
+            ctx.abort_reason.lock().unwrap_poison().as_deref(),
+            Some("spend cap exceeded")
+        );
+    }
+
+    /// A warmup spend-guard or cap trip ends the ladder before its last rung with no observed
+    /// drop, so the row is truncated — never a bare `not measured`, which would claim the endpoint
+    /// produced nothing usable.
+    #[test]
+    fn a_warmup_guard_trip_is_a_truncated_row() {
+        let run = ProviderRun::ladder_never_ran("acme".to_string());
+        assert!(run.truncated);
+        assert_eq!(run.cache_hold_bucket, "not measured (ladder truncated)");
+        // The row that never produced a usable response is not truncated.
+        let unmeasured = ProviderRun::not_measured("acme".to_string());
+        assert!(!unmeasured.truncated);
+        assert_eq!(unmeasured.cache_hold_bucket, "not measured");
     }
 }
