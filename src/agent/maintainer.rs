@@ -160,7 +160,7 @@ pub async fn run_maintainer_loop() {
                     } else {
                         prepend_recommendations(&prompt, &ws.name).await
                     };
-                    let (agent, response) = run_default_agent(
+                    let (mut agent, response) = run_default_agent(
                         &agent_id,
                         Role::Maintainer,
                         &ws,
@@ -178,7 +178,7 @@ pub async fn run_maintainer_loop() {
                         // Post-run recommendation extraction — BEFORE session cleanup so the full
                         // accumulated transcript (including a resumed run's) is available. Strictly
                         // fail-open: any failure leaves the previous blob untouched.
-                        extract_and_store_recommendations(&agent, &ws).await;
+                        extract_and_store_recommendations(&mut agent, &ws).await;
 
                         // The created tickets are the durable outcome, not the transcript — delete
                         // the session so the next run starts fresh (does not rely on TTL cleanup),
@@ -219,7 +219,7 @@ pub async fn run_maintainer_loop() {
 /// Runs BEFORE session cleanup so the full accumulated transcript (including a resumed run's) is
 /// available. An empty extraction still saves an empty blob (replace-only semantics: the next run
 /// simply gets no block).
-async fn extract_and_store_recommendations(agent: &Agent, ws: &Workspace) {
+async fn extract_and_store_recommendations(agent: &mut Agent, ws: &Workspace) {
     let prompt = crate::prompt::load_prompt("extraction/maintainer.md");
     let extracted = match agent
         .extract_verdict::<MaintainerRecommendationsExtraction>(

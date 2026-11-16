@@ -714,6 +714,8 @@ pub(crate) async fn run_grouping_repair(
                 if non_retryable {
                     break;
                 }
+                // A dead pin does not get the rest of the ladder (see `providers::selection`).
+                loop_state.retarget_after_failure(err.class, &mut request);
                 transport_failures += 1;
                 if round < policy.max_attempts
                     && let Err(FailureClass::Shutdown) =
@@ -890,7 +892,7 @@ pub(crate) async fn run_grouping_repair(
 }
 
 /// Grouping request with the consumer-supplied system prompt, user material,
-/// model/effort/routing/max_tokens. `meta` purpose and agent id are filled in here so the
+/// model/effort/provider/max_tokens. `meta` purpose and agent id are filled in here so the
 /// consumer gets a uniform telemetry shape. The pipeline joint-verdict path deliberately
 /// builds its own `ChatRequest` instead (`pipeline::verdict::synthesis_request`) — its
 /// telemetry differs on purpose.
@@ -902,7 +904,7 @@ pub(crate) fn grouping_request(
     user: &str,
     model: String,
     reasoning_effort: Option<String>,
-    provider_order: Option<String>,
+    provider: Option<String>,
     max_tokens: Option<u32>,
 ) -> ChatRequest {
     ChatRequest {
@@ -914,7 +916,7 @@ pub(crate) fn grouping_request(
         model,
         max_tokens,
         reasoning_effort,
-        provider_order,
+        provider,
         meta: Some(ChatRequestMeta {
             purpose,
             agent_id: format!("grouping_{}_{}", ws.name, crate::generate_suffix()),

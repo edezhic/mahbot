@@ -408,25 +408,22 @@ pub(crate) fn role_tool_specs(
     .1
 }
 
-/// A role's derived chat-request triplet (model → provider routing → reasoning
-/// effort); named fields keep the order unambiguous for cross-module callers.
+/// A role's derived chat-request params: the model and the reasoning effort every call of that role
+/// shares. The provider is deliberately absent — it belongs to the conversation
+/// ([`crate::providers::selection`]), not to the role.
 pub(crate) struct RoleChatParams {
     pub model: String,
-    pub provider_order: Option<String>,
     pub reasoning_effort: Option<String>,
 }
 
-/// Derive a role's chat-request triplet — the single source shared by
-/// [`chat_request`], [`crate::pipeline::verdict::synthesis_request`] and
-/// [`crate::tools::analyze::consolidate_findings`]. Consumers keep their own
-/// `max_tokens`, `tools` and `meta`; the call sites share no KV-cache prefix.
+/// Derive a role's chat-request params — the single source shared by [`chat_request`],
+/// [`crate::pipeline::verdict::synthesis_request`] and
+/// [`crate::tools::analyze::consolidate_findings`]. Consumers keep their own `max_tokens`, `tools`,
+/// `provider` and `meta`; the call sites share no KV-cache prefix.
 #[must_use]
 pub(crate) fn role_chat_params(role: crate::Role) -> RoleChatParams {
-    let model = crate::config::CONFIG.role_model(role);
-    let routing = crate::config::CONFIG.model_routing(&model);
     RoleChatParams {
-        model,
-        provider_order: routing.provider_order,
+        model: crate::config::CONFIG.role_model(role),
         reasoning_effort: Some(
             crate::agent::role::role_info(&role)
                 .default_reasoning_effort
@@ -435,9 +432,11 @@ pub(crate) fn role_chat_params(role: crate::Role) -> RoleChatParams {
     }
 }
 
-/// Build the byte-relevant chat params (model, tools, reasoning_effort, routing,
-/// max_tokens) for a role; the triplet comes from [`role_chat_params`]. `meta` is
-/// telemetry-only (never in the request body) and attached by call sites.
+/// Build the byte-relevant chat params (model, tools, reasoning_effort, max_tokens) for a role;
+/// params come from [`role_chat_params`]. The provider is the caller's: a conversation pins its own
+/// ([`Agent::build_chat_request`]), a one-off call with no conversation takes
+/// [`crate::providers::selection::pick`]. `meta` is telemetry-only (never in the request body) and
+/// attached by call sites.
 #[must_use]
 pub(crate) fn chat_request(
     role: crate::Role,
@@ -446,7 +445,6 @@ pub(crate) fn chat_request(
 ) -> ChatRequest {
     let RoleChatParams {
         model,
-        provider_order,
         reasoning_effort,
     } = role_chat_params(role);
     ChatRequest {
@@ -455,7 +453,7 @@ pub(crate) fn chat_request(
         model,
         max_tokens: Some(crate::DEFAULT_MAX_TOKENS),
         reasoning_effort,
-        provider_order,
+        provider: None,
         meta: None,
     }
 }
@@ -566,6 +564,7 @@ impl Agent {
             parent_key,
             parent_label,
             incoming_rx: None,
+            provider: crate::providers::selection::ProviderSelection::default(),
             round_ts: None,
             first_call_notify: None,
             failure: None,
@@ -676,6 +675,10 @@ impl Agent {
                 }
             }
         }
+        // A turn whose first model call ran before the session had a `session_metadata` row recorded
+        // no provider then; `finalize` has just created it, so the choice lands now instead of being
+        // lost to the next run's re-selection.
+        self.persist_provider().await;
         Ok(())
     }
 
@@ -766,6 +769,12 @@ impl Agent {
         // dangling calls BEFORE the new message lands (results insert right after their
         // frame, keeping the history provider-valid).
         self.session.init(&self.agent_id).await?;
+
+        // The provider this conversation holds: the one stored with the session, kept while it
+        // serves the model and its outage is young, re-selected from the top of the list
+        // otherwise. Every model call of this turn uses it, so a provider change mid-work never
+        // happens by accident.
+        self.adopt_session_provider().await;
 
         // Re-engaging (any job kind): clear a stale sleep-ended flag BEFORE this turn, so
         // a crash mid-round is still recovered by the dead-session poller. Only the
@@ -1608,19 +1617,25 @@ impl Agent {
     }
 
     async fn llm_call(&mut self) -> anyhow::Result<ChatResponse> {
+        // The provider is chosen in `build_chat_request` (see its doc).
         let messages = self.session.history().to_vec();
         let request = self.build_chat_request(messages.clone(), "agent");
 
         let policy = crate::retry::RetryPolicy::current();
-        let response = crate::retry::agent_chat(request, &policy)
-            .await
-            .with_context(|| format!("LLM call {RETRY_EXHAUSTION_MARKER}"))?;
+        let result = crate::retry::agent_chat(request, &mut self.provider, &policy).await;
+        // Recorded before the error path can return: a run that moved off a dead provider ends on
+        // the new one, and the next run picks it up from there.
+        self.persist_provider().await;
+        let response = result.with_context(|| format!("LLM call {RETRY_EXHAUSTION_MARKER}"))?;
 
-        // Reasoning-only stop: recovered here, before any promotion, persistence or
-        // display, via the bounded continuation.
-        let response = self
+        // Reasoning-only stop: recovered here, before any promotion, persistence or display, via the
+        // bounded continuation. Its own ladder can move the provider too, so the pin is written
+        // again before its error path can return.
+        let recovered = self
             .recover_if_reasoning_only_stop(messages, response, Self::AGENT_REASONING_RECOVERY)
-            .await?;
+            .await;
+        self.persist_provider().await;
+        let response = recovered?;
 
         // Only a response actually returned to the loop updates the session length:
         // failures propagate above, and an exhausted reasoning-only turn returned
@@ -1759,7 +1774,7 @@ impl Agent {
     /// never embedded, so logs cannot leak it and it is not misclassified as provider
     /// retry exhaustion.
     async fn recover_reasoning_only_stop(
-        &self,
+        &mut self,
         base: Vec<ChatMessage>,
         first: ChatResponse,
         purpose: &'static str,
@@ -1868,6 +1883,17 @@ impl Agent {
                     if !err.class.is_retryable() {
                         break;
                     }
+                    // A provider that has been down for the whole window: this attempt and every
+                    // rebuild below continue on the next available one, and the recorded operation
+                    // follows the move so the failure rows name the serving provider.
+                    if let Some(request) = last_request.as_mut() {
+                        crate::retry::switch_provider(
+                            err.class,
+                            &mut self.provider,
+                            request,
+                            operation.as_mut(),
+                        );
+                    }
                 }
             }
         }
@@ -1903,7 +1929,7 @@ impl Agent {
     /// full history. Leak safety: appended-only, never touching the transcript, and the
     /// exhaustion error never embeds the thinking text.
     async fn recover_if_reasoning_only_stop(
-        &self,
+        &mut self,
         messages: Vec<ChatMessage>,
         response: ChatResponse,
         recovery: ReasoningOnlyStopRecovery,
@@ -2121,32 +2147,63 @@ impl Agent {
     }
 
     /// Build a [`ChatRequest`] from the messages with the agent's current model, tools,
-    /// reasoning-effort and provider routing — resolved each call, so a hot-reload is
-    /// reflected immediately (reasoning effort is baked into role metadata).
+    /// reasoning-effort and held provider.
+    ///
+    /// Model, tools and reasoning-effort are resolved each call, so a hot-reload is reflected
+    /// immediately (reasoning effort is baked into role metadata); the provider is NOT — the run
+    /// holds one, and only an outage outlasting [`crate::providers::selection::MOVE_AFTER`] (or a
+    /// model change under it) moves it. Selection therefore happens here, once per request, from the
+    /// model the request carries: the run keeps its provider while that provider serves it, and a
+    /// hot reload that changed the model re-selects (the previous provider may not serve the new
+    /// one) with the choice recorded on the run.
     ///
     /// Every call site for the same conversation *must* use exactly the same parameter
-    /// sources — model, reasoning_effort, tools (critically tools!) and routing — or the
+    /// sources — model, reasoning_effort, tools (critically tools!) and provider — or the
     /// provider recomputes the whole KV-cache prefix.
     ///
     /// The request never carries more pictures than [`crate::session::SUMMARIZATION_IMAGE_COUNT`]:
     /// the session's recorded count gates the walk, and the oldest pictures step aside in place
     /// ([`crate::session::image_cap`]), so the conversation itself is untouched.
     fn build_chat_request(
-        &self,
+        &mut self,
         mut messages: Vec<ChatMessage>,
         purpose: &'static str,
     ) -> ChatRequest {
         crate::session::image_cap::apply(&mut messages, Some(self.session.image_count()));
-        ChatRequest {
-            meta: Some(crate::ChatRequestMeta {
-                purpose,
-                agent_id: self.agent_id.clone(),
-                role: self.role.as_str().to_string(),
-                workspace: self.workspace.name.clone(),
-                ticket_id: self.ticket.as_ref().map(|t| t.id.clone()),
-            }),
-            ..chat_request(self.role, Some(self.tool_specs.clone()), messages)
+        let mut request = chat_request(self.role, Some(self.tool_specs.clone()), messages);
+        self.provider.apply(&mut request);
+        request.meta = Some(crate::ChatRequestMeta {
+            purpose,
+            agent_id: self.agent_id.clone(),
+            role: self.role.as_str().to_string(),
+            workspace: self.workspace.name.clone(),
+            ticket_id: self.ticket.as_ref().map(|t| t.id.clone()),
+        });
+        request
+    }
+
+    /// Keep the conversation's stored provider in step with the run's, writing only when it changed,
+    /// so the choice survives a restart, a resumed run and a re-dispatched agent. Fail-soft: a
+    /// failed write costs the next run a re-selection, never this run its provider.
+    async fn persist_provider(&mut self) {
+        let stored = self.provider.stored();
+        if stored.as_ref() == self.session.provider() {
+            return;
         }
+        self.session.set_provider(&self.agent_id, stored).await;
+    }
+
+    /// Take the provider the conversation holds, re-selected only when its outage has outlasted the
+    /// window. A conversation with none keeps whatever selection the agent already holds: its first
+    /// request resolves one for the model it carries.
+    pub(crate) async fn adopt_session_provider(&mut self) {
+        if let Some(stored) = self.session.provider().cloned() {
+            self.provider = crate::providers::selection::ProviderSelection::resolve(
+                &stored.model,
+                Some(&stored),
+            );
+        }
+        self.persist_provider().await;
     }
 
     /// Extract a structured verdict with the hardened scoped retry loop. KV-cache:
@@ -2155,7 +2212,7 @@ impl Agent {
     /// [0,10]) and a rejected value is re-prompted as a parse failure — `None` for
     /// plain extraction. `policy_override` gives fail-open callers a shorter schedule.
     pub(crate) async fn extract_verdict<T: serde::de::DeserializeOwned>(
-        &self,
+        &mut self,
         extraction_prompt: &str,
         validate: Option<&crate::ExtractionValidator<T>>,
         policy_override: Option<&crate::retry::RetryPolicy>,
@@ -2172,23 +2229,28 @@ impl Agent {
         .await
     }
 
-    /// Summarise the session history. KV-cache: see [`Self::build_chat_request`] — the
-    /// request is built once and re-sent verbatim, so every attempt is byte-identical.
+    /// Summarise the session history. KV-cache: see [`Self::build_chat_request`] — the request is
+    /// built once and re-sent verbatim, so every attempt is byte-identical except the provider,
+    /// which the run's selection decides per attempt and moves only once the pinned one has been
+    /// unavailable for the whole window.
     ///
     /// A tool call is not a summary: it carries no text, so it is re-asked
     /// (`SUMMARIZE_ATTEMPTS` in total, each a successful `summarize` request of its
     /// own) and never executed; text alongside a tool call is the summary. Exhaustion
     /// raises the empty-response error, so [`Self::maybe_summarize`] fails open.
-    pub(crate) async fn summarize(&self) -> anyhow::Result<String> {
+    pub(crate) async fn summarize(&mut self) -> anyhow::Result<String> {
         let _activity = self.activity_guard("summarizing");
         let mut history = self.session.history().to_vec();
         history.push(crate::ChatMessage::user(self.role.summary_prompt()));
 
-        let request = self.build_chat_request(history.clone(), "summarize");
+        let mut request = self.build_chat_request(history.clone(), "summarize");
         let policy = crate::retry::RetryPolicy::current();
 
         for _ in 1..=SUMMARIZE_ATTEMPTS {
-            let chat_resp = crate::retry::agent_chat(request.clone(), &policy)
+            // The run's provider serves the attempt: the ladder and the reasoning-only continuation
+            // of the previous one may each have moved it since the request was built.
+            self.provider.pin(&mut request);
+            let chat_resp = crate::retry::agent_chat(request.clone(), &mut self.provider, &policy)
                 .await
                 .with_context(|| format!("summarization LLM call {RETRY_EXHAUSTION_MARKER}"))?;
 
@@ -2272,6 +2334,10 @@ impl Agent {
                 );
             }
         }
+        // The ladder — and the reasoning-only continuation it can run — may move the run off a dead
+        // provider. Written here because a cancelled or draining turn ends without another model
+        // call, so `finalize_session` may never reach it.
+        self.persist_provider().await;
     }
 
     /// Compact a long-lived chat role's session (Assistant, Manager, custom) right
@@ -2839,6 +2905,7 @@ mod tests {
             parent_key: None,
             parent_label: None,
             incoming_rx: None,
+            provider: crate::providers::selection::ProviderSelection::default(),
             round_ts: None,
             first_call_notify: None,
             failure: None,
@@ -4085,7 +4152,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn recover_reasoning_only_stop_abort_classifies_as_shutdown() {
-        let agent = make_agent(vec![]);
+        let mut agent = make_agent(vec![]);
         let first = crate::ChatResponse {
             text: None,
             reasoning: Some(crate::Reasoning {
@@ -4190,7 +4257,7 @@ mod tests {
         let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
         let _provider_guard = install_fake_provider(provider);
 
-        let agent = make_agent(vec![]);
+        let mut agent = make_agent(vec![]);
         let err = agent
             .summarize()
             .await
@@ -4222,7 +4289,7 @@ mod tests {
         let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
         let _provider_guard = install_fake_provider(provider);
 
-        let agent = make_agent(vec![]);
+        let mut agent = make_agent(vec![]);
         let err = agent
             .summarize()
             .await
@@ -4469,6 +4536,100 @@ mod tests {
             crate::session::image_cap::count(agent.session.history()),
             total,
             "the conversation itself keeps every picture"
+        );
+    }
+
+    /// The run holds one provider: every request it builds carries the conversation's provider, a
+    /// stored provider that no longer serves the model is replaced by a fresh choice from the top of
+    /// the list, and a model change under the run re-selects. Durability is
+    /// [`the_first_turn_records_its_provider_once_finalize_creates_the_row`]'s subject.
+    #[tokio::test]
+    async fn a_run_holds_one_provider_and_follows_a_model_change() {
+        use crate::providers::selection;
+
+        crate::util::test::init_test_stores().await;
+        let mut agent = make_agent(vec![]);
+        agent.agent_id = "provider-wiring".into();
+        let model = crate::config::CONFIG.role_model(agent.role);
+        // The outage map is process-global and production `chat_scoped` calls elsewhere in this
+        // binary write to it, so the model starts from a clock this test controls.
+        selection::clear_outages(&model);
+        let expected = selection::pick(&model)
+            .expect("the default routing pins the default chat model to a provider");
+
+        let stale = selection::StoredProvider {
+            model: model.clone(),
+            provider: "no-longer-listed".into(),
+        };
+        agent.provider = selection::ProviderSelection::resolve(&model, Some(&stale));
+        assert_eq!(agent.provider.slug(), Some(expected.as_str()));
+
+        // Every request of the run carries it.
+        let request = agent.build_chat_request(vec![crate::ChatMessage::user("hi")], "agent");
+        assert_eq!(request.provider.as_deref(), Some(expected.as_str()));
+
+        // A model change under the run re-selects: a live provider chosen for another model says
+        // nothing about this one, so the request re-picks for the model it carries and the run
+        // records it.
+        agent.provider =
+            selection::ProviderSelection::for_test("selection/some-other-model", &["live"], "live");
+        let request = agent.build_chat_request(vec![crate::ChatMessage::user("hi")], "agent");
+        assert_eq!(
+            request.provider.as_deref(),
+            Some(expected.as_str()),
+            "another model's live provider is not reused"
+        );
+        assert_eq!(
+            agent.provider.stored().map(|stored| stored.model),
+            Some(model.clone()),
+            "the run's selection follows the model the request carries"
+        );
+    }
+
+    /// A conversation whose first turn makes a single model call still records its provider: the
+    /// write lands nowhere before the session has a metadata row, and `finalize` retries it once it
+    /// has one. Without that, the choice would survive neither a restart nor a resumed run.
+    #[tokio::test]
+    async fn the_first_turn_records_its_provider_once_finalize_creates_the_row() {
+        use crate::providers::selection;
+
+        crate::util::test::init_test_stores().await;
+        let mut agent = make_agent(vec![]);
+        agent.agent_id = "provider-first-turn".into();
+        let model = crate::config::CONFIG.role_model(agent.role);
+        // As above: the outage clock is process-global, so this test starts from a clean model.
+        selection::clear_outages(&model);
+        let expected = selection::pick(&model)
+            .expect("the default routing pins the default chat model to a provider");
+
+        agent.provider = selection::ProviderSelection::resolve(&model, None);
+        assert_eq!(agent.provider.slug(), Some(expected.as_str()));
+        // No metadata row exists yet, so the write lands nowhere and records nothing.
+        agent.persist_provider().await;
+        assert_eq!(
+            crate::session::store().get_provider(&agent.agent_id).await,
+            None,
+        );
+
+        // `finalize` flushes the tail (creating the row) and the retry records the provider.
+        agent.session.push_messages_unpersisted(&[
+            crate::ChatMessage::user("hi"),
+            crate::ChatMessage::assistant("hello"),
+        ]);
+        agent
+            .finalize_session()
+            .await
+            .expect("finalize persists the unpersisted tail");
+        let recorded = crate::session::store()
+            .get_provider(&agent.agent_id)
+            .await
+            .map(|stored| stored.provider);
+        // The row is real: remove it, so the shared test store is left as this test found it.
+        let _ = crate::session::store().delete(&agent.agent_id).await;
+        assert_eq!(
+            recorded,
+            Some(expected),
+            "the first turn's provider must not be lost to the next run's re-selection"
         );
     }
 

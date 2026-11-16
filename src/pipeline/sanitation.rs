@@ -205,7 +205,7 @@ async fn finalize_commit_and_transition(
 
 pub(crate) async fn finalize_sanitation_stage(
     ticket: &Ticket,
-    agent: &Agent,
+    agent: &mut Agent,
     response: Option<&str>,
     job_id: &str,
     ws: &Workspace,

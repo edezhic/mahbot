@@ -70,7 +70,8 @@ pub mod photocraft;
 
 // A standalone benchmark for OpenRouter models, run outside the product.
 pub mod bench_openrouter;
-// Model providers: the OpenAI-compatible client, reasoning replay, error classes.
+// Model providers: the OpenAI-compatible client, reasoning replay, error classes, and provider
+// selection — the per-model priority list the product pins one provider from per conversation.
 pub mod providers;
 // The single retry authority for LLM calls: attempt schedules and backoff.
 pub(crate) mod retry;
@@ -963,6 +964,9 @@ pub struct Agent {
     /// question), purely presentational for the group header. Propagated to sub-agents
     /// via [`CURRENT_TOOL_PARENT_LABEL`](crate::agent::CURRENT_TOOL_PARENT_LABEL).
     pub(crate) parent_label: Option<String>,
+    /// The provider this run's model calls are pinned to; see [`crate::providers::selection`] for
+    /// when it moves. `Default` (no provider) until the turn starts.
+    pub(crate) provider: crate::providers::selection::ProviderSelection,
     /// Mid-work messages (e.g. ticket comments): `llm_loop` drains this channel before
     /// each LLM call and injects what it finds into the session history.
     pub(crate) incoming_rx:
@@ -1589,9 +1593,10 @@ pub(crate) struct ChatRequest {
     /// Sent as `reasoning_effort` (xhigh, high, medium, low, minimal); omitted when
     /// `None` (model defaults apply).
     pub reasoning_effort: Option<String>,
-    /// Comma-separated provider slugs, sent as the provider routing block when non-empty;
-    /// omitted when `None` (OpenRouter defaults apply).
-    pub provider_order: Option<String>,
+    /// The single provider this call is pinned to — one entry of the model's priority list; sent as
+    /// the `provider` routing block when set, omitted when `None` (the router decides). A mid-run
+    /// switch rewrites it (see [`crate::providers::selection`]).
+    pub provider: Option<String>,
     pub meta: Option<ChatRequestMeta>,
 }
 

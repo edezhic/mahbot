@@ -32,6 +32,7 @@
 use crate::agent::message_router::{self, AgentJob, MessageKind};
 use crate::agent::{chat_request, role_tool_specs, run_default_agent};
 use crate::prompt::{load_prompt, substitute};
+use crate::providers::selection::ProviderSelection;
 use crate::retry::FailureClass;
 use crate::tools::analyze::{
     AnalystFindings, Claim, RoundMember, VerificationResult, VerificationTarget,
@@ -1100,9 +1101,11 @@ struct GapRoundsOutcome {
 }
 
 /// One deadline-aborted analyst's dispatch-time snapshot: the agent_id plus the frozen
-/// chat params (model, tools, reasoning_effort, routing, max_tokens) captured BEFORE
-/// spawn so the wrap-up replays the analyst's KV-cache prefix. Config/daemon-state
-/// drift after the snapshot is not reflected (fail-open: a miss re-encodes the tail).
+/// chat params (model, tools, reasoning_effort, max_tokens) captured BEFORE spawn so the
+/// wrap-up replays the analyst's KV-cache prefix. The provider is the exception — it is
+/// read from the analyst's own conversation when the wrap-up is built
+/// ([`wrap_up_timed_out`]). Config/daemon-state drift after the snapshot is not
+/// reflected (fail-open: a miss re-encodes the tail).
 #[derive(Clone)]
 struct WrapUpEntry {
     agent_id: String,
@@ -1122,27 +1125,26 @@ fn wrap_up_timeout() -> Duration {
 
 /// Build Analyst chat params carrying `purpose`/`agent_id` metadata and optional tool
 /// specs; byte-relevant fields come from the shared [`chat_request`] helper (model,
-/// reasoning_effort, routing, max_tokens).
+/// reasoning_effort, max_tokens). The provider belongs to the caller — see [`WrapUpEntry`].
 fn research_params(
     ws: &Workspace,
     purpose: &'static str,
     agent_id: String,
     tool_specs: Option<Vec<ToolSpec>>,
 ) -> ChatRequest {
-    ChatRequest {
-        meta: Some(ChatRequestMeta {
-            purpose,
-            agent_id,
-            role: Role::Analyst.as_str().to_string(),
-            workspace: ws.name.clone(),
-            ticket_id: None,
-        }),
-        ..chat_request(Role::Analyst, tool_specs, Vec::new())
-    }
+    let mut request = chat_request(Role::Analyst, tool_specs, Vec::new());
+    request.meta = Some(ChatRequestMeta {
+        purpose,
+        agent_id,
+        role: Role::Analyst.as_str().to_string(),
+        workspace: ws.name.clone(),
+        ticket_id: None,
+    });
+    request
 }
 
-/// Wrap-up params: the tool specs frozen at dispatch. The dedicated purpose tag
-/// separates wrap-up calls in the request journal.
+/// Wrap-up params: the tool specs frozen at dispatch. The provider is not chosen here — see
+/// [`WrapUpEntry`].
 fn wrap_up_params(ws: &Workspace, agent_id: &str, tool_specs: Vec<ToolSpec>) -> ChatRequest {
     research_params(
         ws,
@@ -1211,10 +1213,12 @@ async fn wrap_up_timed_out(
         }
         let has_success = session_has_successful_tool_result(&history);
         if has_success {
-            prepared.push(WrapUpPrepared {
-                params: entry.params,
-                history,
-            });
+            // The wrap-up replays this conversation's prefix, so it continues on the provider that
+            // conversation holds — read here, where its session is loaded, not guessed at dispatch.
+            let stored = crate::session::store().get_provider(&entry.agent_id).await;
+            let mut params = entry.params;
+            ProviderSelection::resolve(&params.model, stored.as_ref()).pin(&mut params);
+            prepared.push(WrapUpPrepared { params, history });
         }
     }
     // Skip the batch when nothing is prepared or a drain started during the
@@ -1419,7 +1423,7 @@ async fn run_structured_analyst<T: serde::de::DeserializeOwned>(
     run_key: &str,
     question: &str,
 ) -> AnalystRun<T> {
-    let (agent, response) = run_default_agent(
+    let (mut agent, response) = run_default_agent(
         agent_id,
         Role::Analyst,
         ws,
@@ -1547,13 +1551,22 @@ fn collect_evidence(
 /// Orchestrator chat params: cheap Analyst model (per-role overrides respected),
 /// constant model/effort/tools across a run's coordination calls (KV-cache friendly —
 /// the leading workspace-context system message is constant too).
-fn orchestrator_params(ws: &Workspace, purpose: &'static str) -> ChatRequest {
-    research_params(
+///
+/// The run holds ONE provider for all of them ([`crate::providers::selection`]): a coordination
+/// call that blips does not move the next one, which is what keeps the shared prefix cached.
+fn orchestrator_params(
+    ws: &Workspace,
+    purpose: &'static str,
+    held: &mut ProviderSelection,
+) -> ChatRequest {
+    let mut request = research_params(
         ws,
         purpose,
         format!("research_{}_orchestrator", ws.name),
         None,
-    )
+    );
+    held.apply(&mut request);
+    request
 }
 
 /// Structured orchestrator extraction via the hardened scoped retry loop; `prompt`
@@ -1566,9 +1579,10 @@ async fn orchestrator_extract<T: serde::de::DeserializeOwned>(
     validate: Option<&crate::ExtractionValidator<T>>,
     run_key: &str,
     question: &str,
+    held: &mut ProviderSelection,
 ) -> Result<T> {
     let _call = research_call_guard(purpose, &ws.name, run_key, false, question);
-    let params = orchestrator_params(ws, purpose);
+    let params = orchestrator_params(ws, purpose, held);
     let mut messages = Vec::with_capacity(2);
     crate::prompt::prepend_general_context(&mut messages, ws).await;
     messages.push(ChatMessage::user(prompt));
@@ -1600,6 +1614,7 @@ async fn round0_decompose(
     run_root: &str,
     captured: &mut Vec<String>,
     run_key: &str,
+    held: &mut ProviderSelection,
 ) -> Result<(MergedPlan, Option<String>)> {
     budget
         .try_reserve(DECOMPOSE_FAN_OUT)
@@ -1647,7 +1662,8 @@ async fn round0_decompose(
     if valid.is_empty() {
         anyhow::bail!("all decomposition analysts failed — no research plan produced");
     }
-    if let Ok(mut plan) = merge_decomposition_plans(ws, question, &valid, max_slots, run_key).await
+    if let Ok(mut plan) =
+        merge_decomposition_plans(ws, question, &valid, max_slots, run_key, held).await
     {
         resolve_merged_plan_ids(&mut plan, &valid);
         // The validator already rejected an over-wide plan; fitting is the deterministic backstop
@@ -1727,6 +1743,7 @@ async fn merge_decomposition_plans(
     plans: &[DecompositionPlan],
     max_slots: usize,
     run_key: &str,
+    held: &mut ProviderSelection,
 ) -> Result<MergedPlan> {
     let max_slots_arg = max_slots.to_string();
     let prompt = substitute(
@@ -1746,6 +1763,7 @@ async fn merge_decomposition_plans(
         Some(&move |p| validate_merged_plan(p, &plans_owned, max_slots)),
         run_key,
         question,
+        held,
     )
     .await
 }
@@ -2048,6 +2066,7 @@ async fn extract_gap_list(
     acc: &AccumulatedEvidence,
     plan: &MergedPlan,
     run_key: &str,
+    held: &mut ProviderSelection,
 ) -> Option<GapList> {
     let evidence = render_accumulated_evidence(acc, true);
     let plan_json = serde_json::to_string(plan).unwrap_or_default();
@@ -2068,6 +2087,7 @@ async fn extract_gap_list(
         Some(&move |g| validate_gap_list(g, &plan_owned)),
         run_key,
         question,
+        held,
     )
     .await
     .ok()
@@ -2311,6 +2331,7 @@ async fn gap_rounds(
     run_root: &str,
     resume: bool,
     recovered: &mut Vec<AnalystFindings>,
+    held: &mut ProviderSelection,
 ) -> GapRoundsOutcome {
     // Cumulative across boot-resumes: seed the per-invocation dispatch count from the
     // persisted checkpoint so a resumed run's "rounds used" telemetry covers the whole run.
@@ -2328,7 +2349,7 @@ async fn gap_rounds(
     }
     let initial_list = match state.gap_list.take() {
         Some(list) => Some(list),
-        None => extract_gap_list(ws, question, &state.acc, plan, job_id).await,
+        None => extract_gap_list(ws, question, &state.acc, plan, job_id, held).await,
     };
     let Some(mut gap_list) = initial_list else {
         // Explicit marker — never collapse into coverage completion.
@@ -2417,6 +2438,7 @@ async fn gap_rounds(
             &mut state.markers,
             job_id,
             question,
+            held,
         )
         .await;
         outcome.rounds_dispatched += 1;
@@ -2428,7 +2450,8 @@ async fn gap_rounds(
             // weak-duplicate-only round also lands here (weak duplicates append standalone claims
             // but never count as novel) — the answerability check fires and the gap list is not
             // refreshed: intended premature-saturation protection.
-            if let Some(reason) = check_answerability(ws, question, &state.acc, job_id).await {
+            if let Some(reason) = check_answerability(ws, question, &state.acc, job_id, held).await
+            {
                 outcome.abstention = Some(reason);
                 outcome.unresolved = gap_items(gaps);
                 return outcome;
@@ -2437,7 +2460,7 @@ async fn gap_rounds(
         // Refresh the gap list from the accumulated evidence only when the round produced progress.
         if new_urls != 0 || novel_claims != 0 {
             let Some(next_gap_list) =
-                extract_gap_list(ws, question, &state.acc, plan, job_id).await
+                extract_gap_list(ws, question, &state.acc, plan, job_id, held).await
             else {
                 outcome.incomplete = Some(GAP_EXTRACTION_FAILED.to_string());
                 outcome.unresolved = gap_items(gaps);
@@ -2481,6 +2504,7 @@ async fn annotate_claims(
     pending: &[Claim],
     run_key: &str,
     question: &str,
+    held: &mut ProviderSelection,
 ) -> Result<AnnotationPass> {
     let mut existing_claims = String::new();
     for (i, c) in existing.iter().enumerate() {
@@ -2510,6 +2534,7 @@ async fn annotate_claims(
         Some(&move |a| validate_annotations(a, &existing_owned, &pending_owned)),
         run_key,
         question,
+        held,
     )
     .await
 }
@@ -2583,6 +2608,7 @@ async fn confirm_links(
     pass: &AnnotationPass,
     run_key: &str,
     question: &str,
+    held: &mut ProviderSelection,
 ) -> Result<ConfirmPass> {
     let mut links = String::new();
     for a in pass.annotations.iter().filter(|a| a.verdict != "novel") {
@@ -2618,6 +2644,7 @@ async fn confirm_links(
         Some(&move |c| validate_confirm(c, &mutating)),
         run_key,
         question,
+        held,
     )
     .await
 }
@@ -2652,6 +2679,7 @@ async fn annotate_round(
     markers: &mut Vec<String>,
     run_key: &str,
     question: &str,
+    held: &mut ProviderSelection,
 ) -> usize {
     if pending.is_empty() {
         return 0;
@@ -2663,7 +2691,8 @@ async fn annotate_round(
         acc.claims.extend(pending.iter().cloned());
         return pending.len();
     }
-    let Ok(pass) = annotate_claims(ws, &acc.claims, &acc.weak, pending, run_key, question).await
+    let Ok(pass) =
+        annotate_claims(ws, &acc.claims, &acc.weak, pending, run_key, question, held).await
     else {
         acc.claims.extend(pending.iter().cloned());
         if !markers.iter().any(|m| m == CLAIM_ANNOTATION_FAILED) {
@@ -2673,7 +2702,8 @@ async fn annotate_round(
     };
     // Confirm pass over the mutating links only. No mutating links → every verdict applies as-is.
     let confirm = if pass.annotations.iter().any(|a| a.verdict != "novel") {
-        if let Ok(c) = confirm_links(ws, &acc.claims, pending, &pass, run_key, question).await {
+        if let Ok(c) = confirm_links(ws, &acc.claims, pending, &pass, run_key, question, held).await
+        {
             ConfirmOutcome::Passed(c)
         } else {
             // Fail-open: every mutating verdict becomes weak/unconfirmed (never all-novel, no
@@ -2697,6 +2727,7 @@ async fn check_answerability(
     question: &str,
     acc: &AccumulatedEvidence,
     run_key: &str,
+    held: &mut ProviderSelection,
 ) -> Option<String> {
     let evidence = render_accumulated_evidence(acc, true);
     let prompt = substitute(
@@ -2710,6 +2741,7 @@ async fn check_answerability(
         None,
         run_key,
         question,
+        held,
     )
     .await
     .ok()?;
@@ -2799,6 +2831,7 @@ async fn synthesize(
     open: &[String],
     ceiling: usize,
     run_key: &str,
+    held: &mut ProviderSelection,
 ) -> Result<SynthesisOutcome> {
     let _call = research_call_guard("synthesize", &ws.name, run_key, false, question);
     // The open-questions section below is the single place the analysts' unanswered aspects appear
@@ -2834,7 +2867,7 @@ async fn synthesize(
         );
     }
     let policy = crate::retry::RetryPolicy::synthesis();
-    let mut params = orchestrator_params(ws, "synthesize");
+    let mut params = orchestrator_params(ws, "synthesize", held);
     let mut loop_state = crate::retry::RetryLoop::new_scoped(&policy, &params);
     let operation_started = Instant::now();
     let mut prefix = Vec::with_capacity(2);
@@ -2936,6 +2969,10 @@ async fn synthesize(
                 if non_retryable {
                     break;
                 }
+                // A dead pin does not get the rest of the ladder: the round moves to the first
+                // available entry from the top and the request continues there (see
+                // `providers::selection`).
+                loop_state.switch_after_failure(err.class, held, &mut params);
                 transport_failures += 1;
                 if attempt < policy.max_attempts
                     && let Err(FailureClass::Shutdown) =
@@ -3627,6 +3664,10 @@ async fn run_deep_research(
         return ResearchExit::Cancelled;
     }
 
+    // A research run is its own conversation (see `providers::selection`): one provider for every
+    // coordination call of the round, resolved on the first and re-resolved only when the model
+    // changed or that provider's outage outlasted the window.
+    let mut held = ProviderSelection::default();
     let mut round_agents: Vec<String> = Vec::new();
     if state.stage == ResearchStage::Decompose {
         let round0 = round0_decompose(
@@ -3639,6 +3680,7 @@ async fn run_deep_research(
             &run_root_str,
             &mut round_agents,
             job_id,
+            &mut held,
         )
         .await;
         // Capture on EVERY outcome — a hard decompose failure still leaves the dispatched agents'
@@ -3732,6 +3774,7 @@ async fn run_deep_research(
                 &mut state.markers,
                 job_id,
                 question,
+                &mut held,
             )
             .await;
             // The directions the round examined are checkpointed with it, so a resumed run does not
@@ -3782,6 +3825,7 @@ async fn run_deep_research(
                 &run_root_str,
                 resume,
                 &mut recovered,
+                &mut held,
             )
             .await;
             // Aborting mid-gap-loop (drain/shutdown): leave the stage at GapRounds so the next
@@ -3849,6 +3893,7 @@ async fn run_deep_research(
             &open,
             answer_text_ceiling(&open_section, job_id),
             job_id,
+            &mut held,
         )
         .await
         {
@@ -4331,10 +4376,19 @@ mod tests {
                         .ok_with_finish("compressed final", Some("length"));
                     let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
                     let _provider_guard = crate::util::test::install_fake_provider(provider);
-                    let out =
-                        synthesize(&ws, "q", &acc, &[], None, &[], ANSWER_MAX_BYTES, "test_run")
-                            .await
-                            .expect("truncated output is reported, not errored");
+                    let out = synthesize(
+                        &ws,
+                        "q",
+                        &acc,
+                        &[],
+                        None,
+                        &[],
+                        ANSWER_MAX_BYTES,
+                        "test_run",
+                        &mut ProviderSelection::default(),
+                    )
+                    .await
+                    .expect("truncated output is reported, not errored");
                     let SynthesisOutcome::Undelivered { reason, output } = out else {
                         panic!("[{}] a truncated output is not the answer", case.name);
                     };
@@ -4356,10 +4410,19 @@ mod tests {
                         .ok(&compact);
                     let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
                     let _provider_guard = crate::util::test::install_fake_provider(provider);
-                    let out =
-                        synthesize(&ws, "q", &acc, &[], None, &[], ANSWER_MAX_BYTES, "test_run")
-                            .await
-                            .expect("clean completion wins");
+                    let out = synthesize(
+                        &ws,
+                        "q",
+                        &acc,
+                        &[],
+                        None,
+                        &[],
+                        ANSWER_MAX_BYTES,
+                        "test_run",
+                        &mut ProviderSelection::default(),
+                    )
+                    .await
+                    .expect("clean completion wins");
                     let SynthesisOutcome::Answer { text, undelivered } = out else {
                         panic!("[{}] a clean attempt is the answer", case.name);
                     };
@@ -4379,12 +4442,19 @@ mod tests {
                         .err(crate::retry::FailureClass::Transport, "outage");
                     let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
                     let _provider_guard = crate::util::test::install_fake_provider(provider);
-                    let err =
-                        synthesize(&ws, "q", &acc, &[], None, &[], ANSWER_MAX_BYTES, "test_run")
-                            .await
-                            .expect_err(
-                                "transport exhaustion must error into the product-built answer",
-                            );
+                    let err = synthesize(
+                        &ws,
+                        "q",
+                        &acc,
+                        &[],
+                        None,
+                        &[],
+                        ANSWER_MAX_BYTES,
+                        "test_run",
+                        &mut ProviderSelection::default(),
+                    )
+                    .await
+                    .expect_err("transport exhaustion must error into the product-built answer");
                     assert!(
                         err.to_string().contains("no usable output"),
                         "[{}] {err}",
@@ -4399,10 +4469,19 @@ mod tests {
                         .ok(&compact);
                     let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
                     let _provider_guard = crate::util::test::install_fake_provider(provider);
-                    let out =
-                        synthesize(&ws, "q", &acc, &[], None, &[], ANSWER_MAX_BYTES, "test_run")
-                            .await
-                            .expect("the retried answer is delivered");
+                    let out = synthesize(
+                        &ws,
+                        "q",
+                        &acc,
+                        &[],
+                        None,
+                        &[],
+                        ANSWER_MAX_BYTES,
+                        "test_run",
+                        &mut ProviderSelection::default(),
+                    )
+                    .await
+                    .expect("the retried answer is delivered");
                     assert_eq!(
                         synthesis_answer(out),
                         compact,
@@ -4418,10 +4497,19 @@ mod tests {
                         .ok(&long);
                     let provider: std::sync::Arc<dyn crate::Provider> = std::sync::Arc::new(fake);
                     let _provider_guard = crate::util::test::install_fake_provider(provider);
-                    let out =
-                        synthesize(&ws, "q", &acc, &[], None, &[], ANSWER_MAX_BYTES, "test_run")
-                            .await
-                            .expect("the over-long output is reported, not errored");
+                    let out = synthesize(
+                        &ws,
+                        "q",
+                        &acc,
+                        &[],
+                        None,
+                        &[],
+                        ANSWER_MAX_BYTES,
+                        "test_run",
+                        &mut ProviderSelection::default(),
+                    )
+                    .await
+                    .expect("the over-long output is reported, not errored");
                     let SynthesisOutcome::Undelivered { reason, output } = out else {
                         panic!("[{}] an over-long answer is never delivered", case.name);
                     };
@@ -4446,10 +4534,19 @@ mod tests {
                     );
                     let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
                     let _provider_guard = crate::util::test::install_fake_provider(provider);
-                    let out =
-                        synthesize(&ws, "q", &acc, &[], None, &[], ANSWER_MAX_BYTES, "test_run")
-                            .await
-                            .expect("a short answer is still an answer");
+                    let out = synthesize(
+                        &ws,
+                        "q",
+                        &acc,
+                        &[],
+                        None,
+                        &[],
+                        ANSWER_MAX_BYTES,
+                        "test_run",
+                        &mut ProviderSelection::default(),
+                    )
+                    .await
+                    .expect("a short answer is still an answer");
                     assert_eq!(
                         synthesis_answer(out),
                         "still brief",
@@ -4480,6 +4577,7 @@ mod tests {
                         &[],
                         ANSWER_MAX_BYTES,
                         "test_run",
+                        &mut ProviderSelection::default(),
                     )
                     .await
                     .expect("clean completion wins");
@@ -4518,6 +4616,7 @@ mod tests {
                         &mut markers,
                         "test_run",
                         "question",
+                        &mut ProviderSelection::default(),
                     )
                     .await;
                     assert_eq!(
@@ -5082,6 +5181,85 @@ mod tests {
             ChatMessage::tool_result("t2", "results ok"),
         ];
         assert!(session_has_successful_tool_result(&mixed));
+    }
+
+    /// The wrap-up continues on the timed-out analyst's own provider: it replays that conversation's
+    /// prefix, so a fresh choice would re-encode what already lives at the provider that wrote it.
+    /// Only a conversation with no stored pair (a first turn that never finalized) selects from the
+    /// top, like any new conversation.
+    #[tokio::test]
+    #[serial_test::serial(config_persist, provider, drain)] // the priority list, the fake provider and the drain flag are process-global
+    async fn the_wrap_up_continues_on_the_analysts_own_provider() {
+        crate::util::test::init_test_stores().await;
+        // A private model, so the priority list this test installs cannot leak into another test's
+        // selection for the default chat model.
+        let model = "research/wrap-up-provider";
+        let _order = crate::config::test_routing_order(model, "first, second");
+        let agent_id = "research-wrap-up-analyst";
+        let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new().ok(
+            r#"{"claims":[{"claim":"found","source":"u1","confidence":"high","contradictions":[]}],"unanswered":[]}"#,
+        ));
+
+        // The body runs as its own task so the conversation is removed even when an assertion
+        // panics — the seeded session is the only process-global state this test creates.
+        let body = {
+            let fake = fake.clone();
+            tokio::spawn(async move {
+                // The analyst's conversation: one successful tool result (the wrap-up's gate) and a
+                // provider it holds — the second entry, so a fresh pick from the top differs.
+                let mut session = crate::session::Session::default();
+                session.init(agent_id).await.expect("session init");
+                session.push_messages_unpersisted(&[
+                    ChatMessage::user("research the question"),
+                    ChatMessage::tool_result("t1", "results ok"),
+                ]);
+                session.finalize(agent_id).await.expect("create the row");
+                let stored = crate::providers::selection::StoredProvider {
+                    model: model.to_string(),
+                    provider: "second".into(),
+                };
+                assert!(
+                    crate::session::store()
+                        .set_provider(agent_id, Some(&stored))
+                        .await
+                        .expect("record the conversation's provider"),
+                );
+
+                let provider: std::sync::Arc<dyn crate::Provider> = fake.clone();
+                let _guard = crate::util::test::install_fake_provider(provider);
+                let ws = crate::workspace::test_ws("/tmp/test_ws");
+                let mut params = wrap_up_params(&ws, agent_id, vec![]);
+                params.model = model.to_string();
+
+                let findings = wrap_up_timed_out(
+                    &ws,
+                    vec![WrapUpEntry {
+                        agent_id: agent_id.to_string(),
+                        params,
+                    }],
+                    &mut QueryLedger::default(),
+                    &mut RunStats::default(),
+                    "run-key",
+                    "the question",
+                )
+                .await;
+                let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
+                (findings.len(), fingerprints)
+            })
+        };
+        let outcome = body.await;
+        let _ = crate::session::store().delete(agent_id).await;
+        let (found, fingerprints) = match outcome {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic.into_panic()),
+        };
+
+        assert_eq!(found, 1, "the wrap-up extracted the findings");
+        assert!(
+            fingerprints[0].contains(r#"provider: Some("second")"#),
+            "the wrap-up continues on the conversation's own provider, not the top of the list: {}",
+            fingerprints[0]
+        );
     }
 
     #[test]

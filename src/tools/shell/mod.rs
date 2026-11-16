@@ -6122,15 +6122,22 @@ mod tests {
     }
 
     /// A leftover holding only ONE pipe (stdout EOFs, stderr hangs) still reports the completed
-    /// side and the command's status once the holder is stopped, without re-polling the completed
-    /// reader.
+    /// side and the command's own status, and the run does not wait for the leftover. Which arm the
+    /// stop lands in depends on whether the killed holder's pipe closed inside the grace — a
+    /// wall-clock race under load — so the assertions are on what the run reports and on the holder
+    /// actually dying, never on that arm.
     #[cfg(unix)]
     #[tokio::test]
     async fn output_drain_keeps_the_completed_side_of_a_stopped_leftover() {
         let dir = TempDir::new().expect("tempdir");
+        let pid_path = dir.path().join("bg.pid");
+        let pid_path_str = pid_path.to_str().expect("valid utf-8 path");
         // The backgrounded sleep redirects stdout (releasing that pipe → EOF) but inherits stderr
         // past the bound.
-        let mut cmd = build_shell_command("echo out; sleep 5 >/dev/null &", dir.path());
+        let mut cmd = build_shell_command(
+            &format!("echo out; sleep 5 >/dev/null & echo $! > {pid_path_str}"),
+            dir.path(),
+        );
         let result = run_command_with_timeout(
             &mut cmd,
             Some(Duration::from_secs(30)),
@@ -6141,14 +6148,36 @@ mod tests {
             None,
         )
         .await;
-        let ShellRunResult::Completed { stdout, status, .. } = result else {
-            panic!("expected Completed, got {result:?}");
+        let (stdout, status, elapsed) = match result {
+            ShellRunResult::Completed {
+                stdout,
+                status,
+                elapsed,
+                ..
+            }
+            | ShellRunResult::ExitedWithLeftovers {
+                stdout,
+                status,
+                elapsed,
+                ..
+            } => (stdout, status, elapsed),
+            other => panic!("a stopped leftover must report the command's own run, got {other:?}"),
         };
         assert_eq!(status.code(), Some(0));
         assert!(
             String::from_utf8_lossy(&stdout).contains("out"),
             "completed stdout side must be preserved: {stdout:?}"
         );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the run must not wait for the leftover: {elapsed:?}"
+        );
+        let pid: i32 = std::fs::read_to_string(&pid_path)
+            .expect("the leftover's PID file must exist — it was launched")
+            .trim()
+            .parse()
+            .expect("valid PID from file");
+        wait_for_death(pid).await;
     }
 
     /// The [`LeftoverPolicy::Program`] path ends the run's tree at the drain bound: the holder is

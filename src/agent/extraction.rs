@@ -63,7 +63,7 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     // never diverge from the bytes actually sent. Only the telemetry fields are read from it —
     // messages are emptied here so the per-attempt spread doesn't clone the caller's history; the
     // one-time params.clone() below is that cost.
-    let record_request = ChatRequest {
+    let mut record_request = ChatRequest {
         messages: vec![],
         ..params.clone()
     };
@@ -154,6 +154,8 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                     );
                     return fail_exhausted(&record_request, operation_started, exhausted);
                 }
+                // A dead pin does not get the rest of the ladder (see `providers::selection`).
+                loop_state.retarget_after_failure(scoped_err.class, &mut record_request);
             }
         }
 
@@ -202,7 +204,7 @@ mod tests {
             model: "test-model".to_string(),
             max_tokens: None,
             reasoning_effort: None,
-            provider_order: None,
+            provider: None,
             meta: None,
         }
     }
@@ -224,6 +226,67 @@ mod tests {
             None,
         )
         .await
+    }
+
+    /// A provider that has been failing for the whole window does not get the rest of the ladder:
+    /// the remaining attempts go to the next entry of the model's priority list. Without this the
+    /// run would fail at extraction with a live provider one entry down.
+    #[tokio::test]
+    #[serial_test::serial(config_persist, provider)] // the routing row, the fake provider and the outage map are process-global
+    async fn a_dead_provider_is_left_mid_ladder() {
+        use crate::providers::selection;
+
+        crate::util::test::init_test_stores().await;
+        let model = "extraction/provider-switch";
+        // Guarded: the priority list lives in the process-global CONFIG, and a panic mid-test must
+        // not leave these providers installed for the rest of the binary.
+        let _order = crate::config::test_routing_order(model, "first, second");
+        selection::force_outage(
+            model,
+            "first",
+            std::time::Instant::now()
+                .checked_sub(selection::MOVE_AFTER + std::time::Duration::from_secs(1))
+                .expect("a five-minute subtraction stays representable"),
+        );
+
+        let fake = Arc::new(
+            FakeProvider::new()
+                .err(
+                    crate::retry::FailureClass::Transport,
+                    "the provider is down",
+                )
+                .ok(r#"{"score": 8}"#),
+        );
+        let provider: Arc<dyn crate::Provider> = fake.clone();
+        let _guard = install_fake_provider(provider);
+        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
+
+        let mut params = test_params();
+        params.model = model.to_string();
+        params.provider = Some("first".to_string());
+        let verdict = retry_extract_structured_scoped::<FakeVerdict>(
+            &history(),
+            "return JSON verdict",
+            &params,
+            Some(&score_validator),
+            None,
+        )
+        .await
+        .expect("the second attempt is served");
+        assert_eq!(verdict.score, 8);
+
+        let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
+        assert_eq!(fingerprints.len(), 2);
+        assert!(
+            fingerprints[0].contains(r#"provider: Some("first")"#),
+            "the first attempt stays on the pinned provider: {}",
+            fingerprints[0]
+        );
+        assert!(
+            fingerprints[1].contains(r#"provider: Some("second")"#),
+            "the attempt after the window goes to the next available entry: {}",
+            fingerprints[1]
+        );
     }
 
     #[tokio::test]

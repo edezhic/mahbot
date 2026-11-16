@@ -58,8 +58,11 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
     run_stage_agent(&ticket, &ws, job_id, &message, StageRunKind::Engineer).await;
 }
 
-async fn engineer_comment_text(agent: &Agent, raw: &str) -> String {
-    let ticket_id = agent.ticket.as_ref().map_or("?", |t| t.id.as_str());
+async fn engineer_comment_text(agent: &mut Agent, raw: &str) -> String {
+    let ticket_id = agent
+        .ticket
+        .as_ref()
+        .map_or_else(|| "?".to_string(), |t| t.id.clone());
     let policy = crate::retry::RetryPolicy::comment();
     let extraction_prompt = load_prompt("extraction/engineer.md");
     let summary = match agent
@@ -145,7 +148,7 @@ fn notify_engineer_pause(ticket_id: &str, ws: &Workspace, failure_details: &str,
 /// transition, and job terminalization.
 pub(crate) async fn finalize_engineer_stage(
     ticket: &Ticket,
-    agent: &Agent,
+    agent: &mut Agent,
     response: Option<&str>,
     job_id: &str,
     ws: &Workspace,

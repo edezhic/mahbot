@@ -24,7 +24,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::borrow::Cow;
 
 // The summarization LLM call lives in `crate::Agent::summarize` so its parameters (model,
-// reasoning_effort, tools, provider routing) stay byte-identical to the work loop's.
+// reasoning_effort, tools, pinned provider) stay byte-identical to the work loop's.
 
 /// Token threshold (REAL provider-reported input + output of the last successful agent call,
 /// persisted in `session_metadata.token_length`) that triggers summarization. `None` — never
@@ -1229,6 +1229,64 @@ impl SessionStore {
         .await
     }
 
+    /// The provider this conversation holds, with the model it was chosen for. `None` when none was
+    /// recorded yet (never selected, or a session predating the columns).
+    ///
+    /// Both columns are read by ONE query because the pair is the unit: a row carrying one of them
+    /// is not a choice, and half of it must not be handed to a selection that would then treat a
+    /// stale provider as current. Fail open like the single-column readers — a read error reads as
+    /// "no provider", which selects again on this run.
+    pub(crate) async fn get_provider(
+        &self,
+        agent_id: &str,
+    ) -> Option<crate::providers::selection::StoredProvider> {
+        self.read_optional_row(
+            "SELECT provider, provider_model FROM session_metadata WHERE agent_id = ?1",
+            agent_id,
+            "Failed to read the session's provider",
+            |row| {
+                let provider = row.get::<Option<String>>(0)?;
+                let model = row.get::<Option<String>>(1)?;
+                Ok(provider.zip(model).map(|(provider, model)| {
+                    crate::providers::selection::StoredProvider { model, provider }
+                }))
+            },
+        )
+        .await
+        .flatten()
+    }
+
+    /// Record (or clear, with `None`) the conversation's provider, returning whether the write
+    /// matched a `session_metadata` row — `false` means it landed nowhere, so the caller keeps its
+    /// in-memory value unrecorded and writes again once the session has a row.
+    ///
+    /// Deliberately an UPDATE and never an upsert: an upsert would create a `session_metadata` row
+    /// for a session that has no history yet (and resurrect one `/clear` removed), which the
+    /// Sessions list would then decode as a conversation. [`crate::session::Session::init`]'s
+    /// `image_count` note carries the same reasoning.
+    pub(crate) async fn set_provider(
+        &self,
+        agent_id: &str,
+        stored: Option<&crate::providers::selection::StoredProvider>,
+    ) -> Result<bool> {
+        let (provider, model) = match stored {
+            Some(stored) => (
+                Value::Text(stored.provider.clone()),
+                Value::Text(stored.model.clone()),
+            ),
+            None => (Value::Null, Value::Null),
+        };
+        let matched = self
+            .conn
+            .execute(
+                "UPDATE session_metadata SET provider = ?1, provider_model = ?2 WHERE agent_id = ?3",
+                params![provider, model, agent_id],
+            )
+            .await
+            .context("Failed to record the session's provider")?;
+        Ok(matched > 0)
+    }
+
     /// Record the user-activity state the admin Assistant was last shown, so the next message
     /// reports a change against what was actually seen. Upserts, like the snapshot above.
     pub(crate) async fn set_user_activity(&self, agent_id: &str, location: &str) -> Result<()> {
@@ -2422,6 +2480,110 @@ mod tests {
         // The persisted real length is loaded so `maybe_summarize` and the Running Agents card
         // see it from the very start of the turn.
         assert_eq!(session.token_length(), Some(123_456));
+    }
+
+    /// The provider belongs to the conversation, not to the process: a fresh [`Session`] over the same
+    /// agent id loads the provider its predecessor recorded. That is the restart / resumed-run /
+    /// re-dispatched-agent guarantee the whole feature rests on.
+    #[tokio::test]
+    async fn a_provider_round_trips_through_a_restart() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+        let ws = crate::workspace::test_ws_named("/_test_stored_provider", "stored_provider");
+        // A recorded provider needs the metadata row the append path creates.
+        let mut session = session_with_init(&k, "hello", &ws).await;
+        let stored = crate::providers::selection::StoredProvider {
+            model: "claude-sonnet-4".to_string(),
+            provider: "anthropic".to_string(),
+        };
+
+        session.set_provider(&k, Some(stored.clone())).await;
+        assert_eq!(
+            session.provider(),
+            Some(&stored),
+            "the provider is held in memory"
+        );
+
+        let restarted = session_with_init(&k, "", &ws).await;
+        assert_eq!(
+            restarted.provider(),
+            Some(&stored),
+            "a fresh session must read back the provider AND the model it was chosen for"
+        );
+    }
+
+    /// `None` clears it on both sides: a later run then selects from the top of the list instead of
+    /// holding a provider the caller gave up on.
+    #[tokio::test]
+    async fn clearing_the_provider_clears_it_durably() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+        let ws = crate::workspace::test_ws_named("/_test_provider_clear", "provider_clear");
+        let mut session = session_with_init(&k, "hello", &ws).await;
+        session
+            .set_provider(
+                &k,
+                Some(crate::providers::selection::StoredProvider {
+                    model: "claude-sonnet-4".to_string(),
+                    provider: "anthropic".to_string(),
+                }),
+            )
+            .await;
+
+        session.set_provider(&k, None).await;
+        assert_eq!(
+            session.provider(),
+            None,
+            "the in-memory provider is cleared"
+        );
+        assert_eq!(
+            store().get_provider(&k).await,
+            None,
+            "both columns are cleared, so a fresh session sees no provider"
+        );
+        assert_eq!(session_with_init(&k, "", &ws).await.provider(), None);
+    }
+
+    /// A provider write must never create the metadata row: an upsert would give an empty session a
+    /// conversation the Sessions list decodes (and resurrect one `/clear` removed). An unmatched
+    /// write therefore advances nothing, so the next model call retries it once the first append
+    /// has created the row.
+    #[tokio::test]
+    async fn an_unmatched_provider_write_records_nothing_and_is_retried() {
+        crate::util::test::init_test_stores().await;
+        let k = unique_key();
+        let stored = crate::providers::selection::StoredProvider {
+            model: "claude-sonnet-4".to_string(),
+            provider: "anthropic".to_string(),
+        };
+
+        assert!(
+            !store().set_provider(&k, Some(&stored)).await.unwrap(),
+            "a session with no metadata row must report the write landed nowhere"
+        );
+        let mut session = Session::default();
+        session.init(&k).await.unwrap();
+        session.set_provider(&k, Some(stored.clone())).await;
+        assert_eq!(
+            session.provider(),
+            None,
+            "an unmatched write advances nothing, so the next model call writes it again"
+        );
+
+        let rows: i64 = store()
+            .conn
+            .query(
+                "SELECT COUNT(*) FROM session_metadata WHERE agent_id = ?1",
+                params![k.as_str()],
+            )
+            .await
+            .unwrap()[0]
+            .get(0)
+            .unwrap();
+        assert_eq!(
+            rows, 0,
+            "no provider write may create a session_metadata row"
+        );
     }
 
     #[tokio::test]

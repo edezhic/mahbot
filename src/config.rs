@@ -15,9 +15,15 @@
 //!   [`reload_from_db`] applies rows through [`ConfigData::set_string_field`];
 //!   an absent key stays `None` so the accessor resolves its fallback. Fields
 //!   outside this chain (e.g. `model_routings`) have their own table.
-//! * Routing chain: `config_model_routing` row → [`default_model_routing`] →
-//!   OpenRouter auto-routing. Stored in [`ConfigData::model_routings`]; every
-//!   chat request is built through [`ConfigReload::model_routing`].
+//! * Routing chain: `config_model_routing` row → [`default_model_routing`].
+//!   The row is the model's provider **priority list**, not a preference handed
+//!   to the router: the product pins one entry per conversation and leaves it
+//!   only once that provider has been unavailable for five minutes, then takes
+//!   the first available entry from the top ([`crate::providers::selection`]). Stored in
+//!   [`ConfigData::model_routings`]; every chat request is built through
+//!   [`ConfigReload::model_routing`], and [`default_model_routing`] supplies the
+//!   whole list when the field is empty, so a cleared field behaves as if that
+//!   provider had been set.
 //!
 //! `provider_endpoint` (self-hosted OpenAI-compatible: Ollama, LM Studio,
 //! llama.cpp, vLLM, LiteLLM) is honored at runtime and falls back to
@@ -39,8 +45,9 @@
 //! Downgrade resurrection is therefore lost: orphans are deleted on first
 //! reboot instead of re-appearing. The settings path cannot create new ones
 //! because [`write_kv_and_update_config`] rejects unknown keys before any DB
-//! write. [`crate::providers::compatible`] writes the resolved provider order
-//! into the OpenRouter body (`None` sends no preference at all).
+//! write. [`crate::providers::compatible`] sends the pinned provider — exactly
+//! one entry, fallbacks disabled — as the OpenRouter body's provider block
+//! (`None` sends no block at all).
 
 use crate::Role;
 use crate::util::{UnwrapPoison, is_http_url};
@@ -94,6 +101,9 @@ const FRESH_INSTALL_VIDEO_MODELS: &str =
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRouting {
     pub model: String,
+    /// Comma-separated provider slugs, highest priority first — the product's own priority list,
+    /// resolved through [`crate::providers::selection`]. It is never handed to the router as a
+    /// preference to walk, because a provider change mid-work throws away the prompt cache.
     pub provider_order: Option<String>,
 }
 
@@ -651,7 +661,8 @@ impl ConfigReload {
     }
 
     /// Find-or-push in memory; `None` `provider_order` removes the row, mirroring
-    /// the DELETE-if-empty persistence path.
+    /// the DELETE-if-empty persistence path. The row holds the same string it always did — the
+    /// model's provider priority list, comma-separated, highest priority first.
     fn set_model_routing_row(&self, model: &str, provider_order: Option<String>) {
         let mut guard = self.inner.write().unwrap_poison();
         if provider_order.is_none() {
@@ -675,9 +686,10 @@ impl ConfigReload {
             .cloned()
     }
 
-    /// The effective routing: the stored order (Settings → Provider → Models settings →
-    /// Provider Routing) wins, else [`default_model_routing`], so a cleared field behaves
-    /// exactly as if that provider had been set.
+    /// The effective routing: the stored priority list (Settings → Provider → Models settings →
+    /// Provider Priority) wins, else [`default_model_routing`], so a cleared field behaves
+    /// exactly as if that provider had been set. The list is the product's to walk — see
+    /// [`crate::providers::selection`] — never a preference handed to the router.
     #[must_use]
     pub(crate) fn model_routing(&self, model: &str) -> ModelRouting {
         // No stored order → the model's default provider; see `default_model_routing`.
@@ -758,7 +770,8 @@ fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
 
 /// The provider that serves a model unless the user chose one: a DeepSeek-family
 /// slug (case-insensitive substring) → OpenRouter's lowercase `deepseek`; every
-/// other model stays auto-routed.
+/// other model stays auto-routed. This is the model's whole priority list when the
+/// field is empty, so a DeepSeek-named model is pinned to the `deepseek` provider.
 ///
 /// **DO NOT DELETE, WEAKEN OR "SIMPLIFY" THIS RULE WITHOUT AN EXPLICIT USER
 /// REQUEST.** Which host serves a model decides prompt-cache locality, so
@@ -801,7 +814,7 @@ async fn seed_fresh_install_defaults(
         }
     }
     tracing::info!(
-        "Fresh config database: seeded fresh-install defaults (image/video generation model sets; provider routing for the default model slots)"
+        "Fresh config database: seeded fresh-install defaults (image/video generation model sets; provider priority for the default model slots)"
     );
     Ok(())
 }
@@ -1079,8 +1092,8 @@ async fn probe_validate_write(key: &str, trimmed: &str) -> Result<ConfigData> {
     Ok(probe)
 }
 
-/// Persist a settled routing `provider_order` (`""` clears it), returning the
-/// canonical value. Routing applies only to the manager and worker slots.
+/// Persist a settled provider priority list (`""` clears it), returning the
+/// canonical value. Priority applies only to the manager and worker slots.
 pub async fn persist_settled_routing_order(model: &str, order: &str) -> Result<String> {
     let _guard = persist_lock().lock().await;
     let order = trimmed_or_none(order);
@@ -1094,6 +1107,27 @@ async fn save_routing_row(model: &str, order: Option<String>) -> Result<String> 
     store.save_model_routing(model, order.as_deref()).await?;
     CONFIG.set_model_routing_row(model, order.clone());
     Ok(order.unwrap_or_default())
+}
+
+/// A model's provider priority list installed in the process-global CONFIG for a test, cleared again
+/// when the guard drops — a panic mid-test must not leave a test's providers installed for the rest
+/// of the binary. In memory only: [`crate::providers::selection`] reads the mirror, so no row is
+/// written and none can be left behind.
+#[cfg(test)]
+pub(crate) fn test_routing_order(model: &str, order: &str) -> TestRoutingOrder {
+    CONFIG.set_model_routing_row(model, Some(order.to_string()));
+    TestRoutingOrder(model.to_string())
+}
+
+/// Restores a test model's routing row on drop; see [`test_routing_order`].
+#[cfg(test)]
+pub(crate) struct TestRoutingOrder(String);
+
+#[cfg(test)]
+impl Drop for TestRoutingOrder {
+    fn drop(&mut self) {
+        CONFIG.set_model_routing_row(&self.0, None);
+    }
 }
 
 /// Write a single `config_kv` row (delete when the value is empty after
@@ -1890,8 +1924,8 @@ mod tests {
         );
     }
 
-    /// A stored override wins, else the model's default provider; a non-DeepSeek
-    /// model stays auto-routed. Normalisation runs first, so a stored order is
+    /// A stored priority list wins, else the model's default one; a non-DeepSeek
+    /// model stays auto-routed. Normalisation runs first, so a stored list is
     /// trimmed and a whitespace-only one is as unset as an empty one.
     #[test]
     fn model_routing_applies_the_default_provider_when_unset() {

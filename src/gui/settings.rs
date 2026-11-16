@@ -466,7 +466,7 @@ fn routing_slots(config: &ConfigData) -> BTreeSet<String> {
     models
 }
 
-/// A model's saved provider routing order from a config snapshot.
+/// A model's saved provider priority list from a config snapshot.
 fn routing_order_of(config: &ConfigData, model: &str) -> Option<String> {
     config
         .model_routings
@@ -3253,8 +3253,8 @@ impl SettingsState {
             Column::with_children(rows)
                 .spacing(theme::SPACE_4)
                 .push(Space::new().height(theme::SPACE_4))
-                // The model slots, the model lists and provider routing live only in the
-                // popup this opens.
+                // The model slots, the model lists and the provider priority lists live only in
+                // the popup this opens.
                 .push(
                     button(text("Models settings").size(theme::TEXT_12))
                         .style(theme::button_secondary)
@@ -3263,7 +3263,7 @@ impl SettingsState {
         )
     }
 
-    /// The model settings: the two model slots, their provider routing, and the two model
+    /// The model settings: the two model slots, their provider priority lists, and the two model
     /// lists, with their add/remove controls and inline errors. Rendered only inside the
     /// Models settings popup.
     fn models_body(&self) -> Column<'_, SettingsMessage> {
@@ -3281,10 +3281,26 @@ impl SettingsState {
         ]
         .spacing(theme::SPACE_4);
         if let Some(routing) = self.routing_group() {
+            // The window is stated from the constant that owns it, never restated here.
+            let window = format!(
+                "{} minutes",
+                crate::providers::selection::MOVE_AFTER.as_secs() / 60
+            );
             body = body
                 .push(Space::new().height(12))
-                .push(widgets::section_subheading("Provider Routing"))
+                .push(widgets::section_subheading("Provider Priority"))
                 .push(Space::new().height(2))
+                .push(
+                    text(format!(
+                        "MahBot holds one provider for a conversation and leaves it only once that \
+                         provider has been unavailable for {window}, then takes the first available \
+                         one from the top of this list. Comma-separated provider slugs, highest \
+                         priority first.",
+                    ))
+                    .size(theme::TEXT_11)
+                    .color(theme::TEXT_FAINT),
+                )
+                .push(Space::new().height(theme::SPACE_4))
                 .push(routing);
         }
         body.push(Space::new().height(12))
@@ -3897,8 +3913,8 @@ impl SettingsState {
         .into()
     }
 
-    /// The provider routing rows: the saved provider order per routable model slot. None while
-    /// a custom chat endpoint is in use — routing is then a no-op.
+    /// The provider priority rows: the saved priority list per routable model slot. None while
+    /// a custom chat endpoint is in use — priority is then a no-op.
     fn routing_group(&self) -> Option<Element<'_, SettingsMessage>> {
         if self.custom_endpoint_active_ui() {
             return None;
@@ -4871,11 +4887,11 @@ mod tests {
                 .get("routing_order:custom-model")
                 .map(super::super::common::SingleLineEditorState::text),
             Some(String::new()),
-            "mid-edit: routing row seeded for the newly-typed model"
+            "mid-edit: a priority list is seeded for the newly-typed model"
         );
         let _ = state.routing_group(); // must not panic
 
-        // Saved routing order is displayed, not replaced by empty.
+        // A saved priority list is displayed, not replaced by empty.
         let _ = state.update(SettingsMessage::ConfigField {
             key: "manager_model",
             value: "saved-routing-model".into(),
@@ -4886,7 +4902,7 @@ mod tests {
                 .get("routing_order:saved-routing-model")
                 .map(super::super::common::SingleLineEditorState::text),
             Some("SavedOrder".into()),
-            "a model with a saved routing order shows that order"
+            "a model with a saved priority list shows it"
         );
         let _ = state.routing_group(); // must not panic
 
@@ -5037,7 +5053,7 @@ mod tests {
         });
         assert!(
             state.models_popup_open,
-            "a failed provider-routing save reopens the popup"
+            "a failed provider-priority save reopens the popup"
         );
 
         close(&mut state);
@@ -5063,7 +5079,7 @@ mod tests {
                 None,
             ),
             (
-                "provider routing hides while a custom endpoint is staged",
+                "provider priority hides while a custom endpoint is staged",
                 Some("http://localhost:11434/v1"),
                 None,
             ),

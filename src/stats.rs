@@ -185,7 +185,7 @@ pub(crate) struct LlmRequestRecord {
     pub workspace: String,
     pub ticket_id: Option<String>,
     pub model: String,
-    /// Requested provider routing (provider_order); "default" when unset.
+    /// The provider the call was pinned to; `default` when unset.
     /// Requested-vs-actual: the serving upstream is [`LlmRequestRecord::upstream_provider`].
     pub routing: String,
     pub input_tokens: Option<u64>,
@@ -225,7 +225,7 @@ pub(crate) struct LlmFailureRow {
     pub workspace: String,
     pub ticket_id: Option<String>,
     pub model: String,
-    /// Requested provider routing (provider_order); "default" when unset.
+    /// The provider the call was pinned to; `default` when unset.
     pub routing: String,
     /// 1-based sequential failure index within the operation, as counted by
     /// the loop that recorded it.
@@ -246,8 +246,8 @@ pub(crate) struct LlmFailureRow {
 pub(crate) struct LlmCallMeta {
     pub meta: crate::ChatRequestMeta,
     pub model: String,
-    /// Requested provider routing (provider_order); `None` = provider default.
-    pub provider_order: Option<String>,
+    /// The provider the call was pinned to; `None` = the router decides.
+    pub provider: Option<String>,
 }
 
 /// Per-operation context for `llm_failures` persistence: an operation id
@@ -259,6 +259,15 @@ pub(crate) struct LlmOperationCtx {
 }
 
 impl LlmCallMeta {
+    /// The provider column of both telemetry rows: the pinned slug, or `default` when the router
+    /// decides. One accessor so the two row builders cannot drift.
+    #[must_use]
+    fn routing(&self) -> String {
+        self.provider
+            .clone()
+            .unwrap_or_else(|| "default".to_string())
+    }
+
     /// Extract the request fields the durable rows read from a `ChatRequest`.
     /// `None` when the request carries no metadata — the same gating as the
     /// `llm_requests` rows (context-free calls are never logged).
@@ -267,7 +276,7 @@ impl LlmCallMeta {
         Some(Self {
             meta: meta.clone(),
             model: request.model.clone(),
-            provider_order: request.provider_order.clone(),
+            provider: request.provider.clone(),
         })
     }
 }
@@ -282,6 +291,13 @@ impl LlmOperationCtx {
             operation_id: crate::generate_id(),
             call,
         })
+    }
+
+    /// Record the provider that actually serves the in-flight operation after a mid-run switch, so
+    /// later `llm_failures` rows and the final `llm_requests` row name it (the one place this
+    /// invariant is written; see [`crate::providers::selection`]).
+    pub(crate) fn set_provider(&mut self, provider: Option<String>) {
+        self.call.provider = provider;
     }
 }
 
@@ -303,11 +319,7 @@ fn llm_request_record_meta(
         workspace: call.meta.workspace.clone(),
         ticket_id: call.meta.ticket_id.clone(),
         model: call.model.clone(),
-        routing: call
-            .provider_order
-            .as_deref()
-            .unwrap_or("default")
-            .to_string(),
+        routing: call.routing(),
         input_tokens: usage.and_then(|u| u.input_tokens),
         output_tokens: usage.and_then(|u| u.output_tokens),
         cached_input_tokens: usage.and_then(|u| u.cached_input_tokens),
@@ -408,10 +420,7 @@ fn llm_failure_row(
         workspace: call.meta.workspace.clone(),
         ticket_id: call.meta.ticket_id.clone(),
         model: call.model.clone(),
-        routing: call
-            .provider_order
-            .clone()
-            .unwrap_or_else(|| "default".to_string()),
+        routing: call.routing(),
         attempt: outcome.attempt,
         attempt_duration_ms: outcome.attempt_duration_ms,
         failure_class: outcome.failure_class,

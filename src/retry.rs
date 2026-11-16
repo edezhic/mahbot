@@ -9,17 +9,20 @@
 //! suppressed (see [`Provider::chat_scoped`]), so total provider HTTP calls per operation are
 //! bounded by the policy in effect.
 //!
-//! All request parameters (model, messages, tools, max_tokens, reasoning_effort, provider routing)
-//! are byte-identical across ALL attempts — reasoning_effort is FIXED (prefix cache preservation,
-//! never lower it) and no escalation of any kind. The only permitted change is appended feedback on
-//! a failed attempt (the extraction re-prompt, repair-round instructions, synthesis feedback),
-//! which extends the cached prefix.
+//! All request parameters (model, messages, tools, max_tokens, reasoning_effort, pinned provider)
+//! are byte-identical across ALL attempts of an operation, with two exceptions: the pinned provider
+//! moves once its outage has outlasted [`crate::providers::selection::MOVE_AFTER`] (that module owns
+//! the rule and which ladders apply it), and a failed attempt may append feedback (the extraction
+//! re-prompt, repair-round instructions, synthesis feedback), which extends the cached prefix.
+//! Model, messages, tools, max_tokens and reasoning_effort never change; reasoning_effort is FIXED
+//! (prefix cache preservation, never lower it) and there is no escalation of any kind.
 //!
 //! A terminal class — [`FailureClass::InvalidRequest`], [`FailureClass::ContentRejection`],
 //! [`FailureClass::Guardrail`] — ends the loop after the FIRST attempt: the same bytes would be
 //! refused the same way, so retrying burns the budget for nothing (see
 //! [`FailureClass::is_retryable`]). Transport, timeout, overload, truncation and empty responses
-//! keep retrying.
+//! keep retrying, and so does the router's no-provider answer ([`FailureClass::Unavailable`]): the
+//! request is fine and the same bytes succeed once a provider is back.
 //!
 //! Four policies, snapshotted once at operation start ([`RetryPolicy`]). All share the same
 //! mechanics: ±25% jitter on the SLEEP ONLY (never on request bytes); Retry-After honoured, clamped
@@ -247,6 +250,10 @@ pub(crate) enum FailureClass {
     /// Network/transport error (connection reset, timeouts, 5xx, 429) — overload and upstream
     /// unavailability included; all retryable.
     Transport,
+    /// The router answered that no provider can serve this model. Provider-side and retryable: the
+    /// request is fine and the same bytes succeed once a provider is back, so it must never be
+    /// terminal and must never suppress dead-session recovery.
+    Unavailable,
     /// Server truncated the response envelope: body-read error or content-length mismatch (the
     /// "error reading response body" / "EOF while parsing" defect class).
     TruncatedEnvelope,
@@ -298,10 +305,20 @@ impl FailureClass {
         !self.is_retryable() && !matches!(self, Self::Shutdown)
     }
 
+    /// Whether this failure means the provider could not serve the call — the set that starts a
+    /// provider's outage clock: transport and connection failures, timeouts, server-side errors,
+    /// rate limits, and the router's no-provider answer. A refusal, an invalid request, a truncated
+    /// or unparsable answer and a shutdown are not unavailability.
+    #[must_use]
+    pub(crate) const fn provider_unavailable(self) -> bool {
+        matches!(self, Self::Transport | Self::Unavailable)
+    }
+
     #[must_use]
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Transport => "transport",
+            Self::Unavailable => "provider_unavailable",
             Self::TruncatedEnvelope => "truncated_envelope",
             Self::Parse => "parse",
             Self::OutOfRangeScore => "out_of_range_score",
@@ -529,6 +546,32 @@ impl RetryLoop {
         self.failures.push(rec);
     }
 
+    /// Move `request` off a provider that has been unavailable for the whole window, for a ladder
+    /// that owns no [`crate::providers::selection::ProviderSelection`], keeping the recorded
+    /// operation in step.
+    pub(crate) fn retarget_after_failure(
+        &mut self,
+        class: FailureClass,
+        request: &mut crate::ChatRequest,
+    ) {
+        if class.provider_unavailable()
+            && crate::providers::selection::retarget(request)
+            && let Some(operation) = self.operation.as_mut()
+        {
+            operation.set_provider(request.provider.clone());
+        }
+    }
+
+    /// [`switch_provider`] for a ladder that owns its retry loop.
+    pub(crate) fn switch_after_failure(
+        &mut self,
+        class: FailureClass,
+        selection: &mut crate::providers::selection::ProviderSelection,
+        request: &mut crate::ChatRequest,
+    ) {
+        switch_provider(class, selection, request, self.operation.as_mut());
+    }
+
     /// Sleep between attempts, honouring the schedule and Retry-After;
     /// `Err(FailureClass::Shutdown)` when the global shutdown token fires during the sleep.
     /// `attempt` is the backoff-schedule index (`attempt - 1`) and the guard trigger (no sleep when
@@ -556,13 +599,33 @@ impl RetryLoop {
     }
 }
 
-// The agent-loop LLM call with the outer retry loop. Byte-identical request across ALL attempts;
-// retries provider failures of any retryable class (the 600 s idle timeout is the only per-attempt
-// bound). Any `Ok` response is accepted — empty text is a valid tool-call turn. A reasoning-only
-// stop is NOT handled here: the caller classifies and recovers it via bounded continuation before
-// any persistence or display.
+/// Move `request` and `selection` off a provider that has been unavailable for the whole window and
+/// record the provider that now serves the attempt on `operation` — the one implementation of the
+/// gate-move-record pairing (see [`crate::providers::selection`]).
+pub(crate) fn switch_provider(
+    class: FailureClass,
+    selection: &mut crate::providers::selection::ProviderSelection,
+    request: &mut ChatRequest,
+    operation: Option<&mut crate::stats::LlmOperationCtx>,
+) {
+    if !class.provider_unavailable() || !selection.switch_on_failure(request) {
+        return;
+    }
+    if let Some(operation) = operation {
+        operation.set_provider(request.provider.clone());
+    }
+}
+
+// The agent-loop LLM call with the outer retry loop. The request is byte-identical across ALL
+// attempts with ONE exception: the pinned provider moves only after
+// [`crate::providers::selection::MOVE_AFTER`] of provider unavailability — model, messages, tools,
+// max_tokens and reasoning_effort never change. Retries provider failures of any retryable class
+// (the 600 s idle timeout is the only per-attempt bound). Any `Ok` response is accepted — empty
+// text is a valid tool-call turn. A reasoning-only stop is NOT handled here: the caller classifies
+// and recovers it via bounded continuation before any persistence or display.
 pub(crate) async fn agent_chat(
-    request: ChatRequest,
+    mut request: ChatRequest,
+    selection: &mut crate::providers::selection::ProviderSelection,
     policy: &RetryPolicy,
 ) -> Result<ChatResponse, RetryExhausted> {
     let mut loop_state = RetryLoop::new_scoped(policy, &request);
@@ -582,6 +645,11 @@ pub(crate) async fn agent_chat(
                     let exhausted = RetryExhausted::new(loop_state.into_failures(), err.class);
                     return fail_exhausted(&request, operation_started, exhausted);
                 }
+                // Provider-side failure: the outage clock is already running (recorded at the
+                // outbound boundary). Retries stay on the pinned provider until its outage has
+                // lasted MOVE_AFTER; then the run continues on the first available provider from
+                // the top of the list. The retry ladder itself is untouched.
+                loop_state.switch_after_failure(err.class, selection, &mut request);
             }
         }
 
@@ -664,6 +732,7 @@ mod tests {
     #[test]
     fn failure_class_labels_and_retryability() {
         assert!(FailureClass::Transport.is_retryable());
+        assert!(FailureClass::Unavailable.is_retryable());
         assert!(FailureClass::TruncatedEnvelope.is_retryable());
         assert!(FailureClass::Parse.is_retryable());
         assert!(FailureClass::OutOfRangeScore.is_retryable());
@@ -675,9 +744,29 @@ mod tests {
             FailureClass::TruncatedEnvelope.label(),
             "truncated_envelope"
         );
+        assert_eq!(FailureClass::Unavailable.label(), "provider_unavailable");
         assert_eq!(FailureClass::InvalidRequest.label(), "invalid_request");
         assert_eq!(FailureClass::ContentRejection.label(), "content_rejection");
         assert_eq!(FailureClass::Guardrail.label(), "guardrail");
+        // The provider-unavailable set starts an outage clock: transport and the router's
+        // no-provider answer. A refusal, an invalid request, a bad answer and a shutdown say
+        // nothing about whether the provider can serve the next call.
+        assert!(FailureClass::Transport.provider_unavailable());
+        assert!(FailureClass::Unavailable.provider_unavailable());
+        for class in [
+            FailureClass::TruncatedEnvelope,
+            FailureClass::Parse,
+            FailureClass::NoResponse,
+            FailureClass::InvalidRequest,
+            FailureClass::ContentRejection,
+            FailureClass::Guardrail,
+            FailureClass::Shutdown,
+        ] {
+            assert!(
+                !class.provider_unavailable(),
+                "{class:?} is not provider unavailability"
+            );
+        }
         // Exactly the three provider refusals are deterministic: the same bytes are refused again,
         // which is what the dead-session poller keys on. Shutdown is terminal but not deterministic
         // (a later attempt is a new run, not the same refused request).
@@ -690,6 +779,7 @@ mod tests {
         }
         for class in [
             FailureClass::Transport,
+            FailureClass::Unavailable,
             FailureClass::TruncatedEnvelope,
             FailureClass::Parse,
             FailureClass::NoResponse,
@@ -717,9 +807,13 @@ mod tests {
             let _provider_guard = crate::util::test::install_fake_provider(fake.clone());
             let request =
                 crate::providers::test_request(vec![crate::ChatMessage::user("hi")], None);
-            let err = agent_chat(request, &RetryPolicy::current())
-                .await
-                .expect_err("a terminal class must fail the operation");
+            let err = agent_chat(
+                request,
+                &mut crate::providers::selection::ProviderSelection::default(),
+                &RetryPolicy::current(),
+            )
+            .await
+            .expect_err("a terminal class must fail the operation");
             assert_eq!(err.final_class, class);
             assert_eq!(
                 fake.request_fingerprints.lock().unwrap().len(),
@@ -746,9 +840,74 @@ mod tests {
         let fake = fake.ok("recovered");
         let _provider_guard = crate::util::test::install_fake_provider(std::sync::Arc::new(fake));
         let request = crate::providers::test_request(vec![crate::ChatMessage::user("hi")], None);
-        let resp = agent_chat(request, &policy)
-            .await
-            .expect("must recover on attempt 13");
+        let resp = agent_chat(
+            request,
+            &mut crate::providers::selection::ProviderSelection::default(),
+            &policy,
+        )
+        .await
+        .expect("must recover on attempt 13");
         assert_eq!(resp.text_or_empty(), "recovered");
+    }
+
+    /// The one permitted change between attempts: the pinned provider moves only once its outage
+    /// has outlasted [`crate::providers::selection::MOVE_AFTER`]. Before that, retries stay on it;
+    /// after a move, the following attempt carries the new provider in the request bytes.
+    #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
+    async fn a_run_leaves_a_dead_provider_only_after_move_after() {
+        use crate::providers::selection::{self, ProviderSelection};
+
+        for (label, outage_age, expected) in [
+            (
+                "younger than the window",
+                std::time::Duration::from_secs(60),
+                "first",
+            ),
+            (
+                "past the window",
+                selection::MOVE_AFTER + std::time::Duration::from_secs(1),
+                "second",
+            ),
+        ] {
+            let model = format!("retry/switch-{}", outage_age.as_secs());
+            let fake = std::sync::Arc::new(
+                crate::util::test::FakeProvider::new()
+                    .err(FailureClass::Transport, "the provider is down")
+                    .ok("served"),
+            );
+            let _provider_guard = crate::util::test::install_fake_provider(fake.clone());
+            selection::force_outage(
+                &model,
+                "first",
+                std::time::Instant::now()
+                    .checked_sub(outage_age)
+                    .expect("an outage age is representable"),
+            );
+            let mut selection = ProviderSelection::for_test(&model, &["first", "second"], "first");
+            let request = crate::ChatRequest {
+                model: model.clone(),
+                provider: Some("first".to_string()),
+                ..crate::providers::test_request(vec![crate::ChatMessage::user("hi")], None)
+            };
+            let policy = RetryPolicy {
+                max_attempts: 2,
+                base_backoff_ms: 1,
+                max_backoff_ms: 1,
+            };
+
+            let resp = agent_chat(request, &mut selection, &policy)
+                .await
+                .expect("the second attempt is served");
+            assert_eq!(resp.text_or_empty(), "served", "{label}");
+            assert_eq!(selection.slug(), Some(expected), "{label}");
+            let fingerprints = fake.request_fingerprints.lock().unwrap().clone();
+            assert_eq!(fingerprints.len(), 2, "{label}");
+            assert!(
+                fingerprints[1].contains(&format!("provider: Some(\"{expected}\")")),
+                "{label}: the attempt after the move must carry the new provider: {}",
+                fingerprints[1]
+            );
+        }
     }
 }

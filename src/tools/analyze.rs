@@ -454,6 +454,9 @@ pub(crate) async fn run_analyze_with_job(
                 None,
             );
             let _ = agent.session.init(&slot.agent_id).await;
+            // The stored conversation keeps its provider: the extraction below is a model call of
+            // this conversation, so it must not land on a provider the round never used.
+            agent.adopt_session_provider().await;
             runs.push(AnalyzeRun::settle(agent, Some(raw.clone())));
         } else if let Some(run) = fresh_iter.next() {
             runs.push(run);
@@ -893,7 +896,7 @@ async fn extract_findings(
             let extraction_prompt = extraction_prompt.clone();
             let round_key = round_key.to_string();
             tokio::spawn(async move {
-                let (agent, raw) = match run {
+                let (mut agent, raw) = match run {
                     AnalyzeRun::Completed { agent, response } => (agent, response),
                     AnalyzeRun::Failed { reason } => {
                         return AnalystOutcome::NoResponse(reason);
@@ -1028,6 +1031,8 @@ async fn consolidate_findings(
         format!("# Original Question\n\n{analyze}\n\n# Agent Claims (id-numbered)\n\n{material}");
 
     let derived = crate::agent::role_chat_params(Role::Analyst);
+    // The consolidation call has no conversation behind it, so it chooses from the top of the list.
+    let provider = crate::providers::selection::pick(&derived.model);
     let system = format!(
         "{}\n\n{}",
         load_prompt("synthesis/analyst.md"),
@@ -1040,7 +1045,7 @@ async fn consolidate_findings(
         &user,
         derived.model,
         derived.reasoning_effort,
-        derived.provider_order,
+        provider,
         Some(DEFAULT_MAX_TOKENS),
     );
 
@@ -1364,7 +1369,7 @@ async fn run_claim_verifier(
     parent_key: Option<crate::agent::registry::ParentKey>,
     question: &str,
 ) -> VerificationResult {
-    let (agent, response) = run_default_agent(
+    let (mut agent, response) = run_default_agent(
         agent_id,
         Role::Analyst,
         ws,

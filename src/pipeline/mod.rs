@@ -1436,7 +1436,7 @@ async fn run_parallel_agents(
                     // session dispatches fresh with the stored task.
                     let has_session =
                         resume && crate::session::store().has_content(&agent_id).await;
-                    let (agent, response) = run_agent(
+                    let (mut agent, response) = run_agent(
                         agent_id.clone(),
                         role,
                         &ws,
@@ -1688,7 +1688,7 @@ async fn run_stage_agent(
     .await;
 
     let message = task.to_string();
-    let (agent, response) = run_single_agent(
+    let (mut agent, response) = run_single_agent(
         agent_id,
         kind.role(),
         ws,
@@ -1707,10 +1707,11 @@ async fn run_stage_agent(
 
     match kind {
         StageRunKind::Engineer => {
-            finalize_engineer_stage(ticket, &agent, response.as_deref(), job_id, ws, paused).await;
+            finalize_engineer_stage(ticket, &mut agent, response.as_deref(), job_id, ws, paused)
+                .await;
         }
         StageRunKind::Sanitation => {
-            finalize_sanitation_stage(ticket, &agent, response.as_deref(), job_id, ws, paused)
+            finalize_sanitation_stage(ticket, &mut agent, response.as_deref(), job_id, ws, paused)
                 .await;
         }
     }

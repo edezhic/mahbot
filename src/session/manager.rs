@@ -56,6 +56,10 @@ pub(crate) struct Session {
     /// branch address, or a worker branch's address. `Some` for a branch session, `None` for
     /// built-in roles.
     pub(crate) launch: Option<crate::Launch>,
+    /// The provider this conversation holds, so every model call of a run goes to the same one. It
+    /// survives a restart, a resumed run and a re-dispatched agent: loaded at
+    /// [`init`](Self::init) and kept in step by the caller that resolves it.
+    provider: Option<crate::providers::selection::StoredProvider>,
 }
 
 /// Outcome of a [`Session::finalize`] call. The guard is deliberately logging-free: whether an
@@ -160,6 +164,11 @@ impl Session {
                 }
             },
         };
+
+        // The conversation's provider: every model call of this run must go to the provider the
+        // conversation already holds, so a restart or a re-dispatched agent resumes on it instead of
+        // re-selecting (and re-paying for a cold prompt cache). `None` = none yet, select fresh.
+        self.provider = crate::session::store().get_provider(agent_id).await;
 
         // All loaded history above is persisted — record the prefix so finalize appends only new
         // output.
@@ -469,6 +478,38 @@ impl Session {
         self.image_count
     }
 
+    /// The provider this conversation holds, as last loaded or recorded.
+    #[must_use]
+    pub(crate) fn provider(&self) -> Option<&crate::providers::selection::StoredProvider> {
+        self.provider.as_ref()
+    }
+
+    /// Record the conversation's provider. The in-memory value advances only when the session's
+    /// metadata row took it, so a write that landed nowhere (a conversation whose first append has
+    /// not created the row yet) or failed is retried by the next model call — it is never an error
+    /// the run must stop for, and never a provider the next run wrongly believes it has.
+    pub(crate) async fn set_provider(
+        &mut self,
+        agent_id: &str,
+        stored: Option<crate::providers::selection::StoredProvider>,
+    ) {
+        let outcome = crate::session::store()
+            .set_provider(agent_id, stored.as_ref())
+            .await;
+        if let Err(e) = &outcome {
+            tracing::warn!(
+                agent_id = %agent_id,
+                error = %e,
+                "Failed to record the session's provider"
+            );
+        }
+        // Only a write that matched the row advances the in-memory pair; one that landed nowhere is
+        // retried by the next model call, exactly like a failed one.
+        if let Ok(true) = outcome {
+            self.provider = stored;
+        }
+    }
+
     /// Update the in-memory length after a successful agent call. The durable write is the caller's
     /// ([`crate::Agent::record_session_usage`]).
     pub(crate) fn set_token_length(&mut self, token_length: Option<u64>) {
@@ -665,9 +706,9 @@ impl Session {
     /// deletes are dumped via [`super::compaction_dump`] and the path is appended to the summary
     /// message so the agent can re-read the dropped content; a dump failure is fail-open. Producing
     /// the summary text is [`crate::Agent::summarize`]'s job. KV-cache preservation: the Agent calls
-    /// this with byte-identical parameters (model, reasoning effort, tools, routing) so the provider
-    /// reuses the cached prefix. On a persist failure the full in-memory history is kept and the
-    /// next turn reloads from the DB.
+    /// this with byte-identical parameters (model, reasoning effort, tools, pinned provider) so the
+    /// provider reuses the cached prefix. On a persist failure the full in-memory history is kept
+    /// and the next turn reloads from the DB.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn apply_summary(
         &mut self,

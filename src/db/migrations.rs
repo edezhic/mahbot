@@ -117,8 +117,14 @@
 //! `79` adds the `guest_reports` table — the one-day ledger behind a guest
 //! assistant's `report_gap` daily cap and duplicate check (see
 //! [`GUEST_REPORTS_TABLE`] for what it does and does not hold).
+//! `80` adds the nullable `session_metadata.provider` / `provider_model`
+//! columns — the provider a conversation is pinned to and the chat model it was
+//! chosen for, so one conversation keeps one provider across a restart, a
+//! resumed run and a re-dispatched agent; both are NULL for a conversation that
+//! has no pin yet, which selects on its next run (likewise a no-op on fresh
+//! installs).
 //!
-//! Future schema changes resume the chain at id `80` with monotonically
+//! Future schema changes resume the chain at id `81` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -235,7 +241,9 @@ CREATE TABLE IF NOT EXISTS session_metadata (
     reply_to       TEXT,
     context_block_len INTEGER,
     user_activity  TEXT,
-    image_count    INTEGER
+    image_count    INTEGER,
+    provider       TEXT,
+    provider_model TEXT
 );
 CREATE TABLE IF NOT EXISTS session_personal_changes (
     agent_id TEXT PRIMARY KEY REFERENCES session_metadata(agent_id) ON DELETE CASCADE,
@@ -1330,6 +1338,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Sql(GUEST_REPORTS_TABLE),
     },
+    Migration {
+        id: "80",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_session_metadata_provider),
+    },
 ];
 
 /// Apply the catalog to `conn` for one physical database. Each SQL entry's
@@ -2372,6 +2385,24 @@ async fn run_add_session_metadata_image_count(conn: &Connection) -> anyhow::Resu
     add_column_if_missing(conn, "session_metadata", "image_count", "INTEGER").await
 }
 
+fn add_session_metadata_provider(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_session_metadata_provider(conn))
+}
+
+/// Catalog `80`: add the nullable `session_metadata.provider` and
+/// `session_metadata.provider_model` columns — the provider slug this conversation is pinned to,
+/// and the chat model it was chosen for. A model change re-selects, because the previous provider
+/// may not serve the new model, so the model the pin was made for has to be stored beside it.
+/// Both are nullable with no backfill: a conversation with no pin (every conversation predating
+/// the columns) selects on its next run and records its pick then. Fresh installs get the columns
+/// from entry `24`'s `CREATE TABLE`, so the probes make this a no-op there. Guarded by
+/// [`add_column_if_missing`], so this body is idempotent (non-transactional like every Rust body,
+/// re-runnable until recorded).
+async fn run_add_session_metadata_provider(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "session_metadata", "provider", "TEXT").await?;
+    add_column_if_missing(conn, "session_metadata", "provider_model", "TEXT").await
+}
+
 fn add_alarms_command(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
     Box::pin(run_add_alarms_command(conn))
 }
@@ -3154,6 +3185,8 @@ mod tests {
                 "context_block_len",
                 "user_activity",
                 "image_count",
+                "provider",
+                "provider_model",
             ],
         ),
         ("session_personal_changes", &["agent_id", "baseline"]),
@@ -4291,10 +4324,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
                 "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-                "70", "72", "73", "74", "75", "76", "77", "78", "79"
+                "70", "72", "73", "74", "75", "76", "77", "78", "79", "80"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–79 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–80 tail exactly"
         );
     }
 
@@ -4981,7 +5014,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-            "70", "72", "73", "74", "75", "76", "77", "78", "79",
+            "70", "72", "73", "74", "75", "76", "77", "78", "79", "80",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -4990,7 +5023,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–79"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–80"
         );
 
         // Only the tables named here change shape (`72` makes one appear under
@@ -5078,11 +5111,13 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         expected_sm_cols.push("context_block_len".to_string());
         expected_sm_cols.push("user_activity".to_string());
         expected_sm_cols.push("image_count".to_string());
+        expected_sm_cols.push("provider".to_string());
+        expected_sm_cols.push("provider_model".to_string());
         assert_eq!(
             after_sm_cols["session_metadata"], expected_sm_cols,
             "reopen must append exactly created_at/sleep_ended/custom_role/custom_identifier/\
-             launch_stopped/reply_to/context_block_len/user_activity/image_count to session_metadata \
-             columns"
+             launch_stopped/reply_to/context_block_len/user_activity/image_count/provider/\
+             provider_model to session_metadata columns"
         );
         let after_users_cols = column_sets(&conn, &["users"]).await;
         let mut expected_users_cols = before.cols["users"].clone();
@@ -5401,7 +5436,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-            "70", "72", "73", "74", "75", "76", "77", "78", "79",
+            "70", "72", "73", "74", "75", "76", "77", "78", "79", "80",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -5410,7 +5445,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–79"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–80"
         );
 
         let after_users_cols = column_names(&conn, "users").await;

@@ -98,11 +98,13 @@ impl JointRound {
 const PIPELINE_GROUPING_MAX_TOKENS: u32 = 16_000;
 
 /// Build the synthesis chat request for a stage role (the stage role's own
-/// model, reasoning effort, and provider routing — no separate grouping
-/// model). The shared contradiction package is appended to the system prompt;
-/// the general workspace context is prepended by the consensus core. The
-/// system prompt is byte-stable across rounds — repair-round schema selection
-/// lives in the appended user-section instructions.
+/// model and reasoning effort — no separate grouping model). Verdict synthesis
+/// has no conversation of its own, so the call chooses its provider from the
+/// top of the model's priority list. The shared contradiction package is
+/// appended to the system prompt; the general workspace context is prepended by
+/// the consensus core. The system prompt is byte-stable across rounds —
+/// repair-round schema selection lives in the appended user-section
+/// instructions.
 fn synthesis_request(
     round: &JointRound,
     role: Role,
@@ -124,13 +126,15 @@ fn synthesis_request(
         material,
     );
     let derived = crate::agent::role_chat_params(role);
+    // Verdict synthesis has no conversation behind it, so it chooses its provider from the top.
+    let provider = crate::providers::selection::pick(&derived.model);
     ChatRequest {
         messages: vec![ChatMessage::system(&system), ChatMessage::user(&user)],
         tools: None,
         model: derived.model,
         max_tokens: Some(PIPELINE_GROUPING_MAX_TOKENS),
         reasoning_effort: derived.reasoning_effort,
-        provider_order: derived.provider_order,
+        provider,
         meta: Some(ChatRequestMeta {
             purpose: "synthesis",
             agent_id: format!("verdict_{}", crate::generate_suffix()),

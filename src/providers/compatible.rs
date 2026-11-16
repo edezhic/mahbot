@@ -784,13 +784,10 @@ impl OpenAiCompatibleProvider {
 
         // OpenRouter provider preferences — OpenRouter-only:
         // the block has no meaning outside OpenRouter, so it is never sent to
-        // custom endpoints. It carries the pinned provider order with fallbacks
-        // disabled, and is only assembled when an order is configured.
+        // custom endpoints. It carries exactly the one provider this call is pinned to, with
+        // fallbacks disabled, and is only assembled when one is set.
         if crate::config::is_default_endpoint(&self.base_url)
-            && let Some(provider) = request
-                .provider_order
-                .as_deref()
-                .and_then(provider_routing_json)
+            && let Some(provider) = request.provider.as_deref().and_then(provider_routing_json)
         {
             extra.insert("provider".to_string(), provider);
         }
@@ -1310,14 +1307,15 @@ mod tests {
 
     /// Provider routing is OpenRouter-only: asserted on
     /// the serialized request body at the builder choke point — the block is
-    /// sent for the default endpoint when an order is configured, suppressed
-    /// entirely when it is not, and suppressed for a custom endpoint,
+    /// sent for the default endpoint when a provider is pinned (exactly one,
+    /// with fallbacks disabled), suppressed entirely when it is not, and
+    /// suppressed for a custom endpoint,
     /// while `reasoning_effort` is sent unchanged to the default endpoint and
     /// translated per model family on custom endpoints.
     #[test]
     fn provider_routing_block_suppressed_for_custom_endpoint() {
         let mut request = test_request(vec![ChatMessage::user("hello")], None);
-        request.provider_order = Some("deepseek".to_string());
+        request.provider = Some("deepseek".to_string());
         request.reasoning_effort = Some("xhigh".to_string());
 
         // Default endpoint → routing block present, reasoning_effort present.
@@ -1333,7 +1331,7 @@ mod tests {
         );
         assert!(
             or_body.contains("\"order\":[\"deepseek\"]"),
-            "routing order must be inside the block: {or_body}"
+            "the pinned provider must be inside the block: {or_body}"
         );
         assert!(
             or_body.contains("xhigh"),
@@ -1342,11 +1340,11 @@ mod tests {
 
         // Default endpoint without routing sends no provider block at all.
         let mut no_routing = test_request(vec![ChatMessage::user("hello")], None);
-        no_routing.provider_order = None;
+        no_routing.provider = None;
         let no_routing_body = serialized_body(&or_provider, &no_routing);
         assert!(
             !no_routing_body.contains("\"provider\""),
-            "no provider block when provider_order is unset: {no_routing_body}"
+            "no provider block when no provider is pinned: {no_routing_body}"
         );
 
         // Custom endpoint → routing block suppressed; reasoning_effort is

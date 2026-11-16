@@ -3,10 +3,17 @@
 //! This module implements the factory pattern for AI model providers. Each provider
 //! implements the [`Provider`] trait. Currently only OpenAI-compatible providers
 //! are supported; the outer retry orchestration lives in [`crate::retry`].
+//!
+//! [`chat_scoped`] is the single outbound chat boundary: every retry loop goes through it, so it is
+//! also where provider availability is learned — a provider-side failure starts that provider's
+//! outage clock and a success clears it ([`selection`]). Which provider a call goes to is decided
+//! by [`selection`] too: the product owns the per-model priority list and holds one provider per
+//! conversation instead of handing the router an ordered preference to walk.
 
 pub(crate) mod compatible;
 pub(crate) mod error_class;
 pub(crate) mod reasoning;
+pub(crate) mod selection;
 
 pub(crate) use reasoning::plaintext_for_display;
 
@@ -31,7 +38,7 @@ pub(crate) fn test_request(
         model: "test".to_string(),
         max_tokens: None,
         reasoning_effort: None,
-        provider_order: None,
+        provider: None,
         meta: None,
     }
 }
@@ -78,16 +85,20 @@ impl std::error::Error for ScopedCallError {}
 
 /// Map a provider [`ErrorClass`] to a granular [`FailureClass`]. The terminal reasons keep their
 /// identity (`invalid_request` / `content_rejection` / `guardrail`) so the failure trail says why a
-/// request was abandoned instead of collapsing every refusal into one label; retryable errors refine
-/// to [`FailureClass::TruncatedEnvelope`] when the response envelope was truncated mid-read (the
-/// defect class this hardening targets), and stay [`FailureClass::Transport`] otherwise — overload,
-/// timeout and upstream unavailability included.
+/// request was abandoned instead of collapsing every refusal into one label; the router's
+/// no-provider answer keeps its own [`FailureClass::Unavailable`], which labels that trail — every
+/// predicate ([`FailureClass::provider_unavailable`], `is_retryable`, `is_deterministic`) treats it
+/// exactly like [`FailureClass::Transport`]. Retryable errors refine to
+/// [`FailureClass::TruncatedEnvelope`] when the response envelope was truncated mid-read (the
+/// defect class this hardening targets), and stay [`FailureClass::Transport`] otherwise — overload
+/// and timeouts included.
 #[must_use]
 pub(crate) fn failure_class(class: error_class::ErrorClass, truncated: bool) -> FailureClass {
     match class {
         error_class::ErrorClass::InvalidRequest => FailureClass::InvalidRequest,
         error_class::ErrorClass::ContentRejection => FailureClass::ContentRejection,
         error_class::ErrorClass::Guardrail => FailureClass::Guardrail,
+        error_class::ErrorClass::Unavailable => FailureClass::Unavailable,
         error_class::ErrorClass::Retryable if truncated => FailureClass::TruncatedEnvelope,
         error_class::ErrorClass::Retryable => FailureClass::Transport,
     }
@@ -115,25 +126,21 @@ pub(crate) fn ensure_base_url(url: &str) -> String {
 
 /// Build a `provider` routing JSON value for OpenAI-compatible chat requests.
 ///
-/// Splits `order` on commas, trims whitespace, and filters empty strings.
-/// Returns `None` when the resulting provider list is empty, so callers can
-/// skip inserting the routing block entirely (matching the behaviour of the
-/// OpenAI-compatible request builder).
+/// The product pins exactly one provider — one entry of the model's priority list (see
+/// [`selection`]) — so the router is never handed a list to walk. Returns `None` for an
+/// empty/whitespace-only slug, so callers can skip inserting the routing block entirely
+/// (matching the behaviour of the OpenAI-compatible request builder).
 ///
-/// Fallbacks are explicitly pinned to `false` in the emitted JSON — the
-/// Allow Fallbacks option was removed from the settings and the runtime.
-///
-pub(crate) fn provider_routing_json(order: &str) -> Option<serde_json::Value> {
-    let providers: Vec<&str> = order
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    if providers.is_empty() {
+/// Fallbacks are explicitly pinned to `false` in the emitted JSON — the Allow Fallbacks
+/// option was removed from the settings and the runtime: a pinned provider that cannot serve
+/// the call is a failure the retry layer handles, not a silent re-route.
+pub(crate) fn provider_routing_json(provider: &str) -> Option<serde_json::Value> {
+    let provider = provider.trim();
+    if provider.is_empty() {
         return None;
     }
     Some(serde_json::json!({
-        "order": providers,
+        "order": [provider],
         "allow_fallbacks": false,
     }))
 }
@@ -262,15 +269,26 @@ pub(crate) fn recreate_all(config: &crate::config::ConfigData, background_warmup
 
 /// Single-attempt scoped chat for the outer retry loops (see [`crate::retry`]).
 ///
-/// Suppresses provider-internal retries (the outer loop is the single retry
-/// authority) and applies idle-timeout semantics. See [`Provider::chat_scoped`].
+/// Suppresses provider-internal retries (the outer loop is the single retry authority) and applies
+/// idle-timeout semantics. See [`Provider::chat_scoped`]; availability is learned here
+/// (see [`selection`]).
 pub(crate) async fn chat_scoped(request: ChatRequest) -> Result<ChatResponse, ScopedCallError> {
     let provider = PROVIDER
         .read()
         .unwrap_poison()
         .clone()
         .expect("PROVIDER not initialized");
-    provider.chat_scoped(request).await
+    let pinned = request.provider.clone();
+    let model = request.model.clone();
+    let result = provider.chat_scoped(request).await;
+    if let Some(pinned) = pinned {
+        match &result {
+            Ok(_) => selection::note_success(&model, &pinned),
+            Err(e) if e.class.provider_unavailable() => selection::note_failure(&model, &pinned),
+            Err(_) => {}
+        }
+    }
+    result
 }
 
 /// Swap the global provider for tests, returning the previous value so the
@@ -471,52 +489,44 @@ mod tests {
     fn provider_routing() {
         struct Case {
             name: &'static str,
-            order: &'static str,
+            provider: &'static str,
             expected: Option<serde_json::Value>,
         }
 
         let cases = [
             Case {
                 name: "single_provider",
-                order: "openai",
+                provider: "openai",
                 expected: Some(serde_json::json!({
                     "order": ["openai"],
-                    "allow_fallbacks": false,
-                })),
-            },
-            Case {
-                name: "multiple_providers",
-                order: "openai, anthropic, google",
-                expected: Some(serde_json::json!({
-                    "order": ["openai", "anthropic", "google"],
                     "allow_fallbacks": false,
                 })),
             },
             Case {
                 name: "whitespace_only_yields_none",
-                order: "  , ,  ",
+                provider: "   ",
                 expected: None,
             },
             Case {
                 name: "empty_string_yields_none",
-                order: "",
+                provider: "",
                 expected: None,
             },
             Case {
                 name: "leading_trailing_whitespace",
-                order: "  openai  ",
+                provider: "  openai  ",
                 expected: Some(serde_json::json!({
                     "order": ["openai"],
                     "allow_fallbacks": false,
                 })),
             },
-            // A single slug (no commas) survives the split/trim/filter
-            // cycle unchanged as a one-element list.
+            // A slug is never split: the product pins exactly one provider, so a comma would be
+            // part of the provider's own name rather than a list separator.
             Case {
-                name: "single_slug_survives_split",
-                order: "google-gemini",
+                name: "a_comma_is_not_a_list_separator",
+                provider: "a,b",
                 expected: Some(serde_json::json!({
-                    "order": ["google-gemini"],
+                    "order": ["a,b"],
                     "allow_fallbacks": false,
                 })),
             },
@@ -524,12 +534,53 @@ mod tests {
 
         for c in &cases {
             assert_eq!(
-                provider_routing_json(c.order),
+                provider_routing_json(c.provider),
                 c.expected,
                 "case '{}': provider_routing_json({:?})",
                 c.name,
-                c.order,
+                c.provider,
             );
         }
+    }
+
+    /// Availability is learned from our own calls — no probe, no health endpoint: a provider-side
+    /// failure starts the pinned provider's outage clock, a success clears it, and a failure that
+    /// is not provider-side (an unparsable answer) leaves it alone.
+    #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (PROVIDER)
+    async fn availability_is_learned_from_our_own_calls() {
+        use crate::providers::selection;
+
+        let model = "providers/availability";
+        let fake = std::sync::Arc::new(
+            crate::util::test::FakeProvider::new()
+                .err(crate::retry::FailureClass::Transport, "connection reset")
+                .ok("served")
+                .err(crate::retry::FailureClass::Parse, "unparsable answer"),
+        );
+        let _provider_guard = crate::util::test::install_fake_provider(fake);
+        let request = || ChatRequest {
+            model: model.to_string(),
+            provider: Some("pinned".to_string()),
+            ..test_request(vec![ChatMessage::user("hi")], None)
+        };
+
+        assert!(chat_scoped(request()).await.is_err());
+        assert!(
+            selection::is_failing(model, "pinned"),
+            "a provider-side failure starts the clock"
+        );
+
+        assert!(chat_scoped(request()).await.is_ok());
+        assert!(
+            !selection::is_failing(model, "pinned"),
+            "a success clears the clock"
+        );
+
+        assert!(chat_scoped(request()).await.is_err());
+        assert!(
+            !selection::is_failing(model, "pinned"),
+            "an unparsable answer is the model's fault, not the provider's"
+        );
     }
 }

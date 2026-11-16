@@ -228,7 +228,7 @@ async fn run_workspace_diagnostics(
     // Load the diagnostics discovery prompt directly (not a role-specific discovery prompt).
     let prompt = crate::prompt::load_prompt("discovery/diagnostics.md");
 
-    let (agent, response) = run_default_agent(
+    let (mut agent, response) = run_default_agent(
         &agent_id,
         Role::Discovery,
         ws,
@@ -248,7 +248,7 @@ async fn run_workspace_diagnostics(
     let extraction_prompt = crate::prompt::load_prompt("extraction/diagnostics.md");
 
     // Prefix-cache preservation: `agent.extract_verdict` uses the agent's own
-    // parameters (model, reasoning_effort, tools, provider routing) with no
+    // parameters (model, reasoning_effort, tools, pinned provider) with no
     // response_format override — the extraction request shares the Discovery
     // agent-loop prefix, only the extraction prompt is new. Retry exhaustion
     // (RetryExhausted) surfaces the scoped loop's failure trail.
@@ -494,6 +494,7 @@ fn classify_discovery_failure(
     };
     match class {
         crate::retry::FailureClass::Transport
+        | crate::retry::FailureClass::Unavailable
         | crate::retry::FailureClass::TruncatedEnvelope
         | crate::retry::FailureClass::NoResponse
         | crate::retry::FailureClass::TruncatedOutput
@@ -2460,6 +2461,7 @@ mod tests {
         // Provider-class → Transient (workspace returns to Pending).
         for class in [
             crate::retry::FailureClass::Transport,
+            crate::retry::FailureClass::Unavailable,
             crate::retry::FailureClass::TruncatedEnvelope,
             crate::retry::FailureClass::NoResponse,
             crate::retry::FailureClass::TruncatedOutput,

@@ -10,6 +10,10 @@ use crate::util::error::HttpError;
 pub(crate) enum ErrorClass {
     /// A transient error that may resolve with retries (timeouts, 5xx, 429, …).
     Retryable,
+    /// The router answered that it has nowhere to send this model (`No endpoints found for <model>`,
+    /// `No allowed providers are available for the selected model`); provider-side, retryable, and
+    /// it must count as unavailability.
+    Unavailable,
     /// The request itself is unacceptable (auth, invalid model, billing/quota exhausted, tool
     /// schema, context length).
     InvalidRequest,
@@ -47,6 +51,30 @@ const NON_RETRYABLE_HINTS: &[&str] = &[
     "quota exhausted",
     "quota exceeded",
     "error code 1113",
+];
+
+/// Body-text vocabulary of the router answering that it has nowhere to send this model. The status
+/// cannot decide this one: OpenRouter reports it as a 404 (`No endpoints found for <model>`, or
+/// `No allowed providers are available for the selected model` when the pinned provider cannot serve
+/// the model and others could) or a 503 (`There is no available model provider that meets your
+/// routing requirements`) — so the wording decides.
+///
+/// Every entry is a whole phrase from a real body, never a fragment: step 2 runs before the
+/// 4xx-to-terminal rule, so a bare fragment would turn an ordinary 400 into a full retry ladder and
+/// start the provider's outage clock on a healthy provider. "No endpoints found matching your data
+/// policy" is the neighbouring rejection this deliberately does not match — it is a privacy setting
+/// the same bytes will keep failing.
+///
+/// Accepted trade-off: a retired or mistyped model slug answers with the same `No endpoints found
+/// for <model>` as a live model with no provider left, and no body tells the two apart. Such a slug
+/// therefore rides the retry ladder to exhaustion and marks its provider unavailable until a call
+/// succeeds. That costs no outcome — a model no provider serves fails on every provider — and the
+/// alternative, treating the phrase as terminal, would end every genuinely exhausted run on its
+/// first attempt and leave the five-minute rule with nothing to do.
+const UNAVAILABLE_HINTS: &[&str] = &[
+    "no endpoints found for",
+    "no allowed providers are available",
+    "no available model provider",
 ];
 
 /// Body-text vocabulary of a provider refusing the request's **content**. A leaked model control
@@ -103,10 +131,11 @@ pub(crate) fn implied_status(body: &str) -> u16 {
 /// Classify an error into one of the [`ErrorClass`] variants, in this cascade: (1) the refusal
 /// wording of [`refusal_class`] on a status below 500 that is neither 408 nor 429 — a 2xx body can
 /// carry one (that is how OpenRouter reports a post-header rejection), and no retry clears it;
-/// (2) any other 4xx — clear client errors that never self-heal; (3) 429, disambiguated by body
-/// text — [`RETRYABLE_OVERRIDES`] first (transient upstream rate limits), then
-/// [`NON_RETRYABLE_HINTS`] (billing/quota exhaustion); (4) otherwise retryable, 408 and every 5xx
-/// included.
+/// (2) the router's own no-provider wording ([`UNAVAILABLE_HINTS`]) on any status other than 408
+/// and 429 — provider-side and retryable, whatever the status says; (3) any other 4xx — clear
+/// client errors that never self-heal; (4) 429, disambiguated by body text —
+/// [`RETRYABLE_OVERRIDES`] first (transient upstream rate limits), then [`NON_RETRYABLE_HINTS`]
+/// (billing/quota exhaustion); (5) otherwise retryable, 408 and every 5xx included.
 pub(crate) fn classify_err(err: &anyhow::Error) -> ErrorClass {
     // Typed path: use the structured fields from HttpError directly.
     if let Some(http_err) = err.downcast_ref::<HttpError>() {
@@ -125,23 +154,38 @@ pub(crate) fn classify_err(err: &anyhow::Error) -> ErrorClass {
             return class;
         }
 
-        // Step 2: 4xx other than 408 and 429 — auth, invalid model, context window, tool schema:
+        // Step 2: the router has nowhere to send this model. The status cannot decide here: the same
+        // answer arrives as a 404 ("No endpoints found for <model>", "No allowed providers are
+        // available for the selected model") or a 503 ("There is no available model provider that
+        // meets your routing requirements") — so the wording decides. An unknown or retired model
+        // slug answers with the same 404, and the accepted trade-off is on `UNAVAILABLE_HINTS`. A 408
+        // and a 429 are excluded: their bodies quote upstream metadata that can carry this phrasing
+        // while the failure itself is a timeout or a rate limit, which the retry layer already
+        // handles.
+        if http_err.status != 408
+            && http_err.status != 429
+            && UNAVAILABLE_HINTS.iter().any(|h| body_lower.contains(h))
+        {
+            return ErrorClass::Unavailable;
+        }
+
+        // Step 3: 4xx other than 408 and 429 — auth, invalid model, context window, tool schema:
         // never retryable.
         if (400..500).contains(&http_err.status) && http_err.status != 408 && http_err.status != 429
         {
             return ErrorClass::InvalidRequest;
         }
 
-        // Step 3: 429 is ambiguous — delegate to the body-text hints.
+        // Step 4: 429 is ambiguous — delegate to the body-text hints.
         if http_err.status == 429 {
-            // 3a. Retryable overrides take priority: a proxy may embed billing keywords in
+            // 4a. Retryable overrides take priority: a proxy may embed billing keywords in
             // transient metadata (e.g. `insufficient_quota` in OpenRouter's
             // `metadata.provider_error_code`), while a "temporarily rate-limited" signal means the
             // failure is a transient upstream limit, not account exhaustion.
             if RETRYABLE_OVERRIDES.iter().any(|h| body_lower.contains(h)) {
                 return ErrorClass::Retryable;
             }
-            // 3b. Billing/quota body text — permanent account exhaustion, not transient rate
+            // 4b. Billing/quota body text — permanent account exhaustion, not transient rate
             // limiting.
             if NON_RETRYABLE_HINTS.iter().any(|h| body_lower.contains(h)) {
                 return ErrorClass::InvalidRequest;
@@ -169,7 +213,12 @@ mod tests {
 
     #[test]
     fn retryable_error_classification() {
-        let is_terminal = |e: &anyhow::Error| classify_err(e) != ErrorClass::Retryable;
+        let is_terminal = |e: &anyhow::Error| {
+            !matches!(
+                classify_err(e),
+                ErrorClass::Retryable | ErrorClass::Unavailable
+            )
+        };
         // Terminal via status code (HttpError 4xx, excluding 408/429).
         assert!(is_terminal(&test_err(401, "Unauthorized")));
         assert!(is_terminal(&test_err(403, "Forbidden")));
@@ -266,6 +315,71 @@ mod tests {
         assert_eq!(implied_status("blocked by guardrail"), 502);
         assert_eq!(implied_status("upstream provider is overloaded"), 502);
         assert_eq!(implied_status(""), 502);
+    }
+
+    /// The router's no-destination answer is a class of its own whatever status carries it: the
+    /// bodies below all mean "nowhere to send this model" — provider-side and retryable. The wording,
+    /// not the status, decides; a retired model slug answers with the same phrase and is accepted
+    /// into the same class (see [`UNAVAILABLE_HINTS`]).
+    #[test]
+    fn no_provider_available_is_unavailable_and_not_terminal() {
+        // The router's own wordings, on both statuses it uses for them. The second is the answer a
+        // pinned-but-unserved provider gets: `allow_fallbacks: false` leaves the router no endpoint.
+        // The first doubles as the retired/mistyped-slug answer — the accepted ambiguity.
+        for (status, body) in [
+            (
+                404u16,
+                r#"{"error":{"message":"No endpoints found for deepseek/deepseek-v4.1-flash"}}"#,
+            ),
+            (
+                404u16,
+                r#"{"error":{"message":"No allowed providers are available for the selected model."}}"#,
+            ),
+            (
+                503u16,
+                r#"{"error":{"message":"There is no available model provider that meets your routing requirements"}}"#,
+            ),
+        ] {
+            assert_eq!(
+                classify_err(&test_err(status, body)),
+                ErrorClass::Unavailable,
+                "status {status} with body {body} must be Unavailable"
+            );
+        }
+
+        // The neighbouring data-policy rejection shares the status but not the remedy: the same
+        // bytes keep failing, so it stays terminal.
+        assert_eq!(
+            classify_err(&test_err(
+                404,
+                "No endpoints found matching your data policy"
+            )),
+            ErrorClass::InvalidRequest
+        );
+        // The hints are whole phrases, so an ordinary 400 that merely mentions the routing block
+        // stays terminal instead of burning the retry ladder and demoting a healthy provider.
+        assert_eq!(
+            classify_err(&test_err(400, "invalid provider order: manual order")),
+            ErrorClass::InvalidRequest
+        );
+        assert_eq!(
+            classify_err(&test_err(400, "routing requirements not met")),
+            ErrorClass::InvalidRequest
+        );
+        // A 408 and a 429 keep their status-driven class (the plain 4xx family is
+        // `retryable_error_classification`'s subject): their bodies quote upstream metadata that can
+        // carry this wording while the failure itself is a timeout or a rate limit.
+        assert_eq!(
+            classify_err(&test_err(
+                408,
+                "No endpoints found for deepseek/deepseek-v4.1-flash"
+            )),
+            ErrorClass::Retryable
+        );
+        assert_eq!(
+            classify_err(&test_err(429, "no available model provider")),
+            ErrorClass::Retryable
+        );
     }
 
     #[test]
