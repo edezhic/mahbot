@@ -274,7 +274,8 @@ resvg = { version = "0.48", default-features = false, features = ["text", "syste
 #                 behaviour change must be taken deliberately, not at the next
 #                 `cargo update`. Brings its own quick-xml 0.42 next to the
 #                 OOXML reader's 0.39 — the accepted price of reading the old
-#                 formats.
+#                 formats. The lock's third copy (0.41) is the Linux Wayland
+#                 scanner's, on no document path.
 pdf-extract = { version = "0.12", default-features = false }
 hayro = "0.7"
 quick-xml = { version = "0.39", default-features = false }
