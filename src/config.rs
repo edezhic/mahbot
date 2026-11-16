@@ -23,7 +23,7 @@
 //!   [`ConfigData::model_routings`]; every chat request is built through
 //!   [`ConfigReload::model_routing`], and [`default_model_routing`] supplies the
 //!   whole list when the field is empty, so a cleared field behaves as if that
-//!   provider had been set.
+//!   list had been set.
 //!
 //! `provider_endpoint` (self-hosted OpenAI-compatible: Ollama, LM Studio,
 //! llama.cpp, vLLM, LiteLLM) is honored at runtime and falls back to
@@ -688,11 +688,11 @@ impl ConfigReload {
 
     /// The effective routing: the stored priority list (Settings → Provider → Models settings →
     /// Provider Priority) wins, else [`default_model_routing`], so a cleared field behaves
-    /// exactly as if that provider had been set. The list is the product's to walk — see
+    /// exactly as if that list had been set. The list is the product's to walk — see
     /// [`crate::providers::selection`] — never a preference handed to the router.
     #[must_use]
     pub(crate) fn model_routing(&self, model: &str) -> ModelRouting {
-        // No stored order → the model's default provider; see `default_model_routing`.
+        // No stored order → the model's built-in list; see `default_model_routing`.
         let provider_order = self
             .model_routing_by_key(model)
             .and_then(|mr| mr.provider_order)
@@ -768,25 +768,60 @@ fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
     !crate::db::store_db_path(mahbot_dir, "config").exists()
 }
 
-/// The provider that serves a model unless the user chose one: a DeepSeek-family
-/// slug (case-insensitive substring) → OpenRouter's lowercase `deepseek`; every
-/// other model stays auto-routed. This is the model's whole priority list when the
-/// field is empty, so a DeepSeek-named model is pinned to the `deepseek` provider.
+/// The endpoints the provider benchmark of 15 November 2026 chose for the default chat model: the
+/// three cheapest that held the prompt cache through its top measured rung, in priority order. It
+/// is the default chat model's list, so a change of `DEFAULT_CHAT_MODEL` re-measures it.
 ///
-/// **DO NOT DELETE, WEAKEN OR "SIMPLIFY" THIS RULE WITHOUT AN EXPLICIT USER
-/// REQUEST.** Which host serves a model decides prompt-cache locality, so
-/// auto-routing a DeepSeek model across hosts is a large billing regression.
+/// The list deliberately spans two hosts — two DeepInfra service tiers, then StepFun — because the
+/// owner's criterion was cache hold, then price. That is the opposite of the accidental cross-host
+/// routing the family rule in [`default_model_routing`] guards against, so it must not be
+/// "simplified" to a single host.
+const DEFAULT_CHAT_MODEL_ROUTING: &str = "deepinfra/fp8/flex,deepinfra/fp8,stepfun/fp8";
+
+/// The built-in priority list of a model that has one of its own, keyed by exact model id;
+/// `None` for every other model. Only the default chat model has one, and matching is exact: its
+/// id is a prefix of the other DeepSeek identifiers.
+fn built_in_model_routing(model: &str) -> Option<&'static str> {
+    (model == DEFAULT_CHAT_MODEL).then_some(DEFAULT_CHAT_MODEL_ROUTING)
+}
+
+/// The provider priority list that serves a model unless the user chose one: a model's own
+/// built-in list ([`built_in_model_routing`]), else a DeepSeek-family slug (case-insensitive
+/// substring) → OpenRouter's lowercase `deepseek`, else `None` (auto-routed). This is the model's
+/// whole priority list when the field is empty.
 pub(crate) fn default_model_routing(model: &str) -> Option<&'static str> {
-    model
-        .to_ascii_lowercase()
-        .contains("deepseek")
-        .then_some("deepseek")
+    built_in_model_routing(model).or_else(|| {
+        // **DO NOT DELETE, WEAKEN OR "SIMPLIFY" THIS RULE WITHOUT AN EXPLICIT USER REQUEST.** Which
+        // host serves a model decides prompt-cache locality, so spreading a DeepSeek model across
+        // hosts by accident is a large billing regression.
+        model
+            .to_ascii_lowercase()
+            .contains("deepseek")
+            .then_some("deepseek")
+    })
+}
+
+/// Seed the routing row that renders a default model's priority list in the
+/// Settings field — it duplicates what an empty field resolves to, but the field
+/// shows it as the value. A model with its own built-in list gets none: the row
+/// would freeze that list at install time.
+async fn seed_default_routing_row(
+    store: &crate::config_db::ConfigStore,
+    model: &str,
+) -> Result<()> {
+    if built_in_model_routing(model).is_none()
+        && let Some(provider) = default_model_routing(model)
+    {
+        store.save_model_routing(model, Some(provider)).await?;
+    }
+    Ok(())
 }
 
 /// Seed the rows a fresh install must show: the image/video generation model
 /// lists (the Settings GUI reads the raw snapshot fields, not the
-/// default-resolving `list_or` accessors) and the default slots' routing. The
-/// active selection is per-user (`crate::users`), so no singular key is seeded.
+/// default-resolving `list_or` accessors) and, for a default slot whose model has
+/// no built-in list of its own, its routing row. The active selection is
+/// per-user (`crate::users`), so no singular key is seeded.
 /// The transcription-off flag belongs to catalog `69`, the single owner of that
 /// initial value. `fresh` is the pre-open discriminator from [`load_or_init`] —
 /// the seed writes nothing to existing databases.
@@ -803,18 +838,12 @@ async fn seed_fresh_install_defaults(
     store
         .set_kv(CONFIG_KEY_VIDEO_MODELS, FRESH_INSTALL_VIDEO_MODELS)
         .await?;
-    // These rows duplicate what an empty field resolves to, but are kept so the
-    // Settings routing field renders the value. Only the manager/worker slots
-    // are seeded: the selection is per-user.
+    // Only the manager/worker slots are seeded: the selection is per-user.
     for default_model in [DEFAULT_MANAGER_MODEL, DEFAULT_WORKER_MODEL] {
-        if let Some(provider) = default_model_routing(default_model) {
-            store
-                .save_model_routing(default_model, Some(provider))
-                .await?;
-        }
+        seed_default_routing_row(store, default_model).await?;
     }
     tracing::info!(
-        "Fresh config database: seeded fresh-install defaults (image/video generation model sets; provider priority for the default model slots)"
+        "Fresh config database: seeded fresh-install defaults (image/video generation model sets)"
     );
     Ok(())
 }
@@ -834,8 +863,9 @@ async fn seed_fresh_install_defaults_from_flag(
 /// installation that skipped releases migrates too. Exact match on the full
 /// provider-prefixed string — accepted residual: a deliberate pick of an id that
 /// was also a historical default is indistinguishable and moves. A rewrite also
-/// seeds the new default's routing row so the Settings field renders it. A no-op
-/// once no row matches, so safe on every boot.
+/// seeds the new default's routing row so the Settings field renders it — unless
+/// that model has a built-in list of its own, which a stored row would freeze. A
+/// no-op once no row matches, so safe on every boot.
 async fn migrate_old_default_models(store: &crate::config_db::ConfigStore) -> Result<()> {
     let mut changed_manager = 0;
     for old in OLD_DEFAULT_MANAGER_MODELS {
@@ -853,10 +883,8 @@ async fn migrate_old_default_models(store: &crate::config_db::ConfigStore) -> Re
         (changed_manager, DEFAULT_MANAGER_MODEL),
         (changed_worker, DEFAULT_WORKER_MODEL),
     ] {
-        if changed > 0
-            && let Some(provider) = default_model_routing(model)
-        {
-            store.save_model_routing(model, Some(provider)).await?;
+        if changed > 0 {
+            seed_default_routing_row(store, model).await?;
         }
     }
     if changed_manager > 0 || changed_worker > 0 {
@@ -1250,8 +1278,8 @@ mod tests {
         );
         assert_eq!(
             default_model_routing(DEFAULT_CHAT_MODEL),
-            Some("deepseek"),
-            "the default must keep the DeepSeek provider pin"
+            Some("deepinfra/fp8/flex,deepinfra/fp8,stepfun/fp8"),
+            "the default chat model must resolve to its built-in priority list"
         );
     }
 
@@ -1579,12 +1607,17 @@ mod tests {
             ],
             "a fresh config database must hold catalog 69's transcription row plus the fresh-install defaults"
         );
-        // Manager and worker share one default, so the passes collapse into one row.
-        assert_eq!(
-            fresh_store.get_all_model_routings().await.unwrap(),
-            vec![model_routing(DEFAULT_MANAGER_MODEL, Some("deepseek"))],
-            "a fresh config database must seed routing rows for default models \
-             with a known provider (others get none)"
+        // The only routable default has a built-in list of its own, so the seed
+        // writes no routing row at all: a row would freeze that list at install
+        // time.
+        assert!(
+            fresh_store
+                .get_all_model_routings()
+                .await
+                .unwrap()
+                .is_empty(),
+            "a fresh config database must not seed a routing row for a model \
+             with a built-in priority list"
         );
 
         let (existing_store, existing_dir) =
@@ -1616,8 +1649,35 @@ mod tests {
         );
     }
 
-    /// Only exact full-string matches are rewritten, each seeding the new
-    /// default's routing row; re-running is a no-op.
+    /// The seeding helper writes a row for a default model that resolves through the family
+    /// fallback and none for a model with a built-in list, whose row would freeze that list.
+    #[tokio::test]
+    async fn seed_default_routing_row_skips_a_built_in_list() {
+        let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
+
+        seed_default_routing_row(&store, DEFAULT_MANAGER_MODEL)
+            .await
+            .unwrap();
+        assert!(
+            store.get_all_model_routings().await.unwrap().is_empty(),
+            "a model with a built-in list must get no seeded row"
+        );
+
+        seed_default_routing_row(&store, "deepseek/deepseek-v4.1-flash")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_all_model_routings().await.unwrap(),
+            vec![model_routing(
+                "deepseek/deepseek-v4.1-flash",
+                Some("deepseek")
+            )],
+            "a model that resolves through the family fallback still gets its row seeded"
+        );
+    }
+
+    /// Only exact full-string matches are rewritten, and a model with a built-in
+    /// priority list gets no seeded row; re-running is a no-op.
     #[tokio::test]
     async fn migrate_old_default_models_rewrites_every_previous_default() {
         let (store, _dir) = crate::open_test_store!(crate::config_db::ConfigStore, "config");
@@ -1687,11 +1747,11 @@ mod tests {
             Some("sk-example"),
             "unrelated config keys must never be touched"
         );
-        // Both slots share one default, so one shared routing row.
-        assert_eq!(
-            store.get_all_model_routings().await.unwrap(),
-            vec![model_routing(DEFAULT_MANAGER_MODEL, Some("deepseek"))],
-            "migrating a slot to the new default must upsert its routing row"
+        // The target default has a built-in list of its own, so migrating a slot
+        // to it writes no routing row — a row would freeze that list.
+        assert!(
+            store.get_all_model_routings().await.unwrap().is_empty(),
+            "migrating a slot to a model with a built-in list must not write a routing row"
         );
 
         migrate_old_default_models(&store).await.unwrap();
@@ -1713,10 +1773,9 @@ mod tests {
             Some(DEFAULT_WORKER_MODEL),
             "re-running the migration must be a no-op"
         );
-        assert_eq!(
-            store.get_all_model_routings().await.unwrap(),
-            vec![model_routing(DEFAULT_MANAGER_MODEL, Some("deepseek"))],
-            "re-running the migration must not add or drop the migrated routing row"
+        assert!(
+            store.get_all_model_routings().await.unwrap().is_empty(),
+            "re-running the migration must not add or drop a routing row"
         );
     }
 
@@ -1924,7 +1983,7 @@ mod tests {
         );
     }
 
-    /// A stored priority list wins, else the model's default one; a non-DeepSeek
+    /// A stored priority list wins, else the model's built-in one; a non-DeepSeek
     /// model stays auto-routed. Normalisation runs first, so a stored list is
     /// trimmed and a whitespace-only one is as unset as an empty one.
     #[test]
@@ -1933,6 +1992,7 @@ mod tests {
         let mut data = ConfigData::STRUCT_FIELDS_DEFAULT;
         data.model_routings = vec![
             model_routing("deepseek/deepseek-v4.1-flash", Some("  GMICloud  ")),
+            model_routing(DEFAULT_CHAT_MODEL, Some("")),
             model_routing("deepseek/deepseek-v4-flash-0731", Some("")),
             model_routing("deepseek/deepseek-v4.1-pro", Some("   ")),
             model_routing("qwen/qwen3.8-flash", Some("  ")),
@@ -1956,23 +2016,38 @@ mod tests {
             assert_eq!(
                 config.model_routing(model).provider_order.as_deref(),
                 Some("deepseek"),
-                "{model} has no explicit setting — an empty or whitespace-only order \
+                "{model} has no built-in list of its own — an empty or whitespace-only order \
                  is no setting — and must fall back to the canonical DeepSeek slug"
             );
         }
+        // The default chat model's empty row resolves to its built-in list, not the
+        // family slug, so a fresh install's requests are routed by that order.
+        assert_eq!(
+            config
+                .model_routing(DEFAULT_CHAT_MODEL)
+                .provider_order
+                .as_deref(),
+            Some("deepinfra/fp8/flex,deepinfra/fp8,stepfun/fp8"),
+            "an empty field must resolve the default chat model to its built-in list"
+        );
         assert_eq!(
             config.model_routing("qwen/qwen3.8-flash").provider_order,
             None,
             "a non-DeepSeek model must stay auto-routed"
         );
 
-        // The built-in default model carries its provider pin, so a fresh
-        // install's manager requests are routed rather than left to the
-        // provider's own choice.
+        // A value set after the upgrade wins over the built-in list.
+        data = config.snapshot();
+        data.model_routings = vec![model_routing(DEFAULT_CHAT_MODEL, Some("stepfun/fp8"))];
+        data.normalize();
+        config.swap(data);
         assert_eq!(
-            default_model_routing(DEFAULT_CHAT_MODEL),
-            Some("deepseek"),
-            "the default must keep the DeepSeek provider pin"
+            config
+                .model_routing(DEFAULT_CHAT_MODEL)
+                .provider_order
+                .as_deref(),
+            Some("stepfun/fp8"),
+            "a stored list must win over the built-in one"
         );
     }
 }

@@ -349,6 +349,20 @@ mod tests {
         assert_eq!(resolved.stored(), Some(stored(model, "second")));
     }
 
+    /// The default chat model's built-in list parses into the three candidate endpoints in priority
+    /// order — the one place the routing string and the selection's split meet.
+    #[test]
+    fn the_default_chat_model_resolves_to_its_built_in_priority_list() {
+        assert_eq!(
+            parse_priority_list(
+                crate::config::default_model_routing(crate::config::DEFAULT_MANAGER_MODEL)
+                    .expect("the default model's built-in list"),
+            ),
+            candidates_of(&["deepinfra/fp8/flex", "deepinfra/fp8", "stepfun/fp8"]),
+            "the built-in list must reach the selection as the three endpoints in priority order"
+        );
+    }
+
     #[test]
     fn a_provider_is_kept_while_its_outage_is_younger_than_move_after() {
         let model = "selection/young-outage";

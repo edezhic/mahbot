@@ -122,9 +122,12 @@
 //! chosen for, so one conversation keeps one provider across a restart, a
 //! resumed run and a re-dispatched agent; both are NULL for a conversation that
 //! has no pin yet, which selects on its next run (likewise a no-op on fresh
-//! installs).
+//! installs). `81` drops a stored provider priority list for
+//! `deepseek/deepseek-v4.1-flash-1017`, the one model that now carries a
+//! built-in list of its own, so a value set earlier does not survive the upgrade
+//! (see [`DROP_DEEPSEEK_V41_FLASH_1017_ROUTING`]).
 //!
-//! Future schema changes resume the chain at id `81` with monotonically
+//! Future schema changes resume the chain at id `82` with monotonically
 //! increasing, unique integer ids, never reused across any store for the
 //! lifetime of the catalog.
 //!
@@ -738,6 +741,14 @@ CREATE INDEX IF NOT EXISTS idx_chat_history_user_ws_id ON chat_history(user_name
 /// rewritten; every other stored order survives verbatim.
 const REWRITE_LEGACY_DEEPSEEK_ROUTING_SLUG: &str = "UPDATE config_model_routing SET provider_order = 'deepseek' WHERE provider_order = 'DeepSeek';";
 
+/// One-shot data migration (`81`): drop the stored provider priority list of
+/// `deepseek/deepseek-v4.1-flash-1017`, which now has a built-in list of its own
+/// ([`crate::config::default_model_routing`]) — the owner's earlier value is
+/// discarded by design, and the field is his to set again. Matched on the exact
+/// model id, so the other DeepSeek identifiers keep their rows.
+const DROP_DEEPSEEK_V41_FLASH_1017_ROUTING: &str =
+    "DELETE FROM config_model_routing WHERE model = 'deepseek/deepseek-v4.1-flash-1017';";
+
 /// Catalog `44`: rewrite the retired `in_review`/`in_qa` stages to the merged
 /// `verification` stage — a data migration; no schema change.
 ///
@@ -1342,6 +1353,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "80",
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_session_metadata_provider),
+    },
+    Migration {
+        id: "81",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(DROP_DEEPSEEK_V41_FLASH_1017_ROUTING),
     },
 ];
 
@@ -4324,10 +4340,10 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
                 "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
                 "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
                 "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-                "70", "72", "73", "74", "75", "76", "77", "78", "79", "80"
+                "70", "72", "73", "74", "75", "76", "77", "78", "79", "80", "81"
             ]
             .map(String::from),
-            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–80 tail exactly"
+            "fresh core applies the 24–34 baseline + the 36–57/59–63/65–81 tail exactly"
         );
     }
 
@@ -5014,7 +5030,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-            "70", "72", "73", "74", "75", "76", "77", "78", "79", "80",
+            "70", "72", "73", "74", "75", "76", "77", "78", "79", "80", "81",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -5023,7 +5039,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–80"
+            "reopen must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–81"
         );
 
         // Only the tables named here change shape (`72` makes one appear under
@@ -5436,7 +5452,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             "24", "25", "27", "28", "29", "30", "31", "32", "33", "34", "36", "37", "38", "39",
             "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53",
             "54", "55", "56", "57", "59", "60", "61", "62", "63", "65", "66", "67", "68", "69",
-            "70", "72", "73", "74", "75", "76", "77", "78", "79", "80",
+            "70", "72", "73", "74", "75", "76", "77", "78", "79", "80", "81",
         ] {
             expected_ids.push(id.to_string());
         }
@@ -5445,7 +5461,7 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
         after_ids.sort();
         assert_eq!(
             after_ids, expected_ids,
-            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–80"
+            "upgrade must record exactly old ids ∪ 24/25/27..34/36..57/59–63/65–81"
         );
 
         let after_users_cols = column_names(&conn, "users").await;
@@ -5836,6 +5852,70 @@ ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);"
             .await
             .expect("re-run entry 37 body");
         assert_eq!(model_routing_orders(&conn).await, rewritten);
+    }
+
+    /// Behavioral pin for catalog entry `81`: the stored priority list of the model that now has a
+    /// built-in list of its own is deleted, while every other routing row — the DeepSeek
+    /// identifiers whose ids share its prefix included — survives verbatim. Idempotent: a second
+    /// execution matches no rows.
+    #[tokio::test]
+    async fn drop_deepseek_v41_flash_1017_routing_deletes_only_that_model() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_with_schema(
+            &crate::db::store_db_path(tmp.path(), crate::db::CONSOLIDATED_DB_NAME),
+            "",
+        )
+        .await
+        .expect("open core");
+        // Catalog front entry 24 (baseline core schema) creates
+        // `config_model_routing`.
+        run_catalog(&conn, TargetDb::Core, &MIGRATIONS[..1])
+            .await
+            .expect("baseline catalog");
+        for (model, order) in [
+            ("deepseek/deepseek-v4.1-flash-1017", "deepinfra/fp8/flex"),
+            ("deepseek/deepseek-v4.1-flash", "deepseek"),
+            ("deepseek/deepseek-v4.1-flash-1017-preview", "deepseek"),
+            ("qwen/qwen3.8-flash", "GMICloud"),
+        ] {
+            conn.execute(
+                "INSERT INTO config_model_routing (model, provider_order) VALUES (?1, ?2)",
+                params![model, order],
+            )
+            .await
+            .unwrap();
+        }
+
+        let entry = MIGRATIONS
+            .iter()
+            .find(|m| m.id == "81")
+            .expect("entry 81 in the catalog");
+        run_catalog(&conn, TargetDb::Core, std::slice::from_ref(entry))
+            .await
+            .expect("apply entry 81");
+        let remaining = model_routing_orders(&conn).await;
+        assert_eq!(
+            remaining,
+            vec![
+                (
+                    "deepseek/deepseek-v4.1-flash".to_string(),
+                    "deepseek".to_string()
+                ),
+                (
+                    "deepseek/deepseek-v4.1-flash-1017-preview".to_string(),
+                    "deepseek".to_string()
+                ),
+                ("qwen/qwen3.8-flash".to_string(), "GMICloud".to_string()),
+            ],
+            "only the exact model id may be dropped — prefix and family neighbours keep their row"
+        );
+
+        // The ledger records `81` after the first application, so re-run the SQL
+        // body directly to pin that it matches no rows a second time.
+        conn.execute(DROP_DEEPSEEK_V41_FLASH_1017_ROUTING, ())
+            .await
+            .expect("re-run entry 81 body");
+        assert_eq!(model_routing_orders(&conn).await, remaining);
     }
 
     /// The stage-merge description probe catches the spellings the retired

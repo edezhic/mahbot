@@ -4965,7 +4965,7 @@ mod tests {
         let default_field = format!("routing_order:{}", crate::config::DEFAULT_MANAGER_MODEL);
         assert!(
             state.field_editors.contains_key(&default_field),
-            "clear-to-empty coerces to the default manager model; its routing row is seeded"
+            "clear-to-empty coerces to the default manager model; its routing field editor is registered"
         );
         let _ = state.routing_group(); // must not panic
 
