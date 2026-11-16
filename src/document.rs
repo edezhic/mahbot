@@ -45,11 +45,11 @@ use hayro::hayro_syntax::content::ops::TypedInstruction;
 use hayro::hayro_syntax::object::dict::Dict;
 use hayro::hayro_syntax::object::stream::{ImageColorSpace, ImageDecodeParams, Stream};
 use hayro::hayro_syntax::object::{Array, Name, Object, ObjectIdentifier, Rect};
-use hayro::hayro_syntax::page::Page;
+use hayro::hayro_syntax::page::{Page, Resources};
 use hayro::hayro_syntax::{DecryptionError, LoadPdfError, Pdf};
-use hayro::vello_cpu::color::Rgba8;
 use hayro::vello_cpu::color::palette::css::WHITE;
-use hayro::{RenderCache, RenderSettings};
+use hayro::vello_cpu::peniko::ImageAlphaType;
+use hayro::{PixmapSettings, RenderCache, RenderSettings};
 use image::codecs::jpeg::JpegEncoder;
 use image::{RgbImage, RgbaImage};
 use office_oxide::cfb::CfbReader;
@@ -80,6 +80,11 @@ const RASTER_MAX_SCALE: f32 = 3.0;
 
 /// JPEG quality for rasterized pages: small print stays legible, a page stays a few hundred KB.
 const RASTER_JPEG_QUALITY: u8 = 90;
+
+/// How far up the page tree the inherited resources are read: a file whose `/Parent` entries form
+/// a cycle must not make this walk unbounded. hayro-syntax guards its own page-tree walk with a
+/// visited set rather than a depth, so the chain read here needs a bound of its own.
+const MAX_PAGE_TREE_DEPTH: usize = 64;
 
 const PDF_MAGIC: &[u8] = b"%PDF-";
 /// Magic bytes of a ZIP local file header — OOXML packages and plain archives alike.
@@ -271,7 +276,7 @@ fn zip_family(bytes: &[u8]) -> RealFamily {
     let Ok(archive) = ZipArchive::new(Cursor::new(bytes)) else {
         return RealFamily::Other;
     };
-    let has = |part: &str| archive.file_names().any(|name| name == part);
+    let has = |part: &str| crate::ooxml::entry_names(&archive).any(|name| name == part);
     if has(crate::ooxml::DOCX_BODY_PART) {
         RealFamily::Docx
     } else if has(crate::ooxml::WORKBOOK_PART) {
@@ -1108,21 +1113,32 @@ fn page_image_streams<'a>(page: &Page<'a>) -> (Vec<Stream<'a>>, Vec<Stream<'a>>)
     (images, forms)
 }
 
-/// The XObjects the page's own resources name, then those inherited from the page-tree
-/// resources: a name defined twice is taken from the most specific definition.
+/// The XObjects in scope for `page`: those its own resources name, then those the page-tree
+/// resources above it name, most specific level first — a name defined twice is taken from the
+/// most specific definition.
+///
+/// PDF gives a page its ancestors' `/Resources` only when it declares none of its own, but files
+/// in the wild do split one resource set across the tree, and an XObject named only above the page
+/// is still one its content can paint, so every level is merged rather than the nearest taken.
+/// hayro-syntax resolves the page tree itself and keeps one resources dictionary per page
+/// (`Resources::parent` is gone), so the chain is walked through the raw `/Parent` dictionaries.
 fn page_x_objects<'a>(page: &Page<'a>) -> Vec<Stream<'a>> {
     let mut seen: HashSet<Name<'a>> = HashSet::new();
     let mut streams = Vec::new();
-    let mut level = Some(page.resources());
-    while let Some(resources) = level {
-        for name in resources.x_objects.keys() {
-            if seen.insert(name.clone())
-                && let Some(stream) = resources.get_x_object(&name)
-            {
-                streams.push(stream);
+    let mut level = Some(page.raw().clone());
+    for _ in 0..MAX_PAGE_TREE_DEPTH {
+        let Some(dict) = level else { break };
+        if let Some(own) = dict.get::<Dict<'a>>(b"Resources") {
+            let resources = Resources::new(own);
+            for name in resources.x_objects.keys() {
+                if seen.insert(name.clone())
+                    && let Some(stream) = resources.get_x_object(&name)
+                {
+                    streams.push(stream);
+                }
             }
         }
-        level = resources.parent();
+        level = dict.get::<Dict<'a>>(b"Parent");
     }
     streams
 }
@@ -1579,24 +1595,22 @@ pub(crate) fn render_page_image(
     // stays finite.
     let (width, height) = page.render_dimensions();
     let scale = (long_side / width.max(height)).min(max_scale);
-    let settings = RenderSettings {
+    // The scale and the background belong to the pixmap, not to the render: on white, so a page
+    // whose own background is transparent still reads as paper.
+    let pixmap_settings = PixmapSettings {
         x_scale: scale,
         y_scale: scale,
         bg_color: WHITE,
-        ..RenderSettings::default()
     };
     let pixmap = hayro::render(
         page,
         &RenderCache::new(),
         &InterpreterSettings::default(),
-        &settings,
+        &RenderSettings::default(),
+        &pixmap_settings,
     );
     let (pixel_width, pixel_height) = (pixmap.width(), pixmap.height());
-    let raw: Vec<u8> = pixmap
-        .take_unpremultiplied()
-        .into_iter()
-        .flat_map(Rgba8::to_u8_array)
-        .collect();
+    let raw = pixmap.take_rgba8(ImageAlphaType::Alpha);
     RgbaImage::from_raw(u32::from(pixel_width), u32::from(pixel_height), raw)
 }
 
@@ -2229,6 +2243,36 @@ mod tests {
                 "{label}: the image is the page's"
             );
         }
+    }
+
+    /// A page's own `/Resources` replace the page tree's rather than extend them, yet a file in the
+    /// wild leaves an image on the tree node for its pages to paint.
+    #[test]
+    fn an_x_object_named_only_by_the_page_tree_is_still_the_pages() {
+        let content = "BT /F1 24 Tf 72 700 Td (Hello PDF text layer) Tj ET";
+        let objects = vec![
+            b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+            b"<< /Type /Pages /Kids [4 0 R] /Count 1 /Resources \
+              << /XObject << /Im0 5 0 R >> >> >>"
+                .to_vec(),
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources \
+              << /Font << /F1 3 0 R >> >> /Contents 6 0 R >>"
+                .to_vec(),
+            ImageXObject::rgb(4, 2, Some("FlateDecode"), flate(&solid_rgb_samples())).body(),
+            format!(
+                "<< /Length {} >>\nstream\n{content}\nendstream",
+                content.len()
+            )
+            .into_bytes(),
+        ];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outcome = convert_document(&assemble_pdf(&objects), "scan.pdf", dir.path());
+        let DocOutcome::Text { images, notes, .. } = outcome else {
+            panic!("expected Text outcome for a text-layer PDF");
+        };
+        assert!(notes.is_empty(), "nothing was skipped: {notes:?}");
+        assert_eq!(images, vec![dir.path().join("page_1_img_0.jpg")]);
     }
 
     /// A PNG predictor in `/DecodeParms` is what most producers emit, and the filter chain has to

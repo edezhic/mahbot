@@ -40,8 +40,8 @@
 //!   calls an excess counted.
 
 use super::{
-    Relationship, ZipEntry, append_entity, attr, is_chart_part, numfmt, read_zip_entry, rel_id,
-    resolve_part, scan_elements,
+    Relationship, ZipEntry, append_entity, attr, entry_names, is_chart_part, numfmt, part_text,
+    read_zip_entry, rel_id, resolve_part, scan_elements,
 };
 use crate::reader_output::{
     CHART_EXTENDED, CHART_LABEL, CHART_NO_VALUES, CHART_TEXT, CHART_TITLE, CHART_UNREADABLE,
@@ -50,6 +50,7 @@ use crate::reader_output::{
 use crate::util::one_line;
 use quick_xml::Reader;
 use quick_xml::events::{BytesRef, BytesStart, Event};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::io::{Read, Seek};
@@ -124,11 +125,10 @@ pub(crate) fn read_charts<R: Read + Seek>(
     prefix: &str,
     date1904: bool,
 ) -> HashMap<String, ChartRead> {
-    let parts: Vec<String> = archive
-        .file_names()
+    let parts: Vec<String> = entry_names(archive)
         .filter(|name| is_chart_part(name, prefix))
         .take(MAX_CHARTS)
-        .map(str::to_owned)
+        .map(Cow::into_owned)
         .collect();
     parts
         .into_iter()
@@ -147,7 +147,7 @@ pub(crate) fn read_charts<R: Read + Seek>(
 /// element of a slide, a worksheet's drawing or a Word body, whichever namespace wraps it.
 pub(crate) fn chart_parts(xml: &[u8], rels: &[Relationship], base: &str) -> Vec<String> {
     let mut parts = Vec::new();
-    for id in scan_elements(xml, b"chart", rel_id).unwrap_or_default() {
+    for id in scan_elements(xml, "chart", rel_id).unwrap_or_default() {
         let Some(rel) = rels.iter().find(|rel| rel.id == id) else {
             continue;
         };
@@ -309,24 +309,24 @@ enum Kind {
     Surface3D,
 }
 
-fn kind_of(name: &[u8]) -> Option<Kind> {
+fn kind_of(name: &str) -> Option<Kind> {
     Some(match name {
-        b"areaChart" => Kind::Area,
-        b"area3DChart" => Kind::Area3D,
-        b"barChart" => Kind::Bar,
-        b"bar3DChart" => Kind::Bar3D,
-        b"bubbleChart" => Kind::Bubble,
-        b"doughnutChart" => Kind::Doughnut,
-        b"lineChart" => Kind::Line,
-        b"line3DChart" => Kind::Line3D,
-        b"ofPieChart" => Kind::OfPie,
-        b"pieChart" => Kind::Pie,
-        b"pie3DChart" => Kind::Pie3D,
-        b"radarChart" => Kind::Radar,
-        b"scatterChart" => Kind::Scatter,
-        b"stockChart" => Kind::Stock,
-        b"surfaceChart" => Kind::Surface,
-        b"surface3DChart" => Kind::Surface3D,
+        "areaChart" => Kind::Area,
+        "area3DChart" => Kind::Area3D,
+        "barChart" => Kind::Bar,
+        "bar3DChart" => Kind::Bar3D,
+        "bubbleChart" => Kind::Bubble,
+        "doughnutChart" => Kind::Doughnut,
+        "lineChart" => Kind::Line,
+        "line3DChart" => Kind::Line3D,
+        "ofPieChart" => Kind::OfPie,
+        "pieChart" => Kind::Pie,
+        "pie3DChart" => Kind::Pie3D,
+        "radarChart" => Kind::Radar,
+        "scatterChart" => Kind::Scatter,
+        "stockChart" => Kind::Stock,
+        "surfaceChart" => Kind::Surface,
+        "surface3DChart" => Kind::Surface3D,
         _ => return None,
     })
 }
@@ -338,7 +338,7 @@ struct Parser {
     /// Whether the part's root was a chart space — a part that is no chart at all is not a chart
     /// with no values.
     root: bool,
-    stack: Vec<Vec<u8>>,
+    stack: Vec<String>,
     kinds: Vec<String>,
     kind: Option<KindBuilder>,
     capture: Option<Capture>,
@@ -383,31 +383,28 @@ impl Parser {
     }
 
     fn run(&mut self, xml: &[u8]) -> Result<(), ChartLoss> {
-        let mut reader = Reader::from_reader(xml);
+        let text = part_text(xml);
+        let mut reader = Reader::from_reader(text.as_bytes());
         let mut buffer = Vec::new();
         loop {
             match reader.read_event_into(&mut buffer) {
                 Ok(Event::Start(event)) => {
-                    let name = event.local_name().as_ref().to_vec();
+                    let name = event.local_name().as_ref().to_string();
                     self.stack.push(name.clone());
                     self.start(&event, &name)?;
                 }
                 Ok(Event::Empty(event)) => {
-                    let name = event.local_name().as_ref().to_vec();
+                    let name = event.local_name().as_ref().to_string();
                     self.stack.push(name.clone());
                     self.start(&event, &name)?;
                     self.stack.pop();
                     self.end();
                 }
                 Ok(Event::Text(event)) => {
-                    if let Ok(text) = event.xml10_content() {
-                        self.text(&text);
-                    }
+                    self.text(&event.xml10_content());
                 }
                 Ok(Event::CData(event)) => {
-                    if let Ok(text) = event.xml10_content() {
-                        self.text(&text);
-                    }
+                    self.text(&event.xml10_content());
                 }
                 Ok(Event::GeneralRef(reference)) => self.entity(&reference),
                 Ok(Event::End(_)) => {
@@ -428,31 +425,31 @@ impl Parser {
         Ok(())
     }
 
-    fn ancestor(&self, back: usize) -> Option<&[u8]> {
+    fn ancestor(&self, back: usize) -> Option<&str> {
         let index = self.stack.len().checked_sub(back)?;
-        self.stack.get(index).map(Vec::as_slice)
+        self.stack.get(index).map(String::as_str)
     }
 
-    fn start(&mut self, event: &BytesStart<'_>, name: &[u8]) -> Result<(), ChartLoss> {
+    fn start(&mut self, event: &BytesStart<'_>, name: &str) -> Result<(), ChartLoss> {
         let depth = self.stack.len();
         if depth > MAX_DEPTH {
             return Err(ChartLoss::Part);
         }
         if depth == 1 {
-            if name != b"chartSpace" {
+            if name != "chartSpace" {
                 return Err(ChartLoss::Part);
             }
             // An extended chart's own root: a schema this reading does not parse, said plainly
             // rather than read as a chart with none.
-            if event.name().prefix().is_some_and(|p| p.as_ref() == b"cx") {
+            if event.name().prefix().is_some_and(|p| p.as_ref() == "cx") {
                 return Err(ChartLoss::Extended);
             }
             self.root = true;
         }
         match name {
-            b"chartData" => return Err(ChartLoss::Extended),
-            b"title" => {
-                let kind = if self.ancestor(2) == Some(b"chart") {
+            "chartData" => return Err(ChartLoss::Extended),
+            "title" => {
+                let kind = if self.ancestor(2) == Some("chart") {
                     CaptureKind::Title
                 } else {
                     CaptureKind::Axis
@@ -467,8 +464,8 @@ impl Parser {
             }
             // A paragraph or a line break inside a captured run starts a new line of it: rich text
             // is joined with a space, never glued.
-            b"p" | b"br" => self.separate(),
-            b"ser" if self.series.is_none() => {
+            "p" | "br" => self.separate(),
+            "ser" if self.series.is_none() => {
                 if self.series_done.len() < MAX_SERIES {
                     self.series = Some(Series::default());
                     self.series_depth = Some(depth);
@@ -476,9 +473,9 @@ impl Parser {
                     self.more_series += 1;
                 }
             }
-            b"tx" => match self.ancestor(2) {
-                Some(b"ser") => self.tx_depth = Some(depth),
-                Some(b"dLbl") if self.capture.is_none() => {
+            "tx" => match self.ancestor(2) {
+                Some("ser") => self.tx_depth = Some(depth),
+                Some("dLbl") if self.capture.is_none() => {
                     self.capture = Some(Capture {
                         depth,
                         kind: CaptureKind::Label,
@@ -487,44 +484,44 @@ impl Parser {
                 }
                 _ => {}
             },
-            b"cat" | b"val" | b"xVal" | b"yVal" | b"bubbleSize" => {
+            "cat" | "val" | "xVal" | "yVal" | "bubbleSize" => {
                 if self.series.is_some() {
                     let slot = match name {
-                        b"cat" | b"xVal" => Slot::Category,
-                        b"val" | b"yVal" => Slot::Value,
+                        "cat" | "xVal" => Slot::Category,
+                        "val" | "yVal" => Slot::Value,
                         _ => Slot::Size,
                     };
                     self.slot = Some((slot, depth));
                 }
             }
-            b"numCache" | b"strCache" | b"numLit" | b"strLit" => {
-                self.open_cache(matches!(name, b"numCache" | b"numLit"));
+            "numCache" | "strCache" | "numLit" | "strLit" => {
+                self.open_cache(matches!(name, "numCache" | "numLit"));
             }
-            b"lvl" => self.open_cache(false),
-            b"pt" => {
+            "lvl" => self.open_cache(false),
+            "pt" => {
                 if self.slot.is_some()
-                    && let Some(index) = attr(event, b"idx").and_then(|idx| idx.trim().parse().ok())
+                    && let Some(index) = attr(event, "idx").and_then(|idx| idx.trim().parse().ok())
                 {
                     self.keep_point(index, depth);
                 }
             }
-            b"externalData" => self.attached = true,
-            b"date1904" => {
+            "externalData" => self.attached = true,
+            "date1904" => {
                 self.part_date1904 =
-                    Some(matches!(attr(event, b"val").as_deref(), Some("1" | "true")));
+                    Some(matches!(attr(event, "val").as_deref(), Some("1" | "true")));
             }
-            b"barDir" | b"grouping" | b"ofPieType" => {
+            "barDir" | "grouping" | "ofPieType" => {
                 if let Some(kind) = self.kind.as_mut() {
-                    let value = attr(event, b"val");
+                    let value = attr(event, "val");
                     match name {
-                        b"barDir" => kind.bar_dir = value,
-                        b"grouping" => kind.grouping = value,
+                        "barDir" => kind.bar_dir = value,
+                        "grouping" => kind.grouping = value,
                         _ => kind.of_pie = value,
                     }
                 }
             }
             _ => {
-                if self.ancestor(2) == Some(b"plotArea")
+                if self.ancestor(2) == Some("plotArea")
                     && let Some(kind) = kind_of(name)
                 {
                     self.kind = Some(KindBuilder {
@@ -596,24 +593,24 @@ impl Parser {
 
     fn target(&mut self) -> Option<&mut String> {
         let depth = self.stack.len();
-        let leaf = self.stack.last()?.as_slice();
+        let leaf = self.stack.last()?.as_str();
         // A title, an axis title or a data label: its rich text runs and its cached string, never
         // the reference it points at.
         if let Some(capture) = self.capture.as_mut()
             && capture.depth < depth
         {
-            return matches!(leaf, b"t" | b"v").then_some(&mut capture.text);
+            return matches!(leaf, "t" | "v").then_some(&mut capture.text);
         }
         if let Some(tx) = self.tx_depth
             && tx < depth
         {
-            if !matches!(leaf, b"t" | b"v") {
+            if !matches!(leaf, "t" | "v") {
                 return None;
             }
             let series = self.series.as_mut()?;
             return Some(series.name.get_or_insert_with(String::new));
         }
-        if leaf == b"v"
+        if leaf == "v"
             && let (Some((index, _)), Some((slot, _))) = (self.point, self.slot)
         {
             let series = self.series.as_mut()?;
@@ -621,7 +618,7 @@ impl Parser {
             return Some(cache.points.entry(index).or_default());
         }
         match leaf {
-            b"formatCode" => {
+            "formatCode" => {
                 let (slot, _) = self.slot?;
                 let series = self.series.as_mut()?;
                 let cache = series.slot(slot).last_mut()?;

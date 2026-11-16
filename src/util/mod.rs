@@ -313,7 +313,7 @@ pub(crate) fn process_alive(pid: u32) -> bool {
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
     // SAFETY: a plain open by pid, asking only to query; no code in the target runs.
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if process == 0 {
+    if process.is_null() {
         return false;
     }
     // SAFETY: `process` came from the `OpenProcess` above and is not used again.
@@ -2029,11 +2029,10 @@ mod raster_dimensions_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod executable_tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn test_is_executable_on_unix() {
         use std::os::unix::fs::PermissionsExt;

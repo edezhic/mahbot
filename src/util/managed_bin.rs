@@ -647,7 +647,13 @@ pub(crate) fn extract_tree_zip(archive: &Path, dir: &Path) -> Result<(), String>
                 zip_reason(&e)
             )
         })?;
-        let Some(relative) = safe_entry_path(entry.name()) else {
+        let name = entry.name().map_err(|e| {
+            format!(
+                "a release archive entry name could not be read ({})",
+                zip_reason(&e)
+            )
+        })?;
+        let Some(relative) = safe_entry_path(&name) else {
             return Err("the release archive holds a path outside its own tree".to_string());
         };
         let out = dir.join(relative);
@@ -727,7 +733,12 @@ pub(crate) fn extract_named_files_zip(
         if !entry.is_file() {
             continue;
         }
-        let Some(index) = index_of(Path::new(entry.name()), &names) else {
+        // A name that does not decode cannot be one of the names wanted here — those are matched
+        // exactly — so it is skipped like an entry under a path nobody asked for.
+        let Some(name) = entry.name().ok() else {
+            continue;
+        };
+        let Some(index) = index_of(Path::new(name.as_ref()), &names) else {
             continue;
         };
         let name = names[index];

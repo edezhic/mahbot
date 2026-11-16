@@ -46,7 +46,7 @@ iced_fonts = { version = "0.3", default-features = false, features = ["lucide", 
 # running, so no GTK. The portal feature builds without system packages. No
 # default features: the portal's window-identification helper needs Wayland
 # protocol crates the product does not otherwise build.
-rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+rfd = { version = "0.18", default-features = false, features = ["xdg-portal"] }
 # The same markdown parser iced_widget uses (resolved to the lock's 0.12.2 —
 # no new crates). The Sessions transcript pre-scans it to find HTML regions
 # (angle-bracket tag blocks) and escape only those, so they render as literal
@@ -71,7 +71,10 @@ cpal = "0.18"
 earshot = "1.2"
 # Spoken-phrase playback and the wake-word recording cues: both play through one
 # shared output device on the same host API, and a WAV cue is decoded by `hound`.
-rodio = { version = "0.22", default-features = false, features = ["playback", "hound"] }
+# 0.23 is the release that moved onto the cpal generation `cpal` above captures
+# on, so the microphone and the output share one host-API generation instead of
+# opening two side by side.
+rodio = { version = "0.23", default-features = false, features = ["playback", "hound"] }
 # The recogniser's input decoders: OGG/Opus (a Telegram voice note arrives as one),
 # and MP3 (an audio attachment). WAV is read by the product itself; every other
 # sound the media path reads is converted by the product's own ffmpeg first
@@ -121,7 +124,7 @@ anyhow = "1.0"
 self-replace = "1.5"
 
 # Utils
-base64 = "0.22"
+base64 = "0.23"
 # Local IPC for the mahbot debug read-only query endpoint (UDS on Unix,
 # named pipe on Windows). Enables the removal of multiprocess_wal.
 interprocess = { version = "2", default-features = false, features = ["tokio"] }
@@ -190,7 +193,7 @@ ignore = "0.4"
 
 # SHA256 for downloaded-artifact checksum verification, and the Windows debug
 # endpoint's location-derived pipe name (see src/db/ipc.rs)
-sha2 = "0.10"
+sha2 = "0.11"
 # SHA-256 at the machine's own hashing speed: the speech model check hashes
 # gigabytes once per start, and on arm64 sha2's default path is portable
 # software (a fifth of this). Already built for rustls's ring provider, so
@@ -199,7 +202,7 @@ ring = "0.17"
 paste = "1.0"
 
 # Enum derive helpers
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 
 # Image decode/re-encode for reference-image compression (already compiled via
 # iced's image-without-codecs feature; promoted to a direct dependency for the
@@ -211,11 +214,15 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 
 # Tree-sitter for code navigation
 # The core and the bash grammar are exact-pinned: the read-only shell guard
-# walks the bash CST, so grammar/ABI drift must fail loudly at build time.
-tree-sitter = "=0.26.12"
-tree-sitter-rust = "0.23"
-tree-sitter-javascript = "0.23"
-tree-sitter-python = "0.23"
+# walks the bash CST, so grammar/ABI drift must fail loudly at build time. The
+# grammars reach the core only through `tree-sitter-language`, except
+# `tree-sitter-md`, whose `parser` feature compiles against one core generation
+# — exact-pinned with it, so a routine `cargo update` cannot pull a markdown
+# release that needs a different core.
+tree-sitter = "=0.27.2"
+tree-sitter-rust = "0.24"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
 tree-sitter-typescript = "0.23"
 tree-sitter-json = "0.24"
 tree-sitter-toml-ng = "0.7"
@@ -226,11 +233,11 @@ tree-sitter-go = "0.25"
 tree-sitter-ruby = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-sequel = "0.3"
-tree-sitter-md = { version = "0.5.3", features = ["parser"] }
+tree-sitter-md = { version = "=0.5.4", features = ["parser"] }
 
 # Managed bun runtime release archive extraction (zip, DEFLATE-compressed), and
 # the container format for `.docx` ingestion.
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # Rasterizing an SVG or a PDF page: a pure-Rust in-process engine for the tool's
 # SVG and PDF inputs — an HTML input renders through the product's connected
@@ -251,7 +258,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # second copy of each next to the ones iced already links (`tiny-skia` 0.12 /
 # `tiny-skia-path` 0.12 alongside 0.11, `fontdb` 0.24 alongside 0.23): both
 # small, both self-contained, neither shared with the dashboard's own stack.
-resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
+resvg = { version = "0.50", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 
 # Document ingestion (inbound [FILE:...] markers and documents opened with the
 # read tool): pure-Rust text extraction and page rasterization for .pdf, plus a
@@ -264,22 +271,31 @@ resvg = { version = "0.48", default-features = false, features = ["text", "syste
 #                 (Apache-2.0 OR MIT); supplies the page list, reports an
 #                 encrypted document, decodes both rasterized pages and the
 #                 embedded images of text pages, and carries the annotation and
-#                 AcroForm dictionaries a document's marks are read from.
+#                 AcroForm dictionaries a document's marks are read from. Each
+#                 generation renders different pixels: nothing here asserts them,
+#                 only page dimensions.
 #   quick-xml   — XML reader for every OOXML package part: the .docx body,
-#                 .xlsx sheets/shared strings and .pptx slides/notes (MIT).
+#                 .xlsx sheets/shared strings and .pptx slides/notes (MIT). The
+#                 same release `office_oxide` below reads its package with, so the
+#                 graph holds one copy for the whole document path; the lock's
+#                 other copy is the Linux Wayland scanner's, on no document path.
 #   office_oxide — readers for the legacy binary Word/Excel/PowerPoint formats
 #                 (.doc/.xls/.ppt) this converter also accepts (MIT OR
 #                 Apache-2.0). Pinned exactly like turso and tree-sitter: its
 #                 parse result *is* the delivered text, so a new release's
 #                 behaviour change must be taken deliberately, not at the next
-#                 `cargo update`. Brings its own quick-xml 0.42 next to the
-#                 OOXML reader's 0.39 — the accepted price of reading the old
-#                 formats. The lock's third copy (0.41) is the Linux Wayland
-#                 scanner's, on no document path.
+#                 `cargo update`. Its own `zip` requirement is the reason the
+#                 archive crate is on the same major. The releases since 0.1.13
+#                 change delivered text on purpose: a `.ppt` whose shape keeps
+#                 its text in a `metroBlob` package is now read (such a deck
+#                 used to come out nearly empty with `Ok`), and a `.doc` run in
+#                 Symbol/Wingdings/Webdings now reads as the characters those
+#                 fonts draw instead of private-use codes. The pin is what makes
+#                 each such change a deliberate step.
 pdf-extract = { version = "0.12", default-features = false }
-hayro = "0.7"
-quick-xml = { version = "0.39", default-features = false }
-office_oxide = { version = "=0.1.13" }
+hayro = "0.9"
+quick-xml = { version = "0.42", default-features = false }
+office_oxide = { version = "=0.1.17" }
 
 [build-dependencies]
 # The product's icon inside the Windows executable (build.rs). Requested without
@@ -312,7 +328,7 @@ libc = "0.2"
 # Wdk_System_SystemServices carries RtlGetVersion — the real Windows build, which
 # GetVersionExW misreports for an image with no compatibility manifest; used only by
 # the update path's host check (`self_update::windows_build`).
-windows-sys = { version = "0.52", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Com", "Win32_System_Console", "Win32_System_Environment", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Com", "Win32_System_Console", "Win32_System_Environment", "Win32_System_JobObjects", "Win32_System_Registry", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader"] }
 
 # Computer Use tool (GUI observe/act): UI Automation for observe/act, SendInput
 # for pointer and keyboard synthesis, and Windows.Graphics.Capture with a GDI
@@ -389,7 +405,14 @@ enigo = { version = "0.6", default-features = false, features = ["x11rb"] }
 # The `screensaver` feature adds the screen-saver extension's idle time — how long
 # since the X server last saw input, read by `user_activity::os_idle`. The same client
 # reads the desktop's `_NET_WORKAREA`, which caps a fresh window's size (`gui::screen`).
+# 0.14 is out, but every consumer this tree has still asks for 0.13: `enigo` (input),
+# `winit` (windowing), `softbuffer` (iced's software renderer) and `clipboard_x11`
+# (iced's clipboard). Moving alone would put two majors of the same client in one
+# process, so this waits for them.
 x11rb = { version = "0.13", features = ["screensaver"] }
+# `atspi` 0.30 — the newest release of the accessibility crate — is built on zbus 5,
+# so this stays one generation behind D-Bus's own newest (6) for as long as that
+# crate does; the AT-SPI proxies and this client must share one connection type.
 zbus = "5"
 # Boxes the async AT-SPI tree walk (already a transitive zbus dependency — same
 # version, no new fork); the accessibility tree is inherently recursive.
@@ -406,7 +429,7 @@ tray-icon = { version = "0.26", default-features = false }
 
 [dev-dependencies]
 http = "1.5"
-serial_test = "3"
+serial_test = "4"
 
 [profile.dev]
 incremental = true

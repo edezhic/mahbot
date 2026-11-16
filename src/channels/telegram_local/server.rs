@@ -166,7 +166,7 @@ pub(super) fn credentials_fingerprint(api_id: &str, api_hash: &str) -> String {
     hasher.update(api_id.as_bytes());
     hasher.update(b":");
     hasher.update(api_hash.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::util::hex_string(&hasher.finalize())
 }
 
 /// Ask a port whether the server answers there. A connection and one HTTP request line: the answer
@@ -666,7 +666,7 @@ fn process_identity(pid: u32) -> Option<u64> {
             GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if handle == 0 {
+        if handle.is_null() {
             return None;
         }
         let mut creation = FILETIME {
@@ -714,7 +714,7 @@ fn process_alive(pid: u32) -> bool {
             OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
         };
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if handle == 0 {
+        if handle.is_null() {
             return false;
         }
         unsafe { CloseHandle(handle) };
@@ -748,7 +748,7 @@ fn signal_kill(pid: u32) {
             OpenProcess, PROCESS_TERMINATE, TerminateProcess,
         };
         let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
-        if handle != 0 {
+        if !handle.is_null() {
             unsafe {
                 TerminateProcess(handle, 1);
                 CloseHandle(handle);

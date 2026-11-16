@@ -10,7 +10,9 @@
 //!
 //! The speaking flag is what the voice pipeline's echo gate reads: while a spoken phrase plays
 //! — and for [`SPEAKING_TAIL`] after it — the pipeline drops microphone audio instead of
-//! hearing the product itself.
+//! hearing the product itself. The gate is purely time-based and reads nothing but that flag, so
+//! it makes no assumption about the device's rate: the device is opened with its own default
+//! config, and 44.1 kHz is only the builder's fallback when the host names no rate.
 
 use crate::util::UnwrapPoison;
 use std::sync::atomic::{AtomicUsize, Ordering};

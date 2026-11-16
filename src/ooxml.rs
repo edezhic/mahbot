@@ -22,7 +22,9 @@ use crate::reader_output::{
 };
 use crate::util::one_line;
 use quick_xml::Reader;
+use quick_xml::XmlVersion;
 use quick_xml::events::{BytesRef, BytesStart, Event};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
@@ -295,7 +297,7 @@ fn resolve_slide_parts<R: Read + Seek>(
     let parts = match presentation.as_deref() {
         Some(xml) => {
             let rels = relationship_targets(presentation_rels);
-            let resolved = scan_elements(xml, b"sldId", rel_id).map(|ids| {
+            let resolved = scan_elements(xml, "sldId", rel_id).map(|ids| {
                 ids.iter()
                     .map(|id| rels.get(id).map(|target| resolve_part(PPT_BASE, target)))
                     .collect::<Vec<_>>()
@@ -321,8 +323,7 @@ fn resolve_slide_parts<R: Read + Seek>(
 /// `ppt/slides/slide<N>.xml` in numeric order — the fallback order for a
 /// presentation whose relationship list cannot be read.
 fn fallback_slide_parts<R: Read + Seek>(archive: &ZipArchive<R>) -> Vec<Option<String>> {
-    let mut slides: Vec<(u32, String)> = archive
-        .file_names()
+    let mut slides: Vec<(u32, String)> = entry_names(archive)
         .filter_map(|name| {
             let number = name
                 .strip_prefix(PPT_SLIDES_PREFIX)?
@@ -330,7 +331,7 @@ fn fallback_slide_parts<R: Read + Seek>(archive: &ZipArchive<R>) -> Vec<Option<S
                 .strip_suffix(".xml")?
                 .parse()
                 .ok()?;
-            Some((number, name.to_owned()))
+            Some((number, name.into_owned()))
         })
         .collect();
     slides.sort();
@@ -462,7 +463,8 @@ impl CommentEntry {
 /// `None` when the part cannot be read as XML, is cut short, or is no comments document.
 fn comment_lines(xml: &[u8], authors: &HashMap<String, String>) -> Option<Vec<String>> {
     let mut part = Part::new(xml);
-    let mut reader = Reader::from_reader(xml);
+    let text = part_text(xml);
+    let mut reader = Reader::from_reader(text.as_bytes());
     let mut buffer = Vec::new();
     let mut runs = TextRuns::default();
     // The entries open right now, innermost last: a reply is pushed onto the comment it
@@ -480,25 +482,25 @@ fn comment_lines(xml: &[u8], authors: &HashMap<String, String>) -> Option<Vec<St
         }
         match event {
             Event::Start(event) => match event.local_name().as_ref() {
-                b"cmLst" => part.kind_seen(),
-                b"cm" | b"reply" => {
+                "cmLst" => part.kind_seen(),
+                "cm" | "reply" => {
                     // Text read before the entry opened belongs to no comment: it
                     // is discarded here rather than leaking into this one.
                     runs.discard();
                     open.push(CommentEntry {
                         order,
-                        author_id: attr(&event, b"authorId").map(|id| id.trim().to_owned()),
+                        author_id: attr(&event, "authorId").map(|id| id.trim().to_owned()),
                         text: String::new(),
                     });
                     order += 1;
                 }
                 _ => {}
             },
-            Event::Empty(event) if event.local_name().as_ref() == b"cmLst" => {
+            Event::Empty(event) if event.local_name().as_ref() == "cmLst" => {
                 part.kind_seen();
             }
             Event::End(event) => {
-                if matches!(event.local_name().as_ref(), b"cm" | b"reply") {
+                if matches!(event.local_name().as_ref(), "cm" | "reply") {
                     flush_paragraph(&mut runs, &mut open);
                     if let Some(entry) = open.pop() {
                         entries.push(entry);
@@ -560,7 +562,7 @@ fn read_ppt_authors<R: Read + Seek>(
 /// `p:188:author` entries, which differ in element name alone. A part that will not parse
 /// holds none.
 fn author_names(xml: &[u8]) -> HashMap<String, String> {
-    scan_names(xml, &[b"cmAuthor", b"author"], author_entry)
+    scan_names(xml, &["cmAuthor", "author"], author_entry)
         .unwrap_or_default()
         .into_iter()
         .collect()
@@ -574,8 +576,8 @@ fn author_names(xml: &[u8]) -> HashMap<String, String> {
 /// a mark adds around a file's text is bounded here — a field instruction, a link's address
 /// — never the text itself.
 fn author_entry(event: &BytesStart<'_>) -> Option<(String, String)> {
-    let id = attr(event, b"id")?.trim().to_owned();
-    let name = one_line(attr(event, b"name")?);
+    let id = attr(event, "id")?.trim().to_owned();
+    let name = one_line(attr(event, "name")?);
     (!name.is_empty()).then_some((id, name))
 }
 
@@ -609,28 +611,26 @@ impl TextRuns {
     fn note(&mut self, event: &Event<'_>) -> bool {
         match event {
             Event::Start(event) => match event.local_name().as_ref() {
-                b"t" | b"text" => self.in_text = true,
-                b"br" => self.paragraph.push('\n'),
-                b"fld" => self.fields += 1,
+                "t" | "text" => self.in_text = true,
+                "br" => self.paragraph.push('\n'),
+                "fld" => self.fields += 1,
                 _ => {}
             },
             Event::Empty(event) => {
-                if event.local_name().as_ref() == b"br" {
+                if event.local_name().as_ref() == "br" {
                     self.paragraph.push('\n');
                 }
             }
             Event::Text(event) if self.in_text && self.fields == 0 => {
-                if let Ok(chunk) = event.xml10_content() {
-                    self.paragraph.push_str(&chunk);
-                }
+                self.paragraph.push_str(&event.xml10_content());
             }
             Event::GeneralRef(event) if self.in_text && self.fields == 0 => {
                 append_entity(&mut self.paragraph, event);
             }
             Event::End(event) => match event.local_name().as_ref() {
-                b"t" | b"text" => self.in_text = false,
-                b"fld" => self.fields = self.fields.saturating_sub(1),
-                b"p" => return true,
+                "t" | "text" => self.in_text = false,
+                "fld" => self.fields = self.fields.saturating_sub(1),
+                "p" => return true,
                 _ => {}
             },
             _ => {}
@@ -660,7 +660,8 @@ fn slide_text(
     xml: &[u8],
     is_title: impl Fn(Option<&str>, Option<&str>) -> bool,
 ) -> Option<SlideText> {
-    let mut reader = Reader::from_reader(xml);
+    let text = part_text(xml);
+    let mut reader = Reader::from_reader(text.as_bytes());
     let mut buffer = Vec::new();
     // One entry per open `<p:sp>`: whether that shape is the title. `<p:ph>` sets the
     // innermost entry, and a run with no shape open is body text.
@@ -677,17 +678,17 @@ fn slide_text(
         let ended = runs.note(&event);
         match event {
             Event::Start(event) => match event.local_name().as_ref() {
-                b"sp" => shapes.push(false),
-                b"ph" => mark_title(&mut shapes, &event, &is_title),
+                "sp" => shapes.push(false),
+                "ph" => mark_title(&mut shapes, &event, &is_title),
                 _ => {}
             },
             Event::Empty(event) => {
-                if event.local_name().as_ref() == b"ph" {
+                if event.local_name().as_ref() == "ph" {
                     mark_title(&mut shapes, &event, &is_title);
                 }
             }
             Event::End(event) => {
-                if event.local_name().as_ref() == b"sp" {
+                if event.local_name().as_ref() == "sp" {
                     shapes.pop();
                 }
             }
@@ -716,8 +717,8 @@ fn mark_title(
 ) {
     if let Some(shape) = shapes.last_mut() {
         *shape = is_title(
-            attr(event, b"type").as_deref(),
-            attr(event, b"idx").as_deref(),
+            attr(event, "type").as_deref(),
+            attr(event, "idx").as_deref(),
         );
     }
 }
@@ -736,7 +737,7 @@ fn push_lines(lines: &mut Vec<String>, current: &mut String) {
 /// attribute by local name keeps `showMasterSp`/`showMasterPhAnim` from being mistaken
 /// for it.
 fn slide_hidden(xml: &[u8]) -> bool {
-    scan_elements(xml, b"sld", |event| attr(event, b"show"))
+    scan_elements(xml, "sld", |event| attr(event, "show"))
         .and_then(|values| values.into_iter().next())
         .is_some_and(|value| value == "0" || value.eq_ignore_ascii_case("false"))
 }
@@ -774,9 +775,9 @@ fn read_layout_title_indices<R: Read + Seek>(
     let Some(xml) = read_zip_entry(archive, part).bytes() else {
         return HashSet::new();
     };
-    scan_elements(&xml, b"ph", |event| {
-        matches!(attr(event, b"type").as_deref(), Some("title" | "ctrTitle"))
-            .then(|| attr(event, b"idx").unwrap_or_else(|| "0".to_owned()))
+    scan_elements(&xml, "ph", |event| {
+        matches!(attr(event, "type").as_deref(), Some("title" | "ctrTitle"))
+            .then(|| attr(event, "idx").unwrap_or_else(|| "0".to_owned()))
     })
     .unwrap_or_default()
     .into_iter()
@@ -831,7 +832,7 @@ fn slide_diagrams<R: Read + Seek>(
     // name, so this is the data-model reference. Every `relIds` a slide holds is collected:
     // a frame whose `relIds` names no data model still shows a diagram, and one read as no
     // diagram would be dropped in silence.
-    let Some(ids) = scan_elements(xml, b"relIds", |event| Some(attr(event, b"dm"))) else {
+    let Some(ids) = scan_elements(xml, "relIds", |event| Some(attr(event, "dm"))) else {
         return Vec::new();
     };
     let mut seen = HashSet::new();
@@ -875,7 +876,8 @@ struct DiagramPoint {
 /// model, one cut short, or one left empty — the slide states the loss.
 fn diagram_text_lines(xml: &[u8]) -> Option<Vec<String>> {
     let mut part = Part::new(xml);
-    let mut reader = Reader::from_reader(xml);
+    let text = part_text(xml);
+    let mut reader = Reader::from_reader(text.as_bytes());
     let mut buffer = Vec::new();
     let mut points: Vec<DiagramPoint> = Vec::new();
     let mut runs = TextRuns::default();
@@ -888,8 +890,8 @@ fn diagram_text_lines(xml: &[u8]) -> Option<Vec<String>> {
         let ended = runs.note(&event);
         match event {
             Event::Start(event) => match event.local_name().as_ref() {
-                b"dataModel" => part.kind_seen(),
-                b"pt" => {
+                "dataModel" => part.kind_seen(),
+                "pt" => {
                     // Text read before the point opened belongs to no node: it is discarded here.
                     runs.discard();
                     points.push(DiagramPoint {
@@ -897,17 +899,17 @@ fn diagram_text_lines(xml: &[u8]) -> Option<Vec<String>> {
                         lines: Vec::new(),
                     });
                 }
-                b"prSet" => mark_placeholder(&mut points, &event),
+                "prSet" => mark_placeholder(&mut points, &event),
                 _ => {}
             },
             Event::Empty(event) => match event.local_name().as_ref() {
                 // A self-closing `<dgm:dataModel/>` is a data model too.
-                b"dataModel" => part.kind_seen(),
-                b"prSet" => mark_placeholder(&mut points, &event),
+                "dataModel" => part.kind_seen(),
+                "prSet" => mark_placeholder(&mut points, &event),
                 _ => {}
             },
             Event::End(event) => {
-                if event.local_name().as_ref() == b"pt"
+                if event.local_name().as_ref() == "pt"
                     && let Some(point) = points.pop()
                     && !point.placeholder
                 {
@@ -937,7 +939,7 @@ fn mark_placeholder(points: &mut [DiagramPoint], event: &BytesStart<'_>) {
     let Some(point) = points.last_mut() else {
         return;
     };
-    point.placeholder = attr(event, b"phldr")
+    point.placeholder = attr(event, "phldr")
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
 }
 
@@ -1017,12 +1019,11 @@ fn write_media_parts<R: Read + Seek>(
     skipped: &mut SkippedImages,
     unshown: &mut Unshown,
 ) -> Vec<PathBuf> {
-    let entries: Vec<String> = archive
-        .file_names()
+    let entries: Vec<String> = entry_names(archive)
         // A media part names a file, i.e. carries an extension: directory entries and
         // extension-less names would otherwise be ingested as a nonexistent image.
-        .filter(|name| name.starts_with(prefix) && Path::new(name).extension().is_some())
-        .map(str::to_owned)
+        .filter(|name| name.starts_with(prefix) && Path::new(name.as_ref()).extension().is_some())
+        .map(Cow::into_owned)
         .collect();
     let mut images = Vec::new();
     let mut next_suffix = HashMap::new();
@@ -1065,12 +1066,11 @@ fn count_chart_parts<R: Read + Seek>(
     chart_sheets: Option<&HashSet<String>>,
     described: &HashSet<String>,
 ) -> usize {
-    archive
-        .file_names()
+    entry_names(archive)
         .filter(|name| {
             is_chart_part(name, prefix)
-                && !chart_sheets.is_some_and(|sheets| sheets.contains(*name))
-                && !described.contains(*name)
+                && !chart_sheets.is_some_and(|sheets| sheets.contains(name.as_ref()))
+                && !described.contains(name.as_ref())
         })
         .count()
 }
@@ -1096,8 +1096,7 @@ fn count_numbered_parts<R: Read + Seek>(
     prefix: &str,
     stem: &str,
 ) -> usize {
-    archive
-        .file_names()
+    entry_names(archive)
         .filter(|name| is_numbered_part(name, prefix, stem))
         .count()
 }
@@ -1105,12 +1104,11 @@ fn count_numbered_parts<R: Read + Seek>(
 /// The parts a package keeps in one of its directories (`embeddings/`) that are parts of
 /// their own: a directory entry or a relationships part only places one.
 fn parts_under<R: Read + Seek>(archive: &ZipArchive<R>, prefix: &str) -> Vec<String> {
-    archive
-        .file_names()
+    entry_names(archive)
         .filter(|name| {
             name.starts_with(prefix) && !name.ends_with('/') && !name.contains("/_rels/")
         })
-        .map(str::to_owned)
+        .map(Cow::into_owned)
         .collect()
 }
 
@@ -1122,10 +1120,9 @@ fn chart_data_parts<R: Read + Seek>(
     charts: &str,
     embedded: &[String],
 ) -> usize {
-    let chart_parts: Vec<String> = archive
-        .file_names()
+    let chart_parts: Vec<String> = entry_names(archive)
         .filter(|name| is_chart_part(name, charts))
-        .map(str::to_owned)
+        .map(Cow::into_owned)
         .collect();
     let counted: HashSet<&str> = embedded.iter().map(String::as_str).collect();
     let mut data_parts: HashSet<String> = HashSet::new();
@@ -1187,7 +1184,8 @@ struct Relationship {
 /// cut part reports the loss rather than reading a shortened list as everything.
 fn relationships_and_whole(xml: &[u8]) -> (Option<Vec<Relationship>>, bool) {
     let mut part = Part::new(xml);
-    let mut reader = Reader::from_reader(xml);
+    let text = part_text(xml);
+    let mut reader = Reader::from_reader(text.as_bytes());
     let mut buffer = Vec::new();
     let mut entries = Vec::new();
     let mut document = false;
@@ -1198,8 +1196,8 @@ fn relationships_and_whole(xml: &[u8]) -> (Option<Vec<Relationship>>, bool) {
         part.note(&event);
         match event {
             Event::Start(event) | Event::Empty(event) => match event.local_name().as_ref() {
-                b"Relationships" => document = true,
-                b"Relationship" => entries.extend(relationship_entry(&event)),
+                "Relationships" => document = true,
+                "Relationship" => entries.extend(relationship_entry(&event)),
                 _ => {}
             },
             Event::Eof => break,
@@ -1248,12 +1246,12 @@ fn flatten(text: &str) -> String {
 
 /// One `<Relationship Id Type Target/>` entry, or `None` when it names no id or target.
 fn relationship_entry(event: &BytesStart<'_>) -> Option<Relationship> {
-    let (Some(id), Some(target)) = (attr(event, b"Id"), attr(event, b"Target")) else {
+    let (Some(id), Some(target)) = (attr(event, "Id"), attr(event, "Target")) else {
         return None;
     };
     Some(Relationship {
         id,
-        kind: attr(event, b"Type").unwrap_or_default(),
+        kind: attr(event, "Type").unwrap_or_default(),
         target,
     })
 }
@@ -1324,34 +1322,27 @@ fn rel_id(event: &BytesStart<'_>) -> Option<String> {
         .with_checks(false)
         .flatten()
         .find(|attribute| {
-            attribute.key.local_name().as_ref() == b"id" && attribute.key.prefix().is_some()
+            attribute.key.local_name().as_ref() == "id" && attribute.key.prefix().is_some()
         })
-        .and_then(|attribute| {
-            attribute
-                .unescape_value()
-                .ok()
-                .map(std::borrow::Cow::into_owned)
-        })
+        .and_then(|attribute| attribute.normalized_value(XmlVersion::Implicit1_0).ok())
+        .map(Cow::into_owned)
 }
 
-/// The value of the attribute whose local name is `name` (after any prefix), unescaped.
-fn attr(event: &BytesStart<'_>, name: &[u8]) -> Option<String> {
+/// The value of the attribute whose local name is `name` (after any prefix), entities resolved
+/// and XML-normalized: a literal tab, carriage return or newline in the value reads as one space.
+fn attr(event: &BytesStart<'_>, name: &str) -> Option<String> {
     event
         .attributes()
         .with_checks(false)
         .flatten()
         .find(|attribute| attribute.key.local_name().as_ref() == name)
-        .and_then(|attribute| {
-            attribute
-                .unescape_value()
-                .ok()
-                .map(std::borrow::Cow::into_owned)
-        })
+        .and_then(|attribute| attribute.normalized_value(XmlVersion::Implicit1_0).ok())
+        .map(Cow::into_owned)
 }
 
 fn scan_elements<T>(
     xml: &[u8],
-    element: &[u8],
+    element: &str,
     collect: impl FnMut(&BytesStart<'_>) -> Option<T>,
 ) -> Option<Vec<T>> {
     scan_names(xml, &[element], collect)
@@ -1361,10 +1352,11 @@ fn scan_elements<T>(
 /// entry under the name its schema version gives it.
 fn scan_names<T>(
     xml: &[u8],
-    names: &[&[u8]],
+    names: &[&str],
     mut collect: impl FnMut(&BytesStart<'_>) -> Option<T>,
 ) -> Option<Vec<T>> {
-    let mut reader = Reader::from_reader(xml);
+    let text = part_text(xml);
+    let mut reader = Reader::from_reader(text.as_bytes());
     let mut buffer = Vec::new();
     let mut found = Vec::new();
     loop {
@@ -1383,6 +1375,17 @@ fn scan_names<T>(
         buffer.clear();
     }
     Some(found)
+}
+
+/// A part's bytes as the text every XML walk here reads.
+///
+/// Decoding is lossy on purpose: a part is document-controlled, and one undecodable byte
+/// sequence must cost the run it sits in (shown as a replacement character) rather than
+/// the whole part. The reader validates a part's UTF-8 before it walks it, so handing it
+/// raw bytes would turn one bad run into an unreadable part. A part that is valid UTF-8 —
+/// the overwhelmingly common case — is borrowed, so the walk copies nothing.
+fn part_text(xml: &[u8]) -> Cow<'_, str> {
+    String::from_utf8_lossy(xml)
 }
 
 /// Whether a part's bytes carry nothing but whitespace (a byte-order mark included): an
@@ -1449,15 +1452,22 @@ impl<'a> Part<'a> {
 /// Resolve one XML entity reference (`&amp;`, `&#x41;`) in run text. An
 /// unresolvable reference is dropped rather than aborting the whole body.
 fn append_entity(text: &mut String, reference: &BytesRef<'_>) {
-    if let Ok(name) = reference.decode()
-        && let Some(resolved) = quick_xml::escape::resolve_predefined_entity(&name)
-    {
+    if let Some(resolved) = quick_xml::escape::resolve_predefined_entity(reference) {
         text.push_str(resolved);
         return;
     }
     if let Ok(Some(character)) = reference.resolve_char_ref() {
         text.push(character);
     }
+}
+
+/// The package's entry names, each as text. The archive library reports a name as a `Result`;
+/// one it could not decode names no part of any reading, so it is dropped like an entry under a
+/// prefix a caller does not look for.
+pub(crate) fn entry_names<R: Read + Seek>(
+    archive: &ZipArchive<R>,
+) -> impl Iterator<Item = Cow<'_, str>> + '_ {
+    archive.file_names().filter_map(Result::ok)
 }
 
 /// A named ZIP entry as the reader found it: absent, present but unreadable within
@@ -1784,6 +1794,20 @@ mod tests {
                 "{label}: the part it could not read is named once"
             );
         }
+    }
+
+    /// A run whose bytes are not valid UTF-8 costs that run alone: the part is still read, and
+    /// every other run's text is still there.
+    #[test]
+    fn one_undecodable_run_costs_that_run_and_not_the_part() {
+        let mut slide = b"<p:sld><p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>before ".to_vec();
+        slide.push(0xFF);
+        slide.extend_from_slice(
+            b" after</a:t></a:r></a:p><a:p><a:r><a:t>second run</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld></p:sld>",
+        );
+        let content = slide_text(&slide, |_, _| false)
+            .expect("a part holding one undecodable run is still read");
+        assert_eq!(content.lines, vec!["before \u{FFFD} after", "second run"]);
     }
 
     #[test]

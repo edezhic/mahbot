@@ -4912,6 +4912,12 @@ mod tests {
         crate::legacy::test_fixtures::doc_fixture("secret", &[], true)
     }
 
+    /// A password-protected legacy `.xls`: the reader's own encrypted fixture, whose workbook
+    /// stream carries the `FILEPASS` record only the reader can see.
+    fn encrypted_legacy_xls() -> Vec<u8> {
+        crate::legacy::test_fixtures::xls_fixture("secret", true)
+    }
+
     /// A one-page PDF with a single fillable field named `name`; the kit authors no form, so the
     /// fixture is written here.
     fn fillable_pdf() -> Vec<u8> {
@@ -5102,52 +5108,60 @@ mod tests {
         drop((dir, outside));
     }
 
-    /// An encrypted legacy `.doc` is the password verdict, not the old formats' sentence: only
-    /// the family's own reader can see the password, so the classifier asks it.
+    /// An encrypted legacy `.doc` or `.xls` is the password verdict, not the old formats'
+    /// sentence: only the family's own reader can see the password, so the classifier asks it.
+    /// The verdict must win over every action's own family check — the write path refuses the
+    /// input on it, which is what keeps an encrypted workbook from being written as if it were
+    /// an ordinary one.
     #[tokio::test]
     async fn a_legacy_encrypted_document_is_the_password_verdict() {
         let (_dir, ws) = workspace();
-        let secret = write_fixture(&ws, "secret.doc", &encrypted_legacy_doc());
+        for (name, bytes) in [
+            ("secret.doc", encrypted_legacy_doc()),
+            ("secret.xls", encrypted_legacy_xls()),
+        ] {
+            let secret = write_fixture(&ws, name, &bytes);
 
-        let err = confined_document()
-            .execute(
-                &ws,
-                json!({
-                    "action": "docx_edit", "path": secret.to_string_lossy(),
-                    "edits": [{ "op": "replace_text", "find": "x", "replace": "y" }],
-                }),
-            )
-            .await
-            .expect_err("an encrypted old document cannot be edited");
-        let message = err.to_string();
-        assert!(
-            message.contains("password-protected"),
-            "the edit refusal must give the read path's verdict: {message}"
-        );
-        assert!(
-            !message.contains("save it as one of the OOXML families"),
-            "a password is not a reason to convert the file: {message}"
-        );
+            let err = confined_document()
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "docx_edit", "path": secret.to_string_lossy(),
+                        "edits": [{ "op": "replace_text", "find": "x", "replace": "y" }],
+                    }),
+                )
+                .await
+                .expect_err("an encrypted old document cannot be edited");
+            let message = err.to_string();
+            assert!(
+                message.contains("password-protected"),
+                "{name}: the edit refusal must give the read path's verdict: {message}"
+            );
+            assert!(
+                !message.contains("save it as one of the OOXML families"),
+                "{name}: a password is not a reason to convert the file: {message}"
+            );
 
-        let err = confined_document()
-            .execute(
-                &ws,
-                json!({
-                    "action": "fill_template", "file_name": "copy",
-                    "path": secret.to_string_lossy(), "values": { "name": "Имя" },
-                }),
-            )
-            .await
-            .expect_err("an encrypted old document cannot be filled");
-        let message = err.to_string();
-        assert!(
-            message.contains("password-protected"),
-            "the fill refusal must give the read path's verdict: {message}"
-        );
-        assert!(
-            message.contains("secret.doc"),
-            "the refusal must name the file: {message}"
-        );
+            let err = confined_document()
+                .execute(
+                    &ws,
+                    json!({
+                        "action": "fill_template", "file_name": "copy",
+                        "path": secret.to_string_lossy(), "values": { "name": "Имя" },
+                    }),
+                )
+                .await
+                .expect_err("an encrypted old document cannot be filled");
+            let message = err.to_string();
+            assert!(
+                message.contains("password-protected"),
+                "{name}: the fill refusal must give the read path's verdict: {message}"
+            );
+            assert!(
+                message.contains(name),
+                "{name}: the refusal must name the file: {message}"
+            );
+        }
     }
 
     /// A PDF action given an encrypted input is owed the password verdict in its own voice, with

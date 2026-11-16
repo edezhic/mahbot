@@ -758,13 +758,13 @@ mod session_end {
                 0,
                 0,
                 0,
-                0,
-                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
                 instance,
                 std::ptr::null(),
             )
         };
-        if window == 0 {
+        if window.is_null() {
             report("window not created", &Error::last_os_error());
             return;
         }
@@ -775,7 +775,7 @@ mod session_end {
             // ask for every message of this thread. The retrieval also dispatches messages *sent*
             // from another thread, which is how the platform delivers the two this listener
             // exists for.
-            let retrieved = unsafe { GetMessageW(&raw mut message, 0, 0, 0) };
+            let retrieved = unsafe { GetMessageW(&raw mut message, std::ptr::null_mut(), 0, 0) };
             if retrieved == 0 {
                 // `WM_QUIT` — nothing posts one to this thread.
                 break;

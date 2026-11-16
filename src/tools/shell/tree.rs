@@ -316,13 +316,13 @@ impl Job {
         // SAFETY: an unnamed job (a null name) with default security (no
         // SECURITY_ATTRIBUTES) is the documented anonymous shape.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        if handle == 0 {
+        if handle.is_null() {
             return Err(std::io::Error::last_os_error());
         }
         let job = Self {
             // SAFETY: the call just returned this owned handle; nothing else
             // holds it.
-            handle: unsafe { OwnedHandle::from_raw_handle(handle as _) },
+            handle: unsafe { OwnedHandle::from_raw_handle(handle) },
             ended: AtomicBool::new(false),
         };
         // SAFETY: all-zero is a valid value for every field of the struct, and
@@ -347,7 +347,7 @@ impl Job {
     }
 
     fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
-        self.handle.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE
+        self.handle.as_raw_handle()
     }
 
     /// Assign a process to the job. The process is named by the pid of a child
@@ -363,7 +363,7 @@ impl Job {
         // SAFETY: a plain open by pid — no pseudo-handle — asking for the two
         // rights `AssignProcessToJobObject` requires.
         let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
-        if process == 0 {
+        if process.is_null() {
             return Err(std::io::Error::last_os_error());
         }
         // SAFETY: both handles are live for the duration of the call.

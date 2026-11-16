@@ -441,7 +441,7 @@ mod platform {
 
     fn open(key_path: &str, access: REG_SAM_FLAGS) -> anyhow::Result<Option<HKEY>> {
         let path = wide(key_path);
-        let mut key: HKEY = 0;
+        let mut key: HKEY = std::ptr::null_mut();
         // SAFETY: `path` is a NUL-terminated UTF-16 string that outlives the call,
         // and `key` is ours to fill.
         let status =
@@ -458,7 +458,7 @@ mod platform {
 
     fn create(key_path: &str) -> anyhow::Result<HKEY> {
         let path = wide(key_path);
-        let mut key: HKEY = 0;
+        let mut key: HKEY = std::ptr::null_mut();
         let mut disposition = 0;
         // SAFETY: `path` is a NUL-terminated UTF-16 string that outlives the call,
         // `key` and `disposition` are ours to fill, and the default security

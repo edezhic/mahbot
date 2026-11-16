@@ -271,7 +271,7 @@ fn process_rss(pid: u32) -> Option<u64> {
     // `GetProcessMemoryInfo` documents.
     let process =
         unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
-    if process == 0 {
+    if process.is_null() {
         return None;
     }
     // SAFETY: all-zero is valid; `cb` is set to the struct's size below.

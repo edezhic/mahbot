@@ -315,7 +315,7 @@ mod windows {
     /// it: it sits blocked until a message arrives.
     fn pump() {
         let mut message = std::mem::MaybeUninit::zeroed();
-        while unsafe { GetMessageW(message.as_mut_ptr(), 0, 0, 0) } > 0 {
+        while unsafe { GetMessageW(message.as_mut_ptr(), std::ptr::null_mut(), 0, 0) } > 0 {
             let message = unsafe { message.assume_init_ref() };
             unsafe {
                 TranslateMessage(message);

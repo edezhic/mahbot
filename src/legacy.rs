@@ -311,6 +311,9 @@ fn sheet_lines(sheet: &Sheet) -> Vec<String> {
 /// Each slide's text plus its speaker notes, in the shapes [`crate::ooxml::convert_pptx`]
 /// renders — without its marks: a title run reads here as ordinary text and a hidden slide is not
 /// flagged, though the IR holds both, while a SmartArt diagram's text has no counterpart in it.
+/// A shape may keep its text in a `metroBlob` package rather than in the legacy text atoms, which
+/// is how WPS writes an OOXML-origin deck; the reader reads such a package only for a shape with
+/// no legacy text of its own, so a deck that writes both is not repeated.
 fn convert_ppt(bytes: &[u8], out_dir: Option<&Path>) -> DocOutcome {
     match PptDocument::from_reader(Cursor::new(bytes)) {
         Ok(doc) => {
@@ -457,8 +460,9 @@ fn encrypted() -> DocOutcome {
 }
 
 /// The verdict for an intact legacy file in a version the reader recognizes but cannot read — its
-/// own reason, so an old format is never called corrupt. No `office_oxide` 0.1.13 error carries
-/// it, so this guards the reader version that starts doing so.
+/// own reason, so an old format is never called corrupt. No error the reader raises through
+/// `from_reader` carries it (`XlsError::UnsupportedVersion` is constructed nowhere in the pinned
+/// release), so this guards the reader version that starts doing so.
 fn unsupported() -> DocOutcome {
     DocOutcome::Unreadable {
         reason: "an old Office version this tool cannot read".to_string(),
@@ -475,9 +479,14 @@ fn doc_error(err: &DocError) -> DocOutcome {
     }
 }
 
+/// A `.xls` parse error as a verdict. Both of the reader's encryption variants are the password
+/// verdict: a workbook that says it is password-protected, and one whose protection this reader
+/// does not implement. [`is_encrypted`] matches that one reason, and the document tool asks it
+/// before an encrypted input reaches any writing path, so calling either corrupt would send an
+/// encrypted workbook down the ordinary reading/writing path instead of refusing it.
 fn xls_error(err: &XlsError) -> DocOutcome {
     match err {
-        XlsError::Encrypted => encrypted(),
+        XlsError::Encrypted | XlsError::EncryptionNotSupported(_) => encrypted(),
         XlsError::UnsupportedVersion(_) => unsupported(),
         _ => corrupt(Family::Xls),
     }
@@ -847,7 +856,7 @@ pub(crate) mod test_fixtures {
         stream
     }
 
-    pub(super) fn xls_fixture(shared: &str, encrypted: bool) -> Vec<u8> {
+    pub(crate) fn xls_fixture(shared: &str, encrypted: bool) -> Vec<u8> {
         cfb(&[("Workbook", &xls_stream(shared, encrypted, &[]))])
     }
 
@@ -1369,7 +1378,23 @@ mod tests {
                 ),
                 "{family:?}"
             );
+            // The verdict the write path acts on, from the very same fixture: it asks this
+            // before it reserves an output file.
+            assert!(is_encrypted(&fixture, family), "{family:?}");
         }
+    }
+
+    /// The reader's second encryption variant — a workbook whose protection it cannot open — is
+    /// the password verdict too, so the write path still recognizes the file as encrypted rather
+    /// than overwriting it as corrupt. No fixture can drive it (the variant is raised only by the
+    /// reader's `default-password` feature, which this build does not turn on), so the mapping is
+    /// asserted here directly.
+    #[test]
+    fn an_unsupported_xls_encryption_is_the_password_verdict() {
+        assert!(matches!(
+            xls_error(&XlsError::EncryptionNotSupported("XOR obfuscation".to_string())),
+            DocOutcome::Unreadable { reason } if reason == ENCRYPTED_REASON
+        ));
     }
 
     #[test]
@@ -1476,13 +1501,13 @@ mod tests {
     #[test]
     fn unsupported_version_keeps_its_own_reason() {
         // The reader declares a "recognized but unreadable version" variant for
-        // each of its formats and raises NEITHER through `from_reader` in
-        // `office_oxide` 0.1.13: a Word 6.0/95 `.doc` is handed to the crate's
-        // own Word 6 reader before the Word 97 FIB version check runs, and
-        // `XlsError::UnsupportedVersion` is constructed nowhere in it. No
-        // fixture can therefore drive these, so the mapping is asserted here
-        // directly — it is the guard that keeps an old format from being called
-        // corrupt by the reader version that starts raising them.
+        // each of its formats and raises NEITHER through `from_reader`: a Word
+        // 6.0/95 `.doc` is handed to the crate's own Word 6 reader before the
+        // Word 97 FIB version check runs, and `XlsError::UnsupportedVersion` is
+        // constructed nowhere in it. No fixture can therefore drive these, so
+        // the mapping is asserted here directly — it is the guard that keeps an
+        // old format from being called corrupt by the reader version that starts
+        // raising them.
         for outcome in [
             doc_error(&DocError::UnsupportedVersion("Word 6.0/95".to_string())),
             xls_error(&XlsError::UnsupportedVersion("BIFF5".to_string())),

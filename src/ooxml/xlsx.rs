@@ -24,8 +24,8 @@
 use super::chart;
 use super::{
     Family, Part, Relationship, ZipEntry, append_entity, attr, flatten, numfmt, part_dir,
-    read_relationships, read_zip_entry, rel_id, relationship_targets, rels_part_of, resolve_part,
-    scan_elements, unopened_parts, unreadable, write_media_parts,
+    part_text, read_relationships, read_zip_entry, rel_id, relationship_targets, rels_part_of,
+    resolve_part, scan_elements, unopened_parts, unreadable, write_media_parts,
 };
 use crate::document::{DocOutcome, SkippedImages, ensure_out_dir};
 use crate::reader_output::{
@@ -350,7 +350,8 @@ struct SheetEntry {
 /// every later sheet's scoped defined name is matched by.
 fn workbook(xml: &[u8]) -> Option<Workbook> {
     let mut part = Part::new(xml);
-    let mut reader = Reader::from_reader(xml);
+    let text = part_text(xml);
+    let mut reader = Reader::from_reader(text.as_bytes());
     let mut buffer = Vec::new();
     let mut read_workbook = false;
     let mut sheets = Vec::new();
@@ -364,26 +365,26 @@ fn workbook(xml: &[u8]) -> Option<Workbook> {
         part.note(&event);
         match event {
             Event::Start(event) => match event.local_name().as_ref() {
-                b"workbook" => read_workbook = true,
-                b"sheet" => sheets.push(sheet_entry(&event)),
+                "workbook" => read_workbook = true,
+                "sheet" => sheets.push(sheet_entry(&event)),
                 // The first `workbookPr` that declares a date system is the one
                 // the workbook's dates are written in.
-                b"workbookPr" if date1904.is_none() => {
-                    date1904 = attr(&event, b"date1904");
+                "workbookPr" if date1904.is_none() => {
+                    date1904 = attr(&event, "date1904");
                 }
-                b"definedName" => {
+                "definedName" => {
                     text.clear();
                     current = defined_name(&event);
                 }
                 _ => {}
             },
             Event::Empty(event) => match event.local_name().as_ref() {
-                b"workbook" => read_workbook = true,
-                b"sheet" => sheets.push(sheet_entry(&event)),
-                b"workbookPr" if date1904.is_none() => {
-                    date1904 = attr(&event, b"date1904");
+                "workbook" => read_workbook = true,
+                "sheet" => sheets.push(sheet_entry(&event)),
+                "workbookPr" if date1904.is_none() => {
+                    date1904 = attr(&event, "date1904");
                 }
-                b"definedName" => {
+                "definedName" => {
                     if let Some(name) = defined_name(&event) {
                         names.push(name);
                     }
@@ -393,14 +394,10 @@ fn workbook(xml: &[u8]) -> Option<Workbook> {
             // A defined name's text is the character data of its own element (a
             // plain string or a CDATA section), entity references resolved.
             Event::Text(event) if current.is_some() => {
-                if let Ok(chunk) = event.xml10_content() {
-                    text.push_str(&chunk);
-                }
+                text.push_str(&event.xml10_content());
             }
             Event::CData(event) if current.is_some() => {
-                if let Ok(chunk) = event.xml10_content() {
-                    text.push_str(&chunk);
-                }
+                text.push_str(&event.xml10_content());
             }
             Event::GeneralRef(event) if current.is_some() => {
                 append_entity(&mut text, &event);
@@ -408,7 +405,7 @@ fn workbook(xml: &[u8]) -> Option<Workbook> {
             // A name whose element never closes is dropped rather than costing the
             // ones before it; the part's cut is said by the caller.
             Event::End(event) => {
-                if event.local_name().as_ref() == b"definedName"
+                if event.local_name().as_ref() == "definedName"
                     && let Some(mut name) = current.take()
                 {
                     name.text = one_line(text.trim().to_owned());
@@ -437,9 +434,9 @@ fn workbook(xml: &[u8]) -> Option<Workbook> {
 /// part, and the state it marks.
 fn sheet_entry(event: &BytesStart<'_>) -> SheetEntry {
     SheetEntry {
-        name: one_line(attr(event, b"name").unwrap_or_default()),
+        name: one_line(attr(event, "name").unwrap_or_default()),
         id: rel_id(event).unwrap_or_default(),
-        state: attr(event, b"state"),
+        state: attr(event, "state"),
     }
 }
 
@@ -459,12 +456,12 @@ struct DefinedName {
 /// One `<definedName .../>` as a name, or `None` when it carries no `name` or is a service name
 /// Excel writes for itself (`_xlnm.…`: print areas, `_FilterDatabase`, …) and never shows.
 fn defined_name(event: &BytesStart<'_>) -> Option<DefinedName> {
-    let name = attr(event, b"name")?;
+    let name = attr(event, "name")?;
     if name.to_ascii_lowercase().starts_with("_xlnm.") {
         return None;
     }
     Some(DefinedName {
-        local_sheet: attr(event, b"localSheetId").and_then(|id| id.trim().parse().ok()),
+        local_sheet: attr(event, "localSheetId").and_then(|id| id.trim().parse().ok()),
         name: one_line(name),
         text: String::new(),
     })
@@ -491,7 +488,8 @@ fn defined_name_lines(names: &[DefinedName], sheets: &[SheetEntry]) -> Vec<Strin
 /// Read `xl/sharedStrings.xml` into the strings a `t="s"` cell indexes: each `<si>` is the
 /// concatenation of its `<t>` texts, rich-text runs included.
 fn shared_strings(xml: &[u8]) -> Vec<String> {
-    let mut reader = Reader::from_reader(xml);
+    let text = part_text(xml);
+    let mut reader = Reader::from_reader(text.as_bytes());
     let mut buffer = Vec::new();
     let mut strings = Vec::new();
     let mut current = String::new();
@@ -499,24 +497,22 @@ fn shared_strings(xml: &[u8]) -> Vec<String> {
     loop {
         match reader.read_event_into(&mut buffer) {
             Ok(Event::Start(event)) => match event.local_name().as_ref() {
-                b"si" => current.clear(),
-                b"t" => in_text = true,
+                "si" => current.clear(),
+                "t" => in_text = true,
                 _ => {}
             },
             Ok(Event::Text(event)) if in_text => {
-                if let Ok(chunk) = event.xml10_content() {
-                    current.push_str(&chunk);
-                }
+                current.push_str(&event.xml10_content());
             }
             Ok(Event::GeneralRef(event)) if in_text => append_entity(&mut current, &event),
             Ok(Event::End(event)) => match event.local_name().as_ref() {
-                b"t" => in_text = false,
-                b"si" => strings.push(std::mem::take(&mut current)),
+                "t" => in_text = false,
+                "si" => strings.push(std::mem::take(&mut current)),
                 _ => {}
             },
             // A self-closed `<si/>` is still a shared string, so it must occupy
             // its index rather than shift every later one.
-            Ok(Event::Empty(event)) if event.local_name().as_ref() == b"si" => {
+            Ok(Event::Empty(event)) if event.local_name().as_ref() == "si" => {
                 strings.push(std::mem::take(&mut current));
             }
             Ok(Event::Eof) | Err(_) => break,
@@ -546,7 +542,8 @@ struct Styles {
 /// workbook whose formats were not read is not one to pass its cells off as unformatted.
 fn styles(xml: &[u8]) -> Option<Styles> {
     let mut part = Part::new(xml);
-    let mut reader = Reader::from_reader(xml);
+    let text = part_text(xml);
+    let mut reader = Reader::from_reader(text.as_bytes());
     let mut buffer = Vec::new();
     let mut num_fmts = HashMap::new();
     // The base styles a cell format may inherit from, and the cell formats as the three things
@@ -564,39 +561,39 @@ fn styles(xml: &[u8]) -> Option<Styles> {
         part.note(&event);
         match event {
             Event::Start(event) => match event.local_name().as_ref() {
-                b"styleSheet" => part.kind_seen(),
-                b"cellXfs" => {
+                "styleSheet" => part.kind_seen(),
+                "cellXfs" => {
                     in_cell_xfs = true;
                     declares_formats = true;
                 }
-                b"cellStyleXfs" => {
+                "cellStyleXfs" => {
                     in_base_xfs = true;
                     declares_formats = true;
                 }
-                b"numFmt" => {
+                "numFmt" => {
                     declares_formats = true;
                     add_num_fmt(&event, &mut num_fmts);
                 }
-                b"xf" if in_cell_xfs || in_base_xfs => {
+                "xf" if in_cell_xfs || in_base_xfs => {
                     collect_xf(&event, in_cell_xfs, &mut cell_xfs, &mut base_xfs);
                 }
                 _ => {}
             },
             Event::Empty(event) => match event.local_name().as_ref() {
-                b"styleSheet" => part.kind_seen(),
-                b"cellXfs" | b"cellStyleXfs" => declares_formats = true,
-                b"numFmt" => {
+                "styleSheet" => part.kind_seen(),
+                "cellXfs" | "cellStyleXfs" => declares_formats = true,
+                "numFmt" => {
                     declares_formats = true;
                     add_num_fmt(&event, &mut num_fmts);
                 }
-                b"xf" if in_cell_xfs || in_base_xfs => {
+                "xf" if in_cell_xfs || in_base_xfs => {
                     collect_xf(&event, in_cell_xfs, &mut cell_xfs, &mut base_xfs);
                 }
                 _ => {}
             },
             Event::End(event) => match event.local_name().as_ref() {
-                b"cellXfs" => in_cell_xfs = false,
-                b"cellStyleXfs" => in_base_xfs = false,
+                "cellXfs" => in_cell_xfs = false,
+                "cellStyleXfs" => in_base_xfs = false,
                 _ => {}
             },
             Event::Eof => break,
@@ -655,7 +652,7 @@ fn collect_xf(
         cell_xfs.push((
             xf_num_fmt_id(event),
             xf_base_id(event),
-            attr(event, b"applyNumberFormat")
+            attr(event, "applyNumberFormat")
                 .as_deref()
                 .is_some_and(is_true),
         ));
@@ -667,7 +664,7 @@ fn collect_xf(
 /// Record a `<numFmt numFmtId formatCode/>`; both attributes are required, so a
 /// malformed entry is skipped.
 fn add_num_fmt(event: &BytesStart<'_>, formats: &mut HashMap<u32, String>) {
-    let (Some(id), Some(code)) = (attr(event, b"numFmtId"), attr(event, b"formatCode")) else {
+    let (Some(id), Some(code)) = (attr(event, "numFmtId"), attr(event, "formatCode")) else {
         return;
     };
     if let Ok(id) = id.trim().parse() {
@@ -679,7 +676,7 @@ fn add_num_fmt(event: &BytesStart<'_>, formats: &mut HashMap<u32, String>) {
 /// declares none, and `None` when the attribute is there and does not parse — an
 /// entry whose own format this reader cannot read.
 fn xf_num_fmt_id(event: &BytesStart<'_>) -> Option<u32> {
-    match attr(event, b"numFmtId") {
+    match attr(event, "numFmtId") {
         None => Some(0),
         Some(id) => id.trim().parse().ok(),
     }
@@ -697,7 +694,7 @@ enum Base {
 
 /// The base style an `xf` names.
 fn xf_base_id(event: &BytesStart<'_>) -> Base {
-    match attr(event, b"xfId") {
+    match attr(event, "xfId") {
         None => Base::None,
         Some(id) => id.trim().parse().map_or(Base::Unread, Base::Index),
     }
@@ -812,7 +809,7 @@ fn read_persons<R: Read + Seek>(
     };
     read_zip_entry(archive, &part)
         .bytes()
-        .and_then(|xml| scan_elements(&xml, b"person", person_entry))
+        .and_then(|xml| scan_elements(&xml, "person", person_entry))
         .unwrap_or_default()
         .into_iter()
         .collect()
@@ -822,8 +819,8 @@ fn read_persons<R: Read + Seek>(
 /// absent. The display name is one line by construction ([`one_line`]): it stands
 /// inside a comment's line, so a break in it must not become a line there.
 fn person_entry(event: &BytesStart<'_>) -> Option<(String, String)> {
-    let id = attr(event, b"id")?;
-    let name = one_line(attr(event, b"displayName")?);
+    let id = attr(event, "id")?;
+    let name = one_line(attr(event, "displayName")?);
     Some((id, name))
 }
 
@@ -884,7 +881,8 @@ impl Comment {
 /// of `<text>`, so a plain string, a `<t>` run and a rich `<r>` all read the same.
 fn legacy_comments(xml: &[u8]) -> Option<Vec<Comment>> {
     let mut part = Part::new(xml);
-    let mut reader = Reader::from_reader(xml);
+    let text = part_text(xml);
+    let mut reader = Reader::from_reader(text.as_bytes());
     let mut buffer = Vec::new();
     let mut authors: Vec<String> = Vec::new();
     let mut author_text = String::new();
@@ -900,36 +898,34 @@ fn legacy_comments(xml: &[u8]) -> Option<Vec<Comment>> {
         part.note(&event);
         match event {
             Event::Start(event) => match event.local_name().as_ref() {
-                b"comments" => part.kind_seen(),
-                b"author" => {
+                "comments" => part.kind_seen(),
+                "author" => {
                     in_author = true;
                     author_text.clear();
                 }
-                b"comment" => {
+                "comment" => {
                     current = Some((
-                        attr(&event, b"ref").unwrap_or_default(),
-                        attr(&event, b"authorId"),
+                        attr(&event, "ref").unwrap_or_default(),
+                        attr(&event, "authorId"),
                     ));
                     text.clear();
                 }
-                b"text" if current.is_some() => in_text = true,
+                "text" if current.is_some() => in_text = true,
                 _ => {}
             },
-            Event::Empty(event) if event.local_name().as_ref() == b"comments" => {
+            Event::Empty(event) if event.local_name().as_ref() == "comments" => {
                 part.kind_seen();
             }
-            Event::Empty(event) if event.local_name().as_ref() == b"author" => {
+            Event::Empty(event) if event.local_name().as_ref() == "author" => {
                 // An empty author still occupies its index, so the entries after
                 // it keep their `authorId`.
                 authors.push(String::new());
             }
             Event::Text(event) => {
                 if in_author {
-                    if let Ok(chunk) = event.xml10_content() {
-                        author_text.push_str(&chunk);
-                    }
-                } else if in_text && let Ok(chunk) = event.xml10_content() {
-                    text.push_str(&chunk);
+                    author_text.push_str(&event.xml10_content());
+                } else if in_text {
+                    text.push_str(&event.xml10_content());
                 }
             }
             Event::GeneralRef(event) => {
@@ -940,13 +936,13 @@ fn legacy_comments(xml: &[u8]) -> Option<Vec<Comment>> {
                 }
             }
             Event::End(event) => match event.local_name().as_ref() {
-                b"author" => {
+                "author" => {
                     in_author = false;
                     // The author is one line ([`one_line`]): it stands inside the comment's line.
                     authors.push(one_line(std::mem::take(&mut author_text)));
                 }
-                b"text" => in_text = false,
-                b"comment" => {
+                "text" => in_text = false,
+                "comment" => {
                     if let Some((reference, author_id)) = current.take() {
                         // An `authorId` the authors list does not hold names an
                         // author that is in the file but not in this answer.
@@ -984,7 +980,8 @@ fn legacy_comments(xml: &[u8]) -> Option<Vec<Comment>> {
 /// name its `personId` maps to — [`Author::Lost`] when the person names do not hold it.
 fn threaded_comments(xml: &[u8], persons: &HashMap<String, String>) -> Option<Vec<Comment>> {
     let mut part = Part::new(xml);
-    let mut reader = Reader::from_reader(xml);
+    let text = part_text(xml);
+    let mut reader = Reader::from_reader(text.as_bytes());
     let mut buffer = Vec::new();
     let mut current: Option<(String, Author)> = None;
     let mut text = String::new();
@@ -997,33 +994,31 @@ fn threaded_comments(xml: &[u8], persons: &HashMap<String, String>) -> Option<Ve
         part.note(&event);
         match event {
             Event::Start(event) => match event.local_name().as_ref() {
-                b"ThreadedComments" => part.kind_seen(),
-                b"threadedComment" => {
-                    let author = match attr(&event, b"personId") {
+                "ThreadedComments" => part.kind_seen(),
+                "threadedComment" => {
+                    let author = match attr(&event, "personId") {
                         Some(id) => persons
                             .get(&id)
                             .cloned()
                             .map_or(Author::Lost, Author::Named),
                         None => Author::None,
                     };
-                    current = Some((attr(&event, b"ref").unwrap_or_default(), author));
+                    current = Some((attr(&event, "ref").unwrap_or_default(), author));
                     text.clear();
                 }
-                b"text" if current.is_some() => in_text = true,
+                "text" if current.is_some() => in_text = true,
                 _ => {}
             },
-            Event::Empty(event) if event.local_name().as_ref() == b"ThreadedComments" => {
+            Event::Empty(event) if event.local_name().as_ref() == "ThreadedComments" => {
                 part.kind_seen();
             }
             Event::Text(event) if in_text => {
-                if let Ok(chunk) = event.xml10_content() {
-                    text.push_str(&chunk);
-                }
+                text.push_str(&event.xml10_content());
             }
             Event::GeneralRef(event) if in_text => append_entity(&mut text, &event),
             Event::End(event) => match event.local_name().as_ref() {
-                b"text" => in_text = false,
-                b"threadedComment" => {
+                "text" => in_text = false,
+                "threadedComment" => {
                     if let Some((reference, author)) = current.take()
                         && let Some(comment) = Comment::new(reference, author, &text)
                     {
@@ -1230,7 +1225,8 @@ fn sheet_rows(
     link_targets: &HashMap<String, String>,
 ) -> Option<SheetRead> {
     let mut part = Part::new(xml);
-    let mut reader = Reader::from_reader(xml);
+    let text = part_text(xml);
+    let mut reader = Reader::from_reader(text.as_bytes());
     let mut buffer = Vec::new();
     let mut cells: Vec<CellLine> = Vec::new();
     let mut lost = 0usize;
@@ -1258,17 +1254,17 @@ fn sheet_rows(
         part.note(&event);
         match event {
             Event::Start(event) => match event.local_name().as_ref() {
-                b"worksheet" | b"chartsheet" | b"dialogsheet" | b"macrosheet" => part.kind_seen(),
-                b"row" => {
+                "worksheet" | "chartsheet" | "dialogsheet" | "macrosheet" => part.kind_seen(),
+                "row" => {
                     row_number = next_row_number(&event, row_number);
                     row_style = row_default_style(&event);
                     next_column = 0;
-                    if attr(&event, b"hidden").as_deref().is_some_and(is_true) {
+                    if attr(&event, "hidden").as_deref().is_some_and(is_true) {
                         hidden_rows.insert(row_number);
                     }
                 }
-                b"cols" => in_cols = true,
-                b"col" if in_cols => {
+                "cols" => in_cols = true,
+                "col" if in_cols => {
                     collect_columns(
                         &event,
                         &mut column_ranges,
@@ -1276,17 +1272,17 @@ fn sheet_rows(
                         &mut partial_columns,
                     );
                 }
-                b"mergeCells" => in_merges = true,
-                b"mergeCell" if in_merges => {
+                "mergeCells" => in_merges = true,
+                "mergeCell" if in_merges => {
                     collect_merge(&event, &mut merges, &mut lost_merges);
                 }
                 // `<hyperlinks>` follows `<sheetData>`: collected here, applied after render.
-                b"hyperlinks" => in_hyperlinks = true,
-                b"hyperlink" if in_hyperlinks => {
+                "hyperlinks" => in_hyperlinks = true,
+                "hyperlink" if in_hyperlinks => {
                     collect_link(&event, link_targets, &mut links, &mut lost_links);
                 }
                 // `<cols>` precedes `<sheetData>`: the ranges are settled when a cell asks.
-                b"c" => {
+                "c" => {
                     let columns = columns.get_or_insert_with(|| {
                         settled_columns = Some(column_ranges.len());
                         resolve_columns(&column_ranges)
@@ -1299,9 +1295,9 @@ fn sheet_rows(
                         &mut next_column,
                     ));
                 }
-                b"v" => in_value = true,
-                b"t" => in_text = true,
-                b"f" => {
+                "v" => in_value = true,
+                "t" => in_text = true,
+                "f" => {
                     in_formula = true;
                     if let Some(cell) = &mut cell {
                         cell.start_formula(&event);
@@ -1310,16 +1306,16 @@ fn sheet_rows(
                 _ => {}
             },
             Event::Empty(event) => match event.local_name().as_ref() {
-                b"worksheet" | b"chartsheet" | b"dialogsheet" | b"macrosheet" => part.kind_seen(),
+                "worksheet" | "chartsheet" | "dialogsheet" | "macrosheet" => part.kind_seen(),
                 // A row with no cells still hides, so it counts like any other.
-                b"row" => {
+                "row" => {
                     row_number = next_row_number(&event, row_number);
                     row_style = row_default_style(&event);
-                    if attr(&event, b"hidden").as_deref().is_some_and(is_true) {
+                    if attr(&event, "hidden").as_deref().is_some_and(is_true) {
                         hidden_rows.insert(row_number);
                     }
                 }
-                b"col" if in_cols => {
+                "col" if in_cols => {
                     collect_columns(
                         &event,
                         &mut column_ranges,
@@ -1327,18 +1323,18 @@ fn sheet_rows(
                         &mut partial_columns,
                     );
                 }
-                b"mergeCell" if in_merges => {
+                "mergeCell" if in_merges => {
                     collect_merge(&event, &mut merges, &mut lost_merges);
                 }
-                b"hyperlink" if in_hyperlinks => {
+                "hyperlink" if in_hyperlinks => {
                     collect_link(&event, link_targets, &mut links, &mut lost_links);
                 }
                 // A valueless cell still occupies its column, so the counter
                 // advances even though there is nothing to emit for it.
-                b"c" => {
+                "c" => {
                     let _ = cell_reference(&event, row_number, &mut next_column);
                 }
-                b"f" => {
+                "f" => {
                     if let Some(cell) = &mut cell {
                         cell.resolve_shared_formula(&event, &shared_formulas);
                     }
@@ -1346,9 +1342,8 @@ fn sheet_rows(
                 _ => {}
             },
             Event::Text(event) => {
-                if let Some(cell) = &mut cell
-                    && let Ok(chunk) = event.xml10_content()
-                {
+                if let Some(cell) = &mut cell {
+                    let chunk = event.xml10_content();
                     if in_formula {
                         cell.formula.push_str(&chunk);
                     } else if in_value || in_text {
@@ -1366,18 +1361,18 @@ fn sheet_rows(
                 }
             }
             Event::End(event) => match event.local_name().as_ref() {
-                b"cols" => in_cols = false,
-                b"mergeCells" => in_merges = false,
-                b"hyperlinks" => in_hyperlinks = false,
-                b"v" => in_value = false,
-                b"t" => in_text = false,
-                b"f" => {
+                "cols" => in_cols = false,
+                "mergeCells" => in_merges = false,
+                "hyperlinks" => in_hyperlinks = false,
+                "v" => in_value = false,
+                "t" => in_text = false,
+                "f" => {
                     in_formula = false;
                     if let Some(cell) = &mut cell {
                         cell.end_formula(&mut shared_formulas);
                     }
                 }
-                b"c" => {
+                "c" => {
                     if let Some(mut cell) = cell.take() {
                         let line = cell.line(book);
                         if cell.shared_lost {
@@ -1421,7 +1416,7 @@ fn sheet_rows(
 
 /// The number of a `<row>`: its `r`, or one past `previous` when it has none.
 fn next_row_number(event: &BytesStart<'_>, previous: u32) -> u32 {
-    attr(event, b"r")
+    attr(event, "r")
         .and_then(|row| row.trim().parse().ok())
         .unwrap_or(previous.saturating_add(1))
 }
@@ -1430,10 +1425,10 @@ fn next_row_number(event: &BytesStart<'_>, previous: u32) -> u32 {
 /// declaring none, and wins over a covering `<col>` — a row marking it custom but naming no `s`
 /// takes the schema's entry 0, and one naming an unreadable `s` gives a format it cannot show.
 fn row_default_style(event: &BytesStart<'_>) -> Option<Style> {
-    if !attr(event, b"customFormat").as_deref().is_some_and(is_true) {
+    if !attr(event, "customFormat").as_deref().is_some_and(is_true) {
         return None;
     }
-    Some(match attr(event, b"s") {
+    Some(match attr(event, "s") {
         None => Style::Index(0),
         Some(style) => style.trim().parse().map_or(Style::Unread, Style::Index),
     })
@@ -1487,20 +1482,20 @@ fn collect_columns(
     lost: &mut usize,
     partial: &mut usize,
 ) {
-    let hidden = attr(event, b"hidden").as_deref().is_some_and(is_true);
+    let hidden = attr(event, "hidden").as_deref().is_some_and(is_true);
     let style =
-        attr(event, b"style").map(|value| value.trim().parse().map_or(Style::Unread, Style::Index));
+        attr(event, "style").map(|value| value.trim().parse().map_or(Style::Unread, Style::Index));
     if !hidden && style.is_none() {
         return;
     }
-    let Some(min) = attr(event, b"min")
+    let Some(min) = attr(event, "min")
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|min| (1..=MAX_COLUMNS).contains(min))
     else {
         *lost += 1;
         return;
     };
-    let max = match attr(event, b"max") {
+    let max = match attr(event, "max") {
         None => min,
         Some(value) => {
             if let Ok(max) = value.trim().parse::<u32>() {
@@ -1567,7 +1562,7 @@ fn column_style(columns: &Columns, reference: &str) -> Option<Style> {
 /// or unparsable (an inverted `C3:A1` included) is counted as lost; a ref naming one cell
 /// covers nothing to mark and is no loss.
 fn collect_merge(event: &BytesStart<'_>, merges: &mut Vec<Merge>, lost: &mut usize) {
-    let Some(reference) = attr(event, b"ref") else {
+    let Some(reference) = attr(event, "ref") else {
         *lost += 1;
         return;
     };
@@ -1600,7 +1595,7 @@ fn collect_link(
 /// workbook wrote it — a value is never dropped for its address, it just carries no merge or
 /// link mark — and made one line ([`one_line`]), since it heads the cell's own line.
 fn cell_reference(event: &BytesStart<'_>, row: u32, next_column: &mut u32) -> String {
-    let Some(reference) = attr(event, b"r") else {
+    let Some(reference) = attr(event, "r") else {
         let reference = format!("{}{}", column_letters(*next_column), row);
         *next_column = next_column.saturating_add(1);
         return reference;
@@ -1684,16 +1679,16 @@ impl Link {
     /// The link, or `None` when no target is declared or its `ref` does not parse — the link is
     /// then lost rather than rendered pointing nowhere.
     fn new(event: &BytesStart<'_>, targets: &HashMap<String, String>) -> Option<Self> {
-        let reference = attr(event, b"ref")?;
+        let reference = attr(event, "ref")?;
         let rect = Rect::parse(&reference)?;
         let target = match rel_id(event) {
             Some(id) => one_line(targets.get(&id)?.clone()),
-            None => one_line(attr(event, b"location")?),
+            None => one_line(attr(event, "location")?),
         };
         Some(Self {
             rect,
             reference,
-            display: attr(event, b"display").map(one_line),
+            display: attr(event, "display").map(one_line),
             target,
         })
     }
@@ -2064,7 +2059,7 @@ impl Cell {
         next_column: &mut u32,
     ) -> Self {
         let reference = cell_reference(event, row, next_column);
-        let style = match attr(event, b"s") {
+        let style = match attr(event, "s") {
             // A cell naming a style this reader cannot read is not one of an
             // unformatted cell: its stored text is shown marked as stored rather
             // than passed off as the display, and the cell takes no row or column
@@ -2076,7 +2071,7 @@ impl Cell {
         };
         Self {
             reference,
-            kind: attr(event, b"t"),
+            kind: attr(event, "t"),
             style,
             ..Self::default()
         }
@@ -2086,8 +2081,8 @@ impl Cell {
     /// text is kept for the references that follow) or one of those references.
     fn start_formula(&mut self, event: &BytesStart<'_>) {
         self.has_formula = true;
-        self.formula_si = attr(event, b"si");
-        self.formula_shared = attr(event, b"t").as_deref() == Some("shared");
+        self.formula_si = attr(event, "si");
+        self.formula_shared = attr(event, "t").as_deref() == Some("shared");
     }
 
     /// On `</f>`: a shared definition with text teaches the later references of
@@ -2111,8 +2106,8 @@ impl Cell {
     /// A `<f .../>` shared reference: it carries no text of its own.
     fn resolve_shared_formula(&mut self, event: &BytesStart<'_>, shared: &HashMap<String, String>) {
         self.has_formula = true;
-        if attr(event, b"t").as_deref() == Some("shared")
-            && let Some(si) = attr(event, b"si")
+        if attr(event, "t").as_deref() == Some("shared")
+            && let Some(si) = attr(event, "si")
             && let Some(text) = shared.get(&si)
         {
             self.formula.clone_from(text);

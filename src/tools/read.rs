@@ -642,7 +642,7 @@ async fn execute_zoom(resolved_path: &Path, args: &serde_json::Value) -> anyhow:
     let mut found_node = None;
     qmatches.advance();
     while let Some(m) = qmatches.get() {
-        for c in m.captures {
+        for c in m.captures() {
             if let Ok(name) = c.node.utf8_text(ctx.ps.source.as_bytes())
                 && name == symbol_name
             {
@@ -988,7 +988,7 @@ fn collect_symbols(ps: &ParsedSource, query: &Query) -> Vec<SymbolMatch> {
     let mut symbols = Vec::new();
     matches_iter.advance();
     while let Some(m) = matches_iter.get() {
-        for capture in m.captures {
+        for capture in m.captures() {
             let node = capture.node;
             let name = node
                 .utf8_text(ps.source.as_bytes())

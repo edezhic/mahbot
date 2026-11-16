@@ -29,8 +29,9 @@
 use super::chart;
 use super::{
     DocOutcome, Family, Relationship, SkippedImages, append_entity, attr, ensure_out_dir, part_dir,
-    read_relationships, read_zip_entry, related_part, relationship_targets, relationships,
-    rels_part_of, resolve_part, scan_elements, unopened_parts, unreadable, write_media_parts,
+    part_text, read_relationships, read_zip_entry, related_part, relationship_targets,
+    relationships, rels_part_of, resolve_part, scan_elements, unopened_parts, unreadable,
+    write_media_parts,
 };
 use crate::reader_output::{
     DOC_LINK, TEXT_BOX, WORD_COMMENT, WORD_ENDNOTE, WORD_FOOTER, WORD_FOOTNOTE, WORD_HEADER,
@@ -38,7 +39,9 @@ use crate::reader_output::{
 };
 use crate::util::{one_line, truncate};
 use quick_xml::Reader;
+use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{Cursor, Read, Seek};
@@ -92,8 +95,8 @@ struct Fault;
 /// One element reduced to what the walk needs: its local name and its attributes, both
 /// owned so nothing borrows the event buffer while the walker mutates itself.
 struct Elem {
-    name: Vec<u8>,
-    attrs: Vec<(Vec<u8>, String)>,
+    name: String,
+    attrs: Vec<(String, String)>,
 }
 
 impl Elem {
@@ -101,17 +104,17 @@ impl Elem {
     /// An unreadable value reads as empty rather than costing the part.
     fn of(event: &BytesStart<'_>) -> Self {
         Self {
-            name: event.local_name().as_ref().to_vec(),
+            name: event.local_name().as_ref().to_string(),
             attrs: event
                 .attributes()
                 .with_checks(false)
                 .flatten()
                 .map(|attribute| {
                     (
-                        attribute.key.local_name().as_ref().to_vec(),
+                        attribute.key.local_name().as_ref().to_string(),
                         attribute
-                            .unescape_value()
-                            .map(std::borrow::Cow::into_owned)
+                            .normalized_value(XmlVersion::Implicit1_0)
+                            .map(Cow::into_owned)
                             .unwrap_or_default(),
                     )
                 })
@@ -122,7 +125,7 @@ impl Elem {
     fn attr(&self, name: &str) -> Option<&str> {
         self.attrs
             .iter()
-            .find(|(key, _)| key.as_slice() == name.as_bytes())
+            .find(|(key, _)| key.as_str() == name)
             .map(|(_, value)| value.as_str())
     }
 }
@@ -146,12 +149,8 @@ fn next_event(reader: &mut Xml<'_>, buffer: &mut Vec<u8>) -> Ev {
         Ok(Event::Start(event)) => Ev::Start(Elem::of(&event)),
         Ok(Event::Empty(event)) => Ev::Empty(Elem::of(&event)),
         Ok(Event::End(_)) => Ev::End,
-        // A character that will not decode costs that text, not the part — the
-        // same bargain the run text made before this walker existed.
-        Ok(Event::Text(event)) => match event.xml10_content() {
-            Ok(text) => Ev::Text(text.into_owned()),
-            Err(_) => Ev::Skip,
-        },
+        // The part was decoded lossily before the walk ([`part_text`]).
+        Ok(Event::Text(event)) => Ev::Text(event.xml10_content().into_owned()),
         Ok(Event::GeneralRef(reference)) => {
             let mut text = String::new();
             append_entity(&mut text, &reference);
@@ -369,7 +368,8 @@ impl Word {
     fn read_part(&mut self, xml: &[u8], collect_sections: bool) -> Result<Sink, Fault> {
         self.reset_part();
         self.collect_sections = collect_sections;
-        let mut reader = Reader::from_reader(xml);
+        let text = part_text(xml);
+        let mut reader = Reader::from_reader(text.as_bytes());
         // The part's own top level is a block like any other: a field it left open is
         // reported at its end.
         let result = self.render_block(&mut reader, 0);
@@ -529,63 +529,63 @@ impl Word {
         elem: &Elem,
         empty: bool,
     ) -> Result<(), Fault> {
-        match elem.name.as_slice() {
-            b"p" => self.paragraph(reader, level, empty),
-            b"t" | b"delText" => {
+        match elem.name.as_str() {
+            "p" => self.paragraph(reader, level, empty),
+            "t" | "delText" => {
                 if empty {
                     Ok(())
                 } else {
                     self.run_text(reader, level)
                 }
             }
-            b"tab" | b"br" | b"cr" | b"noBreakHyphen" | b"softHyphen" | b"sym" => {
+            "tab" | "br" | "cr" | "noBreakHyphen" | "softHyphen" | "sym" => {
                 self.leaf_text(elem);
                 self.ignored(reader, level, empty)
             }
-            b"tbl" => self.table(reader, level, empty),
-            b"tr" if !self.tables.is_empty() => self.row(reader, level, empty),
-            b"tc" if !self.tables.is_empty() => self.cell(reader, level, empty),
-            b"pPr" => self.props(reader, level, Ctx::ParagraphProps, empty),
-            b"rPr" => self.run_props(reader, level, empty),
-            b"tblPr" => self.props(reader, level, Ctx::TableProps, empty),
-            b"tblGrid" => self.table_grid(reader, level, empty),
+            "tbl" => self.table(reader, level, empty),
+            "tr" if !self.tables.is_empty() => self.row(reader, level, empty),
+            "tc" if !self.tables.is_empty() => self.cell(reader, level, empty),
+            "pPr" => self.props(reader, level, Ctx::ParagraphProps, empty),
+            "rPr" => self.run_props(reader, level, empty),
+            "tblPr" => self.props(reader, level, Ctx::TableProps, empty),
+            "tblGrid" => self.table_grid(reader, level, empty),
             // The row's own properties, and the table-property exceptions Word writes beside
             // `w:trPr` rather than inside it: the row reports both.
-            b"trPr" | b"tblPrEx" => self.props(reader, level, Ctx::RowProps, empty),
-            b"tcPr" => self.props(reader, level, Ctx::CellProps, empty),
-            b"sectPr" => self.props(reader, level, Ctx::SectionProps, empty),
-            b"ins" | b"del" | b"moveTo" | b"moveFrom" => self.revision(reader, level, elem, empty),
-            b"footnoteReference" => {
+            "trPr" | "tblPrEx" => self.props(reader, level, Ctx::RowProps, empty),
+            "tcPr" => self.props(reader, level, Ctx::CellProps, empty),
+            "sectPr" => self.props(reader, level, Ctx::SectionProps, empty),
+            "ins" | "del" | "moveTo" | "moveFrom" => self.revision(reader, level, elem, empty),
+            "footnoteReference" => {
                 self.note_reference(elem, NoteKind::Footnote);
                 self.ignored(reader, level, empty)
             }
-            b"endnoteReference" => {
+            "endnoteReference" => {
                 self.note_reference(elem, NoteKind::Endnote);
                 self.ignored(reader, level, empty)
             }
-            b"commentRangeStart" | b"commentRangeEnd" | b"commentReference" => {
+            "commentRangeStart" | "commentRangeEnd" | "commentReference" => {
                 self.comment_marker(elem);
                 self.ignored(reader, level, empty)
             }
-            b"fldSimple" => self.simple_field(reader, level, elem, empty),
-            b"fldChar" => {
+            "fldSimple" => self.simple_field(reader, level, elem, empty),
+            "fldChar" => {
                 self.field_char(elem);
                 self.ignored(reader, level, empty)
             }
-            b"instrText" => self.instr_text(reader, level, empty),
+            "instrText" => self.instr_text(reader, level, empty),
             // `w:delInstrText` is part of a deleted field instruction and `w:numberingChange`
             // names a list change: neither is text, and the `w:sdt` placeholder properties hold
             // no content either.
-            b"delInstrText" | b"numberingChange" | b"sdtPr" | b"sdtEndPr" => {
+            "delInstrText" | "numberingChange" | "sdtPr" | "sdtEndPr" => {
                 self.ignored(reader, level, empty)
             }
-            b"txbxContent" => self.text_box(reader, level, empty),
-            b"hyperlink" => self.hyperlink(reader, level, elem, empty),
-            b"chart" => {
+            "txbxContent" => self.text_box(reader, level, empty),
+            "hyperlink" => self.hyperlink(reader, level, elem, empty),
+            "chart" => {
                 self.chart(elem);
                 self.ignored(reader, level, empty)
             }
-            b"AlternateContent" => self.alternate_content(reader, level, empty),
+            "AlternateContent" => self.alternate_content(reader, level, empty),
             // Everything else is a plain container (`w:document`, `w:body`, `w:r`, `w:smartTag`,
             // `w:sdt`, `w:drawing`, `w:pict`, the bookmarks, …): its children are body content.
             _ => self.flow(reader, level, empty),
@@ -595,10 +595,10 @@ impl Word {
     /// The text a leaf run element contributes: `w:softHyphen` and `w:sym` are formatting marks
     /// with nothing readable, a tab is a tab, and a line break is a line end.
     fn leaf_text(&mut self, elem: &Elem) {
-        match elem.name.as_slice() {
-            b"tab" => self.push_str("\t"),
-            b"br" | b"cr" => self.end_line(),
-            b"noBreakHyphen" => self.push_str("-"),
+        match elem.name.as_str() {
+            "tab" => self.push_str("\t"),
+            "br" | "cr" => self.end_line(),
+            "noBreakHyphen" => self.push_str("-"),
             _ => {}
         }
     }
@@ -697,8 +697,8 @@ impl Word {
         elem: &Elem,
         empty: bool,
     ) -> Result<(), Fault> {
-        match elem.name.as_slice() {
-            b"pStyle" => {
+        match elem.name.as_str() {
+            "pStyle" => {
                 if let Some(para) = self.paras.last_mut() {
                     para.style = elem
                         .attr("val")
@@ -707,13 +707,13 @@ impl Word {
                         .map(str::to_owned);
                 }
             }
-            b"outlineLvl" => {
+            "outlineLvl" => {
                 if let Some(para) = self.paras.last_mut() {
                     para.outline = outline_level(elem);
                 }
             }
-            b"rPr" => return self.props(reader, level, Ctx::MarkProps, empty),
-            b"sectPr" => return self.props(reader, level, Ctx::SectionProps, empty),
+            "rPr" => return self.props(reader, level, Ctx::MarkProps, empty),
+            "sectPr" => return self.props(reader, level, Ctx::SectionProps, empty),
             _ => {}
         }
         self.ignored(reader, level, empty)
@@ -728,11 +728,11 @@ impl Word {
         elem: &Elem,
         empty: bool,
     ) -> Result<(), Fault> {
-        match elem.name.as_slice() {
-            b"ins" => self.para_mark("[ins ¶]"),
-            b"del" => self.para_mark("[del ¶]"),
-            b"moveTo" => self.para_mark("[moved-here ¶]"),
-            b"moveFrom" => self.para_mark("[moved-away ¶]"),
+        match elem.name.as_str() {
+            "ins" => self.para_mark("[ins ¶]"),
+            "del" => self.para_mark("[del ¶]"),
+            "moveTo" => self.para_mark("[moved-here ¶]"),
+            "moveFrom" => self.para_mark("[moved-away ¶]"),
             _ => {}
         }
         self.ignored(reader, level, empty)
@@ -757,10 +757,10 @@ impl Word {
         elem: &Elem,
         empty: bool,
     ) -> Result<(), Fault> {
-        match elem.name.as_slice() {
-            b"ins" | b"moveTo" => self.row_mark(Mark::Inserted),
-            b"del" | b"moveFrom" => self.row_mark(Mark::Deleted),
-            b"gridBefore" => {
+        match elem.name.as_str() {
+            "ins" | "moveTo" => self.row_mark(Mark::Inserted),
+            "del" | "moveFrom" => self.row_mark(Mark::Deleted),
+            "gridBefore" => {
                 if let Some(table) = self.tables.last_mut() {
                     table.column = table
                         .column
@@ -770,7 +770,7 @@ impl Word {
             }
             // Neither schema gives a row's mark properties (`w:rPr` is a child of `w:pPr` alone),
             // so a stray producer's `w:rPr` here is read and dropped whole.
-            b"rPr" => return self.discarded(reader, level, empty),
+            "rPr" => return self.discarded(reader, level, empty),
             _ => {}
         }
         self.ignored(reader, level, empty)
@@ -784,13 +784,13 @@ impl Word {
         empty: bool,
     ) -> Result<(), Fault> {
         let restart = elem.attr("val") == Some("restart");
-        match elem.name.as_slice() {
-            b"gridSpan" => {
+        match elem.name.as_str() {
+            "gridSpan" => {
                 if let Some(cell) = self.cells.last_mut() {
                     cell.span = numeric_attr(elem, MAX_TABLE_COLUMNS).max(1);
                 }
             }
-            b"vMerge" => {
+            "vMerge" => {
                 if let Some(cell) = self.cells.last_mut() {
                     cell.merge = if restart {
                         Merge::Restart
@@ -799,7 +799,7 @@ impl Word {
                     };
                 }
             }
-            b"hMerge" => {
+            "hMerge" => {
                 if let Some(cell) = self.cells.last_mut() {
                     cell.hmerge = if restart {
                         Merge::Restart
@@ -808,9 +808,9 @@ impl Word {
                     };
                 }
             }
-            b"cellIns" => self.cell_mark(Mark::Inserted),
-            b"cellDel" => self.cell_mark(Mark::Deleted),
-            b"cellMerge" => self.cell_mark(Mark::MergeRevised),
+            "cellIns" => self.cell_mark(Mark::Inserted),
+            "cellDel" => self.cell_mark(Mark::Deleted),
+            "cellMerge" => self.cell_mark(Mark::MergeRevised),
             _ => {}
         }
         self.ignored(reader, level, empty)
@@ -825,9 +825,9 @@ impl Word {
         elem: &Elem,
         empty: bool,
     ) -> Result<(), Fault> {
-        match elem.name.as_slice() {
-            b"headerReference" => self.reference_part(elem, true),
-            b"footerReference" => self.reference_part(elem, false),
+        match elem.name.as_str() {
+            "headerReference" => self.reference_part(elem, true),
+            "footerReference" => self.reference_part(elem, false),
             _ => {}
         }
         self.ignored(reader, level, empty)
@@ -835,7 +835,7 @@ impl Word {
 
     /// The marker a property change raises on the thing whose formatting changed. A copy the walk
     /// is not rendering raises none.
-    fn change_marker(&mut self, ctx: Ctx, name: &[u8]) {
+    fn change_marker(&mut self, ctx: Ctx, name: &str) {
         if !self.counting {
             return;
         }
@@ -850,7 +850,7 @@ impl Word {
             Ctx::CellProps => self.cell_mark(Mark::FormatRevised),
             // The one property change a table holds outside `w:tblPr`: a `w:tblGridChange`
             // written beside its `w:tblGrid` is still that table's.
-            _ if name == b"tblGridChange" => self.table_mark(),
+            _ if name == "tblGridChange" => self.table_mark(),
             _ => {}
         }
     }
@@ -971,9 +971,9 @@ impl Word {
     /// One `w:tblGrid` child: a `w:gridCol` widens the declared grid, and a `w:tblGridChange` marks
     /// the table revised. Returns whether the child is a column.
     fn grid_child(&mut self, elem: &Elem) -> bool {
-        match elem.name.as_slice() {
-            b"gridCol" => true,
-            b"tblGridChange" => {
+        match elem.name.as_str() {
+            "gridCol" => true,
+            "tblGridChange" => {
                 self.table_mark();
                 false
             }
@@ -1045,10 +1045,10 @@ impl Word {
         if empty {
             return Ok(());
         }
-        let (open, close) = match elem.name.as_slice() {
-            b"ins" => ("[ins]", "[/ins]"),
-            b"del" => ("[del]", "[/del]"),
-            b"moveTo" => ("[moved-here]", "[/moved-here]"),
+        let (open, close) = match elem.name.as_str() {
+            "ins" => ("[ins]", "[/ins]"),
+            "del" => ("[del]", "[/del]"),
+            "moveTo" => ("[moved-here]", "[/moved-here]"),
             _ => ("[moved-away]", "[/moved-away]"),
         };
         let before = self.buffers.last().map_or(0, |sink| sink.text.len());
@@ -1078,12 +1078,12 @@ impl Word {
         let Some(id) = elem.attr("id") else {
             return;
         };
-        let suffix = match elem.name.as_slice() {
-            b"commentRangeStart" => {
+        let suffix = match elem.name.as_str() {
+            "commentRangeStart" => {
                 self.comment_ranges.insert(id.to_owned());
                 " starts"
             }
-            b"commentRangeEnd" => " ends",
+            "commentRangeEnd" => " ends",
             _ if self.comment_ranges.contains(id) => return,
             _ => "",
         };
@@ -1226,7 +1226,7 @@ impl Word {
                 // this element has. A later one carries the text of one that had
                 // none, and the fallback speaks only when no choice rendered
                 // anything: Word writes the same content in each copy.
-                Ev::Start(elem) if elem.name == b"Choice" => {
+                Ev::Start(elem) if elem.name == "Choice" => {
                     if renders_nothing(choice.as_ref()) {
                         self.revisions.rollback(base);
                         choice = Some(self.render_block(reader, level + 1)?);
@@ -1234,7 +1234,7 @@ impl Word {
                         self.discarded(reader, level + 1, false)?;
                     }
                 }
-                Ev::Start(elem) if elem.name == b"Fallback" => {
+                Ev::Start(elem) if elem.name == "Fallback" => {
                     if renders_nothing(fallback.as_ref()) && renders_nothing(choice.as_ref()) {
                         self.revisions.rollback(base);
                         fallback = Some(self.render_block(reader, level + 1)?);
@@ -1381,7 +1381,8 @@ impl Word {
         // relationships, against the part's own directory.
         self.enter_story_part(archive, &part);
         self.reset_part();
-        let mut reader = Reader::from_reader(xml.as_slice());
+        let text = part_text(&xml);
+        let mut reader = Reader::from_reader(text.as_bytes());
         let _ = self.definitions(&mut reader, 0, kind);
     }
 
@@ -1683,11 +1684,11 @@ enum NoteKind {
 }
 
 impl NoteKind {
-    fn element(self) -> &'static [u8] {
+    fn element(self) -> &'static str {
         match self {
-            Self::Footnote => b"footnote",
-            Self::Endnote => b"endnote",
-            Self::Comment => b"comment",
+            Self::Footnote => "footnote",
+            Self::Endnote => "endnote",
+            Self::Comment => "comment",
         }
     }
 
@@ -1804,8 +1805,8 @@ fn keeps_definition(kind: NoteKind, id: &str, type_attr: Option<&str>) -> bool {
 /// The ids a notes part defines, with the entries the walk skips left out.
 fn definition_ids(xml: &[u8], kind: NoteKind) -> Vec<String> {
     scan_elements(xml, kind.element(), |event| {
-        let id = attr(event, b"id")?;
-        let type_attr = attr(event, b"type");
+        let id = attr(event, "id")?;
+        let type_attr = attr(event, "type");
         keeps_definition(kind, &id, type_attr.as_deref()).then_some(id)
     })
     .unwrap_or_default()
@@ -1888,7 +1889,8 @@ impl Styles {
     fn parse(xml: &[u8]) -> Self {
         let mut styles = Self::default();
         let mut scan = StyleScan::default();
-        let mut reader = Reader::from_reader(xml);
+        let text = part_text(xml);
+        let mut reader = Reader::from_reader(text.as_bytes());
         let mut buffer = Vec::new();
         loop {
             let Ok(event) = reader.read_event_into(&mut buffer) else {
@@ -1947,11 +1949,11 @@ impl StyleScan {
             Event::Start(event) => self.element(&Elem::of(event), false),
             Event::Empty(event) => self.element(&Elem::of(event), true),
             Event::End(event) => match event.local_name().as_ref() {
-                b"pPr" => {
+                "pPr" => {
                     self.paragraph_props = false;
                     None
                 }
-                b"style" => self.current.take(),
+                "style" => self.current.take(),
                 _ => None,
             },
             _ => None,
@@ -1961,8 +1963,8 @@ impl StyleScan {
     /// Note one element: what a style states about itself, and where its own
     /// properties begin. `Some` when the element is a style that closed itself.
     fn element(&mut self, elem: &Elem, empty: bool) -> Option<(String, StyleDef)> {
-        match elem.name.as_slice() {
-            b"style" => {
+        match elem.name.as_str() {
+            "style" => {
                 // A style whose type is present and is not a paragraph style is
                 // not one a paragraph can name.
                 let paragraph = elem
@@ -1977,19 +1979,19 @@ impl StyleScan {
                     return self.current.take();
                 }
             }
-            b"pPr" if !empty => self.paragraph_props = self.current.is_some(),
+            "pPr" if !empty => self.paragraph_props = self.current.is_some(),
             // The two statements only count inside the style's own properties.
-            b"outlineLvl" if self.paragraph_props => {
+            "outlineLvl" if self.paragraph_props => {
                 if let Some((_, style)) = self.current.as_mut() {
                     style.outline = outline_level(elem);
                 }
             }
-            b"name" => {
+            "name" => {
                 if let Some((_, style)) = self.current.as_mut() {
                     style.name = style_value(elem);
                 }
             }
-            b"basedOn" => {
+            "basedOn" => {
                 if let Some((_, style)) = self.current.as_mut() {
                     style.based_on = style_value(elem);
                 }
@@ -2140,30 +2142,30 @@ struct RevisionsMark {
 /// one rather than matched by their `Change` suffix, which also catches
 /// `w:numberingChange` — a list-numbering change, which this reader leaves
 /// alone like the rest of list numbering.
-fn is_property_change(name: &[u8]) -> bool {
+fn is_property_change(name: &str) -> bool {
     matches!(
         name,
-        b"rPrChange"
-            | b"pPrChange"
-            | b"tblPrChange"
-            | b"tblPrExChange"
-            | b"tblGridChange"
-            | b"trPrChange"
-            | b"tcPrChange"
-            | b"sectPrChange"
+        "rPrChange"
+            | "pPrChange"
+            | "tblPrChange"
+            | "tblPrExChange"
+            | "tblGridChange"
+            | "trPrChange"
+            | "tcPrChange"
+            | "sectPrChange"
     )
 }
 
 impl Revisions {
     /// Count one element when it is a revision, and remember who made it.
     fn record(&mut self, elem: &Elem) {
-        match elem.name.as_slice() {
-            b"ins" | b"cellIns" => self.tallies.insertions += 1,
-            b"del" | b"cellDel" => self.tallies.deletions += 1,
-            b"moveTo" => self.tallies.moved_here += 1,
-            b"moveFrom" => self.tallies.moved_away += 1,
-            b"moveFromRangeStart" => self.tallies.move_ranges += 1,
-            b"cellMerge" => self.tallies.formatting += 1,
+        match elem.name.as_str() {
+            "ins" | "cellIns" => self.tallies.insertions += 1,
+            "del" | "cellDel" => self.tallies.deletions += 1,
+            "moveTo" => self.tallies.moved_here += 1,
+            "moveFrom" => self.tallies.moved_away += 1,
+            "moveFromRangeStart" => self.tallies.move_ranges += 1,
+            "cellMerge" => self.tallies.formatting += 1,
             name if is_property_change(name) => self.tallies.formatting += 1,
             _ => return,
         }

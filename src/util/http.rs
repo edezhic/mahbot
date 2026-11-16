@@ -620,7 +620,7 @@ pub(crate) async fn download_verified(
     }
 
     if let Some(h) = hasher {
-        let actual_hash = format!("{:x}", h.finalize());
+        let actual_hash = crate::util::hex_string(&h.finalize());
         if actual_hash != expected_sha256 {
             return Err(anyhow::Error::new(ChecksumMismatch).context(format!(
                 "SHA256 mismatch for {}: expected {expected_sha256}, got {actual_hash}",

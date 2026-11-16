@@ -694,6 +694,7 @@ mod tests {
     /// another tree.
     #[tokio::test]
     async fn remaining_names_the_leftovers_without_following_links() {
+        #[cfg_attr(not(unix), expect(unused_variables))]
         let (_dir, root, ws) = setup();
         let mut remains = Vec::new();
         collect_remaining(&root.join("drafts"), &mut remains, 20);
@@ -798,6 +799,7 @@ mod tests {
     /// closed areas, symlinks and everything outside the personal workspace are refused.
     #[tokio::test]
     async fn refusals_cover_the_root_the_memory_the_closed_areas_and_symlinks() {
+        #[cfg_attr(not(unix), expect(unused_variables))]
         let (_dir, root, ws) = setup();
         let refused = |err: anyhow::Error, expected: &str| {
             assert!(

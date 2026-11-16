@@ -792,7 +792,7 @@ fn read_windows() -> Result<OwnerEnv, ReadFailure> {
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    let mut token: HANDLE = 0;
+    let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: the pseudo-handle needs no cleanup and this out-pointer is ours.
     let process = unsafe { GetCurrentProcess() };
     // SAFETY: `process` is the (always valid) current-process pseudo-handle and

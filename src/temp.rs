@@ -256,8 +256,8 @@ fn open_process_token() -> Result<windows_sys::Win32::Foundation::HANDLE> {
     use windows_sys::Win32::Security::TOKEN_QUERY;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    // A null handle: `HANDLE` is a plain integer in `windows_sys`.
-    let mut token: HANDLE = 0;
+    // A null handle: `HANDLE` is a pointer in `windows_sys`.
+    let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: `GetCurrentProcess` is a pseudo-handle (no close needed) and
     // `token` is a distinct local written only by the call.
     let opened = unsafe {
@@ -280,8 +280,7 @@ fn open_process_token() -> Result<windows_sys::Win32::Foundation::HANDLE> {
 /// `GetTokenInformation` buffer.
 #[cfg(windows)]
 fn token_sid(token: windows_sys::Win32::Foundation::HANDLE, class: i32) -> Result<Vec<u8>> {
-    use windows_sys::Win32::Foundation::PSID;
-    use windows_sys::Win32::Security::GetTokenInformation;
+    use windows_sys::Win32::Security::{GetTokenInformation, PSID};
 
     let mut len = 0_u32;
     // First pass: the call is expected to fail with ERROR_INSUFFICIENT_BUFFER,
@@ -404,7 +403,7 @@ fn file_owner_sid(root: &Path) -> Result<Vec<u8>> {
 
 /// Copy a SID's bytes out of the structure that owns them.
 #[cfg(windows)]
-fn copy_sid(sid: windows_sys::Win32::Foundation::PSID) -> Result<Vec<u8>> {
+fn copy_sid(sid: windows_sys::Win32::Security::PSID) -> Result<Vec<u8>> {
     use windows_sys::Win32::Security::GetLengthSid;
 
     if sid.is_null() {

@@ -164,7 +164,7 @@ fn build_markdown_highlights_from_tree(
         let mut matches = cursor.matches(query, block_tree.root_node(), source.as_bytes());
         matches.advance();
         while let Some(m) = matches.get() {
-            for capture in m.captures {
+            for capture in m.captures() {
                 let name = capture_index_to_name(query, capture.index);
                 // Skip `@none` captures (code fence content — injection is out of scope).
                 if name == "none" {
@@ -193,7 +193,7 @@ fn build_markdown_highlights_from_tree(
             let mut matches = cursor.matches(query, root, inline_source);
             matches.advance();
             while let Some(m) = matches.get() {
-                for capture in m.captures {
+                for capture in m.captures() {
                     byte_spans.push((
                         capture.node.start_byte(),
                         capture.node.end_byte(),
@@ -328,7 +328,7 @@ fn build_highlights_from_tree(
     let mut byte_spans: Vec<(usize, usize, HighlightClass)> = Vec::new();
     matches.advance();
     while let Some(m) = matches.get() {
-        for capture in m.captures {
+        for capture in m.captures() {
             byte_spans.push((
                 capture.node.start_byte(),
                 capture.node.end_byte(),

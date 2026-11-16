@@ -1914,7 +1914,7 @@ mod windows {
     /// Open `HKCU\Environment` for reading and writing.
     fn open_key() -> Result<HKEY, String> {
         let name = wide(ENVIRONMENT_KEY);
-        let mut key: HKEY = 0;
+        let mut key: HKEY = std::ptr::null_mut();
         // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the
         // call, `key` is ours to fill, and the call has no other precondition.
         let status = unsafe {

@@ -482,11 +482,8 @@ const ICON_RESOURCE_ID: u16 = 1;
 /// `raw_handle` is the window's `HWND`: [`iced::window::raw_id`] answers with
 /// winit's own window id, and on Windows that conversion *is* the handle.
 #[cfg(target_os = "windows")]
-// iced hands the handle back as a `u64`, and winit's own conversion into that
-// `u64` is an `isize`-to-`u64` cast — this is that same cast reversed, so both
-// lints describe the documented round trip rather than a mistake.
-#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub(crate) fn apply_window_icons(raw_handle: u64) {
+    use windows_sys::Win32::Foundation::HWND;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GCLP_HICON, GCLP_HICONSM, GetSystemMetrics, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_SHARED,
@@ -494,7 +491,9 @@ pub(crate) fn apply_window_icons(raw_handle: u64) {
         WM_SETICON,
     };
 
-    let window = raw_handle as isize;
+    // iced hands the handle back as a `u64`, and winit's own conversion into that
+    // `u64` is a handle-to-`u64` cast — this is that same cast reversed.
+    let window = raw_handle as HWND;
     // SAFETY: `window` is the live window's own handle on the thread that created
     // it, the resource name is the id the build script wrote into this executable,
     // and a shared icon handle is neither freed nor owned by the caller.
@@ -521,14 +520,14 @@ pub(crate) fn apply_window_icons(raw_handle: u64) {
             (big, ICON_BIG, GCLP_HICON, "the taskbar icon"),
             (small, ICON_SMALL, GCLP_HICONSM, "the small icon"),
         ] {
-            if icon == 0 {
+            if icon.is_null() {
                 // No such icon in this executable: `build.rs` has already said so at
                 // build time, and the window keeps the icon iced set on it.
                 not_placed(surface, &std::io::Error::last_os_error().to_string());
                 continue;
             }
-            SendMessageW(window, WM_SETICON, kind as usize, icon);
-            SetClassLongPtrW(window, class_index, icon);
+            SendMessageW(window, WM_SETICON, kind as usize, icon as isize);
+            SetClassLongPtrW(window, class_index, icon as isize);
         }
     }
 }
