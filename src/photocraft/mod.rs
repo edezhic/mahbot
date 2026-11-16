@@ -38,8 +38,8 @@ mod install;
 pub(crate) const MAX_ANSWER_BYTES: usize = crate::util::TOOL_OUTPUT_BUDGET_BYTES;
 
 /// The most a note saying what an answer left out may take: [`capped_lines`], [`capped_rows`] and
-/// [`batch_answer`] keep it back out of their budget. [`capped_document`] needs no reserve — it
-/// measures the note with the rest of the text it emits.
+/// [`capped_batch_answer`] keep it back out of their budget. [`capped_document`] needs no reserve —
+/// it measures the note with the rest of the text it emits.
 const NOTE_ROOM: usize = 96;
 
 /// The most of a failed run's output one answer quotes, so a batch's worth of lines cannot flood a
@@ -384,20 +384,18 @@ fn batch_outcome(
 }
 
 /// A batch's answer. It opens with the product's own sentence about what the batch wrote — the one
-/// fact a caller must never lose — and then the vendor's report: the lines naming files it failed on
-/// with their reasons, whole per-file lines from the start and from the end, and its closing summary.
-/// The count and the summary are kept whatever else goes; the failures are what a caller acts on, so
-/// they take their room first and the per-file lines and encoder warnings get what is left. Whatever
-/// is dropped goes whole and is counted, which the product's own tool-output cut could never do, since
-/// it takes a plain middle out with no count.
+/// fact a caller must never lose — and then the vendor's report: whole per-file lines from the start
+/// and from the end, the engine's warnings collapsed to one line per kind, the lines naming files it
+/// failed on with their reasons, and its closing summary. The count and the summary are kept
+/// whatever else goes; the failures are what a caller acts on, so they take their room first, then
+/// the per-file lines, and the collapsed warnings get what is left. Whatever is dropped goes whole
+/// and is counted, which the product's own tool-output cut could never do, since it takes a plain
+/// middle out with no count.
 fn batch_answer(output: &str, written: &FilesWritten, output_dir: &Path) -> String {
-    let text = output.trim();
     let header = written.written_into(output_dir);
+    let text = output.trim();
     if text.is_empty() {
         return header;
-    }
-    if header.len() + 1 + text.len() <= MAX_ANSWER_BYTES {
-        return format!("{header}\n{text}");
     }
     let lines: Vec<&str> = text.lines().collect();
     let summary: Vec<&str> = lines
@@ -410,35 +408,85 @@ fn batch_answer(output: &str, written: &FilesWritten, output_dir: &Path) -> Stri
         .copied()
         .filter(|line| is_failure(line))
         .collect();
+    let warnings = collapsed_warnings(lines.iter().copied().filter(|line| is_warning(line)));
     let results: Vec<&str> = lines
         .iter()
         .copied()
-        .filter(|line| !is_summary(line) && !is_failure(line))
+        .filter(|line| !is_summary(line) && !is_failure(line) && !is_warning(line))
         .collect();
 
-    // What the header, the summary and the per-file report's own note need, so the whole answer stays
-    // under the cap.
-    let mut left =
-        MAX_ANSWER_BYTES.saturating_sub(header.len() + 1 + lines_bytes(&summary) + NOTE_ROOM);
-    // A file the vendor failed on is what a caller acts on, so the failures take their room first —
-    // appended after the per-file report, because the summary closes the answer. Their own note is
-    // kept back only when some of them are left out.
-    let mut kept_failures = lines_within(failures.iter().copied(), left);
-    if kept_failures < failures.len() {
-        left = left.saturating_sub(NOTE_ROOM);
-        kept_failures = lines_within(failures.iter().copied(), left);
+    // The ordinary answer, whole: every result line, one line per kind of warning, the failures and
+    // the vendor's summary last.
+    let mut answer = header.clone();
+    for line in &results {
+        crate::util::push_line(&mut answer, line);
     }
-    left -= lines_bytes(&failures[..kept_failures]);
-    // The rest is the per-file report: whole lines from the start and from the end.
+    for line in &warnings {
+        crate::util::push_line(&mut answer, line);
+    }
+    for line in &failures {
+        crate::util::push_line(&mut answer, line);
+    }
+    for line in &summary {
+        crate::util::push_line(&mut answer, line);
+    }
+    if answer.len() <= MAX_ANSWER_BYTES {
+        return answer;
+    }
+    // Too large for the cap: a note is room the lines give up, so the first layout reserves none and
+    // a later one reserves what the first turned out to need.
+    let mut notes = 0;
+    loop {
+        let (answer, used) =
+            capped_batch_answer(&header, &results, &warnings, &failures, &summary, notes);
+        if used <= notes {
+            return answer;
+        }
+        notes = used;
+    }
+}
+
+/// The answer for a batch too large to fit: whole result lines from both ends, the collapsed
+/// warnings, the failures the vendor named and its summary, with room for `notes` notes kept out of
+/// the lines' budget. Returns the answer and how many notes it carries.
+fn capped_batch_answer(
+    header: &str,
+    results: &[&str],
+    warnings: &[String],
+    failures: &[&str],
+    summary: &[&str],
+    notes: usize,
+) -> (String, usize) {
+    let mut used = 0;
+    let mut left = MAX_ANSWER_BYTES
+        .saturating_sub(header.len() + 1 + lines_bytes(summary) + notes * NOTE_ROOM);
+    // A file the vendor failed on is what a caller acts on, so the failures take their room first.
+    let kept_failures = lines_within(failures.iter().copied(), left);
+    if kept_failures < failures.len() {
+        used += 1;
+    }
+    left = left.saturating_sub(lines_bytes(&failures[..kept_failures]));
+    // The per-file report next: whole lines from the start and from the end, before any warning.
     let side = left / 2;
     let head = lines_within(results.iter().copied(), side);
     let tail = lines_within(results[head..].iter().rev().copied(), side);
+    let omitted = results.len() - head - tail;
+    if omitted > 0 {
+        used += 1;
+    }
+    left = left.saturating_sub(
+        lines_bytes(&results[..head]) + lines_bytes(&results[results.len() - tail..]),
+    );
+    // The collapsed warnings take only what is left.
+    let kept_warnings = lines_within(warnings.iter().map(String::as_str), left);
+    if kept_warnings < warnings.len() {
+        used += 1;
+    }
 
-    let mut answer = header;
+    let mut answer = header.to_string();
     for line in &results[..head] {
         crate::util::push_line(&mut answer, line);
     }
-    let omitted = results.len() - head - tail;
     if omitted > 0 {
         crate::util::push_line(
             &mut answer,
@@ -447,6 +495,18 @@ fn batch_answer(output: &str, written: &FilesWritten, output_dir: &Path) -> Stri
     }
     for line in &results[results.len() - tail..] {
         crate::util::push_line(&mut answer, line);
+    }
+    for line in &warnings[..kept_warnings] {
+        crate::util::push_line(&mut answer, line);
+    }
+    if kept_warnings < warnings.len() {
+        crate::util::push_line(
+            &mut answer,
+            &format!(
+                "… {} further warning kinds not shown",
+                warnings.len() - kept_warnings
+            ),
+        );
     }
     if kept_failures < failures.len() {
         crate::util::push_line(
@@ -460,10 +520,129 @@ fn batch_answer(output: &str, written: &FilesWritten, output_dir: &Path) -> Stri
     for line in &failures[..kept_failures] {
         crate::util::push_line(&mut answer, line);
     }
-    for line in &summary {
+    for line in summary {
         crate::util::push_line(&mut answer, line);
     }
-    answer
+    (answer, used)
+}
+
+/// The vendor's per-file warnings, one line per kind: its own wording with the numbers that differ
+/// between files shown as `N`, and how many warning lines of that kind it printed — one per file, so
+/// the count reads as the number of files affected.
+fn collapsed_warnings<'a>(warnings: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut kinds: Vec<WarningKind> = Vec::new();
+    for line in warnings {
+        let parts = warning_parts(line.trim_end().strip_prefix(WARNING_PREFIX).unwrap_or(line));
+        match kinds.iter_mut().find(|kind| kind.same_as(&parts)) {
+            Some(kind) => kind.merge(&parts),
+            None => kinds.push(WarningKind::new(parts)),
+        }
+    }
+    kinds
+        .into_iter()
+        .map(|kind| {
+            let lines = if kind.count == 1 { "line" } else { "lines" };
+            format!("warning ({} {lines}): {}", kind.count, kind.wording())
+        })
+        .collect()
+}
+
+/// One kind of warning: its wording, each number kept until another file shows a different one, and
+/// the number of warning lines collapsed into it.
+struct WarningKind {
+    parts: Vec<WarningPart>,
+    count: usize,
+}
+
+/// A warning's message split at its numbers: the text is the warning's own wording, the numbers are
+/// what the vendor varies between files.
+enum WarningPart {
+    Text(String),
+    Number { value: String, varies: bool },
+}
+
+impl WarningKind {
+    fn new(parts: Vec<WarningPart>) -> Self {
+        Self { parts, count: 1 }
+    }
+
+    /// Whether `parts` is this kind's wording: the same text in the same order, whatever its numbers.
+    fn same_as(&self, parts: &[WarningPart]) -> bool {
+        self.parts.len() == parts.len()
+            && self
+                .parts
+                .iter()
+                .zip(parts)
+                .all(|(known, part)| match (known, part) {
+                    (WarningPart::Text(known), WarningPart::Text(text)) => known == text,
+                    (WarningPart::Number { .. }, WarningPart::Number { .. }) => true,
+                    _ => false,
+                })
+    }
+
+    /// Fold another line of this kind in, noting a number that differs from the first one seen.
+    fn merge(&mut self, parts: &[WarningPart]) {
+        self.count += 1;
+        for (known, part) in self.parts.iter_mut().zip(parts) {
+            if let (WarningPart::Number { value, varies }, WarningPart::Number { value: seen, .. }) =
+                (known, part)
+                && !*varies
+                && value != seen
+            {
+                *varies = true;
+            }
+        }
+    }
+
+    /// The kind's wording: the numbers every file agreed on, and `N` where they differed.
+    fn wording(&self) -> String {
+        let mut wording = String::new();
+        for part in &self.parts {
+            match part {
+                WarningPart::Text(text) => wording.push_str(text),
+                WarningPart::Number {
+                    value,
+                    varies: false,
+                } => wording.push_str(value),
+                WarningPart::Number { varies: true, .. } => wording.push('N'),
+            }
+        }
+        wording
+    }
+}
+
+/// A warning's message split where its numbers are, so one kind can hold the wording and compare the
+/// numbers that vary between files.
+fn warning_parts(message: &str) -> Vec<WarningPart> {
+    let mut parts = Vec::new();
+    let mut text = String::new();
+    let mut number = String::new();
+    for character in message.chars() {
+        if character.is_ascii_digit() {
+            if !text.is_empty() {
+                parts.push(WarningPart::Text(std::mem::take(&mut text)));
+            }
+            number.push(character);
+        } else {
+            if !number.is_empty() {
+                parts.push(WarningPart::Number {
+                    value: std::mem::take(&mut number),
+                    varies: false,
+                });
+            }
+            text.push(character);
+        }
+    }
+    if !number.is_empty() {
+        parts.push(WarningPart::Number {
+            value: number,
+            varies: false,
+        });
+    }
+    if !text.is_empty() {
+        parts.push(WarningPart::Text(text));
+    }
+    parts
 }
 
 /// The vendor's closing line for a batch it ran to the end — `<n> succeeded, <m> failed`, and any
@@ -499,6 +678,15 @@ fn failed_some(output: &str) -> bool {
 /// A file the vendor could not do, as it names one on stderr: `FAIL  <input>: <reason>`.
 fn is_failure(line: &str) -> bool {
     line.starts_with("FAIL ")
+}
+
+/// The prefix every warning line the vendor prints carries. Its closing `error:` line is not one.
+const WARNING_PREFIX: &str = "warning: ";
+
+/// Whether a line is one of the vendor's per-file warnings, which it prints on stderr once per file
+/// and per thing it had to change.
+fn is_warning(line: &str) -> bool {
+    line.starts_with(WARNING_PREFIX)
 }
 
 /// How many bytes `lines` take with their line breaks.
@@ -1137,17 +1325,18 @@ mod tests {
     #[test]
     fn a_batch_answer_keeps_every_failure_and_the_summary_whatever_it_drops() {
         // The vendor's own report: successes and the summary on stdout, then the failures and the
-        // encoder's per-file warnings on stderr, which arrives appended. The summary is therefore
+        // engine's per-file warnings on stderr, which arrives appended. The summary is therefore
         // nowhere near the tail, and the failure sits behind hundreds of per-file lines.
         let mut spelled: Vec<String> = (0..300)
             .map(|index| format!("ok    /work/in/photo{index}.jpg -> /work/out/photo{index}.jpg"))
             .collect();
         spelled.push("300 succeeded, 1 failed".to_string());
         spelled.push("FAIL  /work/in/photo150.jpg: unsupported 12-bit depth".to_string());
-        spelled.extend(
-            (0..300)
-                .map(|index| format!("warning: photo{index}.jpg: no ICC profile, assuming sRGB")),
-        );
+        // A wall of distinct warnings: the palette message names each file's own colour count.
+        spelled
+            .extend((0..300).map(|index| {
+                format!("warning: written as an 8-bit palette BMP ({index} colours)")
+            }));
         let output = spelled.join("\n");
         assert!(output.len() > MAX_ANSWER_BYTES, "the fixture must not fit");
         let capped = batch_answer(&output, &counted(300), Path::new("/work/out"));
@@ -1159,6 +1348,11 @@ mod tests {
             "{capped}"
         );
         assert_eq!(capped.lines().last(), Some("300 succeeded, 1 failed"));
+        // The 300 warnings are one kind, and what did not fit is counted as a kind.
+        assert!(
+            capped.contains("… 1 further warning kinds not shown"),
+            "{capped}"
+        );
         // Whole lines only, and the cap binds before the product's own cut.
         assert!(
             kept[1..]
@@ -1167,6 +1361,190 @@ mod tests {
             "{capped}"
         );
         assert_eq!(crate::util::truncate_tool_output(&capped), capped);
+    }
+
+    #[test]
+    fn a_capped_batch_still_shows_a_kind_whose_per_file_values_all_differ() {
+        // 100 per-file palette warnings are one kind, and the result lines leave it the room.
+        let mut spelled: Vec<String> = (0..100)
+            .map(|index| format!("ok    /work/in/photo{index}.png -> /work/out/photo{index}.bmp"))
+            .collect();
+        spelled.push("100 succeeded, 0 failed".to_string());
+        spelled
+            .extend((0..100).map(|index| {
+                format!("warning: written as an 8-bit palette BMP ({index} colours)")
+            }));
+        let output = spelled.join("\n");
+        assert!(output.len() > MAX_ANSWER_BYTES, "the fixture must not fit");
+        let capped = batch_answer(&output, &counted(100), Path::new("/work/out"));
+        assert!(
+            capped.contains("warning (100 lines): written as an 8-bit palette BMP (N colours)"),
+            "{capped}"
+        );
+        assert_eq!(capped.lines().last(), Some("100 succeeded, 0 failed"));
+        assert!(capped.len() <= MAX_ANSWER_BYTES, "{}", capped.len());
+        assert_eq!(crate::util::truncate_tool_output(&capped), capped);
+    }
+
+    #[test]
+    fn a_batch_that_needs_every_note_still_fits_and_keeps_its_head_and_summary() {
+        let mut spelled: Vec<String> = (0..200)
+            .map(|index| format!("ok    /work/in/photo{index}.jpg -> /work/out/photo{index}.jpg"))
+            .collect();
+        spelled.push("200 succeeded, 200 failed".to_string());
+        spelled.extend(
+            (0..200).map(|index| format!("FAIL  /work/in/broken{index}.jpg: unreadable header")),
+        );
+        spelled.extend(
+            (0..200)
+                .map(|index| format!("warning: an encoder complaint number {index} about a file")),
+        );
+        let output = spelled.join("\n");
+        let capped = batch_answer(&output, &counted(200), Path::new("/work/out"));
+        assert_eq!(
+            capped.lines().next(),
+            Some("200 file(s) written to /work/out")
+        );
+        assert_eq!(capped.lines().last(), Some("200 succeeded, 200 failed"));
+        // All three cuts say what they dropped, and the whole answer stays inside the cap.
+        assert!(
+            capped.contains("further result lines not shown"),
+            "{capped}"
+        );
+        assert!(capped.contains("further failures not shown"), "{capped}");
+        assert!(
+            capped.contains("further warning kinds not shown"),
+            "{capped}"
+        );
+        assert!(capped.len() <= MAX_ANSWER_BYTES, "{}", capped.len());
+        assert_eq!(crate::util::truncate_tool_output(&capped), capped);
+    }
+
+    #[test]
+    fn a_batch_answer_collapses_the_engines_warnings_to_one_line_per_kind() {
+        // The live shape: 25 PNGs converted to JPG at quality 80, four warnings per file, all of them
+        // on stderr after the vendor's summary.
+        let mut spelled: Vec<String> = (0..25)
+            .map(|index| format!("ok    /work/in/photo{index}.png -> /work/out/photo{index}.jpg"))
+            .collect();
+        spelled.push("25 succeeded, 0 failed".to_string());
+        for _ in 0..25 {
+            spelled.push("warning: transparency composited over white for Jpeg".to_string());
+            spelled.push("warning: 16-bit will be reduced to 8-bit".to_string());
+            spelled.push("warning: lossy compression".to_string());
+            spelled.push("warning: text metadata dropped".to_string());
+        }
+        let output = spelled.join("\n");
+        let answer = batch_answer(&output, &counted(25), Path::new("/work/out"));
+        let kept: Vec<&str> = answer.lines().collect();
+        // The product's count opens the answer and the vendor's summary closes it, untouched.
+        assert_eq!(kept[0], "25 file(s) written to /work/out");
+        assert_eq!(kept.last(), Some(&"25 succeeded, 0 failed"));
+        // Every per-file result survives.
+        assert_eq!(
+            kept.iter().filter(|line| line.starts_with("ok")).count(),
+            25,
+            "{answer}"
+        );
+        // One line per kind, each carrying the 25 warning lines it collapsed.
+        let warnings: Vec<&&str> = kept
+            .iter()
+            .filter(|line| line.starts_with("warning"))
+            .collect();
+        assert_eq!(warnings.len(), 4, "{answer}");
+        for line in warnings {
+            assert!(line.contains("(25 lines)"), "{line}");
+        }
+        assert!(
+            answer.contains("warning (25 lines): lossy compression"),
+            "{answer}"
+        );
+        assert!(
+            answer.contains("warning (25 lines): 16-bit will be reduced to 8-bit"),
+            "{answer}"
+        );
+        // The answer is a fraction of the wall of warnings it replaced, and fits before the product's
+        // own cut.
+        assert!(answer.len() < 3_000, "{}", answer.len());
+        assert_eq!(crate::util::truncate_tool_output(&answer), answer);
+    }
+
+    #[test]
+    fn a_warning_naming_a_per_file_value_is_one_kind_however_the_value_differs() {
+        // The vendor's palette warning names each file's own colour count, so exact text would give
+        // one line per file. The count varies, the wording does not: one kind, with `N` where it
+        // differed and the numbers every file agreed on kept.
+        let output = [
+            "ok    /work/in/a.png -> /work/out/a.bmp",
+            "warning: written as an 8-bit palette BMP (16 colours)",
+            "ok    /work/in/b.png -> /work/out/b.bmp",
+            "warning: written as an 8-bit palette BMP (2 colours)",
+            "ok    /work/in/c.png -> /work/out/c.bmp",
+            "warning: written as an 8-bit palette BMP (200 colours)",
+            "3 succeeded, 0 failed",
+        ]
+        .join("\n");
+        let answer = batch_answer(&output, &counted(3), Path::new("/work/out"));
+        let warnings: Vec<&str> = answer
+            .lines()
+            .filter(|line| line.starts_with("warning"))
+            .collect();
+        assert_eq!(
+            warnings,
+            ["warning (3 lines): written as an 8-bit palette BMP (N colours)"]
+        );
+        assert_eq!(answer.lines().last(), Some("3 succeeded, 0 failed"));
+    }
+
+    #[test]
+    fn the_engines_own_error_line_is_a_result_and_not_swallowed_as_a_warning() {
+        // `error: <n> file(s) failed` shares stderr with the warnings but is the vendor's own result
+        // line: it stays one, and a single warning still carries its count.
+        let output = [
+            "ok    /work/in/a.png -> /work/out/a.jpg",
+            "warning: lossy compression",
+            "error: 1 file(s) failed",
+            "FAIL  /work/in/b.png: unknown file format: png8",
+            "1 succeeded, 1 failed",
+        ]
+        .join("\n");
+        let answer = batch_answer(&output, &counted(1), Path::new("/work/out"));
+        assert!(answer.contains("error: 1 file(s) failed"), "{answer}");
+        assert!(
+            answer.contains("FAIL  /work/in/b.png: unknown file format: png8"),
+            "{answer}"
+        );
+        assert!(
+            answer.contains("warning (1 line): lossy compression"),
+            "{answer}"
+        );
+        assert_eq!(answer.lines().last(), Some("1 succeeded, 1 failed"));
+    }
+
+    #[test]
+    fn a_batch_too_large_for_its_results_gives_them_the_room_before_any_warning() {
+        let mut spelled: Vec<String> = (0..400)
+            .map(|index| format!("ok    /work/in/photo{index}.jpg -> /work/out/photo{index}.jpg"))
+            .collect();
+        spelled.push("400 succeeded, 0 failed".to_string());
+        let warning = format!("warning: {}", "x".repeat(300));
+        spelled.extend((0..400).map(|_| warning.clone()));
+        let output = spelled.join("\n");
+        let answer = batch_answer(&output, &counted(400), Path::new("/work/out"));
+        // The results fill the answer; the warning is too long for the room they left, so it is
+        // counted rather than taking a result line's place.
+        assert!(
+            answer.contains("further result lines not shown"),
+            "{answer}"
+        );
+        assert!(
+            answer.contains("… 1 further warning kinds not shown"),
+            "{answer}"
+        );
+        assert!(!answer.contains("warning (400 lines)"), "{answer}");
+        assert_eq!(answer.lines().last(), Some("400 succeeded, 0 failed"));
+        assert!(answer.len() <= MAX_ANSWER_BYTES, "{}", answer.len());
+        assert_eq!(crate::util::truncate_tool_output(&answer), answer);
     }
 
     #[test]

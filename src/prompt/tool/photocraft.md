@@ -64,12 +64,17 @@ convert it elsewhere first.
 A `batch` writes into a folder that is new or empty, and its answer opens with how many files were
 written and then lists them; a count the folder could not be read in full for is stated as a floor
 ("at least"), and a folder that could not be read at all says that rather than counting nothing, so a
-short read is never passed off as the count. A long list is cut to its first and
-last lines with a count of the ones left out, so a file it does not name was still written. The
-engine's own succeeded and failed counts are kept however long the batch, and every file it failed on
-is named with its reason — a batch with more failures than one answer can hold says how many more
-there were, so read the counts before reporting a batch's outcome. A batch that stops partway keeps
-the files it already wrote and says how many there are.
+short read is never passed off as the count. A long list is cut to its first and last lines with a
+count of the ones left out, so a file it does not name was still written; the per-file lines are kept
+before the warnings, so a batch too large for both counts the warning kinds it could not show. The
+engine's per-file warnings are collapsed to one line per kind, `warning (<n> lines): <what it says>`
+(`(1 line)` for a single one), where the count is how many warning lines of that kind it printed —
+one per file, so it reads as the number of files affected; a warning naming a per-file value shows
+`N` in its place, and the numbers every file agreed on are kept. The engine's own succeeded and
+failed counts are kept however long the batch, and every file it failed on is named with its reason
+— a batch with more failures than one answer can hold says how many more there were, so read the
+counts before reporting a batch's outcome. A batch that stops partway keeps the files it already
+wrote and says how many there are.
 
 Shortened answers: a registry answer this large drops whole commands and says how many, so a command
 it leaves out is one a narrower filter reaches; an inspection of a heavily layered document keeps its
