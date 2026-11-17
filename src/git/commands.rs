@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tracing::warn;
 
+use crate::git::failure::{GitFailure, GitNetworkFailure, GitStep, report};
 use crate::tools::shell::{internal_env_pairs, program_command};
 use crate::util::unquote_c_style;
 
@@ -606,6 +607,19 @@ async fn ahead_behind(repo_path: &Path, upstream: &str) -> anyhow::Result<Upstre
     })
 }
 
+/// What asking the destination established about the branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DestinationProbe {
+    /// The destination carries the branch: nothing is published.
+    Carries,
+    /// The destination has no branch of this name: a press publishes it and the update step is
+    /// skipped.
+    Absent,
+    /// The destination's copy of the branch is unknown. `failure` is why the probe failed;
+    /// `None` when it never ran (another fetch held the ref locks), so nothing is claimed.
+    Unknown { failure: Option<GitFailure> },
+}
+
 /// Where the sync control pushes the checked-out branch, and what it carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitPushTarget {
@@ -614,10 +628,16 @@ pub struct GitPushTarget {
     /// leaves it, or every commit the branch carries when it is published or `remote`
     /// could not be asked.
     pub commits: usize,
-    /// Whether `remote` lacks a branch of this name: `Some(true)` publishes it (the
-    /// update step is skipped), `Some(false)` it exists, `None` when `remote` could not
-    /// be asked — then neither is claimed.
-    pub publish: Option<bool>,
+    /// What asking `remote` about the branch established.
+    pub probe: DestinationProbe,
+}
+
+impl GitPushTarget {
+    /// Whether a press would publish the branch: `remote` has no branch of this name.
+    #[must_use]
+    pub fn publishes(&self) -> bool {
+        matches!(self.probe, DestinationProbe::Absent)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -736,7 +756,7 @@ async fn resolve_push_lane(repo_path: &Path) -> anyhow::Result<Option<PushLane>>
             let tracked_destination = own.upstream.as_deref() == Some(remote);
             let position = match upstream_counts {
                 Some(counts) if tracked_destination => DestinationPosition {
-                    publish: Some(false),
+                    probe: DestinationProbe::Carries,
                     commits: counts.ahead,
                 },
                 _ => destination_position(repo_path, remote, &branch, push_tip).await?,
@@ -744,7 +764,7 @@ async fn resolve_push_lane(repo_path: &Path) -> anyhow::Result<Option<PushLane>>
             GitPushDestination::Target(GitPushTarget {
                 remote: remote.to_string(),
                 commits: position.commits,
-                publish: position.publish,
+                probe: position.probe,
             })
         }
         None => GitPushDestination::Nowhere {
@@ -773,8 +793,8 @@ async fn checked_out_branch(repo_path: &Path) -> Option<String> {
 /// What the destination answered for a branch: what it would take, and whether it carries
 /// it at all.
 struct DestinationPosition {
-    /// Whether the destination has no branch of this name; `None` when it could not be asked.
-    publish: Option<bool>,
+    /// What asking the destination established.
+    probe: DestinationProbe,
     commits: usize,
 }
 
@@ -784,7 +804,8 @@ struct DestinationPosition {
 /// the control matters. An unknown tip's copy of the branch is fetched into the remote-tracking
 /// ref, so the count holds whatever refspecs are configured. A destination that cannot be reached,
 /// or whose objects cannot be fetched, does not fail the state and claims no publish: the branch is
-/// reported with the commits it carries, and a press reports git's own reason.
+/// reported with the commits it carries, the probe's own failure rides along so the control can
+/// say why, and a press reports git's own reason.
 async fn destination_position(
     repo_path: &Path,
     remote: &str,
@@ -803,8 +824,9 @@ async fn destination_position(
     {
         Ok(output) => output.stdout,
         Err(e) => {
-            tracing::debug!(error = %e, %remote, %branch, "git ls-remote failed");
-            return unreported_position(repo_path).await;
+            let failure = e.into_failure(GitStep::Probe, Some(remote));
+            tracing::debug!(error = %failure.message(), %remote, %branch, "git ls-remote failed");
+            return unreported_position(repo_path, Some(failure)).await;
         }
     };
     let tip = listing.lines().find_map(|line| {
@@ -815,35 +837,53 @@ async fn destination_position(
         // The destination has no such branch: the push publishes it, so the count is
         // everything the branch carries (nothing is pulled first).
         return Ok(DestinationPosition {
-            publish: Some(true),
+            probe: DestinationProbe::Absent,
             commits: count_commits(repo_path, "HEAD").await?,
         });
     };
-    if !rev_exists(repo_path, &tip).await? && !fetch_destination(repo_path, remote, branch).await {
-        return unreported_position(repo_path).await;
+    if !rev_exists(repo_path, &tip).await? {
+        match fetch_destination(repo_path, remote, branch).await {
+            FetchOutcome::Fetched => {}
+            // Another fetch held the ref locks: nothing failed, so nothing is claimed.
+            FetchOutcome::Skipped => return unreported_position(repo_path, None).await,
+            FetchOutcome::Failed(failure) => {
+                return unreported_position(repo_path, Some(failure)).await;
+            }
+        }
     }
     Ok(DestinationPosition {
-        publish: Some(false),
+        probe: DestinationProbe::Carries,
         commits: count_commits(repo_path, &format!("{tip}..{push_tip}")).await?,
     })
 }
 
-/// The position to report when the destination's copy of the branch is unknown — unreachable,
-/// or its tip could not be fetched: every commit the branch carries, so a pushable branch is
-/// never hidden behind a zero, and no publish claim for a destination never asked.
-async fn unreported_position(repo_path: &Path) -> anyhow::Result<DestinationPosition> {
+/// The position to report when the destination's copy of the branch is unknown: every commit the
+/// branch carries, so a pushable branch is never hidden behind a zero. `failure` is why the probe
+/// failed, `None` when it never ran — the control then claims nothing either way.
+async fn unreported_position(
+    repo_path: &Path,
+    failure: Option<GitFailure>,
+) -> anyhow::Result<DestinationPosition> {
     Ok(DestinationPosition {
-        publish: None,
+        probe: DestinationProbe::Unknown { failure },
         commits: count_commits(repo_path, "HEAD").await?,
     })
 }
 
-/// Fetch `remote`'s copy of `branch` into its remote-tracking ref. `false` when another fetch
-/// is already running or this one failed — the caller then reports what the local refs say.
-async fn fetch_destination(repo_path: &Path, remote: &str, branch: &str) -> bool {
+/// What became of the destination fetch the probe needs.
+enum FetchOutcome {
+    Fetched,
+    /// Another fetch held the ref locks, so this one never ran.
+    Skipped,
+    Failed(GitFailure),
+}
+
+/// Fetch `remote`'s copy of `branch` into its remote-tracking ref. A skipped or failed fetch
+/// leaves the caller reporting what the local refs say, with the failure when there is one.
+async fn fetch_destination(repo_path: &Path, remote: &str, branch: &str) -> FetchOutcome {
     if FETCH_IN_FLIGHT.swap(true, Ordering::AcqRel) {
         tracing::debug!(%remote, %branch, "skipping the destination fetch: another fetch is running");
-        return false;
+        return FetchOutcome::Skipped;
     }
     let _guard = FetchInFlightGuard;
     let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
@@ -863,10 +903,11 @@ async fn fetch_destination(repo_path: &Path, remote: &str, branch: &str) -> bool
     )
     .await
     {
-        Ok(_) => true,
+        Ok(_) => FetchOutcome::Fetched,
         Err(e) => {
-            tracing::debug!(error = %e, %remote, %branch, "git fetch of the push destination failed");
-            false
+            let failure = e.into_failure(GitStep::Probe, Some(remote));
+            tracing::debug!(error = %failure.message(), %remote, %branch, "git fetch of the push destination failed");
+            FetchOutcome::Failed(failure)
         }
     }
 }
@@ -984,9 +1025,11 @@ pub async fn run_git_fetch(repo_path: &Path) -> anyhow::Result<String> {
         return Ok(String::new());
     }
     let _guard = FetchInFlightGuard;
-    run_git_network(repo_path, &["fetch", "--quiet"], FETCH_TIMEOUT)
-        .await
-        .map(GitNetworkOutput::report)
+    Ok(
+        run_git_network(repo_path, &["fetch", "--quiet"], FETCH_TIMEOUT)
+            .await?
+            .report(),
+    )
 }
 
 /// What a [`run_git_network`] step printed, both streams trimmed.
@@ -1003,11 +1046,7 @@ impl GitNetworkOutput {
     /// upstream notice on stdout, so reading stdout alone would show a real push as nothing
     /// to do.
     fn report(self) -> String {
-        [self.stderr, self.stdout]
-            .into_iter()
-            .filter(|stream| !stream.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n")
+        report(&self.stderr, &self.stdout)
     }
 }
 
@@ -1019,12 +1058,15 @@ impl GitNetworkOutput {
 /// the `git` child is killed and reaped, and a remote helper it spawned (`git-remote-https`)
 /// terminates when its pipe closes, so nothing holds the command open. A non-zero exit reports
 /// git's own stderr, so a refused push carries git's reason; the streams stay apart — a command's
-/// answer is parsed from stdout while [`GitNetworkOutput::report`] joins both.
+/// answer is parsed from stdout while [`GitNetworkOutput::report`] joins both. The failure says
+/// which of the three it was (never started, deadline passed, git exited), so a caller can
+/// classify it without reading git's text.
 async fn run_git_network(
     repo_path: &Path,
     args: &[&str],
     timeout: Duration,
-) -> anyhow::Result<GitNetworkOutput> {
+) -> Result<GitNetworkOutput, GitNetworkFailure> {
+    let command = args.join(" ");
     let mut cmd = git_command(Some(repo_path));
     cmd.args(args).current_dir(repo_path);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
@@ -1039,9 +1081,10 @@ async fn run_git_network(
     // operation cannot outlive the runtime and orphan.
     cmd.kill_on_drop(true);
 
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("Failed to spawn git {}", args.join(" ")))?;
+    let mut child = cmd.spawn().map_err(|error| GitNetworkFailure::Spawn {
+        command: command.clone(),
+        error: error.to_string(),
+    })?;
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let mut stdout_buf = Vec::new();
@@ -1067,23 +1110,28 @@ async fn run_git_network(
     })
     .await
     {
-        res.with_context(|| format!("git {} wait failed", args.join(" ")))?
+        // A wait that failed leaves the child's state unknown: nothing was heard from the
+        // remote, so this is a local failure rather than git's own report.
+        res.map_err(|error| GitNetworkFailure::WaitFailed {
+            command: command.clone(),
+            error: error.to_string(),
+        })?
     } else {
         let _ = child.kill().await;
         let _ = child.wait().await;
-        anyhow::bail!(
-            "git {} timed out after {}s",
-            args.join(" "),
-            timeout.as_secs()
-        );
+        return Err(GitNetworkFailure::TimedOut {
+            command,
+            secs: timeout.as_secs(),
+        });
     };
 
     if !status.success() {
-        anyhow::bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&stderr_buf)
-        );
+        return Err(GitNetworkFailure::Exited {
+            command,
+            status: status.code(),
+            stderr: String::from_utf8_lossy(&stderr_buf).trim().to_string(),
+            stdout: String::from_utf8_lossy(&stdout_buf).trim().to_string(),
+        });
     }
 
     Ok(GitNetworkOutput {
@@ -1373,15 +1421,28 @@ pub struct GitSyncReport {
 
 /// Sync the checked-out branch: update it from its own update source, then push it wherever a
 /// push can actually go.
-pub async fn run_git_sync(repo_path: &Path) -> anyhow::Result<GitSyncReport> {
+///
+/// A failed step stops the sync and is returned as the classified [`GitFailure`], so the owner
+/// gets the same text in the toast, the branch modal and the logs.
+pub async fn run_git_sync(repo_path: &Path) -> Result<GitSyncReport, GitFailure> {
+    // Resolving the lane runs only local commands (remotes, branch refs, ahead/behind, counts);
+    // a probe failure never reaches this arm — it rides in `DestinationProbe::Unknown` — so
+    // whatever git said here decides what it proves, rather than the product claiming nothing
+    // reached a remote.
     let lane = resolve_push_lane(repo_path)
-        .await?
-        .context("no branch is checked out")?;
-    let publish = matches!(&lane.destination, GitPushDestination::Target(target) if target.publish == Some(true));
+        .await
+        .map_err(|e| {
+            let report = e.to_string();
+            GitFailure::classified(GitStep::Sync, None, &report)
+        })?
+        .ok_or_else(|| GitFailure::local(GitStep::Sync, None, "no branch is checked out"))?;
+    let publish =
+        matches!(&lane.destination, GitPushDestination::Target(target) if target.publishes());
     let update = if lane.remotes.upstream_ref.is_some() && !publish {
         Some(
             run_git_network(repo_path, &["pull", "--ff-only"], SYNC_TIMEOUT)
-                .await?
+                .await
+                .map_err(|e| e.into_failure(GitStep::Pull, lane.remotes.upstream.as_deref()))?
                 .report(),
         )
     } else {
@@ -1398,9 +1459,12 @@ pub async fn run_git_sync(repo_path: &Path) -> anyhow::Result<GitSyncReport> {
             let record_upstream = lane.remotes.upstream.is_none();
             let plain =
                 !record_upstream && lane.remotes.push.as_deref() == Some(target.remote.as_str());
+            let failure =
+                |e: GitNetworkFailure| e.into_failure(GitStep::Push, Some(&target.remote));
             let report = if plain {
                 run_git_network(repo_path, &["push"], SYNC_TIMEOUT)
-                    .await?
+                    .await
+                    .map_err(failure)?
                     .report()
             } else {
                 let mut args = vec!["push"];
@@ -1410,7 +1474,8 @@ pub async fn run_git_sync(repo_path: &Path) -> anyhow::Result<GitSyncReport> {
                 args.push(target.remote.as_str());
                 args.push(lane.branch.as_str());
                 run_git_network(repo_path, &args, SYNC_TIMEOUT)
-                    .await?
+                    .await
+                    .map_err(failure)?
                     .report()
             };
             (None, Some(report))
@@ -1693,6 +1758,7 @@ pub(crate) fn parse_git_status_porcelain(output: &str) -> HashMap<String, GitFil
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git::failure::GitFailureKind;
     use crate::util::test::init_temp_repo;
 
     /// The worktree identity is a pure reading (the repository's own index and status are left
@@ -2292,7 +2358,11 @@ mod tests {
         };
         assert_eq!(target.remote, "origin");
         assert_eq!(target.commits, carried, "publish carries every commit");
-        assert_eq!(target.publish, Some(true), "origin has no such branch yet");
+        assert_eq!(
+            target.probe,
+            DestinationProbe::Absent,
+            "origin has no such branch yet"
+        );
         assert!(state.has_sync_work());
 
         let report = run_git_sync(&repo_path).await.expect("sync");
@@ -2328,7 +2398,7 @@ mod tests {
             panic!("expected a push target, got {:?}", state.push);
         };
         assert_eq!(target.remote, "origin");
-        assert_eq!(target.publish, Some(false));
+        assert_eq!(target.probe, DestinationProbe::Carries);
         assert_eq!(target.commits, 1);
         let report = run_git_sync(&repo_path).await.expect("sync");
         assert!(report.not_pushed.is_none());
@@ -2368,7 +2438,7 @@ mod tests {
             panic!("expected a push target, got {:?}", state.push);
         };
         assert_eq!(target.remote, "origin");
-        assert_eq!(target.publish, Some(false));
+        assert_eq!(target.probe, DestinationProbe::Carries);
         assert_eq!(
             target.commits, 2,
             "the commits the fast-forward brings are pushed too"
@@ -2427,7 +2497,7 @@ mod tests {
             panic!("expected a push target, got {:?}", state.push);
         };
         assert_eq!(target.remote, "origin");
-        assert_eq!(target.publish, Some(false));
+        assert_eq!(target.probe, DestinationProbe::Carries);
         assert_eq!(target.commits, 1, "only the local commit is not on origin");
         assert_eq!(
             rev_parse(&repo_path, &format!("refs/remotes/origin/{branch}")),
@@ -2458,8 +2528,8 @@ mod tests {
             panic!("expected a push target, got {:?}", state.push);
         };
         assert_eq!(
-            target.publish,
-            Some(true),
+            target.probe,
+            DestinationProbe::Absent,
             "origin has no branch named {branch}"
         );
         assert_eq!(
@@ -2468,11 +2538,11 @@ mod tests {
         );
     }
 
-    /// An unreachable destination does not hide the branch and does not claim a publish: the
-    /// branch is reported with the commits it carries, its reachability is not asserted, and a
-    /// press reports git's own reason.
+    /// A destination that cannot be asked does not hide the branch and does not claim a publish:
+    /// the branch is reported with the commits it carries, the probe's own failure rides along so
+    /// the control can say why, and a press reports git's own reason.
     #[tokio::test]
-    async fn unreachable_destination_still_offers_a_push() {
+    async fn unreported_destination_still_offers_a_push() {
         let (_dir, repo_path) = init_temp_repo();
         let remotes = tempfile::tempdir().expect("remote dir");
         let origin = add_bare_remote(remotes.path(), &repo_path, "origin");
@@ -2483,13 +2553,46 @@ mod tests {
             panic!("expected a push target, got {:?}", state.push);
         };
         assert_eq!(target.remote, "origin");
-        assert_eq!(target.publish, None, "the destination was never asked");
+        let DestinationProbe::Unknown {
+            failure: Some(failure),
+        } = &target.probe
+        else {
+            panic!(
+                "the failed probe carries its reason, got {:?}",
+                target.probe
+            );
+        };
+        assert_eq!(failure.step(), GitStep::Probe);
+        assert_eq!(
+            failure.kind(),
+            GitFailureKind::Unknown,
+            "the destination answered that it is not a repository: that is not a local failure, \
+             so nothing is claimed"
+        );
+        assert!(
+            failure
+                .message()
+                .contains("does not appear to be a git repository"),
+            "git's own reason survives: {}",
+            failure.message()
+        );
         assert_eq!(
             target.commits,
             count_commits(&repo_path, "HEAD").await.expect("count"),
             "the branch is reported with the commits it carries"
         );
         assert!(state.has_sync_work());
+
+        let refused = run_git_sync(&repo_path)
+            .await
+            .expect_err("a push to a removed remote cannot succeed");
+        assert!(
+            refused
+                .message()
+                .contains("does not appear to be a git repository"),
+            "a press reports what git said: {}",
+            refused.message()
+        );
     }
 
     /// The destination the control names is the one a plain `git push` reaches: a configured
@@ -2514,7 +2617,7 @@ mod tests {
             panic!("expected a push target, got {:?}", state.push);
         };
         assert_eq!(target.remote, "backup", "the control names the push remote");
-        assert_eq!(target.publish, Some(false));
+        assert_eq!(target.probe, DestinationProbe::Carries);
         assert_eq!(target.commits, 1);
 
         let report = run_git_sync(&repo_path).await.expect("sync");
@@ -2602,8 +2705,8 @@ mod tests {
         };
         assert_eq!(target.remote, "origin");
         assert_eq!(
-            target.publish,
-            Some(false),
+            target.probe,
+            DestinationProbe::Carries,
             "origin already carries the branch"
         );
         assert_eq!(target.commits, 1);
@@ -2641,8 +2744,8 @@ mod tests {
         };
         assert_eq!(target.remote, "origin");
         assert_eq!(
-            target.publish,
-            Some(true),
+            target.probe,
+            DestinationProbe::Absent,
             "origin no longer carries the branch"
         );
 
@@ -2790,13 +2893,20 @@ mod tests {
         git_ok(&repo_path, &["switch", &branch]);
         commit_file(&repo_path, "local.txt", "local only");
 
-        let err = run_git_sync(&repo_path)
+        let failure = run_git_sync(&repo_path)
             .await
-            .expect_err("a diverged push must be refused")
-            .to_string();
+            .expect_err("a diverged push must be refused");
+        assert_eq!(failure.step(), GitStep::Push);
+        assert_eq!(
+            failure.kind(),
+            GitFailureKind::UpdateRejected,
+            "a refused update is not an access denial: {}",
+            failure.message()
+        );
+        let message = failure.message();
         assert!(
-            err.contains("rejected") || err.contains("non-fast-forward"),
-            "git's own refusal reason must survive: {err}"
+            message.contains("non-fast-forward") || message.contains("failed to push some refs"),
+            "git's own refusal reason must survive, not just the classification: {message}"
         );
     }
 

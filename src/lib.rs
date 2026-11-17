@@ -29,7 +29,8 @@ pub(crate) mod consensus;
 // Tickets from backlog to done: claim, dispatch, bounce handling, pause.
 pub mod pipeline;
 
-// Git wrappers and diff parsing, for the worktree checks, the dashboard and nightly runs.
+// Git wrappers and diff parsing for the worktree checks, the dashboard and nightly runs, plus the
+// classification of a failed pull, push or destination probe.
 pub(crate) mod git;
 // Conversation persistence: the in-memory session, its store, the transcript snapshots.
 pub mod session;

@@ -12,8 +12,10 @@ use super::theme;
 use super::widgets;
 
 use crate::git::commands::{
-    DiffStats, GitFileStatus, GitRemoteState, GitSyncReport, GitWorktreeSnapshot,
+    DestinationProbe, DiffStats, GitFileStatus, GitPushDestination, GitRemoteState, GitSyncReport,
+    GitWorktreeSnapshot,
 };
+use crate::git::failure::{GitFailure, GitStep};
 
 use iced::widget::{Column, Space, button, column, container, row, text};
 use iced::{Alignment, Element, Length, Task};
@@ -57,6 +59,9 @@ pub(super) fn nowhere_message(reason: &str) -> String {
     format!("Nowhere to push: {reason}")
 }
 
+/// The logs target of a git sync failure row.
+const GIT_SYNC_TARGET: &str = "git-sync";
+
 /// The toast for a finished sync: git's own report, or — when nothing could be
 /// pushed — the reason, so a push that did not happen is never reported as one that did.
 fn sync_toast(report: GitSyncReport) -> super::ToastMessage {
@@ -70,6 +75,23 @@ fn sync_toast(report: GitSyncReport) -> super::ToastMessage {
         None if output.is_empty() => super::ToastMessage::SuccessMsg("Sync completed".to_string()),
         None => super::ToastMessage::SuccessMsg(format!("Sync completed:\n{output}")),
     }
+}
+
+/// The toast for a failed sync. Its message already opens with the step that failed, so it is
+/// shown as-is rather than behind the generic `Failed: ` frame; a result that belongs to a
+/// workspace no longer on screen also names it, so the toast cannot be read as a failure of what
+/// is on screen now.
+fn failure_toast(
+    workspace: &str,
+    failure: &GitFailure,
+    same_workspace: bool,
+) -> super::ToastMessage {
+    let message = failure.toast();
+    super::ToastMessage::SyncFailure(if same_workspace {
+        message
+    } else {
+        format!("{workspace}: {message}")
+    })
 }
 
 /// Git state owned by the Dashboard.
@@ -90,6 +112,22 @@ pub struct GitState {
     syncing: bool,
     branch_error: Option<String>,
     new_branch_name: super::common::SingleLineEditorState,
+
+    /// The last sync-path failure on this branch: the pull, the push, or asking the destination
+    /// what it carries. The toast is gone after four seconds and the tooltip cannot be read at
+    /// length, so the branch modal shows this in full until the next sync attempt replaces it.
+    last_sync_failure: Option<GitFailure>,
+    /// The identity of the sync press in flight. Its own result is what may release
+    /// [`Self::syncing`], so a result for a press a selection change abandoned never releases a
+    /// control whose newer press is still running.
+    sync_press: Option<u64>,
+    /// The next press identity: monotonic and never reset, so no two presses share one.
+    sync_press_seq: u64,
+    /// The reason already filed in the logs per workspace, keyed by the workspace it belongs to.
+    /// The destination probe runs on a timer, so one reason is filed once — again only when it
+    /// changes or after a success in between — instead of a row a minute into a store whose
+    /// warnings are never pruned, and returning to a workspace does not re-file what it filed.
+    filed_failure: HashMap<String, String>,
 
     /// Workspace name for the currently selected workspace, used to resolve the
     /// per-workspace [`SharedFilePicker`](fff_search::SharedFilePicker) watch
@@ -178,7 +216,17 @@ pub enum GitMessage {
     BranchQueryChanged(super::editor_widget::EditorAction),
 
     Sync,
-    SyncResult(Result<GitSyncReport, String>),
+    /// A sync press finished. `id` is the press it belongs to, and `workspace`/`branch` are what
+    /// it was pressed for: a result that lands after a switch belongs to what was on screen then,
+    /// not now, so it is never attributed to what replaced it.
+    SyncResult {
+        id: u64,
+        workspace: String,
+        branch: Option<String>,
+        result: Result<GitSyncReport, GitFailure>,
+    },
+    /// Copy the remembered failure's full text, which the modal also shows selectable.
+    CopyFailure,
 
     Switch(String),
     SwitchResult(Result<(), String>),
@@ -205,6 +253,10 @@ impl GitState {
             syncing: false,
             branch_error: None,
             new_branch_name: super::common::SingleLineEditorState::new(""),
+            last_sync_failure: None,
+            sync_press: None,
+            sync_press_seq: 0,
+            filed_failure: HashMap::new(),
             workspace_name: None,
             statuses_dirty: false,
             local_generation: 0,
@@ -251,11 +303,13 @@ impl GitState {
         self.workspace_path.is_some()
     }
 
-    /// Clear all cached git info (diff stats, per-file statuses, branch, remote state, modal).
-    /// Does **not** clear `workspace_path`, `workspace_name`, the watch state,
-    /// or the refresh throttle/timer state — those are managed explicitly by
-    /// [`Self::set_workspace_path`] and the periodic/deferred timers. Bumps both
-    /// generations so refresh results still in flight for the previous state
+    /// Clear all cached git info (diff stats, per-file statuses, branch, remote state, modal, and
+    /// the remembered sync failure).
+    /// Does **not** clear `workspace_path`, `workspace_name`, the watch state, the refresh
+    /// throttle/timer state, or the filed-failure record (which is per workspace and outlives a
+    /// selection) — the first four are managed explicitly by [`Self::set_workspace_path`] and the
+    /// periodic/deferred timers, the last by `file_failure` and the sync result arms.
+    /// Bumps both generations so refresh results still in flight for the previous state
     /// are discarded as stale.
     pub fn clear(&mut self) {
         self.diff_stats = None;
@@ -269,6 +323,11 @@ impl GitState {
         self.show_branch_modal = false;
         self.new_branch_name.clear();
         self.syncing = false;
+        // A failure belongs to the branch that produced it: the new selection starts without
+        // one, and a press still in flight for the previous workspace no longer owns the
+        // control (its result is still toasted and filed for its own workspace).
+        self.last_sync_failure = None;
+        self.sync_press = None;
         self.local_generation += 1;
         self.remote_generation += 1;
     }
@@ -364,6 +423,14 @@ impl GitState {
                 if generation == self.local_generation
                     && let Ok(branch) = result
                 {
+                    // A failure belongs to the branch that was checked out when it happened.
+                    if self
+                        .current_branch
+                        .as_deref()
+                        .is_some_and(|known| known != branch)
+                    {
+                        self.last_sync_failure = None;
+                    }
                     self.current_branch = Some(branch);
                 }
                 Task::none()
@@ -372,6 +439,36 @@ impl GitState {
                 if generation == self.remote_generation
                     && let Ok(state) = result
                 {
+                    // The probe describes the branch it asked for: a state that arrived after the
+                    // checked-out branch changed is not what the modal or the log may attribute
+                    // here. Before the branch has resolved (a switch batches both refreshes) the
+                    // current generation is the evidence there is, and it does belong to this
+                    // workspace — gating on a branch that is not known yet would drop the first
+                    // failure the owner sees after selecting a workspace.
+                    let same_branch = state.as_ref().is_some_and(|state| {
+                        self.current_branch
+                            .as_deref()
+                            .is_none_or(|known| known == state.branch)
+                    });
+                    if let Some(GitPushDestination::Target(target)) =
+                        state.as_ref().map(|state| &state.push)
+                        && same_branch
+                    {
+                        match &target.probe {
+                            DestinationProbe::Unknown {
+                                failure: Some(failure),
+                            } => self.remember_probe_failure(failure),
+                            // A probe that answered is the success in between that makes a
+                            // later failure of the same reason news again; one that never ran
+                            // (another fetch held the ref locks) proves nothing either way.
+                            DestinationProbe::Carries | DestinationProbe::Absent => {
+                                if let Some(workspace) = &self.workspace_name {
+                                    self.filed_failure.remove(workspace);
+                                }
+                            }
+                            DestinationProbe::Unknown { failure: None } => {}
+                        }
+                    }
                     self.remote = state;
                 }
                 Task::none()
@@ -520,31 +617,88 @@ impl GitState {
                 if self.syncing {
                     return Task::none();
                 }
-                let ws_path = self.workspace_path.clone();
+                // A press needs a workspace to sync; the branch is only how the result is
+                // attributed, and the first tick after a workspace switch may not have resolved
+                // it yet.
+                let (Some(path), Some(workspace)) =
+                    (self.workspace_path.clone(), self.workspace_name.clone())
+                else {
+                    return Task::none();
+                };
+                let branch = self.current_branch.clone();
                 self.syncing = true;
+                self.sync_press_seq += 1;
+                let id = self.sync_press_seq;
+                self.sync_press = Some(id);
                 Task::perform(
-                    with_ws_path(ws_path, |path: PathBuf| async move {
-                        crate::git::commands::run_git_sync(&path)
-                            .await
-                            .map_err(|e| e.to_string())
-                    }),
-                    GitMessage::SyncResult,
+                    async move { crate::git::commands::run_git_sync(&path).await },
+                    move |result| GitMessage::SyncResult {
+                        id,
+                        workspace,
+                        branch,
+                        result,
+                    },
                 )
             }
-            GitMessage::SyncResult(result) => {
-                self.syncing = false;
+            GitMessage::SyncResult {
+                id,
+                workspace,
+                branch,
+                result,
+            } => {
+                // Only the press in flight releases its own control: a result for a press that a
+                // selection change already abandoned must not re-enable a control whose newer
+                // press is still running, and a press whose branch was switched under it must
+                // not leave the control disabled.
+                if self.sync_press == Some(id) {
+                    self.sync_press = None;
+                    self.syncing = false;
+                }
+                // Whatever the screen shows now, the result belongs to the workspace and branch
+                // that produced it: it is toasted, and a failure is filed for that workspace.
+                // Only the branch modal is scoped to what is on screen.
+                let same_workspace = self.workspace_name.as_deref() == Some(workspace.as_str());
+                let on_screen = same_workspace
+                    && branch
+                        .as_deref()
+                        .is_none_or(|pressed| self.current_branch.as_deref() == Some(pressed));
                 match result {
-                    Ok(report) => Task::batch([
-                        Task::done(GitMessage::Toast(sync_toast(report))),
-                        // A sync (pull/push) moved refs and possibly files, so
-                        // refresh promptly — the watcher is silent to ref-only changes.
-                        self.refresh_after_git_op(),
-                    ]),
-                    Err(e) => Task::done(GitMessage::Toast(super::ToastMessage::Error(format!(
-                        "Sync failed: {e}"
-                    )))),
+                    Ok(report) => {
+                        // The attempt succeeded: the remembered failure is over, and a later
+                        // recurrence of the same reason is news again.
+                        self.filed_failure.remove(&workspace);
+                        if !on_screen {
+                            return Task::done(GitMessage::Toast(sync_toast(report)));
+                        }
+                        self.last_sync_failure = None;
+                        Task::batch([
+                            Task::done(GitMessage::Toast(sync_toast(report))),
+                            // A sync (pull/push) moved refs and possibly files, so
+                            // refresh promptly — the watcher is silent to ref-only changes.
+                            self.refresh_after_git_op(),
+                        ])
+                    }
+                    Err(failure) => {
+                        self.file_failure(&workspace, &failure);
+                        // A press's own result replaces whatever the modal showed, and is what
+                        // the screen may attribute to the branch it was pressed on.
+                        if on_screen {
+                            self.last_sync_failure = Some(failure.clone());
+                        }
+                        Task::done(GitMessage::Toast(failure_toast(
+                            &workspace,
+                            &failure,
+                            same_workspace,
+                        )))
+                    }
                 }
             }
+            GitMessage::CopyFailure => self
+                .last_sync_failure
+                .as_ref()
+                .map_or_else(Task::none, |failure| {
+                    iced::clipboard::write(failure.message())
+                }),
 
             GitMessage::Switch(branch) => {
                 if self.syncing {
@@ -608,6 +762,83 @@ impl GitState {
         }
     }
 
+    /// The remembered sync failure for the branch modal: the claim, git's reason, and a copy
+    /// control. The text is selectable and already credential-scrubbed and length-capped, and the
+    /// bounded scroll keeps a long report from stretching the dialog.
+    fn failure_block(&self) -> Element<'_, GitMessage> {
+        let Some(failure) = self.last_sync_failure.as_ref() else {
+            return container(text("")).into();
+        };
+        column![
+            row![
+                text("Last sync failure")
+                    .size(theme::TEXT_12)
+                    .color(theme::STATUS_ERROR),
+                Space::new().width(Length::Fill),
+                button(
+                    text("Copy")
+                        .size(theme::TEXT_11)
+                        .color(theme::TEXT_SECONDARY),
+                )
+                .padding([theme::PAD_2, theme::PAD_6])
+                .style(theme::button_text)
+                .on_press(GitMessage::CopyFailure),
+            ]
+            .align_y(Alignment::Center),
+            super::widgets::vscroll_sized(
+                super::widgets::selectable_text(failure.message(), theme::STATUS_ERROR)
+                    .size(theme::TEXT_12)
+                    .width(Length::Fill),
+                Length::Fill,
+                Length::Fixed(96.0),
+            ),
+        ]
+        .spacing(theme::SPACE_4)
+        .into()
+    }
+
+    /// Keep the destination probe's failure for the branch modal and file it for the workspace on
+    /// screen.
+    ///
+    /// The probe runs every minute, so its failure must not bury what the owner's own press
+    /// reported: it never replaces a press's result, while a press replaces whatever was there.
+    fn remember_probe_failure(&mut self, failure: &GitFailure) {
+        let presses_own = self
+            .last_sync_failure
+            .as_ref()
+            .is_some_and(|kept| kept.step() != GitStep::Probe);
+        if !presses_own {
+            self.last_sync_failure = Some(failure.clone());
+        }
+        let Some(workspace) = self.workspace_name.clone() else {
+            return;
+        };
+        self.file_failure(&workspace, failure);
+    }
+
+    /// File the failure in the product's logs, attributed to `workspace` — the one it belongs to,
+    /// which is not necessarily the one on screen — and once per distinct cause. The reason is
+    /// already scrubbed of credentials and length-capped, so the never-pruned row cannot grow
+    /// with a pathological report, and the record is kept per workspace, so a result that arrives
+    /// after a switch is still filed without disturbing the workspace on screen.
+    fn file_failure(&mut self, workspace: &str, failure: &GitFailure) {
+        let key = failure.dedupe_key();
+        if self.filed_failure.get(workspace) == Some(&key) {
+            return;
+        }
+        crate::logs::record_warn_row(
+            GIT_SYNC_TARGET,
+            &failure.message(),
+            serde_json::json!({
+                "step": failure.step().label(),
+                "kind": failure.kind().label(),
+                "remote": failure.remote(),
+            }),
+            workspace,
+        );
+        self.filed_failure.insert(workspace.to_string(), key);
+    }
+
     fn finish_branch_op(
         &mut self,
         result: Result<(), String>,
@@ -617,6 +848,8 @@ impl GitState {
         match result {
             Ok(()) => {
                 self.show_branch_modal = false;
+                // The failure belonged to the branch that was checked out then.
+                self.last_sync_failure = None;
                 // A branch switch/create moved refs and possibly files, so
                 // refresh promptly — the watcher is silent to ref-only changes.
                 let refresh = self.refresh_after_git_op();
@@ -693,6 +926,11 @@ impl GitState {
             container(text("")).into()
         };
 
+        // The last sync failure, in full: the toast is gone in four seconds and the sync
+        // control's tooltip cannot be read at length or copied, so this is where the reason
+        // stays.
+        let failure_elem = self.failure_block();
+
         let create_input = super::widgets::single_line_editor(
             &self.new_branch_name.buffer,
             "New branch name…",
@@ -725,6 +963,7 @@ impl GitState {
             Space::new().height(8),
             list,
             error_elem,
+            failure_elem,
             Space::new().height(8),
             row![create_input, create_btn]
                 .spacing(theme::SPACE_8)
@@ -966,6 +1205,7 @@ impl GitState {
 mod tests {
     use super::*;
     use crate::git::commands::{GitPushDestination, GitPushTarget};
+    use crate::git::failure::GitFailureKind;
     use Watch::{Failed, Register, Registered};
 
     fn state_with_gen(generation: u64) -> GitState {
@@ -994,7 +1234,7 @@ mod tests {
         GitPushDestination::Target(GitPushTarget {
             remote: "origin".into(),
             commits,
-            publish: Some(false),
+            probe: DestinationProbe::Carries,
         })
     }
 
@@ -1005,6 +1245,19 @@ mod tests {
             branch: branch.into(),
             behind,
             push: origin_target(5),
+        }
+    }
+
+    /// A remote state whose destination probe failed (`Some`) or never ran (`None`).
+    fn probe_state(failure: Option<GitFailure>) -> GitRemoteState {
+        GitRemoteState {
+            branch: "main".into(),
+            behind: 0,
+            push: GitPushDestination::Target(GitPushTarget {
+                remote: "origin".into(),
+                commits: 1,
+                probe: DestinationProbe::Unknown { failure },
+            }),
         }
     }
 
@@ -1148,6 +1401,332 @@ mod tests {
             assert_eq!(s.take_status_forward(), forward, "case {name}: forward");
             assert_eq!(s.take_status_forward(), None, "case {name}: claimed once");
         }
+    }
+
+    /// A failure the owner's press produced stays until the next press, and a probe failure —
+    /// which runs every minute — never buries it. The probe only fills an empty slot.
+    #[test]
+    fn test_press_failure_outlives_probe_failure() {
+        let mut s = state_with_gen(7);
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        s.workspace_name = Some("ws".into());
+        let press = GitFailure::new(
+            GitStep::Push,
+            Some("origin"),
+            GitFailureKind::UpdateRejected,
+            "! [rejected] main -> main (fetch first)",
+        );
+        let probe = GitFailure::new(
+            GitStep::Probe,
+            Some("origin"),
+            GitFailureKind::AccessRefused,
+            "fatal: Authentication failed",
+        );
+
+        let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
+        let _ = s.update(GitMessage::Sync);
+        let id = s.sync_press.expect("the press is in flight");
+        let _ = s.update(GitMessage::SyncResult {
+            id,
+            workspace: "ws".into(),
+            branch: Some("main".into()),
+            result: Err(press.clone()),
+        });
+        let _ = s.update(GitMessage::RemoteState(
+            7,
+            Ok(Some(probe_state(Some(probe.clone())))),
+        ));
+        assert_eq!(
+            s.last_sync_failure,
+            Some(press),
+            "the press's own result is kept"
+        );
+
+        // A press that succeeds is the next attempt: the failure is over.
+        let _ = s.update(GitMessage::Sync);
+        let id = s.sync_press.expect("the press is in flight");
+        let _ = s.update(GitMessage::SyncResult {
+            id,
+            workspace: "ws".into(),
+            branch: Some("main".into()),
+            result: Ok(GitSyncReport {
+                output: "Everything up-to-date".into(),
+                not_pushed: None,
+            }),
+        });
+        assert_eq!(s.last_sync_failure, None);
+
+        // With nothing remembered, the probe's own failure is what the modal shows. A successful
+        // press arms the footer's refresh, which bumps the generation the probe result must match.
+        let generation = s.remote_generation;
+        let _ = s.update(GitMessage::RemoteState(
+            generation,
+            Ok(Some(probe_state(Some(probe.clone())))),
+        ));
+        assert_eq!(s.last_sync_failure, Some(probe));
+
+        // A branch switch is not the branch that failed: the modal stops showing it.
+        let generation = s.local_generation;
+        let _ = s.update(GitMessage::CurrentBranch(generation, Ok("next".into())));
+        assert_eq!(s.last_sync_failure, None);
+    }
+
+    /// The probe runs on a timer, so one reason is filed once — again only after a success in
+    /// between — and a probe that never ran proves nothing either way. The same git text from a
+    /// different step is a different fact: the log must hold the failed pull too.
+    #[test]
+    fn test_failure_filed_once_per_workspace() {
+        let mut s = state_with_gen(7);
+        s.workspace_name = Some("ws".into());
+        s.current_branch = Some("main".into());
+        let report = "fatal: unable to access 'https://x/': Could not resolve host: x";
+        let probe = GitFailure::new(
+            GitStep::Probe,
+            Some("origin"),
+            GitFailureKind::Unreachable,
+            report,
+        );
+
+        let _ = s.update(GitMessage::CurrentBranch(7, Ok("main".into())));
+        let _ = s.update(GitMessage::RemoteState(
+            7,
+            Ok(Some(probe_state(Some(probe.clone())))),
+        ));
+        let filed = s.filed_failure.get("ws").cloned();
+        assert!(filed.is_some(), "the first failure is filed");
+
+        let _ = s.update(GitMessage::RemoteState(
+            7,
+            Ok(Some(probe_state(Some(probe)))),
+        ));
+        assert_eq!(
+            s.filed_failure.get("ws"),
+            filed.as_ref(),
+            "the same reason is not filed twice"
+        );
+
+        // The probe failing and the owner's own press failing are two facts, even when git said
+        // the same thing: the row for the press must exist too.
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        let _ = s.update(GitMessage::Sync);
+        let id = s.sync_press.expect("the press is in flight");
+        let pull = GitFailure::new(
+            GitStep::Pull,
+            Some("origin"),
+            GitFailureKind::Unreachable,
+            report,
+        );
+        let _ = s.update(GitMessage::SyncResult {
+            id,
+            workspace: "ws".into(),
+            branch: Some("main".into()),
+            result: Err(pull),
+        });
+        let pull_filed = s.filed_failure.get("ws").cloned();
+        assert!(
+            pull_filed.is_some() && pull_filed != filed,
+            "the press is filed"
+        );
+
+        // A probe that never ran (another fetch held the ref locks) proves nothing either way.
+        let _ = s.update(GitMessage::RemoteState(7, Ok(Some(probe_state(None)))));
+        assert_eq!(
+            s.filed_failure.get("ws"),
+            pull_filed.as_ref(),
+            "a probe that never ran is not a success in between"
+        );
+
+        // A probe that answers is the success in between: the same reason is news again.
+        let _ = s.update(GitMessage::RemoteState(7, Ok(Some(remote("main", 0)))));
+        assert_eq!(
+            s.filed_failure.get("ws"),
+            None,
+            "a success forgets the filed reason"
+        );
+    }
+
+    /// A result that lands after a workspace switch is still the owner's own: it is filed for the
+    /// workspace that produced it, and never shown for the one now on screen. Returning to a
+    /// workspace does not file what it already filed.
+    #[test]
+    fn test_failure_after_switch_is_filed_for_its_own_workspace() {
+        let mut s = state_with_gen(7);
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        s.workspace_name = Some("a".into());
+        s.current_branch = Some("main".into());
+        let _ = s.update(GitMessage::Sync);
+        let id = s.sync_press.expect("the press is in flight");
+
+        // The owner selects another workspace while the press is still running.
+        let _ = s.set_workspace_path(Some("b".into()), Some("/nonexistent-b".into()));
+        let failure = GitFailure::new(
+            GitStep::Pull,
+            Some("origin"),
+            GitFailureKind::AccessRefused,
+            "fatal: Authentication failed",
+        );
+        let _ = s.update(GitMessage::SyncResult {
+            id,
+            workspace: "a".into(),
+            branch: Some("main".into()),
+            result: Err(failure.clone()),
+        });
+        assert_eq!(
+            s.last_sync_failure, None,
+            "not shown for the workspace now on screen"
+        );
+        assert_eq!(
+            s.filed_failure.get("a"),
+            Some(&failure.dedupe_key()),
+            "filed for the workspace it belongs to"
+        );
+        assert_eq!(s.filed_failure.get("b"), None);
+
+        // Back on "a", the periodic probe's failure is filed once; selecting another workspace
+        // and returning does not file it again, because the record is per workspace and outlives
+        // the selection.
+        let _ = s.set_workspace_path(Some("a".into()), Some("/nonexistent".into()));
+        let generation = s.remote_generation;
+        let _ = s.update(GitMessage::RemoteState(
+            generation,
+            Ok(Some(probe_state(Some(failure.clone())))),
+        ));
+        let probe_key = s.filed_failure.get("a").cloned();
+        assert!(probe_key.is_some(), "the probe's own failure is filed");
+
+        let _ = s.set_workspace_path(Some("b".into()), Some("/nonexistent-b".into()));
+        let _ = s.set_workspace_path(Some("a".into()), Some("/nonexistent".into()));
+        let generation = s.remote_generation;
+        let _ = s.update(GitMessage::RemoteState(
+            generation,
+            Ok(Some(probe_state(Some(failure)))),
+        ));
+        assert_eq!(
+            s.filed_failure.get("a"),
+            probe_key.as_ref(),
+            "returning to a workspace does not re-file it"
+        );
+    }
+
+    /// A press releases the control only when its own result lands: a branch switched under it
+    /// must not leave the control disabled, and a superseded press must not release a newer one.
+    #[test]
+    fn test_sync_result_releases_its_own_press() {
+        let mut s = state_with_gen(7);
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        s.workspace_name = Some("ws".into());
+        s.current_branch = Some("main".into());
+        let failure = GitFailure::new(
+            GitStep::Push,
+            Some("origin"),
+            GitFailureKind::Local,
+            "no branch is checked out",
+        );
+
+        let _ = s.update(GitMessage::Sync);
+        assert!(s.is_syncing(), "the press is in flight");
+        let first = s.sync_press.expect("the press is in flight");
+        // The branch changed under the press (an external checkout): the result releases the
+        // control but is not what the modal shows for the branch on screen.
+        let _ = s.update(GitMessage::CurrentBranch(7, Ok("next".into())));
+        let _ = s.update(GitMessage::SyncResult {
+            id: first,
+            workspace: "ws".into(),
+            branch: Some("main".into()),
+            result: Err(failure.clone()),
+        });
+        assert!(!s.is_syncing(), "the press that ended releases the control");
+        assert_eq!(
+            s.last_sync_failure, None,
+            "the previous branch's failure is not shown"
+        );
+
+        // A press whose result was superseded does not release the newer press's control.
+        let _ = s.update(GitMessage::Sync);
+        assert!(s.is_syncing());
+        let second = s.sync_press.expect("the press is in flight");
+        assert_ne!(first, second, "every press has its own identity");
+        let _ = s.update(GitMessage::SyncResult {
+            id: first,
+            workspace: "ws".into(),
+            branch: Some("main".into()),
+            result: Err(failure.clone()),
+        });
+        assert!(
+            s.is_syncing(),
+            "a superseded press does not release the one in flight"
+        );
+        let _ = s.update(GitMessage::SyncResult {
+            id: second,
+            workspace: "ws".into(),
+            branch: None,
+            result: Err(failure),
+        });
+        assert!(!s.is_syncing(), "its own result releases the control");
+    }
+
+    /// A result that belongs to a workspace no longer on screen names it, so the toast cannot be
+    /// read as a failure of what is on screen now. The payload is already a full sentence, so the
+    /// generic `Failed: ` frame is not applied to it.
+    #[test]
+    fn test_failure_toast_names_the_workspace_it_belongs_to() {
+        let failure = GitFailure::new(
+            GitStep::Push,
+            Some("origin"),
+            GitFailureKind::AccessRefused,
+            "fatal: Authentication failed",
+        );
+        let crate::gui::ToastMessage::SyncFailure(here) = failure_toast("a", &failure, true) else {
+            panic!("a failed sync is an error toast");
+        };
+        assert_eq!(here, failure.toast());
+        assert!(
+            !here.starts_with("Failed"),
+            "the toast frame supplies that wording: {here}"
+        );
+
+        let crate::gui::ToastMessage::SyncFailure(elsewhere) = failure_toast("b", &failure, false)
+        else {
+            panic!("a failed sync is an error toast");
+        };
+        assert_eq!(elsewhere, format!("b: {}", failure.toast()));
+    }
+
+    /// A sync press needs only a workspace: the branch is how the result is attributed, and the
+    /// first tick after a workspace switch may not have resolved it yet.
+    #[test]
+    fn test_sync_press_runs_before_the_branch_resolves() {
+        let mut s = state_with_gen(7);
+        s.workspace_path = Some(PathBuf::from("/nonexistent"));
+        s.workspace_name = Some("ws".into());
+        let _ = s.update(GitMessage::Sync);
+        assert!(s.is_syncing(), "the press runs without a resolved branch");
+        assert!(s.sync_press.is_some());
+
+        // Nothing resolved at all: there is no workspace to sync.
+        let mut idle = state_with_gen(7);
+        let _ = idle.update(GitMessage::Sync);
+        assert!(!idle.is_syncing());
+    }
+
+    /// The first probe failure after a workspace switch is kept even though the branch has not
+    /// resolved yet: the generation already says the state belongs to this workspace.
+    #[test]
+    fn test_first_probe_failure_before_branch_resolves_is_kept() {
+        let mut s = state_with_gen(7);
+        s.workspace_name = Some("ws".into());
+        let failure = GitFailure::new(
+            GitStep::Probe,
+            Some("origin"),
+            GitFailureKind::AccessRefused,
+            "fatal: Authentication failed",
+        );
+        let _ = s.update(GitMessage::RemoteState(
+            7,
+            Ok(Some(probe_state(Some(failure.clone())))),
+        ));
+        assert_eq!(s.last_sync_failure, Some(failure));
+        assert!(s.filed_failure.contains_key("ws"));
     }
 
     #[test]

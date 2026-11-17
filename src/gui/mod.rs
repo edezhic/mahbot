@@ -48,7 +48,8 @@ pub(crate) mod workspaces;
 
 pub(crate) use self::pulse::activity_dot;
 
-use crate::git::commands::GitPushDestination;
+use crate::git::commands::{DestinationProbe, GitPushDestination};
+use crate::git::failure::GitFailure;
 use crate::logs::LogStore;
 use crate::pipeline::board::Ticket;
 
@@ -232,7 +233,11 @@ pub(crate) struct Toast {
 pub enum ToastMessage {
     Saved,
     Deleted,
+    /// A raw cause, shown behind the generic `Failed: ` frame.
     Error(String),
+    /// A failure whose message is already a full sentence naming what failed, shown as-is so the
+    /// frame does not double the failure wording.
+    SyncFailure(String),
     Warning(String),
     SuccessMsg(String),
 }
@@ -251,6 +256,7 @@ impl Toast {
             ToastMessage::Saved => Toast::new("Saved".to_string(), ToastKind::Success),
             ToastMessage::Deleted => Toast::new("Deleted".to_string(), ToastKind::Success),
             ToastMessage::Error(s) => Toast::new(format!("Failed: {s}"), ToastKind::Error),
+            ToastMessage::SyncFailure(s) => Toast::new(s.clone(), ToastKind::Error),
             ToastMessage::Warning(s) => Toast::new(s.clone(), ToastKind::Warning),
             ToastMessage::SuccessMsg(s) => Toast::new(s.clone(), ToastKind::Success),
         }
@@ -3435,7 +3441,7 @@ impl Dashboard {
         }
         let publish = matches!(
             &state.push,
-            GitPushDestination::Target(target) if target.publish == Some(true)
+            GitPushDestination::Target(target) if target.publishes()
         );
         let mut parts: Vec<Element<'_, Message>> = Vec::new();
         let tooltip_text = match &state.push {
@@ -3454,10 +3460,17 @@ impl Dashboard {
                          so nothing is pulled",
                         target.remote, target.commits
                     )
-                } else if target.publish.is_none() {
+                } else if let DestinationProbe::Unknown { failure } = &target.probe {
+                    // Reaching the remote and being told no is not the same as not reaching
+                    // it: the classified reason says which, and a probe that never ran
+                    // claims nothing.
+                    let why = failure.as_ref().map_or_else(
+                        || "it was not asked just now".to_string(),
+                        GitFailure::short,
+                    );
                     format!(
-                        "Push {} commits to {}: it could not be reached, so whether it already \
-                         carries this branch is unknown",
+                        "Push {} commits to {} \u{2014} whether it already carries this branch \
+                         is unknown: {why}",
                         target.commits, target.remote
                     )
                 } else if target.commits == 0 {
