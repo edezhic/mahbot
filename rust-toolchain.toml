@@ -4,8 +4,33 @@
 # `turso_core` 0.8.3 stops compiling on 1.100.0 — the stabilised allocator API
 # gives `Vec` an inherent `new_in` that shadows the extension trait its
 # full-text-search feature calls through — and no stable `turso` newer than 0.8.3
-# exists. Raise this only with a `turso_core` that builds on the newer compiler,
-# never below `rust-version`.
+# exists. Never below `rust-version`.
+#
+# The pin lifts with a final engine release that compiles on 1.100.0, not with
+# any build that compiles: a pre-release already qualifies and the owner declined
+# it. Nothing watches for one — the owner asked to be told, so the condition is
+# checked by hand. Established 2026-11-17 by reading the engine's sources and
+# modelling the compiler rather than building (no 1.100.0 toolchain is installed
+# here): the newest patch pre-release, 0.8.4-pre.3, still calls `DynVec::new_in`
+# unqualified in its full-text `directory.rs`, while 0.9.0-pre.5 qualifies that
+# call as `<DynVec<u8> as TursoVecInExt<..>>::new_in` and compiles. One sample
+# per release line is all that was checked. Dropping the `fts` feature cannot
+# sidestep the call: the ticket-title index needs it.
+#
+# The move: the toolchain version is stated in three declarations that must
+# agree — the `channel` below and the two `dtolnay/rust-toolchain` install steps
+# in the release workflow, which a test forces to match (the manifest's
+# `rust-version` floor is a separate, lower bound). An engine from the 0.9
+# generation, the only line known to qualify, moves as a lockstep set of three
+# crates — `turso` and `turso_sdk_kit` exact-pinned equal in Cargo.toml, plus
+# `turso_sqlite`, where the SQL dialect type now lives — and its one code change
+# is the single call site naming the dialect (`src/db/debug.rs`,
+# `turso::core::SqliteDialect`).
+#
+# A compiler cache is no reason to move the pin: it accepts this compiler, keys
+# entries on the compiler build so trees on different compilers never share them,
+# and handles both of cargo's build-directory layouts; the one thing it cannot
+# give this version is documentation caching, which no diagnostic here exercises.
 [toolchain]
 channel = "1.99.1"
 components = ["clippy", "rustfmt"]
