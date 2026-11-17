@@ -412,8 +412,7 @@ mod tests {
     use image_crate::ImageEncoder as _;
 
     /// The composer classifies by the delivery picture set, so an attachment is a picture exactly
-    /// when delivery delivers one. gif and bmp — the two formats the local codecs cannot handle —
-    /// are not pictures.
+    /// when delivery delivers one. gif, bmp and heic/heif have no local codec, so none is a picture.
     #[test]
     fn an_attachment_is_a_picture_exactly_when_delivery_delivers_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -425,7 +424,7 @@ mod tests {
         for ext in crate::util::DELIVERABLE_IMAGE_EXTENSIONS {
             assert_eq!(attach(&format!("photo.{ext}")), Kind::Image, "{ext}");
         }
-        for ext in ["gif", "bmp"] {
+        for ext in ["gif", "bmp", "heic", "heif"] {
             assert_eq!(attach(&format!("picture.{ext}")), Kind::File, "{ext}");
         }
     }

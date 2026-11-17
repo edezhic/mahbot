@@ -607,9 +607,8 @@ impl ConfigReload {
             .clone()
     }
 
-    /// `None` instead of panicking when no root is set — for a caller that may run before
-    /// [`load_or_init`] and must still answer; the module's `storage_root` is that caller's entry
-    /// point, so it gets the fallback chain as well.
+    /// `None` when no root is set yet — the state before [`load_or_init`]; `Some` is the root that
+    /// was set. Unlike [`Self::global_storage_root`], it never panics.
     #[must_use]
     pub fn try_storage_root(&self) -> Option<PathBuf> {
         self.storage_root.get().cloned()

@@ -1986,32 +1986,6 @@ async fn reply_to_command_keeps_reference() {
     assert_eq!(reply.snippet, "/clear");
 }
 
-/// The MIME fallback is derived from the delivery picture set: the four spellings the extension
-/// table carries (`image/jpg` is the legacy `image/jpeg`) route as pictures, and gif, bmp and
-/// heic/heif do not. The subtype is matched as a prefix, as the removed list was, so a declared
-/// `image/jpeg2000` still routes here and is then refused by the decode gate.
-#[test]
-fn the_mime_fallback_accepts_the_delivery_picture_spellings() {
-    for mime in ["image/png", "image/jpeg", "image/jpg", "image/webp"] {
-        assert!(is_deliverable_picture_mime(mime), "{mime}");
-    }
-    assert!(
-        is_deliverable_picture_mime("image/jpeg2000"),
-        "the subtype is matched as a prefix, as before"
-    );
-    for mime in [
-        "image/gif",
-        "image/bmp",
-        "image/x-ms-bmp",
-        "image/heic",
-        "image/heif",
-        "image/tiff",
-        "text/plain",
-    ] {
-        assert!(!is_deliverable_picture_mime(mime), "{mime}");
-    }
-}
-
 #[test]
 #[expect(clippy::too_many_lines)]
 fn attachment_content_format_rules() {
@@ -2076,9 +2050,9 @@ fn attachment_content_format_rules() {
         None,
     );
     assert_eq!(c, "[IMAGE:/tmp/workspace/image.jpg]");
-    // Document kind + no extension + jpeg MIME types → [IMAGE:] (mime fallback), admitting both the
-    // canonical image/jpeg and the legacy image/jpg alias.
-    for mime in ["image/jpeg", "image/jpg"] {
+    // Document kind + no extension + a delivery picture MIME → [IMAGE:] (mime fallback), including
+    // the legacy image/jpg alias.
+    for mime in ["image/jpeg", "image/jpg", "image/png", "image/webp"] {
         let c = format_attachment_content(
             IncomingAttachmentKind::Document,
             std::path::Path::new("/tmp/workspace/image_no_ext"),
@@ -2086,9 +2060,26 @@ fn attachment_content_format_rules() {
         );
         assert_eq!(c, "[IMAGE:/tmp/workspace/image_no_ext]", "{mime}");
     }
-    // gif/bmp MIME types are NOT routed as images (the MIME fallback is the delivery picture set)
-    // and fall through to [FILE:]; the legacy image/x-ms-bmp alias is excluded too.
-    for mime in ["image/gif", "image/bmp", "image/x-ms-bmp"] {
+    // The subtype is matched as a prefix, so a declared image/jpeg2000 still routes here and is
+    // then refused by the decode gate rather than by a list.
+    let c = format_attachment_content(
+        IncomingAttachmentKind::Document,
+        std::path::Path::new("/tmp/workspace/image_no_ext"),
+        Some("image/jpeg2000"),
+    );
+    assert_eq!(c, "[IMAGE:/tmp/workspace/image_no_ext]");
+    // gif, bmp, heic, heif and tiff MIME types are NOT routed as images (the MIME fallback is the
+    // delivery picture set) and fall through to [FILE:]; the legacy image/x-ms-bmp alias and a
+    // non-image type are excluded too.
+    for mime in [
+        "image/gif",
+        "image/bmp",
+        "image/x-ms-bmp",
+        "image/heic",
+        "image/heif",
+        "image/tiff",
+        "text/plain",
+    ] {
         let c = format_attachment_content(
             IncomingAttachmentKind::Document,
             std::path::Path::new("/tmp/workspace/anim_no_ext"),

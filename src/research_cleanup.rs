@@ -140,9 +140,8 @@ fn results_dir() -> Option<PathBuf> {
 }
 
 /// Write the run's archived answer to the shared results-archive location. Overwrites idempotently
-/// on resume; a failed write is fail-open, never blocking terminalization. The storage root is
-/// [`config::storage_root`] — CONFIG's when set, else the default config dir, and under
-/// `cargo test` the shared test root, so no test writes into the real `~/.mahbot`.
+/// on resume; a failed write is fail-open, never blocking terminalization. The root is
+/// [`config::storage_root`].
 pub(crate) async fn write_results_md(job_id: &str, result: &str) {
     let content = format!("# Research {job_id}\n\n## Result\n\n{result}\n");
     let _ = write_archive(job_id, "results.md", results_archive_path(job_id), &content).await;

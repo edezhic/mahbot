@@ -1067,10 +1067,8 @@ pub(crate) async fn check_reference_total_input(paths: &[PathBuf]) -> anyhow::Re
     Ok(())
 }
 
-/// The cheap half of the reference gate: refuse a name that cannot be decoded BEFORE any read, so a
-/// 49 MB HEIC is never loaded just to be refused. Deliberately its own list rather than
-/// [`DELIVERABLE_IMAGE_EXTENSIONS`]: the refusal must stay ahead of the read, and a delivery list
-/// that later widened would silently turn the refusal into a full read.
+/// Deliberately its own list rather than [`DELIVERABLE_IMAGE_EXTENSIONS`]: the delivery set answers
+/// what the product delivers, and a widening of it must not silently widen this gate.
 fn check_reference_extension(path: &Path) -> anyhow::Result<()> {
     let ext = path
         .extension()
