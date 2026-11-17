@@ -596,15 +596,14 @@ fn extract_tar_gz(
     for entry in entries {
         let mut entry = entry
             .map_err(|e| format!("a release archive entry could not be read ({})", e.kind()))?;
-        let path = entry
-            .path()
-            .map_err(|e| {
-                format!(
-                    "a release archive entry path could not be read ({})",
-                    e.kind()
-                )
-            })?
-            .into_owned();
+        // An entry name that does not decode names nothing anyone asked for — the wanted names
+        // are matched exactly — so it is skipped like an entry under a path nobody asked for.
+        // Unlike the zip reader's, this arm is reachable: tar has no single-byte fallback, and
+        // one such name must not fail a download the wanted names would otherwise complete.
+        let Ok(path) = entry.path() else {
+            continue;
+        };
+        let path = path.into_owned();
         if !entry.header().entry_type().is_file() {
             continue;
         }
@@ -733,8 +732,10 @@ pub(crate) fn extract_named_files_zip(
         if !entry.is_file() {
             continue;
         }
-        // A name that does not decode cannot be one of the names wanted here — those are matched
-        // exactly — so it is skipped like an entry under a path nobody asked for.
+        // This archive library falls back to a single-byte encoding, so a name it refuses is not
+        // a case a real archive reaches; one that does not decode names nothing anyone asked
+        // for — the wanted names are matched exactly — so it is skipped like an entry under a
+        // path nobody asked for.
         let Some(name) = entry.name().ok() else {
             continue;
         };

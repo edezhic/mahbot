@@ -285,11 +285,11 @@ resvg = { version = "0.50", default-features = false, features = ["text", "syste
 #                 parse result *is* the delivered text, so a new release's
 #                 behaviour change must be taken deliberately, not at the next
 #                 `cargo update`. Its own `zip` requirement is the reason the
-#                 archive crate is on the same major. The releases since 0.1.13
-#                 change delivered text on purpose: a `.ppt` whose shape keeps
-#                 its text in a `metroBlob` package is now read (such a deck
-#                 used to come out nearly empty with `Ok`), and a `.doc` run in
-#                 Symbol/Wingdings/Webdings now reads as the characters those
+#                 archive crate is on the same major. The releases this pin has
+#                 taken change delivered text on purpose: a `.ppt` whose shape
+#                 keeps its text in a `metroBlob` package is now read (such a
+#                 deck used to come out nearly empty with `Ok`), and a `.doc` run
+#                 in Symbol/Wingdings/Webdings now reads as the characters those
 #                 fonts draw instead of private-use codes. The pin is what makes
 #                 each such change a deliberate step.
 pdf-extract = { version = "0.12", default-features = false }

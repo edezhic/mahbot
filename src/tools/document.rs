@@ -4918,6 +4918,12 @@ mod tests {
         crate::legacy::test_fixtures::xls_fixture("secret", true)
     }
 
+    /// A password-protected legacy `.ppt`: the reader's own encrypted fixture, whose document
+    /// stream carries the flag only the reader can see.
+    fn encrypted_legacy_ppt() -> Vec<u8> {
+        crate::legacy::test_fixtures::ppt_fixture("secret", None, true)
+    }
+
     /// A one-page PDF with a single fillable field named `name`; the kit authors no form, so the
     /// fixture is written here.
     fn fillable_pdf() -> Vec<u8> {
@@ -5108,7 +5114,7 @@ mod tests {
         drop((dir, outside));
     }
 
-    /// An encrypted legacy `.doc` or `.xls` is the password verdict, not the old formats'
+    /// An encrypted legacy `.doc`, `.xls` or `.ppt` is the password verdict, not the old formats'
     /// sentence: only the family's own reader can see the password, so the classifier asks it.
     /// The verdict must win over every action's own family check — the write path refuses the
     /// input on it, which is what keeps an encrypted workbook from being written as if it were
@@ -5119,6 +5125,7 @@ mod tests {
         for (name, bytes) in [
             ("secret.doc", encrypted_legacy_doc()),
             ("secret.xls", encrypted_legacy_xls()),
+            ("secret.ppt", encrypted_legacy_ppt()),
         ] {
             let secret = write_fixture(&ws, name, &bytes);
 

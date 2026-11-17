@@ -149,7 +149,7 @@ fn next_event(reader: &mut Xml<'_>, buffer: &mut Vec<u8>) -> Ev {
         Ok(Event::Start(event)) => Ev::Start(Elem::of(&event)),
         Ok(Event::Empty(event)) => Ev::Empty(Elem::of(&event)),
         Ok(Event::End(_)) => Ev::End,
-        // The part was decoded lossily before the walk ([`part_text`]).
+        // The part was decoded lossily before the walk (`part_text`).
         Ok(Event::Text(event)) => Ev::Text(event.xml10_content().into_owned()),
         Ok(Event::GeneralRef(reference)) => {
             let mut text = String::new();

@@ -1184,7 +1184,7 @@ pub(crate) mod test_fixtures {
 
     /// A `.ppt`, encrypted or not: an encrypted deck needs only the encrypted `CurrentUserAtom`
     /// token, as the reader refuses it before reading the ciphertext past the edit.
-    pub(super) fn ppt_fixture(slide_text: &str, notes: Option<&str>, encrypted: bool) -> Vec<u8> {
+    pub(crate) fn ppt_fixture(slide_text: &str, notes: Option<&str>, encrypted: bool) -> Vec<u8> {
         let (stream, edit_offset) = ppt_document_stream(slide_text, notes, None, None);
         ppt_cfb(&stream, edit_offset, encrypted, None)
     }
@@ -1378,9 +1378,6 @@ mod tests {
                 ),
                 "{family:?}"
             );
-            // The verdict the write path acts on, from the very same fixture: it asks this
-            // before it reserves an output file.
-            assert!(is_encrypted(&fixture, family), "{family:?}");
         }
     }
 

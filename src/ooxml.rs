@@ -1461,9 +1461,10 @@ fn append_entity(text: &mut String, reference: &BytesRef<'_>) {
     }
 }
 
-/// The package's entry names, each as text. The archive library reports a name as a `Result`;
-/// one it could not decode names no part of any reading, so it is dropped like an entry under a
-/// prefix a caller does not look for.
+/// The package's entry names, each as text. This archive library falls back to a single-byte
+/// encoding, so a name it cannot decode is not a case a real package reaches; one that does not
+/// decode names nothing anyone asked for — the wanted names are matched exactly — so it is
+/// skipped like an entry under a path nobody asked for.
 pub(crate) fn entry_names<R: Read + Seek>(
     archive: &ZipArchive<R>,
 ) -> impl Iterator<Item = Cow<'_, str>> + '_ {
