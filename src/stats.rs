@@ -51,8 +51,9 @@ impl CallSource {
 /// Longer arguments are truncated at a UTF-8-safe boundary.
 const MAX_STATS_ARG_LENGTH: usize = 500;
 
-/// The `arguments` text one tool call is recorded with: the arguments serialized, then
-/// capped to [`MAX_STATS_ARG_LENGTH`].
+/// The `arguments` text one tool call is recorded with: the arguments serialized, then capped to
+/// [`MAX_STATS_ARG_LENGTH`]. It records what it is handed — the caller asks the tool first
+/// ([`crate::Tool::recorded_arguments`]).
 pub(crate) fn recorded_arguments(args: &serde_json::Value) -> String {
     let serialized = serde_json::to_string(args).expect("Value is always serializable");
     crate::util::truncate_bytes(&serialized, MAX_STATS_ARG_LENGTH).to_string()
@@ -501,13 +502,14 @@ mod tests {
     use super::*;
 
     /// `recorded_arguments` records the serialized arguments as produced, capped at
-    /// [`MAX_STATS_ARG_LENGTH`].
+    /// [`MAX_STATS_ARG_LENGTH`]. What it is handed is what it writes — keeping a secret out is the
+    /// recording caller's job, done where the tool declares it.
     #[test]
-    fn recorded_arguments_keeps_the_arguments_and_caps_them() {
-        let args = serde_json::json!({"action": "search", "query": "rust"});
+    fn recorded_arguments_are_recorded_as_produced_and_capped() {
+        // A short argument set is recorded exactly as produced, key order and all.
         assert_eq!(
-            recorded_arguments(&args),
-            serde_json::to_string(&args).expect("Value is always serializable")
+            recorded_arguments(&serde_json::json!({ "action": "search", "query": "cats" })),
+            r#"{"action":"search","query":"cats"}"#
         );
 
         let args = serde_json::json!({

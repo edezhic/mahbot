@@ -19,6 +19,10 @@
 //! of the running exe, copy in, deferred deletion) — the product no longer copies
 //! itself into any toolchain's directory, in either mode.
 //!
+//! Under a systemd unit there is no replacement process to start: the unit tracks this
+//! PID, so the update execs the new binary in place — same PID, same unit, same cgroup —
+//! and the service keeps running under it ([`exec_in_place`]).
+//!
 //! A downloaded copy also updates *itself*: the periodic release check
 //! ([`run_update_availability_refresh`]) starts the very same update with no
 //! prompt while the owner's Autoupdate switch is on, and a round the restart cuts
@@ -96,11 +100,10 @@ use tracing::{debug, error, info, warn};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Environment marker the updating parent sets (to `"1"`) on the replacement
-/// instance it spawns; [`acquire_lock`] owns what it does. It reaches an agent's
-/// unix shell (that shell's environment is the process's) and the GUI Shell tab's
-/// PTY, but not git children (cleared environment) nor Windows (environment
-/// assembled from the account), so a `mahbot` launched from the replacement's own
-/// terminal takes the hand-off wait once before the ordinary refusal.
+/// instance it spawns; [`acquire_lock`] owns what it does. [`take_handoff_marker`]
+/// reads it and clears it as the first instruction of `main`, so it describes this
+/// launch alone: a `mahbot` started from a shell the instance spawned is an ordinary
+/// launch, refused at once rather than made to wait out the hand-off.
 const HANDOFF_ENV: &str = "MAHBOT_UPDATE_HANDOFF";
 
 /// Environment marker the updating parent sets on the replacement instance it
@@ -184,10 +187,32 @@ fn wait_for_handoff(lock_path: &Path) -> Result<File> {
 
 /// Whether this launch is the updater's replacement of a previous instance
 /// ([`HANDOFF_ENV`]), which takes the location over rather than being a second
-/// launch of the product.
+/// launch of the product. Read from [`take_handoff_marker`], never from the live
+/// environment: the marker is this launch's alone.
 #[must_use]
 pub fn is_handoff() -> bool {
-    std::env::var(HANDOFF_ENV).is_ok_and(|value| value == "1")
+    *HANDOFF.get().unwrap_or(&false)
+}
+
+/// The hand-off fact, captured once by [`take_handoff_marker`].
+static HANDOFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Read the hand-off marker and clear it from the environment, so nothing this instance starts
+/// inherits it: a `mahbot` launched from a shell it spawned would otherwise take the hand-off wait
+/// and then be refused with exit 1 instead of the ordinary "already running" at once. Called as the
+/// first instruction of `main`, where the process has one thread — the condition
+/// [`std::env::remove_var`] requires.
+pub fn take_handoff_marker() {
+    let _ = HANDOFF.set(read_and_clear_handoff_marker());
+}
+
+/// The read and the clear, apart from the once-per-process cell so both halves are testable.
+fn read_and_clear_handoff_marker() -> bool {
+    let set = std::env::var(HANDOFF_ENV).is_ok_and(|value| value == "1");
+    // SAFETY: the caller is the first instruction of `main`, before any thread or runtime exists,
+    // so nothing can be reading the environment while it is changed.
+    unsafe { std::env::remove_var(HANDOFF_ENV) };
+    set
 }
 
 /// The wording every instance refusal carries. It is a matched surface — the shell
@@ -1832,9 +1857,13 @@ async fn finalize_source_tree_update(
 ///    cannot delete the binary the child is validating (macOS syspolicyd SIGKILLs a
 ///    child whose binary is deleted during validation).
 /// 4. Release the instance lock so the child can acquire it.
-/// 5. Spawn the new instance marked as the update hand-off ([`HANDOFF_ENV`] — see
+/// 5. Under a systemd unit, exec the new binary in place ([`exec_in_place`]) and never return:
+///    the unit's main process is this one, so the service survives only if the PID does. An
+///    exec that fails keeps the process alive on the old image and returns `Err` — no detached
+///    replacement is spawned then, since it would run outside the unit the old process left.
+/// 6. Otherwise spawn the new instance marked as the update hand-off ([`HANDOFF_ENV`] — see
 ///    [`acquire_lock`]).
-/// 6. `exit(0)`.
+/// 7. `exit(0)`.
 ///
 /// On spawn failure the process stays alive and returns `Err`, its temp roots already
 /// gone — acceptable, since they are transient update artifacts.
@@ -1864,6 +1893,30 @@ async fn finalize_update_and_restart(spawn_path: &Path, cleanup_paths: Vec<PathB
     crate::channels::stop_telegram_server().await;
 
     release_instance_lock().await;
+
+    // Under the installer's system unit the replacement has to be this very process: a detached
+    // child would leave the unit inactive and run outside it (see [`exec_in_place`]). The unit is
+    // the installer's registration, not merely "systemd started us" — a host where systemd started
+    // this process from something else still updates the way every other host does.
+    #[cfg(unix)]
+    {
+        if crate::autostart::system_unit_installed() {
+            // `exec` runs no destructors either, so the draft is written first, as on the exit
+            // path below.
+            crate::channels::chat_draft::flush_global();
+            let e = exec_in_place(spawn_path);
+            // `exec` returns only on failure: the image is unchanged, the new file is already
+            // in place, so the process keeps running and the next restart picks it up.
+            error!(error = %e, "The new binary could not be executed in place — keeping the current image");
+            UPDATE_FINALIZING.store(false, Ordering::SeqCst);
+            if let Err(lock_err) = reacquire_instance_lock().await {
+                error!(%lock_err, "Failed to re-acquire instance lock after a failed exec");
+            }
+            return Err(
+                anyhow::Error::from(e).context("Failed to exec the new binary after update")
+            );
+        }
+    }
 
     if let Err(e) = spawn_new_instance_from(spawn_path) {
         // The process stays alive unless an exit request arrived during the finalizing
@@ -2165,6 +2218,87 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// The argv a replacement is started with: the launcher's mode — `paused` when the old process
+/// was started paused — and never the old process's argv, since a word this binary has no entry
+/// point for would be refused and the service would not come back.
+fn handoff_args() -> Vec<std::ffi::OsString> {
+    let launch = std::env::args_os().nth(1);
+    match crate::cli::entry_point(launch.as_deref().and_then(std::ffi::OsStr::to_str)) {
+        Some(crate::cli::EntryPoint::Paused) => vec!["paused".into()],
+        _ => Vec::new(),
+    }
+}
+
+/// Hand this process over to the new binary, keeping the PID — how an update restarts a
+/// service that runs under a systemd unit.
+///
+/// A unit tracks its main process by PID and calls the service gone when that process exits,
+/// so the update cannot hand over to a detached child: `Type=simple` would see the unit go
+/// inactive, the replacement would run outside the unit's cgroup, and a later
+/// `systemctl start` would be refused by the lock this process just released. `exec` swaps the
+/// image under the same PID, so the unit stays up, the cgroup stays the same and stdout/stderr
+/// stay the journal — hence no `setsid` and no redirection here, unlike
+/// [`spawn_new_instance_from`].
+///
+/// Returns only on failure, as the error the platform reported; the process then still runs the
+/// old image, and the new file is already in place for the next restart.
+#[cfg(unix)]
+fn exec_in_place(binary_path: &Path) -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+
+    let args = handoff_args();
+    info!(
+        program = %binary_path.display(),
+        args = ?args,
+        "Executing the new binary in place"
+    );
+
+    let mut cmd = std::process::Command::new(binary_path);
+    cmd.args(&args);
+    cmd.env(HANDOFF_ENV, "1");
+    // Written rather than inherited, for the same reason the spawn path writes it: the marker
+    // must describe this instance's own window, not one an earlier hand-off left in place.
+    cmd.env(
+        START_HIDDEN_ENV,
+        if crate::gui::app_window::hidden() {
+            "1"
+        } else {
+            "0"
+        },
+    );
+    // `exec` closes nothing it was not told to, so the new image would inherit the store
+    // connections, the CDC writer and the IPC listener — and reopen those same files under the
+    // same PID, whose inherited descriptors still hold their record locks.
+    #[cfg(target_os = "linux")]
+    close_inherited_descriptors_on_exec();
+    cmd.exec()
+}
+
+/// Mark every descriptor above stderr close-on-exec, so the replacement image starts with the
+/// descriptor table a fresh process has. A flag rather than a close: an `exec` that fails leaves
+/// the old image running with every descriptor it still needs.
+#[cfg(target_os = "linux")]
+fn close_inherited_descriptors_on_exec() {
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(fd) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<libc::c_int>().ok())
+        else {
+            continue;
+        };
+        if fd <= 2 {
+            continue;
+        }
+        // SAFETY: `fcntl` on this process's own descriptor table; the flag changes nothing until
+        // an `exec` runs.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+}
+
 /// Spawn the new mahbot instance as an independent child from `binary_path` — always the
 /// working file the update left in place, never a temp root (see
 /// [`finalize_update_and_restart`]).
@@ -2199,12 +2333,7 @@ fn canonicalize_safe(path: &Path) -> PathBuf {
 /// startup window (see [`finalize_update_and_restart`]): deleting the spawn target while
 /// Gatekeeper validates its signature makes `syspolicyd` SIGKILL the child.
 fn spawn_new_instance_from(binary_path: &Path) -> Result<()> {
-    let launch = std::env::args_os().nth(1);
-    let args: Vec<std::ffi::OsString> =
-        match crate::cli::entry_point(launch.as_deref().and_then(std::ffi::OsStr::to_str)) {
-            Some(crate::cli::EntryPoint::Paused) => vec!["paused".into()],
-            _ => Vec::new(),
-        };
+    let args = handoff_args();
 
     info!(
         program = %binary_path.display(),
@@ -2296,6 +2425,24 @@ fn truncate_to_last_64k(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::util::lock::{lock_file_path, try_flock};
+
+    /// The hand-off marker is this launch's alone: reading it takes it out of the environment, so a
+    /// child process cannot inherit it and take the hand-off wait on its own launch.
+    #[test]
+    fn the_handoff_marker_is_read_once_and_cleared() {
+        let _guard = crate::util::test::env_lock().lock().unwrap_poison();
+        // SAFETY: the env lock keeps every other test off the environment while this runs.
+        unsafe { std::env::set_var(HANDOFF_ENV, "1") };
+        assert!(read_and_clear_handoff_marker(), "a set marker is read");
+        assert!(
+            std::env::var_os(HANDOFF_ENV).is_none(),
+            "the marker must not outlive the read: a child would inherit it"
+        );
+        assert!(
+            !read_and_clear_handoff_marker(),
+            "a launch without the marker is an ordinary one"
+        );
+    }
 
     #[test]
     fn test_try_acquire_lock_held_free() {

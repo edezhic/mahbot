@@ -2281,6 +2281,19 @@ async fn finalize_enrollment_pipeline() -> bool {
 
 #[expect(clippy::too_many_lines)]
 pub async fn run_voice_pipeline() {
+    // The service runs on a host with no audio stack at all; the library is loaded on first use,
+    // and here that use has a plain answer. Voice reports itself unavailable and the rest of the
+    // service is untouched.
+    if !crate::audio::library_available() {
+        warn!("{}", crate::audio::LIBRARY_UNAVAILABLE);
+        let mut state = voice_state().write().unwrap_poison();
+        state.enabled = false;
+        set_status_and_notify(
+            &mut state,
+            VoiceStatus::Error(crate::audio::LIBRARY_UNAVAILABLE.to_string()),
+        );
+        return;
+    }
     info!("Voice pipeline starting...");
 
     let shutdown_token = crate::shutdown::shutdown_token();

@@ -4,16 +4,18 @@
 //! # Exits that run none of the closing path
 //!
 //! The closing path is the library's `gui::Dashboard::save_and_exit` (draft flush, window
-//! state, the token fired before the iced runtime drops) plus the binary's
-//! `shutdown_after_dashboard` (browser release, background-task join, store checkpoint, the
-//! stop of the supervised Telegram Bot API server child). These exits run none of it, listed
-//! here once so the rest of the tree points at this list:
+//! state, the token fired before the iced runtime drops) plus the binary's `shutdown_service`
+//! (browser release, background-task join, store checkpoint, the stop of the supervised Telegram
+//! Bot API server child). These exits run none of it, listed here once so the rest of the tree
+//! points at this list:
 //!
 //! - a platform-forced termination (Force Quit, `SIGKILL`): nothing can intercept it; a plain
 //!   `kill` is SIGTERM, which is handled once the signal task is installed;
 //! - the self-update tail (its own drain and `exit(0)` after its checkpoint);
 //! - the fatal-signal and abort paths (`install_fatal_signal_handlers`, the panic hook);
-//! - an iced `run()` that returns an error;
+//! - an iced `run()` that returns an error, and a window that failed once the service's boot had
+//!   begun (`main::window_failed`): that boot went with the window's runtime, so the process ends
+//!   without a drain;
 //! - macOS log-out, restart or shut-down: the quit hook hands the platform's ask back and
 //!   AppKit ends the process, losing the last moment of typing, the exit-time tidying (the
 //!   next start is slower) and the browser release (which the next start does anyway);
@@ -255,14 +257,12 @@ pub fn urgent_release_budget() -> Option<Duration> {
         .map(|deadline| stage_budget(deadline, Instant::now()))
 }
 
-/// Written by the Windows stop deliveries (the console protocol loop and the session-end
-/// listener), a macOS quit and the tray menu's quit — the last two only where that request
-/// drives the exit, so a repeat gesture leaves the record to the request that caused it. `None`
-/// when nothing was recorded (a close that could not hide, a Unix signal), and the exit line
-/// then keeps its old wording. A `Mutex`, not a `OnceLock`: a later request takes over.
-///
-/// The exit line is dropped outright — it runs after the iced runtime whose log writer batches
-/// — so this makes a stop's reason nameable by that line, not visible.
+/// Written by the stop requests that carry a name: the Windows stop deliveries (the console
+/// protocol loop and the session-end listener), a Unix signal, a macOS quit and the tray menu's
+/// quit — the last two only where that request drives the exit, so a repeat gesture leaves the
+/// record to the request that caused it. `None` when nothing was recorded (a close that could not
+/// hide), and the exit line then keeps its old wording. A `Mutex`, not a `OnceLock`: a later
+/// request takes over.
 static EXIT_TRIGGER: Mutex<Option<&'static str>> = Mutex::new(None);
 
 /// Record the stop request the exit path is running for, so the exit path can name it.
@@ -352,6 +352,7 @@ pub async fn wait_for_shutdown_signal() -> anyhow::Result<Option<&'static str>> 
             };
             if first {
                 info!("Received {signal} — draining (second signal force-cancels)");
+                record_exit_trigger(signal);
                 drain_begin();
                 first = false;
             } else {
@@ -411,11 +412,12 @@ pub fn install_ignored_signals() {
 
 /// Before boot and before the interface exists: the two Windows sources below and the quit
 /// source. They must be up this early because the platform may deliver a stop the moment the
-/// window is up, and the request has to survive until the dashboard subscribes.
-pub fn install_stop_request_sources() {
+/// window is up, and the request has to survive until the dashboard subscribes. `window` is the
+/// decision the daemon already made — the quit interception exists only where a window does.
+pub fn install_stop_request_sources(window: crate::service::WindowMode) {
     install_console_stop_handler();
     install_session_end_listener();
-    install_quit_requests();
+    install_quit_requests(window);
 }
 
 /// Called from [`install_stop_request_sources`] before boot: the handler needs no runtime (it
@@ -841,19 +843,30 @@ pub(crate) const MACOS_QUIT_TRIGGER: &str = "macOS quit";
 pub(crate) const TRAY_QUIT_TRIGGER: &str = "tray quit";
 
 /// The quit channel, and on macOS the interception of the platform's own asks. Called from
-/// [`install_stop_request_sources`] before the interface starts. The channel exists on every
-/// platform so the dashboard's subscription always has a source, but only macOS sends on it.
-fn install_quit_requests() {
+/// [`install_stop_request_sources`] before the interface starts, with the window decision the
+/// daemon already made. The channel exists on every platform so the dashboard's subscription
+/// always has a source, but only macOS sends on it. Its receiving half is stored before anything
+/// can send, so a quit the platform delivers before the dashboard subscribes waits here instead of
+/// being lost.
+fn install_quit_requests(window: crate::service::WindowMode) {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    // The receiving half first, so a quit the platform delivers before the dashboard subscribes
-    // waits here instead of being lost.
     *QUIT_REQUESTS.lock().unwrap_poison() = Some(rx);
-    // The channel exists on every platform so the dashboard's subscription always has a source;
-    // only macOS sends, so everywhere else the sender is dropped here and the source stays empty.
+    // A headless launch has no window and no application menu: winit's delegate never registers,
+    // so there is no platform quit to intercept and waiting for one would only warn.
     #[cfg(target_os = "macos")]
-    macos_quit::install(tx);
+    {
+        if !window.is_headless() {
+            macos_quit::install(tx);
+        }
+    }
+    // No other platform delivers a quit ask, so the sender is dropped here and the subscription's
+    // source stays empty. The window decision is macOS's alone: only that platform's quit ask
+    // depends on whether a window exists.
     #[cfg(not(target_os = "macos"))]
-    drop(tx);
+    {
+        let _ = window;
+        drop(tx);
+    }
 }
 
 /// The dashboard's subscription takes it once, and a quit arriving before anything subscribes
@@ -1236,8 +1249,10 @@ thread_local! {
 ///
 /// For a caller that contains *many* panics by design — the per-page PDF text
 /// pass, where one malformed page panics — the default hook would otherwise
-/// turn one failed document into one report per failed page on stderr.
-pub(crate) fn contain_panics<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
+/// turn one failed document into one report per failed page on stderr. The
+/// window is the other caller: iced panics instead of returning on a broken
+/// display, and the service keeps running while the caller records the reason.
+pub fn contain_panics<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
     let previous = CONTAINED_PANIC.with(|flag| flag.replace(true));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
     CONTAINED_PANIC.with(|flag| flag.set(previous));

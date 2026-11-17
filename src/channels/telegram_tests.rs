@@ -5382,3 +5382,51 @@ async fn a_command_in_a_burst_leaves_the_group_ahead_of_itself() {
     assert_eq!(rows[0].parts, 1);
     listener.abort();
 }
+
+/// The token is part of the request URL, so a transport failure must never put that URL in the
+/// error: the text becomes a failed call's recorded reason, which the log store keeps for days.
+#[tokio::test]
+async fn a_transport_failure_never_names_the_token() {
+    // A port that was free a moment ago: the connection is refused, which is the transport failure
+    // whose error text used to carry the URL.
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let client = crate::util::http::build_http_client(Duration::from_secs(5));
+    let err = get_me(&client, &format!("http://127.0.0.1:{port}"), "123:secret")
+        .await
+        .expect_err("nothing listens on that port");
+    let text = format!("{err:#}");
+    assert!(!text.contains("123:secret"), "{text}");
+    assert!(text.contains("Failed to reach Telegram API"), "{text}");
+}
+
+/// The same rule for the other way an exchange fails: a body that is not JSON makes the decoder's
+/// error carry the request's URL, so it is stripped there too.
+#[tokio::test]
+async fn a_decode_failure_never_names_the_token() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("one request arrives");
+        let mut request = [0u8; 1024];
+        let _ = std::io::Read::read(&mut stream, &mut request);
+        let body = "not json at all";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+    });
+    let client = crate::util::http::build_http_client(Duration::from_secs(5));
+    let err = get_me(&client, &format!("http://127.0.0.1:{port}"), "123:secret")
+        .await
+        .expect_err("that body is not JSON");
+    let text = format!("{err:#}");
+    assert!(!text.contains("123:secret"), "{text}");
+    assert!(
+        text.contains("Failed to parse Telegram API response"),
+        "{text}"
+    );
+}

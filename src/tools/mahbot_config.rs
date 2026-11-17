@@ -3,13 +3,19 @@
 //! `setup_web_search`) plus the per-user custom-tool grants (`grant_tool` / `revoke_tool` /
 //! `list_grants`). It is the admin's Assistant's sole configuration surface. Adding a managed
 //! workspace is not one of its actions — that lives in the `workspace` tool.
+//!
+//! `setup` is the exception: the command line's one-shot setup (`mahbot config setup`), carried
+//! into the instance by this tool so the terminal and the window share one implementation. It
+//! refuses outside a command-line call — the Assistant may use every other action, but writing the
+//! provider credential is the owner's own act at a terminal. It is therefore absent from the tool's
+//! schema, and `src/prompt/tool/mahbot_config.md` names the command instead of the action.
 use crate::config::{
     CONFIG_KEY_DEEPSEEK_KEY, CONFIG_KEY_EXA_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
     CONFIG_KEY_WEB_SEARCH_PROVIDER,
 };
 use crate::custom_role::CustomRoleBehavior;
 use crate::tools::ToolAnswer;
-use crate::users::{AddUserOutcome, GrantChange, format_grants};
+use crate::users::{ADMIN_USER_NAME, AddUserOutcome, GrantChange, format_grants};
 use crate::{Tool, Workspace};
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -60,12 +66,39 @@ fn format_tools(tools: &[String]) -> String {
     }
 }
 
+/// The arguments of this tool that carry a credential: each is a value the tool only writes, never
+/// reads back as data.
+const SECRET_ARGUMENTS: &[&str] = &[
+    "token",
+    "key",
+    "provider_key",
+    "provider_endpoint_key",
+    "telegram_token",
+];
+
 pub(crate) struct MahbotConfigTool;
 
 #[async_trait]
 impl Tool for MahbotConfigTool {
     fn name(&self) -> &'static str {
         "mahbot_config"
+    }
+
+    /// The action word alone for a call that carries a credential — and nothing at all when the
+    /// call names no action, since a call can carry a secret without one.
+    fn recorded_arguments(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+        if !SECRET_ARGUMENTS
+            .iter()
+            .any(|secret| args.get(*secret).is_some())
+        {
+            return None;
+        }
+        Some(
+            match args.get("action").and_then(serde_json::Value::as_str) {
+                Some(action) => json!({ "action": action }),
+                None => json!({}),
+            },
+        )
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -171,6 +204,7 @@ impl MahbotConfigTool {
     /// happens in full or fails.
     async fn answer(&self, args: serde_json::Value) -> anyhow::Result<ToolAnswer> {
         match super::get_str(&args, "action")? {
+            crate::setup::ACTION => Ok(ToolAnswer::done(crate::setup::run(&args).await?)),
             "add_user" => self.answer_add_user(args).await,
             "setup_telegram_bot" => Ok(ToolAnswer::done(self.exec_setup_telegram_bot(args).await?)),
             "bind_telegram" => Ok(ToolAnswer::done(self.exec_bind_telegram(args).await?)),
@@ -183,9 +217,10 @@ impl MahbotConfigTool {
             "list_custom_roles" => Ok(ToolAnswer::done(self.exec_list_custom_roles().await?)),
             "delete_custom_role" => Ok(ToolAnswer::done(self.exec_delete_custom_role(args).await?)),
             other => Err(err(format!(
-                "unknown action '{other}' — expected one of: setup_telegram_bot, bind_telegram, \
-                 add_user, setup_web_search, grant_tool, revoke_tool, list_grants, \
-                 create_custom_role, update_custom_role, list_custom_roles, delete_custom_role"
+                "unknown action '{other}' — expected one of: {}, setup_telegram_bot, \
+                 bind_telegram, add_user, setup_web_search, grant_tool, revoke_tool, list_grants, \
+                 create_custom_role, update_custom_role, list_custom_roles, delete_custom_role",
+                crate::setup::ACTION
             ))),
         }
     }
@@ -206,7 +241,7 @@ impl MahbotConfigTool {
         let value = get_binding_value(&args, "handle")?;
 
         let identifier = crate::users::store()
-            .bind_telegram_for_admin(&value)
+            .bind_telegram(ADMIN_USER_NAME, &value)
             .await?;
 
         Ok(format!(
@@ -442,6 +477,75 @@ mod tests {
     use crate::workspace::test_ws;
     use serde_json::json;
 
+    /// Every credential this tool can be handed is kept out of the record, on both surfaces that
+    /// record one — the row is a log kept for hours, and what it keeps is the action that ran.
+    #[test]
+    fn a_call_is_recorded_without_its_credentials() {
+        let tool = MahbotConfigTool;
+        let args = json!({
+            "action": "setup",
+            "provider_key": "sk-or-v1-secret",
+            "provider_endpoint_key": "local-secret",
+            "telegram_token": "123:ABC",
+            "token": "456:DEF",
+            "key": "exa-secret",
+            "owner": "12345",
+        });
+        let recorded = tool
+            .recorded_arguments(&args)
+            .expect("this call takes credentials");
+        assert_eq!(recorded, json!({ "action": "setup" }));
+
+        // A call that carries no credential is not copied at all: the recorder keeps what it was
+        // handed, and a tool that declares no credentials is never touched.
+        assert_eq!(
+            tool.recorded_arguments(&json!({ "action": "list_grants" })),
+            None
+        );
+        assert_eq!(
+            crate::tools::shell::ShellTool::new(crate::tools::shell::ShellMode::Full)
+                .recorded_arguments(&json!({ "command": "ls" })),
+            None
+        );
+
+        // A credential can arrive without a usable action — a call that never reached the dispatch
+        // has no action to keep, and is still never recorded with its secret.
+        for args in [
+            json!({ "provider_key": "sk-or-v1-secret" }),
+            json!({ "action": 7, "token": "456:DEF" }),
+        ] {
+            assert_eq!(
+                tool.recorded_arguments(&args),
+                Some(json!({})),
+                "a credential with no action must still be kept out: {args}"
+            );
+        }
+    }
+
+    /// The rule is the credential, not the action: every action that takes one is covered, and a
+    /// call that takes none is recorded as it was made — `owner` included.
+    #[test]
+    fn every_action_that_takes_a_credential_is_covered() {
+        let tool = MahbotConfigTool;
+        for (action, secret) in [
+            ("setup", "provider_key"),
+            ("setup_telegram_bot", "token"),
+            ("setup_web_search", "key"),
+        ] {
+            let args = json!({ "action": action, secret: "secret-value", "other": "kept" });
+            assert_eq!(
+                tool.recorded_arguments(&args),
+                Some(json!({ "action": action })),
+                "'{action}' takes a credential and must not be recorded with it"
+            );
+        }
+        // A value that is no credential is not a reason to drop the call.
+        assert_eq!(
+            tool.recorded_arguments(&json!({ "action": "bind_telegram", "owner": "12345" })),
+            None
+        );
+    }
+
     /// The error paths that fire before any store access (action dispatch, unknown action,
     /// per-action required-field and provider validation) are pure and cheaply testable.
     #[tokio::test]
@@ -514,8 +618,10 @@ mod tests {
                 && err.contains("create_custom_role")
                 && err.contains("update_custom_role")
                 && err.contains("list_custom_roles")
-                && err.contains("delete_custom_role"),
-            "unknown-action error must list the valid actions, got: {err}"
+                && err.contains("delete_custom_role")
+                && err.contains(&format!("one of: {}", crate::setup::ACTION)),
+            "unknown-action error must list every action the dispatch accepts, the terminal one \
+             included, got: {err}"
         );
     }
 

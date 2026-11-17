@@ -4,7 +4,16 @@
 #
 # It downloads this system's ready-made release file, puts it in place, makes
 # the location visible to the owner's own shell, gives the speech models their
-# machine-wide home, and starts the product. It never builds anything.
+# machine-wide home, and starts the product — as a system service on a Linux
+# server, at login everywhere else. It never builds anything.
+#
+# One registration per host, and this script is the one that picks it. A server —
+# a Linux host with systemd running and no graphical system — gets
+# `/etc/systemd/system/mahbot.service`, which starts the product at boot with
+# nobody logged in. Every other host starts it at login, which is what an install
+# has always done. The two never coexist: this script removes whichever one it did
+# not choose, and the product follows the choice on every start
+# (`src/autostart.rs`), so neither side can leave a host registered twice.
 #
 # The release contract it mirrors — one contract in four places: this script, the
 # Windows one (`install.ps1`), the product's own updater (`src/self_update.rs`)
@@ -86,7 +95,21 @@ FISH_BODY='set -gx PATH $PATH $HOME/.local/bin'
 
 say() { printf '%s\n' "$1"; }
 warn() { printf '%s\n' "$1" >&2; }
-fail() { printf '%s\n' "$1" >&2; exit 1; }
+# An install that stopped the host's unit to replace its file puts it back when registration
+# could not be completed: the file at the unit's path is the one this install just moved into
+# place, so the host's service comes back on the new build rather than staying down. A no-op
+# when this install stopped nothing. Defined before `fail`, which calls it.
+restore_stopped_unit() {
+    [ -n "${UNIT_STOPPED:-}" ] || return 0
+    sudo systemctl start "$UNIT_NAME" >/dev/null 2>&1 || true
+}
+fail() {
+    # An install that stopped the host's service to replace its file must not leave the
+    # server without it: a refusal puts the copy already installed back in charge.
+    restore_stopped_unit
+    printf '%s\n' "$1" >&2
+    exit 1
+}
 
 # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -291,26 +314,59 @@ add_block() {
     printf '\n%s\n%s\n%s\n' "$BLOCK_START" "$2" "$BLOCK_END" >>"$1" 2>/dev/null
 }
 
-# ── 1. Refuse while the product is running ────────────────────────────────
+# ── 1. Take over from a copy already running ──────────────────────────────
 
 [ -n "${HOME:-}" ] ||
     fail "HOME is not set, so there is no place to install MahBot into."
 INSTALL_DIR="$HOME/.local/bin"
 DEST="$INSTALL_DIR/mahbot"
 
-# Scoped to the data directory this home's product uses, so a product running
-# under another home is not this script's business.
-if [ -e "$HOME/.mahbot/mahbot.lock" ] && lock_held "$HOME/.mahbot/mahbot.lock"; then
-    fail "MahBot is already running; updating a running installation is MahBot's own update path, so nothing was installed."
-fi
+# The two registrations a host can have: the system unit this script writes on a Linux server,
+# and the login entry the product writes everywhere else — on Linux the XDG desktop entry below
+# (macOS writes a LaunchAgent plist and Windows a registry value, neither of which can be paired
+# with a systemd unit). The unit's path is the product's own (`src/autostart.rs`), which reads it
+# to know the installer made the choice.
+UNIT_NAME=mahbot.service
+UNIT_PATH="/etc/systemd/system/$UNIT_NAME"
+AUTOSTART_ENTRY="$HOME/.config/autostart/mahbot.desktop"
+UNIT_STOPPED=''
 
-# ── 2. Work out the system ────────────────────────────────────────────────
-
+# The host's platform, read once: everything below — systemd, the login entry, the floors, the
+# file this install fetches — is decided from it.
 case "$(uname -s)" in
     Darwin) OS=macos ;;
     Linux) OS=linux ;;
     *) fail "$NO_FILE" ;;
 esac
+
+# Whether systemd runs this host. A `systemctl` binary alone is not the answer: it exists
+# inside containers that run no systemd, where a unit would never be started — the running
+# manager's own directory is what says otherwise.
+HAVE_SYSTEMD=''
+if [ "$OS" = linux ] && [ -d /run/systemd/system ] &&
+    command -v systemctl >/dev/null 2>&1; then
+    HAVE_SYSTEMD=1
+fi
+
+# Scoped to the data directory this home's product uses, so a product running
+# under another home is not this script's business.
+if [ -e "$HOME/.mahbot/mahbot.lock" ] && lock_held "$HOME/.mahbot/mahbot.lock"; then
+    # A server's unit owns the copy holding the lock, and that copy is exactly what this
+    # install replaces — so it is stopped, not refused. A lock held by anything else (a copy
+    # started by hand, a unit of another name) is a conflict and stays one.
+    if [ -n "$HAVE_SYSTEMD" ] &&
+        sudo systemctl is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+        say "Stopping the running MahBot service so its file can be replaced. Its in-flight work is drained first, so this can take a while — up to the unit's own stop timeout, 900 seconds."
+        sudo systemctl stop "$UNIT_NAME" 2>/dev/null ||
+            fail "the running MahBot service could not be stopped, so nothing was installed."
+        UNIT_STOPPED=1
+    else
+        fail "MahBot is already running; updating a running installation is MahBot's own update path, so nothing was installed."
+    fi
+fi
+
+# ── 2. Work out the architecture and the floors ───────────────────────────
+
 case "$(uname -m)" in
     x86_64 | amd64) ARCH=x86_64 ;;
     arm64 | aarch64) ARCH=aarch64 ;;
@@ -410,7 +466,7 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
-trap 'cleanup; exit 1' HUP INT TERM
+trap 'cleanup; restore_stopped_unit; exit 1' HUP INT TERM
 
 fetch "$RELEASE_BASE/releases/download/v$VERSION/$ASSET" "$TMP/$ASSET" ||
     fail "the MahBot $VERSION file for this system could not be downloaded, so nothing was installed."
@@ -509,12 +565,173 @@ else
     fi
 fi
 
-# ── 8. Start the product ──────────────────────────────────────────────────
+# ── 8. Where this host starts MahBot ──────────────────────────────────────
+
+# The system's own answer to "does this host boot to a display" is its default target; where
+# that cannot be read, the display variables answer for it. macOS is graphical by definition,
+# and a Linux host with no systemd running is no server this script can register with — nothing
+# would start the unit — so it is treated as graphical and told no unit was registered.
+REGISTER_UNIT=''
+if [ "$OS" = linux ]; then
+    if [ -z "$HAVE_SYSTEMD" ]; then
+        say "No systemd was found on this host, so no service unit was registered."
+    else
+        DEFAULT_TARGET=$(systemctl get-default 2>/dev/null || true)
+        case "$DEFAULT_TARGET" in
+            graphical.target) ;;
+            ?*) REGISTER_UNIT=1 ;;
+            *)
+                if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+                    REGISTER_UNIT=1
+                fi
+                ;;
+        esac
+    fi
+fi
+
+# ── 9. What MahBot needs from this host ───────────────────────────────────
+
+# Said once, on every host: these hold however the product is started. The audio library is
+# named apart from them because only voice needs it — a server with no sound card runs
+# everything else.
+if [ "$OS" = macos ]; then
+    OS_FLOOR="macOS $MACOS_FLOOR_MAJOR.$MACOS_FLOOR_MINOR or newer"
+else
+    OS_FLOOR="glibc $GLIBC_FLOOR_MAJOR.$GLIBC_FLOOR_MINOR or newer"
+fi
+say ""
+say "MahBot needs from this host:"
+say "  - $OS_FLOOR"
+say "  - a local filesystem for $HOME/.mahbot; network storage is not supported"
+say "  - one operating-system user per machine"
+say "  - no inbound network ports: MahBot talks out, and Telegram delivers its messages"
+say "  - for voice only, the audio library (libasound2 on Linux) — the service does not need it"
+
+# ── 10. Register the service, or start at login ───────────────────────────
+
+if [ -n "$REGISTER_UNIT" ]; then
+    # The unit runs as the account that owns this install's data — never root — so every file
+    # the product writes stays its own. `KillMode=mixed` sends SIGTERM to the main process
+    # alone, which is what lets the drain it runs finish the shells it is waiting on;
+    # `TimeoutStopSec` is that drain's own budget plus the closing steps after it (the product's
+    # `EXIT_BOUND`), so systemd never kills a drain that is still inside its allowance.
+    UNIT_TEXT="[Unit]
+Description=MahBot
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=$(id -un)
+Environment=\"HOME=$HOME\"
+WorkingDirectory=\"$HOME\"
+ExecStart=\"$DEST\"
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=900
+
+[Install]
+WantedBy=multi-user.target"
+
+    # The unit, printed for an owner who has to put it in place himself: the exact path, the
+    # exact content, and the two commands that give it effect.
+    unit_by_hand() {
+        say "Save this as $UNIT_PATH as root, then run:"
+        say "  systemctl daemon-reload && systemctl enable --now $UNIT_NAME"
+        printf '%s\n' "$UNIT_TEXT"
+    }
+
+    if ! command -v sudo >/dev/null 2>&1; then
+        warn "sudo was not found, so MahBot was not registered as a service; nothing starts it at boot."
+        unit_by_hand
+        fail "This install is not finished: MahBot starts nothing at boot on this host."
+    fi
+
+    say "Registering MahBot as a system service (your administrator password is needed once)."
+    if ! printf '%s\n' "$UNIT_TEXT" | sudo tee "$UNIT_PATH" >/dev/null 2>&1; then
+        warn "$UNIT_PATH could not be written, so MahBot was not registered as a service."
+        unit_by_hand
+        fail "This install is not finished: MahBot starts nothing at boot on this host."
+    fi
+
+    REGISTERED=1
+    sudo systemctl daemon-reload 2>/dev/null || REGISTERED=''
+    if [ -n "$REGISTERED" ]; then
+        if sudo systemctl is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+            # A unit that is already running is restarted: `enable --now` leaves it alone, and
+            # the file it started is the one this install just replaced.
+            sudo systemctl restart "$UNIT_NAME" 2>/dev/null || REGISTERED=''
+        else
+            sudo systemctl enable --now "$UNIT_NAME" 2>/dev/null || REGISTERED=''
+        fi
+        # `Type=simple` reports success as soon as the process is forked, so a boot that dies a
+        # moment later would still read as started. The unit is asked again over the next few
+        # seconds: one that dies inside that window is failed or waiting to restart, and neither
+        # is active. What this proves is that it came up and stayed up for those seconds — the
+        # sentence printed below says no more than that.
+        if [ -n "$REGISTERED" ]; then
+            for _ in 1 2 3 4 5; do
+                sleep 1
+                sudo systemctl is-active --quiet "$UNIT_NAME" 2>/dev/null || {
+                    REGISTERED=''
+                    break
+                }
+            done
+        fi
+    fi
+    if [ -z "$REGISTERED" ]; then
+        warn "$UNIT_PATH was written, but MahBot is not running under it; see: systemctl status $UNIT_NAME"
+        say "Start it with: systemctl daemon-reload && systemctl enable --now $UNIT_NAME"
+        fail "This install is not finished: the unit is in place but nothing is running."
+    fi
+
+    # The login entry and the unit would start two copies of the product: the entry goes, so
+    # the host has one registration — never both, which is the one outcome this choice forbids.
+    # This branch is Linux's, where the login entry is this file.
+    if ! rm -f "$AUTOSTART_ENTRY" 2>/dev/null; then
+        warn "$AUTOSTART_ENTRY could not be removed, so MahBot would be started twice; remove it as its owner."
+        fail "This install is not finished: the login entry an earlier install left is still in place beside the service."
+    fi
+
+    say "MahBot is registered as a system service at $UNIT_PATH and starts at boot; it was running when this install finished."
+    say "See it with: systemctl status $UNIT_NAME"
+    say "For a window and a login start instead, re-run this installer on a host with a graphical system (sudo systemctl set-default graphical.target, then run it again)."
+    exit 0
+fi
+
+# A graphical host starts the product at login: this install hands the terminal back and the
+# product keeps running beside it. A unit an earlier install registered here would start a
+# second copy, so it goes — and a removal that fails is said plainly rather than hidden.
+if [ -f "$UNIT_PATH" ]; then
+    if [ -n "$HAVE_SYSTEMD" ]; then
+        sudo systemctl disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
+        # Checked after the disable, the way the lock block above does: a copy the unit owns
+        # that is still running would be started twice, once by the login start beside it.
+        if sudo systemctl is-active --quiet "$UNIT_NAME" 2>/dev/null; then
+            fail "This install is not finished: $UNIT_NAME is still running; stop it with: sudo systemctl stop $UNIT_NAME"
+        fi
+    fi
+    if sudo rm -f "$UNIT_PATH" 2>/dev/null &&
+        { [ -z "$HAVE_SYSTEMD" ] || sudo systemctl daemon-reload >/dev/null 2>&1; }; then
+        say "The system service an earlier install registered was removed; MahBot starts at login."
+    else
+        warn "$UNIT_PATH could not be removed, so MahBot would be started twice; remove it as root: rm -f $UNIT_PATH && systemctl daemon-reload"
+        fail "This install is not finished: the service unit an earlier install registered is still in place."
+    fi
+fi
+
+say "MahBot starts when you log in, and this install hands your terminal back to you."
+if [ "$OS" = linux ]; then
+    say "For a service that starts at boot with nobody logged in, re-run this installer on a host with no graphical system (sudo systemctl set-default multi-user.target, then run it again)."
+fi
 
 # The trap cannot clean up after an `exec` — it replaces this shell, and no trap
-# runs then — so the temporary directory goes now. The product itself hands this
-# terminal back before it becomes the service (its own log is
-# `$HOME/.mahbot/daemon.log`), so this ends with the prompt returned and the
-# service running beside it.
+# runs then — so the temporary directory goes now. The product then keeps this
+# terminal until its service is actually up (bounded by `READY_TIMEOUT`,
+# `src/detach.rs`), says whether it came up, and only then hands the prompt back;
+# everything it prints meanwhile goes to `$HOME/.mahbot/daemon.log`.
 cleanup
 exec "$DEST"

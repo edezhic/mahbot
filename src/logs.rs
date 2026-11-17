@@ -776,17 +776,21 @@ fn spawn_log_writer(
     rx: UnboundedReceiver<String>,
     broadcast: tokio::sync::broadcast::Sender<String>,
 ) {
-    spawn_log_writer_with_interval(store, rx, broadcast, LOG_FLUSH_INTERVAL);
+    let flush = spawn_log_writer_with_interval(store, rx, broadcast, LOG_FLUSH_INTERVAL);
+    *FLUSH_REQUESTS.lock().unwrap_poison() = Some(flush);
 }
 
 /// [`spawn_log_writer`] with an explicit flush interval — tests inject a very long or very
-/// short one to exercise the batch-cap and timer paths without racing the production timer.
+/// short one to exercise the batch-cap and timer paths without racing the production timer. The
+/// returned sender is the writer's flush handover ([`flush_writer`]).
 fn spawn_log_writer_with_interval(
     store: Arc<LogStore>,
     mut rx: UnboundedReceiver<String>,
     broadcast: tokio::sync::broadcast::Sender<String>,
     flush_interval: std::time::Duration,
-) {
+) -> tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>> {
+    let (flush_tx, mut flush_rx) =
+        tokio::sync::mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<()>>();
     tokio::spawn(async move {
         let mut batch: Vec<LogEntry> = Vec::new();
         let mut flush_timer = tokio::time::interval(flush_interval);
@@ -795,8 +799,30 @@ fn spawn_log_writer_with_interval(
         // the first full interval.
         flush_timer.tick().await;
 
+        let mut flush_requests_open = true;
         loop {
             tokio::select! {
+                // A handover from `flush_log_writer`: write what is held and say it is in.
+                maybe_flush = flush_rx.recv(), if flush_requests_open => {
+                    let Some(done) = maybe_flush else {
+                        // The handovers moved to a newer writer: this one keeps only its timer.
+                        flush_requests_open = false;
+                        continue;
+                    };
+                    // Everything sent before the handover is already in the channel, and a
+                    // `select!` arm may be served before the lines beside it: take them all
+                    // first, so the caller is told "written" only when the store holds them.
+                    while let Ok(line) = rx.try_recv() {
+                        absorb_line(&mut batch, &broadcast, &line);
+                        if batch.len() >= LOG_BATCH_MAX {
+                            absorb_flush(&store, &mut batch).await;
+                        }
+                    }
+                    if !log_writer_stopped() {
+                        absorb_flush(&store, &mut batch).await;
+                    }
+                    let _ = done.send(());
+                }
                 maybe_line = rx.recv() => {
                     let Some(line) = maybe_line else {
                         // Channel closed (tracing teardown on shutdown) — flush and exit.
@@ -806,27 +832,7 @@ fn spawn_log_writer_with_interval(
                         break;
                     };
 
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-
-                    let Some(entry) = parse_tracing_json(trimmed) else {
-                        continue;
-                    };
-
-                    // Broadcast to dashboard subscribers before inserting (fast path)
-                    let _ = broadcast.send(serde_json::to_string(&entry).expect(
-                        "log entry broadcast serialization failed; this should not happen",
-                    ));
-
-                    if log_writer_stopped() {
-                        // Terminal state: keep draining and broadcasting, but drop entries
-                        // instead of pushing them onto a batch that will never be flushed.
-                        continue;
-                    }
-
-                    batch.push(entry);
+                    absorb_line(&mut batch, &broadcast, &line);
                     if batch.len() >= LOG_BATCH_MAX {
                         absorb_flush(&store, &mut batch).await;
                     }
@@ -839,6 +845,28 @@ fn spawn_log_writer_with_interval(
             }
         }
     });
+    flush_tx
+}
+
+/// Take one line into the batch, broadcasting it first: the dashboard sees a line before the store
+/// holds it, and a stopped writer keeps draining and broadcasting but drops the entry.
+fn absorb_line(
+    batch: &mut Vec<LogEntry>,
+    broadcast: &tokio::sync::broadcast::Sender<String>,
+    line: &str,
+) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let Some(entry) = parse_tracing_json(trimmed) else {
+        return;
+    };
+    let _ = broadcast
+        .send(serde_json::to_string(&entry).expect("log entry broadcast serialization failed"));
+    if !log_writer_stopped() {
+        batch.push(entry);
+    }
 }
 
 /// Flush the accumulated batch, absorbing storage-layer panics: a panic here means a broken
@@ -1110,6 +1138,37 @@ fn record_log_write_failure_impl(message: &str, kind: LogFailureKind) -> u32 {
 fn reset_log_writer_panic_state() {
     let mut guard = LOG_WRITE_LAST_ERROR.lock().unwrap_poison();
     guard.panic_state.reset();
+}
+
+/// The live log writer's flush handover. One writer per process; set by [`spawn_log_writer`].
+static FLUSH_REQUESTS: std::sync::Mutex<
+    Option<tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>>,
+> = std::sync::Mutex::new(None);
+
+/// How long a flush on the way out may take. A writer stuck on a broken store must not hold the
+/// exit; what it holds is a diagnostic line, not the product's state.
+const FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Write every log line produced so far, returning once the store holds them.
+///
+/// Called on the way out (`main::shutdown_service`): the writer batches on a timer, so without
+/// this the last lines of a run — the drain's own — go with the runtime that owned the writer. It
+/// reaches only a writer whose runtime is still alive: a run whose interface owned that runtime
+/// (the windowed path) has already lost it by the time the teardown runs, and the call is a no-op
+/// there.
+pub async fn flush_log_writer() {
+    let Some(tx) = FLUSH_REQUESTS.lock().unwrap_poison().clone() else {
+        return;
+    };
+    flush_writer(&tx).await;
+}
+
+/// Ask one writer to write what it holds and wait for it, bounded by [`FLUSH_TIMEOUT`].
+async fn flush_writer(tx: &tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>) {
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+    if tx.send(done_tx).is_ok() {
+        let _ = tokio::time::timeout(FLUSH_TIMEOUT, done_rx).await;
+    }
 }
 
 fn log_writer_stopped() -> bool {
@@ -1588,6 +1647,7 @@ mod tests {
     /// full batch flushes at the cap while the timer holds the odd earlier entry, and the timer
     /// flushes a lone buffered entry.
     #[tokio::test]
+    #[serial_test::serial(log_surface)] // spawn_log_writer writes the process-global FLUSH_REQUESTS
     async fn the_log_writer_flushes_on_close_the_batch_cap_and_the_timer() {
         let (store, _dir) = test_store().await;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1666,6 +1726,34 @@ mod tests {
         drop(tx);
         drop(tx2);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// The last lines of a run are the drain's own, and the writer batches on a timer: the handover
+    /// writes them before the runtime that owns the writer goes.
+    #[tokio::test]
+    #[serial_test::serial(log_surface)] // the writer's stopped flag is a process-global
+    async fn a_flush_handover_writes_the_batch_the_timer_has_not_reached() {
+        let (store, _dir) = test_store().await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(256);
+        let flush = spawn_log_writer_with_interval(
+            store.clone(),
+            rx,
+            broadcast_tx,
+            std::time::Duration::from_mins(1),
+        );
+        tx.send(
+            r#"{"timestamp":"2025-01-01T00:00:05Z","level":"INFO","target":"test","fields":{"message":"last line"}}"#
+                .to_string(),
+        )
+        .unwrap();
+        // No wait: the handover is asked for while the line is still unread in the channel, which
+        // is the race — the flush must take it rather than answer over it. The timer cannot fire
+        // for a minute.
+        flush_writer(&flush).await;
+        let (entries, total) = store.query(&LogQuery::default()).await.unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(entries[0].message, "last line");
     }
 
     /// What the search box reads over stored rows: a plain substring over the message and the

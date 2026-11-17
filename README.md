@@ -37,6 +37,50 @@ back while the product keeps running: anything it prints while starting lands in
 
 The rest of the onboarding will be explained and done through the assistant.
 
+## Running as a service (Linux servers)
+
+On a Linux host that boots to a console — a server with no graphical system — the same install
+registers MahBot as a system service and starts it: it runs from boot with nobody logged in,
+restarts itself when it fails, and drains its agents before it stops. The unit is
+`/etc/systemd/system/mahbot.service`, and `systemctl status mahbot.service` shows it.
+
+Give it its credentials in one command, then work through Telegram:
+
+```sh
+mahbot config setup --provider-key sk-or-... --telegram-token 123456:ABC... --owner ./@yourname
+```
+
+A custom OpenAI-compatible endpoint instead of OpenRouter:
+
+```sh
+mahbot config setup --provider-endpoint http://127.0.0.1:8080/v1 --provider-endpoint-key secret \
+  --telegram-token 123456:ABC... --owner ./@yourname
+```
+
+A secret may be written `@path` to be read from a file (`--provider-key @openrouter.key`), so it
+never lands in your shell's history. The same `@` is the file form for `--owner` too, which is
+what the `./` in `./@yourname` is for.
+
+From there everything happens in the bot: the assistant runs your work and can explain anything
+left to set up. A host with a display gets the window from the same install instead, at login,
+with the same service behaviour underneath: the same updates, the same pause and resume.
+
+A host whose display exists but cannot be used runs the same service alone with
+`MAHBOT_HEADLESS=1` in its environment: the window is skipped, everything else is unchanged, and
+the service's own log says so once. A host with no display needs no such setting.
+
+# Host requirements
+
+- Linux with glibc 2.35 or newer, or macOS 14 or newer — the released files are built against
+  exactly those floors
+- a local filesystem for `~/.mahbot`: the databases and files live there, and network storage is
+  not supported
+- one operating-system user per machine — the data, the service and the registration are that
+  account's
+- no inbound network ports: MahBot talks out to its model provider and to Telegram, and Telegram
+  delivers your messages to it
+- for voice only, the audio library (`libasound2` on Linux) — the service itself does not need it
+
 # Software development
 
 Mahbot treats software engineering as a managed pipeline, not a chat session: you drop a request to your assistant about any of the projects while it orchestrates other agents to clarify the details and only escalates real product decisions to you.

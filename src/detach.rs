@@ -4,13 +4,20 @@
 //! installer's final `exec` — is not the service itself: it opens `<storage root>/daemon.log`
 //! and a readiness pipe, starts this same image again in a session of its own (`setsid`: no
 //! controlling terminal, none of the shell's streams, not a child of its session), prints one
-//! line and exits. The prompt comes back at once while the service keeps running.
+//! line and exits. The prompt comes back once the service says how the launch went.
 //!
-//! The child's word back is the instance lock: taken, the service is up; refused, the reason
-//! travels back and the launcher exits non-zero — or says the product is already running. A
-//! child that dies before then closes the pipe, and the launcher points at the log either way.
+//! The child's word back is sent when the service is actually up — its boot finished and
+//! command-line operations are being served — not when the instance lock is taken. A boot that
+//! fails sends its reason and the launcher exits non-zero; a child that dies before then closes
+//! the pipe, and the launcher points at the log either way. A start that takes longer than the
+//! launcher's bound says so plainly ("starting", never "running"), and the log holds the rest.
 //! Everything the service prints before the log store is running, a bootstrap failure and a
 //! panic message land in that file, beside `error.log` and `update.log`.
+//!
+//! The bound is [`READY_TIMEOUT`], a boot's own length rather than a lock acquisition: a first
+//! start has stores to create and migrations to run. The installer ends with this same launch, so
+//! a slow first install holds the installer's terminal for up to that long before saying how the
+//! launch went — the honest cost of never reporting success before the service is up.
 //!
 //! A launch that is not from a terminal is left exactly as it was.
 
@@ -45,7 +52,7 @@ pub fn detach_from_terminal(root: &Path) -> anyhow::Result<()> {
     }
 }
 
-/// Tell the waiting launcher the service is up — the instance lock is taken.
+/// Tell the waiting launcher the service is up — its boot finished and it is serving operations.
 pub fn report_running() {
     send(RUNNING);
 }
@@ -56,10 +63,13 @@ pub fn report_already_running() {
     send(ALREADY_RUNNING);
 }
 
-/// Tell the waiting launcher the launch failed, naming the reason it prints.
-pub fn report_failure(reason: &anyhow::Error) {
-    let reason = format!("{reason:#}").replace('\n', " ");
-    send(&format!("{FAILED_PREFIX}{reason}"));
+/// Tell the waiting launcher the launch failed, naming the reason it prints. The reason is the
+/// text the caller already has — one line, so the launcher's read stays one line.
+pub fn report_failure(reason: &str) {
+    send(&format!(
+        "{FAILED_PREFIX}{}",
+        reason.replace('\n', " ").trim_end()
+    ));
 }
 
 const RUNNING: &str = "running";
@@ -92,10 +102,10 @@ const DAEMON_LOG: &str = "daemon.log";
 #[cfg(unix)]
 const READY_FD_ENV: &str = "MAHBOT_LAUNCH_READY_FD";
 
-/// How long the launcher waits for the service's word: it arrives when the instance lock
-/// does, and the bound only keeps a start that never gets that far from holding the terminal.
+/// How long the launcher waits for the service's word: it arrives when the boot has finished, and
+/// the bound only keeps a start that never gets that far from holding the terminal forever.
 #[cfg(unix)]
-const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// The readiness pipe's writing end, held by the service until it says how the launch went.
 /// `None` in a launch that was never detached.
@@ -107,7 +117,8 @@ static READY: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(No
 enum Ready {
     /// Its word.
     Said(String),
-    /// Nothing, with the pipe still open: it is alive but has not reached the lock yet.
+    /// Nothing, with the pipe still open: it is alive but its boot has not finished within
+    /// [`READY_TIMEOUT`].
     Silent,
     /// Nothing, and the pipe closed: it ended before it could say anything.
     Gone,
@@ -274,8 +285,8 @@ fn announce(ready: Ready, log_path: &Path) -> ! {
             print_stderr(&format!("MahBot could not start: {reason}"));
             std::process::exit(1);
         }
-        // The bound passed with the pipe still open: it is alive but has not taken the lock, so
-        // "starting" is all a launcher can honestly say, and what it does next is in the log.
+        // The bound passed with the pipe still open: it is alive but has not finished its boot,
+        // so "starting" is all a launcher can honestly say, and what it does next is in the log.
         Ready::Silent => print_stdout(&format!("MahBot is starting — its log is {path}")),
         Ready::Gone => {
             print_stderr(&format!("MahBot could not start — its log is {path}"));

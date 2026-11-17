@@ -101,6 +101,8 @@ pub(crate) mod chrome;
 pub mod gui;
 // What a fresh install is walked through before it is usable.
 pub(crate) mod onboarding;
+// The one setup path: the terminal command's credentials, bot token and owner, in one run.
+pub(crate) mod setup;
 // A broadcast that tells the dashboard an in-memory registry changed.
 pub(crate) mod runtime_events;
 // The macOS menu bar / Windows notification area icon, its click and quit menu.
@@ -128,6 +130,8 @@ pub(crate) mod audio_cli;
 pub mod detach;
 // How the process comes up: one ordering for every store open.
 pub mod boot;
+// Whether the service runs with a window.
+pub mod service;
 // Defaults, persisted overrides, model routing and the process-global handle.
 pub mod config;
 // The low-disk notice, raised when free space on the temp volume falls below 5%.
@@ -1341,6 +1345,15 @@ pub(crate) trait Tool: Send + Sync {
     /// `"[IMAGE:"`; the full marker `"{prefix}path]"` is built by `format_media_result`.
     /// Non-media tools leave the default `None`.
     fn media_marker(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The arguments a finished call of this tool may be recorded with, when the call carries a
+    /// credential: `None` — the default — records the call exactly as it was made.
+    ///
+    /// A record is a log row kept for hours and never read back, so a tool that takes a credential
+    /// answers with as little of the call as names it.
+    fn recorded_arguments(&self, _args: &serde_json::Value) -> Option<serde_json::Value> {
         None
     }
 

@@ -898,10 +898,11 @@ impl Dashboard {
             self.exit_requested_during_update = true;
             Task::none()
         } else if !self.ready {
-            // Before boot finished there is no drain to complete — the drain-watch and the
-            // shutdown subscription exist only after a successful boot. Mid-boot the exit waits
-            // for the boot's result, since a store left before its first catalog run is refused
-            // on the next start (`db::has_product_schema`); [`BOOT_EXIT_WAIT`] bounds a
+            // Before boot finished there is no drain to complete — the drain-watch is spawned only
+            // by a successful boot, while the shutdown subscription is always on, so a drain begun
+            // during boot still ends this window (see `Message::DrainStarted`). Mid-boot the exit
+            // waits for the boot's result, since a store left before its first catalog run is
+            // refused on the next start (`db::has_product_schema`); [`BOOT_EXIT_WAIT`] bounds a
             // hanging start.
             if self.boot_error.is_some() {
                 // The start failed, so nothing is writing the stores any more.
@@ -950,12 +951,12 @@ impl Dashboard {
             // without a replacement, so wait. A failed update re-enters through UpdateResult.
             return Task::none();
         }
-        // Fire the token before the runtime drops: `shutdown_after_dashboard` relies on it being
+        // Fire the token before the runtime drops: `shutdown_service` relies on it being
         // cancelled by then (see its note in main.rs), and a pre-boot request reaches here with
         // no drain to have fired it. Idempotent.
         crate::shutdown::force_cancel();
-        // No checkpoint here: it lives in shutdown_after_dashboard, after the iced
-        // runtime drops, so it is genuinely single-writer.
+        // No checkpoint here: it lives in shutdown_service, after the iced runtime drops, so it is
+        // genuinely single-writer.
         iced::exit()
     }
 
@@ -1345,7 +1346,13 @@ impl Dashboard {
                 if std::mem::take(&mut self.exit_after_boot) {
                     return self.save_and_exit();
                 }
-                self.finish_boot(result)
+                let task = self.finish_boot(result);
+                // A stop that arrived mid-boot began a drain; a boot that then failed leaves
+                // nothing to drain and no drain-watch to finish it, so the stop ends here.
+                if self.draining && self.boot_error.is_some() {
+                    return self.save_and_exit();
+                }
+                task
             }
             Message::BootExitWaitExpired => {
                 // The boot hung past [`BOOT_EXIT_WAIT`]: the waiting exit ends the
@@ -1384,8 +1391,17 @@ impl Dashboard {
                 WindowAction::Close => self.close_window(),
             },
             Message::QuitRequested => self.request_exit(Some(crate::shutdown::MACOS_QUIT_TRIGGER)),
+            // The token fired: a drain finished, or a second signal force-cancelled one. Before a
+            // finished boot this is that second signal — the forced stop the platform's default
+            // kill used to give — so it ends the process rather than waiting for a boot.
             Message::Shutdown => self.save_and_exit(),
             Message::DrainStarted => {
+                // A boot that failed leaves nothing to drain and no drain-watch to finish the
+                // drain: the stop ends the process here, exactly as that state's window close
+                // does (`close_window`).
+                if !self.ready && self.boot_error.is_some() {
+                    return self.save_and_exit();
+                }
                 // A restart toast only once the update is finalizing and shutting the
                 // service down: a plain quit, close or signal during an update still in
                 // flight must not claim a restart. `!self.draining` guards single emission.
@@ -2563,6 +2579,10 @@ impl Dashboard {
             }),
             window::close_requests().map(Message::CloseRequested),
             iced::Subscription::run(quit_requests_subscription),
+            // The stop protocol, from the start like the quit asks: a drain that began during a
+            // boot still has to reach the window when it ends, and one whose boot FAILED has no
+            // drain-watch behind it at all, so this is the only place its end is observed.
+            iced::Subscription::run(shutdown_subscription),
             // The ways into the window from outside it, subscribed from the start like the quit
             // asks: the tray menu's quit ends the process as a platform quit does, and the way
             // back brings up even a booting window. A platform without them has no gestures.
@@ -2610,7 +2630,6 @@ impl Dashboard {
                 }
                 _ => iced::Subscription::none(),
             },
-            iced::Subscription::run(shutdown_subscription),
             // Local git footer refresh, event-driven, when workspace files change.
             iced::Subscription::run(git_file_changes_subscription),
             // Pipeline auto-commits are ref-only changes the watcher misses.

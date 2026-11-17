@@ -1,28 +1,58 @@
 //! Start at login: the product's own registration with the operating system.
 //!
-//! The running app is the only writer of the system's startup state — the install scripts and
-//! the updater never touch it. Each platform keeps one fixed identity, so a start after an
-//! install, an update or a move re-points the same entry rather than adding a second one. The
-//! owner's decision is `crate::config`'s (`autolaunch`), and it outlives installs. A disable
-//! made in the system's own settings is real state here: it reads as "not registered", and
-//! nothing in the product overrides it on its own.
+//! A host gets one registration, and the installer is the one that picks it: a Linux host with
+//! no graphical system gets the system unit ([`SYSTEM_UNIT`]), every other host starts the
+//! product at login. This module owns the login side of that choice and follows the
+//! installer's where it made one — with the unit in place it removes the login entry and never
+//! writes one, because the two would start two copies.
+//!
+//! Each platform keeps one fixed identity, so a start after an install, an update or a move
+//! re-points the same entry rather than adding a second one. The owner's decision is
+//! `crate::config`'s (`autolaunch`), and it outlives installs. A disable made in the system's own
+//! settings is real state here — a login entry disabled there, or the installer's unit disabled
+//! with `systemctl` — it reads as "not registered", and nothing in the product overrides it on its
+//! own.
 
 use std::path::Path;
 
 use anyhow::Context as _;
 
-/// Keep the system's registration true to the owner's decision and to the running binary.
+/// The system unit the installer registers on a Linux host with no graphical system. Root's to
+/// write and remove, and the one registration such a host gets.
+const SYSTEM_UNIT: &str = "/etc/systemd/system/mahbot.service";
+
+/// The symlink systemd enables a unit with. The file alone starts nothing: a host whose unit was
+/// `systemctl disable`d keeps it and boots the product no more, so this — not the file — is what
+/// "registered" means.
+const SYSTEM_UNIT_ENABLED: &str = "/etc/systemd/system/multi-user.target.wants/mahbot.service";
+
+/// Whether the installer left its unit on this host at all. It answers which registration the
+/// host has (the installer's choice), not whether that registration is enabled
+/// ([`system_unit_enabled`]). Always `false` off Linux, where there is no such unit to respect.
+pub(crate) fn system_unit_installed() -> bool {
+    cfg!(target_os = "linux") && Path::new(SYSTEM_UNIT).is_file()
+}
+
+/// Whether systemd is set to start the installer's unit at boot.
+pub(crate) fn system_unit_enabled() -> bool {
+    cfg!(target_os = "linux") && Path::new(SYSTEM_UNIT_ENABLED).exists()
+}
+
+/// Keep the system's registration true to the installer's choice and to the running binary.
 /// Called at every start; a no-op for a copy built from sources.
+///
+/// With the installer's unit in place the login entry is only ever removed — enabled or not, the
+/// host's registration is the unit, and writing an entry beside it would start two copies.
 pub fn reconcile() {
     if !crate::self_update::is_published_copy() {
         return;
     }
-    let outcome = if decision() {
+    let outcome = if system_unit_installed() || !decision() {
+        platform::remove()
+    } else {
         std::env::current_exe()
             .map_err(anyhow::Error::from)
             .and_then(|exe| platform::ensure(&exe))
-    } else {
-        platform::remove()
     };
     if let Err(e) = outcome {
         tracing::warn!(error = %e, "the login registration could not be kept true");
@@ -32,12 +62,31 @@ pub fn reconcile() {
 /// Whether the system reports a registration that will start the product at login — an entry
 /// the owner disabled reads as `false`, and a probe that could not run as `None`.
 pub(crate) fn registered() -> Option<bool> {
-    platform::registered()
+    if system_unit_enabled() {
+        Some(true)
+    } else {
+        platform::registered()
+    }
 }
 
 /// Apply the owner's choice: remove everything, or (re)write the registration and clear a
 /// system-side disable. Returns what the system reports afterwards.
+///
+/// Where the installer left its unit, the start is the service manager's to set — the switch
+/// cannot enable a disabled unit (that needs root) and must not claim it did, so both answers
+/// name the command that does it.
 pub(crate) fn set_enabled(enabled: bool) -> anyhow::Result<Option<bool>> {
+    if system_unit_installed() {
+        anyhow::bail!(
+            "MahBot is registered as a system service, and its start is the service manager's to \
+             set — run `sudo systemctl {} mahbot.service`",
+            if enabled {
+                "enable --now"
+            } else {
+                "disable --now"
+            }
+        );
+    }
     if enabled {
         let exe = std::env::current_exe().context("the running program's path is unknown")?;
         platform::enable(&exe)?;
@@ -645,6 +694,40 @@ disabled services = {
         assert!(startup_approved_disabled(&[0x03]));
         assert!(startup_approved_disabled(&[0x07]));
         assert!(!startup_approved_disabled(&[]));
+    }
+
+    /// The two unit facts answer two different questions, and both are the installer's own: the
+    /// file says which registration the host has, the wants symlink says whether systemd starts it.
+    /// Both paths are built from the installer's own text, so a change on either side fails here
+    /// instead of landing on an operator's host.
+    #[test]
+    fn the_system_unit_paths_are_the_installers_own() {
+        let installer = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"),
+        )
+        .expect("install.sh is part of the tree");
+        let assigned = |prefix: &str| -> String {
+            installer
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(prefix))
+                .unwrap_or_else(|| panic!("install.sh must set {prefix}"))
+                .trim_matches('"')
+                .to_string()
+        };
+        let name = assigned("UNIT_NAME=");
+        let path = assigned("UNIT_PATH=").replace("$UNIT_NAME", &name);
+        assert_eq!(
+            SYSTEM_UNIT, path,
+            "the product must look for the unit where the installer writes it"
+        );
+        // systemd enables a unit through the wants symlink of the target its [Install] section
+        // names, which is why the product reads that symlink rather than the unit file.
+        let target = assigned("WantedBy=");
+        assert_eq!(
+            SYSTEM_UNIT_ENABLED,
+            format!("/etc/systemd/system/{target}.wants/{name}"),
+            "the product must read the wants symlink of the target the unit is wanted by"
+        );
     }
 
     /// A failed rename must not leave the temp file behind in a directory nothing sweeps.

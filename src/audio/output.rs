@@ -91,6 +91,16 @@ fn open(warn_on_failure: bool) -> bool {
     if OUTPUT.get().is_some() {
         return true;
     }
+    // A host without the audio library has no device to open, and no library call to make: the
+    // answer is the same whether this is the first attempt or the tenth, so nothing is retried.
+    if !crate::audio::library_available() {
+        if warn_on_failure {
+            warn!("{}", crate::audio::LIBRARY_UNAVAILABLE);
+        } else {
+            debug!("{}", crate::audio::LIBRARY_UNAVAILABLE);
+        }
+        return false;
+    }
     // Re-check inside the guard: another thread may have won the race already.
     let _guard = OPEN_LOCK.lock().unwrap_poison();
     if OUTPUT.get().is_some() {

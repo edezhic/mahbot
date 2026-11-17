@@ -10,10 +10,15 @@
 //! kickoff persists `OnboardingState::Finished` (closing the flow) and routes a single real "hi mah
 //! bot" user message through the normal pipeline. The Assistant drives onboarding now; the guide
 //! reaches the greeting session through the pending-guide bridge, not the onboarding state.
+//!
+//! The state has two writers, and only the closing half is shared: the desktop kickoff
+//! ([`kickoff_onboarding`]) and the terminal setup (`crate::setup`), which closes the flow through
+//! [`finish_onboarding`] and sends no greeting — nothing is listening in a window it never opened.
 
 use crate::ChannelMessage;
 use crate::config::{
-    CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY, CONFIG_KEY_PROVIDER_KEY,
+    CONFIG_KEY_ONBOARDING_STATE, CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
+    CONFIG_KEY_PROVIDER_KEY, OnboardingState,
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -156,15 +161,27 @@ pub fn invalid_message() -> &'static str {
     "That doesn't look right. Enter an OpenRouter key (starts with `sk-or-v1-`) or a custom endpoint URL (first line) + optional API key (second line)."
 }
 
+/// Close the desktop onboarding flow: persist [`OnboardingState::Finished`] and nothing else. The
+/// greeting and the pending guide belong to [`kickoff_onboarding`]; the terminal setup has no
+/// window to greet in, so it calls this alone.
+pub async fn finish_onboarding() -> anyhow::Result<()> {
+    crate::config::persist_settled_string_field(
+        CONFIG_KEY_ONBOARDING_STATE,
+        OnboardingState::Finished.as_str(),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Phase-2 kickoff: if the onboarding state is `Init` and a provider is configured, persist
 /// `OnboardingState::Finished` and auto-send a single real "hi mah bot" user message through the
 /// normal GUI pipeline. No-op when the state is not `Init`, no provider is configured, or the user
 /// is not an admin. Onboarding is strictly one-shot: the `== Init` gate plus the `KICKOFF_FIRED`
 /// CAS make a re-trigger impossible, even after a provider reconnection or a second workspace — the
-/// state only moves `Init` → `Finished`, and only this route moves it. A guest never triggers
-/// onboarding: the `is_admin` gate fails closed.
+/// state only moves `Init` → `Finished`. A guest never triggers onboarding: the `is_admin` gate
+/// fails closed. This is the desktop route, and the greeting is its own: the terminal setup command
+/// closes the same state through [`finish_onboarding`] without one.
 pub async fn kickoff_onboarding(user_name: &str) -> anyhow::Result<()> {
-    use crate::config::OnboardingState;
     if crate::config::CONFIG.onboarding_stage() != OnboardingState::Init {
         return Ok(());
     }
@@ -188,12 +205,7 @@ pub async fn kickoff_onboarding(user_name: &str) -> anyhow::Result<()> {
     // a later HistoryLoaded render) retries cleanly — no duplicate greeting
     // is possible. On success the durable one-shot guard is in place before
     // any side effect.
-    if let Err(e) = crate::config::persist_settled_string_field(
-        crate::config::CONFIG_KEY_ONBOARDING_STATE,
-        OnboardingState::Finished.as_str(),
-    )
-    .await
-    {
+    if let Err(e) = finish_onboarding().await {
         KICKOFF_FIRED.store(false, Ordering::SeqCst);
         return Err(e);
     }

@@ -101,6 +101,7 @@ fn not_ready_reason(reason: &NotReady) -> &'static str {
             "the speech models could not be loaded; the next attempt loads them again"
         }
         NotReady::NoAudioDevice => "this machine has no audio output device",
+        NotReady::NoAudioLibrary => crate::audio::LIBRARY_UNAVAILABLE,
     }
 }
 

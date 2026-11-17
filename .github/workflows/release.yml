@@ -23,6 +23,11 @@
 # local builds and the pipeline's own diagnostics use — and never taken from the
 # moving `stable` channel; that file carries the reason the version is this one.
 #
+# The Linux legs are additionally checked on the built file: it must not name the
+# audio library or zlib as a loader dependency, and the `alsa-sys` replacement must
+# be in its graph (`scripts/linux-loader-check.sh`). A release that would need
+# either library present is refused there rather than shipped.
+#
 # What this publishes is the release contract, mirrored by the product's own
 # updater (`src/self_update.rs`) and by `install.sh` / `install.ps1` — this file is
 # the one place it is written down for the release side:
@@ -172,15 +177,17 @@ jobs:
 
       # The GUI stack's dependencies probe for these. The base itself is the image,
       # so the file links against the glibc that image ships. `libasound2-dev` is ALSA's
-      # own headers: the microphone and speech playback reach it through cpal, and
-      # `libasound2` ships in the image, so nothing extra travels with the file.
+      # own headers and `libclang-dev` is what the audio shim's bindgen needs: the shim
+      # generates the bindings at build time and loads `libasound` on first use, so the
+      # file does not name it as a loader dependency and a bare server starts without it.
+      # `binutils` is what reads that list back off the built file below.
       - name: Install the Linux build prerequisites
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config ca-certificates curl \
-            libasound2-dev \
+            build-essential pkg-config ca-certificates curl binutils \
+            libasound2-dev libclang-dev clang \
             libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libfontconfig1-dev
 
       # `turso_sdk_kit`'s build script compiles a VERSIONINFO resource with `rc.exe`
@@ -216,6 +223,16 @@ jobs:
           # macOS: the floor is set in this build, not merely written down.
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.target_os == 'macos' && '14.0' || '' }}
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # The loader dependencies of the file this leg just built, read from the file
+      # and from the lockfile it was built against — never from the source. Nothing
+      # is rebuilt: `cargo tree --locked` reports the same resolution the build used,
+      # so the check cannot validate a binary the release was not built from.
+      - name: Check the Linux artefact's loader dependencies
+        if: runner.os == 'Linux'
+        run: |
+          scripts/linux-loader-check.sh \
+            "target/${{ matrix.target }}/release/mahbot" ${{ matrix.target }}
 
       # Staged before archiving: the archive's single entry is `mahbot` at its root,
       # not a path with the build directory in it. `COPYFILE_DISABLE` keeps it the
@@ -406,13 +423,14 @@ jobs:
       - name: Install the toolchain
         uses: dtolnay/rust-toolchain@1.99.1
 
-      # Verification links the same Linux libraries the build legs install.
+      # Verification links the same Linux libraries the build legs install; the audio
+      # shim's bindgen needs the ALSA headers and libclang too.
       - name: Install the Linux build prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config ca-certificates curl \
-            libasound2-dev \
+            libasound2-dev libclang-dev clang \
             libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libfontconfig1-dev
 
       - name: Publish

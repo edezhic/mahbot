@@ -131,7 +131,16 @@ pub(crate) async fn execute(call: CallRequest) -> CallReply {
     .await;
     let duration_ms = crate::util::millis_i64(started.elapsed());
 
-    record_operation(&call, tool_name, duration_ms, &outcome, &ws.path);
+    // A call that carries a credential is recorded as the tool allows it, never as it was made.
+    let recorded = tool.recorded_arguments(&call.args);
+    record_operation(
+        &call,
+        tool_name,
+        recorded.as_ref(),
+        duration_ms,
+        &outcome,
+        &ws.path,
+    );
 
     reply(outcome)
 }
@@ -160,6 +169,8 @@ async fn execute_document_read(call: &CallRequest) -> CallReply {
     record_operation(
         call,
         "document",
+        // No tool stands behind this one, so nothing can carry a credential in its arguments.
+        None,
         crate::util::millis_i64(started.elapsed()),
         &outcome,
         &ws.path,
@@ -249,11 +260,12 @@ const PARTIAL_RECORD_REASON: &str = "the operation reported that part of it was 
 fn record_operation(
     call: &CallRequest,
     tool_name: &str,
+    recorded: Option<&serde_json::Value>,
     duration_ms: i64,
     outcome: &Result<ToolAnswer, String>,
     workspace_path: &str,
 ) {
-    let record = operation_record(call, tool_name, duration_ms, outcome);
+    let record = operation_record(call, tool_name, recorded, duration_ms, outcome);
     // The row goes on the telemetry queue like the agent path's: the operation's own answer is what
     // the caller is owed.
     crate::telemetry::enqueue(crate::telemetry::TelemetryRecord::ToolCalls(
@@ -277,6 +289,7 @@ fn record_operation(
 fn operation_record(
     call: &CallRequest,
     tool_name: &str,
+    recorded: Option<&serde_json::Value>,
     duration_ms: i64,
     outcome: &Result<ToolAnswer, String>,
 ) -> crate::ToolCallRecord {
@@ -284,8 +297,9 @@ fn operation_record(
         tool_name: tool_name.to_string(),
         // The DESTINATION is deliberately not among the arguments: it is this command line's own
         // operand rather than an argument the tool was handed, and the answer already names every
-        // produced file by absolute path.
-        arguments: crate::stats::recorded_arguments(&call.args),
+        // produced file by absolute path. What a credential-bearing call may be recorded with is
+        // the tool's own answer, passed in.
+        arguments: crate::stats::recorded_arguments(recorded.unwrap_or(&call.args)),
         duration_ms,
         success: matches!(outcome, Ok(answer) if !answer.partial),
         error_message: match outcome {
@@ -353,6 +367,7 @@ mod tests {
         let done = operation_record(
             &call(serde_json::json!({})),
             "document",
+            None,
             5,
             &Ok(ToolAnswer::done("a document was produced")),
         );
@@ -362,6 +377,7 @@ mod tests {
         let partial = operation_record(
             &call(serde_json::json!({})),
             "document",
+            None,
             5,
             &Ok(ToolAnswer::partial("produced, but a placeholder stayed")),
         );
@@ -374,6 +390,7 @@ mod tests {
         let refused = operation_record(
             &call(serde_json::json!({ "path": "missing.docx" })),
             "document",
+            None,
             5,
             &Err("nothing named missing.docx".to_string()),
         );

@@ -1,0 +1,25 @@
+[package]
+name = "alsa-sys"
+version = "0.4.0"
+edition = "2021"
+# The package `alsa` 0.11 asks for, replaced through `[patch.crates-io]` so the file has no
+# load-time dependency on libasound. It is not a fork of the bindings: `build.rs` generates them
+# from the system header and wraps every function in a `dlopen` lookup, so the only hand-written
+# part is the handful of header macros `bindgen` does not emit.
+links = "alsa"
+build = "build.rs"
+
+[lib]
+name = "alsa_sys"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+
+[build-dependencies]
+# The version the published `alsa-sys` generates its bindings with, so the output has the same
+# shape (constant naming, enum style) the `alsa` crate was written against.
+bindgen = "0.72"
+# Include paths only — `cargo_metadata(false)` keeps it from emitting the `-lasound` this crate
+# exists to remove.
+pkg-config = "0.3"

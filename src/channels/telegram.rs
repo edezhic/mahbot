@@ -1149,17 +1149,56 @@ async fn get_me(
         .get(bot_api_url(api_base, token, "getMe"))
         .send()
         .await
-        .context("Failed to reach Telegram API")?;
+        // The URL carries the token, so it is never part of the error: this text reaches the log
+        // store as a failed call's reason, where a credential may not be read back from.
+        .map_err(|e| anyhow::anyhow!("Failed to reach Telegram API: {}", e.without_url()))?;
     let status = response.status();
     let data: serde_json::Value = match response.json().await {
         Ok(data) => data,
-        Err(err) => anyhow::bail!("Failed to parse Telegram API response: {err}"),
+        // Same rule as the transport failure above: a decode error carries the request's URL,
+        // which is the token's own path.
+        Err(err) => anyhow::bail!(
+            "Failed to parse Telegram API response: {}",
+            err.without_url()
+        ),
     };
     if !status.is_success() || data["ok"].as_bool() != Some(true) {
         let desc = data["description"].as_str().unwrap_or("unknown error");
         anyhow::bail!("{REJECTED_TOKEN_PREFIX}{desc}");
     }
     Ok(data)
+}
+
+/// The bot a token belongs to: the platform's own answer to `getMe`, read once and passed on as
+/// itself — validating a token and naming its account are one call.
+#[derive(Debug)]
+pub(crate) struct BotIdentity {
+    pub id: i64,
+    pub username: Option<String>,
+}
+
+/// That identity, named for a person: `@username (id N)`, or `id N` when the account carries no
+/// username.
+#[must_use]
+pub(crate) fn describe_identity(bot: &BotIdentity) -> String {
+    match &bot.username {
+        Some(username) => format!("@{username} (id {})", bot.id),
+        None => format!("id {}", bot.id),
+    }
+}
+
+/// The bot a token belongs to at `api_base`: its id and the username the platform shows, if it has
+/// one. One `getMe`, the one place its shape is read.
+async fn bot_account(api_base: &str, token: &str) -> anyhow::Result<BotIdentity> {
+    let client = crate::util::http::build_http_client(std::time::Duration::from_secs(10));
+    let data = get_me(&client, api_base, token).await?;
+    let id = data["result"]["id"]
+        .as_i64()
+        .ok_or_else(|| anyhow::anyhow!("the Bot API named no bot account"))?;
+    Ok(BotIdentity {
+        id,
+        username: data["result"]["username"].as_str().map(str::to_string),
+    })
 }
 
 /// Cloud download cap; the enrichment gate reuses it as its processing bound.
@@ -1477,6 +1516,9 @@ fn parse_recipient(recipient: &str) -> (&str, Option<&str>) {
 /// binding, else `(canonical_user, chat_id, reply_target)` — `"123456"` or `"123456:789"` for
 /// threads. `Err` is the bindings read failing, which is no decision and must not become a refusal:
 /// that would drop the event for good.
+///
+/// The one side effect beyond recording the address: the owner's first message confirms the binding
+/// back to it (see the body). Nothing else is sent from here.
 async fn resolve_authorized_sender(
     sender_source: &serde_json::Value,
     chat_source: &serde_json::Value,
@@ -1495,9 +1537,31 @@ async fn resolve_authorized_sender(
     let Some((chat_id, reply_target)) = extract_chat_context(chat_source) else {
         return Ok(None);
     };
-    // Update reply_target for future message delivery
-    let _ =
+    // A nickname binding starts with no delivery address, so its first message is the moment that
+    // account proves it owns the binding — the one moment worth a confirmation, and only to the
+    // owner: a guest's first message confirms nothing. Read before the update below writes the
+    // address, and read per message: a binding that already had an address (every numeric id, and
+    // every account that has written before) never confirms. The address came with the match, so
+    // this asks the table nothing.
+    let first_contact =
+        crate::users::is_admin_name(&matched.user_name) && matched.reply_target.is_none();
+    // Update reply_target for future message delivery. The write is what makes the confirmation
+    // final: a failed one is logged and the confirmation withheld, so the owner is told the binding
+    // is confirmed only once the address that carries the reply is actually stored.
+    let recorded =
         crate::users::update_channel_contact("telegram", &matched.identifier, &reply_target).await;
+    if let Err(e) = &recorded {
+        tracing::warn!(error = %e, "a Telegram address could not be recorded for delivery");
+    }
+    if first_contact && recorded.is_ok() {
+        // Best-effort: the owner's message is processed whatever the confirmation's own delivery
+        // does, so a failed send is only a log line inside `send_reply`.
+        send_reply(
+            &reply_target,
+            "Owner confirmed — this Telegram account now owns MahBot.",
+        )
+        .await;
+    }
     Ok(Some((matched.user_name, chat_id, reply_target)))
 }
 
@@ -2113,11 +2177,12 @@ impl TelegramChannel {
         });
     }
 
-    /// Validate a bot token by asking the Bot API the current mode serves for it. There is no
-    /// fallback to the cloud: a token-bearing cloud request logs the bot back in there and splits
-    /// its updates. With no published endpoint nothing is checked — a save must stay possible, the
-    /// token field may be what fixes the bot.
-    pub async fn validate_token(token: &str) -> anyhow::Result<()> {
+    /// Validate a bot token by asking the Bot API the current mode serves for it, and name the bot
+    /// it belongs to. There is no fallback to the cloud: a token-bearing cloud request logs the bot
+    /// back in there and splits its updates. With no published endpoint nothing is checked — a save
+    /// must stay possible, the token field may be what fixes the bot — so `None` means "asked
+    /// nothing", never "refused".
+    pub(crate) async fn validate_token(token: &str) -> anyhow::Result<Option<BotIdentity>> {
         if token.trim().is_empty() {
             anyhow::bail!("Telegram bot token is empty");
         }
@@ -2125,19 +2190,14 @@ impl TelegramChannel {
             tracing::info!(
                 "Telegram: the local server has no endpoint yet, so the token is kept unchecked"
             );
-            return Ok(());
+            return Ok(None);
         };
-        let client = crate::util::http::build_http_client(std::time::Duration::from_secs(10));
-        get_me(&client, &base, token).await.map(|_| ())
+        bot_account(&base, token).await.map(Some)
     }
 
     /// The bot's own account id at `api_base` — the same call as validation, read for its answer.
     pub(crate) async fn probe_bot(api_base: &str, token: &str) -> anyhow::Result<i64> {
-        let client = crate::util::http::build_http_client(std::time::Duration::from_secs(10));
-        let data = get_me(&client, api_base, token).await?;
-        data["result"]["id"]
-            .as_i64()
-            .ok_or_else(|| anyhow::anyhow!("the Bot API named no bot account"))
+        bot_account(api_base, token).await.map(|bot| bot.id)
     }
 
     /// Take the bot out of a Bot API server (`logOut`), which lets another serve it. A server that

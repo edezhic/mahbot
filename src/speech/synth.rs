@@ -75,6 +75,9 @@ pub(crate) enum NotReady {
     /// end — a set on disk is opened again by the next use, and a missing one is fetched again.
     LoadFailed,
     NoAudioDevice,
+    /// The platform's audio library is not installed at all, so no device can be opened: the
+    /// service runs, and only voice is unavailable.
+    NoAudioLibrary,
 }
 
 /// Returns `true` if speech output is enabled in config (regardless of model state), so a
@@ -124,6 +127,9 @@ pub(crate) async fn say_phrase(text: &str) -> SayOutcome {
     // Before the load: a phrase spoken to an empty room must not pay a cold load.
     if crate::user_activity::is_absent() {
         return SayOutcome::Absent;
+    }
+    if !crate::audio::library_available() {
+        return SayOutcome::NotReady(NotReady::NoAudioLibrary);
     }
     if !output::audio_output_ready() {
         // Detached on purpose: the open outlives this answer, and a blocking task cannot be

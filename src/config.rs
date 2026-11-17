@@ -1086,27 +1086,11 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
         }
         // Telegram token change hot-reloads the listener after the write.
         CONFIG_KEY_TELEGRAM_BOT_TOKEN => {
-            let old_token = CONFIG.telegram_bot_token();
-            let new_token = trimmed_or_none(&trimmed);
-            if new_token != old_token
-                && let Some(ref token) = new_token
-            {
-                crate::channels::telegram::TelegramChannel::validate_token(token).await?;
-            }
-            write_kv_and_update_config(CONFIG_KEY_TELEGRAM_BOT_TOKEN, &trimmed).await?;
-            let persisted = CONFIG.telegram_bot_token();
-            if persisted != old_token
-                && let Err(e) =
-                    crate::channels::telegram::restart_telegram_listener(persisted.as_deref())
-            {
-                // The token is written and takes effect at the next start; only
-                // the hot-reload failed, so the save stands. No warning: that slot
-                // belongs to the endpoint arm.
-                tracing::warn!(
-                    key,
-                    "Telegram listener restart failed (non-fatal, value saved): {e:#}"
-                );
-            }
+            let _ = write_telegram_token(&trimmed).await?;
+            return Ok(PersistOutcome {
+                value: canonical,
+                warning: None,
+            });
         }
         // Everything else is read dynamically at use time — persist only.
         _ => {
@@ -1118,6 +1102,47 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
         value: canonical,
         warning: None,
     })
+}
+
+/// Save the Telegram bot token and name the bot it belongs to: the live check a changed token earns
+/// is one `getMe`, and that same answer is what names the account, so a caller that wants both does
+/// not ask the platform twice. Returns the identity described for a person, or `None` when nothing
+/// was checked (an unchanged token, or a local Bot API server with no endpoint yet).
+pub(crate) async fn persist_telegram_bot_token(token: &str) -> Result<Option<String>> {
+    let _guard = persist_lock().lock().await;
+    write_telegram_token(token.trim()).await
+}
+
+/// The Telegram token's write: validate a changed token (which is also the identity read), write
+/// the KV row, then hot-reload the listener.
+///
+/// # Precondition
+/// The caller holds [`persist_lock`]; this helper does not acquire it.
+async fn write_telegram_token(trimmed: &str) -> Result<Option<String>> {
+    let old_token = CONFIG.telegram_bot_token();
+    let new_token = trimmed_or_none(trimmed);
+    let identity = if new_token != old_token
+        && let Some(ref token) = new_token
+    {
+        crate::channels::telegram::TelegramChannel::validate_token(token)
+            .await?
+            .map(|bot| crate::channels::telegram::describe_identity(&bot))
+    } else {
+        None
+    };
+    write_kv_and_update_config(CONFIG_KEY_TELEGRAM_BOT_TOKEN, trimmed).await?;
+    let persisted = CONFIG.telegram_bot_token();
+    if persisted != old_token
+        && let Err(e) = crate::channels::telegram::restart_telegram_listener(persisted.as_deref())
+    {
+        // The token is written and takes effect at the next start; only the hot-reload failed, so
+        // the save stands. No warning: that slot belongs to the endpoint arm.
+        tracing::warn!(
+            key = CONFIG_KEY_TELEGRAM_BOT_TOKEN,
+            "Telegram listener restart failed (non-fatal, value saved): {e:#}"
+        );
+    }
+    Ok(identity)
 }
 
 /// Probe→validate→write for the provider arms: snapshot the live CONFIG, apply

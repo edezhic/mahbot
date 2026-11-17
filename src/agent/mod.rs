@@ -1467,7 +1467,11 @@ impl Agent {
     }
 
     /// Record one tool invocation into the in-memory stats (sent to telemetry at
-    /// finalization); arguments go through [`crate::stats::recorded_arguments`].
+    /// finalization); arguments go through [`crate::stats::recorded_arguments`], with the tool's own
+    /// answer for a call that carries a credential first ([`crate::Tool::recorded_arguments`]).
+    ///
+    /// A call naming a tool this agent does not hold has no such answer and is recorded as it was
+    /// made: it never ran, and the model invented its name.
     fn push_tool_call_record(
         &self,
         tool_name: String,
@@ -1476,7 +1480,9 @@ impl Agent {
         success: bool,
         error_message: Option<String>,
     ) {
-        let arguments = crate::stats::recorded_arguments(arguments);
+        let recorded = crate::tools::find_tool(&self.tools, &tool_name)
+            .and_then(|tool| tool.recorded_arguments(arguments));
+        let arguments = crate::stats::recorded_arguments(recorded.as_ref().unwrap_or(arguments));
         let mut guard = self.tool_stats.lock().unwrap_poison();
         guard.push(crate::ToolCallRecord {
             tool_name,

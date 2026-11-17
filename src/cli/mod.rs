@@ -52,8 +52,9 @@ Usage:
   mahbot bench-openrouter <args>
                          Standalone OpenRouter provider benchmark
   mahbot config <operation> [flags]
-                         Set the RUNNING product up (Telegram bot, users, tool
-                         grants, web search, custom roles)
+                         Set the RUNNING product up: one command for the model
+                         provider, the Telegram bot and the owner, plus users,
+                         tool grants, web search, custom roles
   mahbot workspace <operation> [flags]
                          Work with the RUNNING product's workspaces and tickets
   mahbot send [flags]    Hand one message to an agent and finish — the answer
@@ -76,7 +77,11 @@ Usage:
 
 Options:
   -h, --help             Print this help and exit
-  -V, --version          Print the version and exit";
+  -V, --version          Print the version and exit
+
+Environment:
+  MAHBOT_HEADLESS=1      Run the service without a window, whatever the display
+                         says (a graphical host with an unusable one)";
 
 /// The transport tag the command line's own operations are attributed to: the
 /// one-way `send` reaches the history as a message the owner typed (`gui`) or
@@ -451,9 +456,50 @@ pub(crate) const FAMILIES: &[Family] = &[
         word: "config",
         tool: "mahbot_config",
         protocol: crate::db::ipc::CALL_STORE_BASE,
-        purpose: "Set the running product up — its Telegram bot, its users and \
-                  their tool grants, web search, custom roles",
+        purpose: "Set the running product up — its model provider and Telegram bot in one \
+                  command, plus its users and their tool grants, web search, custom roles",
         surface: Surface::Operations(&[
+            Operation {
+                action: Some(crate::setup::ACTION),
+                purpose: "Set the whole product up in one run — the model provider, the Telegram \
+                          bot and which account is the owner — changing only what is given",
+                flags: &[
+                    Flag {
+                        arg: "provider_key",
+                        kind: FlagKind::Value,
+                        purpose: "The OpenRouter API key; write `@file` to read it from a file",
+                    },
+                    Flag {
+                        arg: "provider_endpoint",
+                        kind: FlagKind::Value,
+                        purpose: "A custom OpenAI-compatible endpoint URL (an optional key goes \
+                                  with --provider-endpoint-key)",
+                    },
+                    Flag {
+                        arg: "provider_endpoint_key",
+                        kind: FlagKind::Value,
+                        purpose: "The custom endpoint's own key; write `@file` to read it from a \
+                                  file",
+                    },
+                    Flag {
+                        arg: "telegram_token",
+                        kind: FlagKind::Value,
+                        purpose: "The Telegram bot token from BotFather; write `@file` to read it \
+                                  from a file",
+                    },
+                    Flag {
+                        arg: "owner",
+                        kind: FlagKind::Value,
+                        purpose: "The owner's Telegram @username or numeric id — write './@name' \
+                                  for the '@' spelling, which otherwise names a file",
+                    },
+                    Flag {
+                        arg: "unbind_owner",
+                        kind: FlagKind::Present,
+                        purpose: "Remove the owner's Telegram binding",
+                    },
+                ],
+            },
             Operation {
                 action: Some("setup_telegram_bot"),
                 purpose: "Save the Telegram bot token from BotFather",
@@ -2628,6 +2674,20 @@ mod tests {
             .collect()
     }
 
+    /// The actions a tool publishes to the command line only. The Assistant's schema is what a model
+    /// may call, so an action the tool refuses everywhere else ([`crate::setup::ACTION`]) is
+    /// reachable from the terminal alone. Pinned rather than read back from a second schema: the
+    /// tool's own schema is the statement, and
+    /// [`command_line_only_actions_are_absent_from_the_assistants_schema`] holds this list to it.
+    const COMMAND_LINE_ONLY_ACTIONS: &[(&str, &str)] = &[("mahbot_config", crate::setup::ACTION)];
+
+    /// Whether this operation's action is one the tool publishes to the command line only.
+    fn command_line_only(family: &Family, operation: &Operation) -> bool {
+        operation
+            .action
+            .is_some_and(|action| COMMAND_LINE_ONLY_ACTIONS.contains(&(family.tool, action)))
+    }
+
     /// Whether a tool's actions declare their OWN arguments (`oneOf`) rather than
     /// sharing one set beside the action (`enum`): only the former sweeps per
     /// operation, the latter stating its arguments once for every action.
@@ -2638,17 +2698,25 @@ mod tests {
     }
 
     /// The arguments one command line can fill: the tool's whole top-level set, or —
-    /// where actions declare their own — the action's entry plus those beside it.
+    /// where actions declare their own — the action's entry plus those beside it. `None` for an
+    /// action only the command line publishes: its arguments are the command line's own, and
+    /// [`crate::setup::tests::the_terminal_flags_are_exactly_what_the_parser_reads`] holds them to
+    /// the parser that reads them.
     fn argument_schema(
         family: &Family,
         operation: &Operation,
-    ) -> serde_json::Map<String, serde_json::Value> {
+    ) -> Option<serde_json::Map<String, serde_json::Value>> {
+        if command_line_only(family, operation) {
+            return None;
+        }
         // The reader is no tool action: its arguments are the two inputs the reading takes.
         if operation.action == Some(DOCUMENT_READ) {
-            return ["path", "file_name"]
-                .into_iter()
-                .map(|name| (name.to_string(), serde_json::json!({ "type": "string" })))
-                .collect();
+            return Some(
+                ["path", "file_name"]
+                    .into_iter()
+                    .map(|name| (name.to_string(), serde_json::json!({ "type": "string" })))
+                    .collect(),
+            );
         }
         let schema = tool_schema(family.tool);
         let top = schema["properties"]
@@ -2656,12 +2724,12 @@ mod tests {
             .expect("the tool's properties")
             .clone();
         let Some(action) = operation.action else {
-            return top;
+            return Some(top);
         };
         // An enum-shaped action states only WHICH action runs: its arguments
         // stand beside it at the tool's top level.
         if !declares_per_action_arguments(family.tool) {
-            return top.into_iter().filter(|(key, _)| key != "action").collect();
+            return Some(top.into_iter().filter(|(key, _)| key != "action").collect());
         }
         let entries = schema["properties"]["action"]["oneOf"]
             .as_array()
@@ -2692,7 +2760,7 @@ mod tests {
             .filter(|(key, _)| key != "action" && !per_action.contains(&key.as_str()))
             .collect();
         args.extend(declared.clone());
-        args
+        Some(args)
     }
 
     /// The words appearing more than once in `words` — a registry bug equality hides.
@@ -2810,8 +2878,9 @@ mod tests {
     /// The command line and the tools must agree on what exists, in both directions:
     /// an operation the tool cannot run, an action the command line cannot reach, a
     /// duplicate on either side. A tool taking no `action` has none in the registry
-    /// either; the one operation no tool action backs is pinned separately
-    /// ([`the_reader_is_the_one_operation_no_tool_backs`]).
+    /// either; an action only the command line may use is pinned in
+    /// [`COMMAND_LINE_ONLY_ACTIONS`]; the one operation no tool action backs is pinned
+    /// separately ([`the_reader_is_the_one_operation_no_tool_backs`]).
     #[test]
     fn operations_match_the_tools_own_actions() {
         for family in FAMILIES {
@@ -2844,7 +2913,7 @@ mod tests {
                 ours.len(),
                 "one of '{tool}'s command lines names an action where another does not"
             );
-            let mut theirs: Vec<&str> = tool_actions(&schema);
+            let theirs: Vec<&str> = tool_actions(&schema);
             assert!(
                 duplicates(taken.iter().copied()).is_empty(),
                 "the '{}' command line repeats an action of '{tool}'",
@@ -2854,7 +2923,15 @@ mod tests {
                 duplicates(theirs.iter().copied()).is_empty(),
                 "'{tool}' repeats an action"
             );
-            let mut ours = taken;
+            // The command line's own surface is the Assistant's plus the actions only it may use.
+            let mut theirs: Vec<String> = theirs.into_iter().map(str::to_string).collect();
+            theirs.extend(
+                COMMAND_LINE_ONLY_ACTIONS
+                    .iter()
+                    .filter(|(owner, _)| *owner == tool)
+                    .map(|(_, action)| (*action).to_string()),
+            );
+            let mut ours: Vec<String> = taken.into_iter().map(str::to_string).collect();
             ours.sort_unstable();
             theirs.sort_unstable();
             assert_eq!(
@@ -2898,6 +2975,27 @@ mod tests {
             !tool_actions(&tool_schema("document")).contains(&DOCUMENT_READ),
             "the reader must not be an action of the document tool"
         );
+    }
+
+    /// A pinned command-line-only action is really absent from the Assistant's schema — that
+    /// absence is the whole reason the pin exists, since the tool refuses the action everywhere
+    /// else — and the command line really exposes it.
+    #[test]
+    fn command_line_only_actions_are_absent_from_the_assistants_schema() {
+        for (tool, action) in COMMAND_LINE_ONLY_ACTIONS {
+            assert!(
+                !tool_actions(&tool_schema(tool)).contains(action),
+                "'{tool}' publishes '{action}' to the Assistant, so it is not command-line only"
+            );
+            assert!(
+                FAMILIES.iter().any(|family| {
+                    family.tool == *tool
+                        && matches!(family.surface, Surface::Operations(operations)
+                            if operations.iter().any(|operation| operation.action == Some(action)))
+                }),
+                "no 'mahbot' operation runs '{action}' of '{tool}'"
+            );
+        }
     }
 
     /// A tool that takes no action is named by its operations from its OWN name
@@ -3061,16 +3159,20 @@ mod tests {
         names
     }
 
-    /// The command lines of one family, as the ties sweep them: name, tool, arguments, flags.
+    /// The command lines of one family, as the ties sweep them: name, tool, arguments, flags. An
+    /// operation whose action the tool publishes to the command line only has no tool-declared
+    /// argument set to tie its flags to; `crate::setup`'s own test holds those to the parser.
     fn command_lines(family: &'static Family) -> Vec<CommandLine> {
         match family.surface {
             Surface::Operations(operations) => operations
                 .iter()
-                .map(|operation| CommandLine {
-                    called: format!("{} {}", family.word, operation_word(family, operation)),
-                    tool: family.tool,
-                    arguments: argument_schema(family, operation),
-                    flags: operation.flags,
+                .filter_map(|operation| {
+                    Some(CommandLine {
+                        called: format!("{} {}", family.word, operation_word(family, operation)),
+                        tool: family.tool,
+                        arguments: argument_schema(family, operation)?,
+                        flags: operation.flags,
+                    })
                 })
                 .collect(),
             Surface::Standalone(flags) => {
@@ -3088,6 +3190,26 @@ mod tests {
         }
     }
 
+    /// No operation repeats a flag. Swept over the registry itself rather than the tie below, so an
+    /// operation whose action the tool publishes only to the command line — which has no
+    /// tool-declared argument set to tie them to — is held to it too.
+    #[test]
+    fn no_operation_repeats_a_flag() {
+        for family in FAMILIES {
+            let Surface::Operations(operations) = family.surface else {
+                continue;
+            };
+            for operation in operations {
+                assert!(
+                    duplicates(operation.flags.iter().map(|flag| flag.arg)).is_empty(),
+                    "'mahbot {} {}' repeats a flag",
+                    family.word,
+                    operation_word(family, operation)
+                );
+            }
+        }
+    }
+
     /// Every flag must be an argument the tool actually reads, and able to fill that
     /// argument's type — swept per OPERATION, so a flag is judged against its own
     /// operation. The ONE exception is the destination ([`FlagKind::Destination`]),
@@ -3099,11 +3221,6 @@ mod tests {
         for family in FAMILIES {
             let lines = command_lines(family);
             for line in &lines {
-                assert!(
-                    duplicates(line.flags.iter().map(|flag| flag.arg)).is_empty(),
-                    "'mahbot {}' repeats a flag",
-                    line.called
-                );
                 for flag in line.flags {
                     if matches!(flag.kind, FlagKind::Destination) {
                         continue;

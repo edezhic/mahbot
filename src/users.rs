@@ -91,7 +91,7 @@ fn canonical_telegram_number(value: &str) -> Option<String> {
 /// Refuses what can never belong to a person: the reserved `unknown` sentinel, Telegram's
 /// own service identities under either spelling, and a value of nothing but zeros. A single
 /// leading `@` is stripped as it always has been; what remains decides the kind.
-fn normalize_telegram_binding(value: &str) -> anyhow::Result<String> {
+pub(crate) fn normalize_telegram_binding(value: &str) -> anyhow::Result<String> {
     let trimmed = value.trim();
     let trimmed = trimmed.strip_prefix('@').unwrap_or(trimmed).trim();
     match telegram_key(trimmed) {
@@ -142,7 +142,7 @@ fn is_telegram_service_nickname(nickname: &str) -> bool {
 
 /// Digits alone, however spelled. A stored value that is number-shaped but nothing but
 /// zeros binds nobody; it is still written as a number, so it shows as an id, never `@0`.
-fn telegram_identifier_is_number(identifier: &str) -> bool {
+pub(crate) fn telegram_identifier_is_number(identifier: &str) -> bool {
     telegram_digits(identifier).is_some()
 }
 
@@ -199,6 +199,17 @@ pub enum AddUserOutcome {
     Complete,
     /// In place, but its folder could not be created — also reported out of band.
     WithoutPersonalWorkspace,
+}
+
+/// The refusal for a Telegram value another account already holds: `bind_channel` would silently
+/// take that account's routing away, and the remedy is the Settings page for either caller — the
+/// owner's rebind and any user's bind alike.
+fn telegram_taken_refusal(identifier: &str, owner: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{} is already bound to user '{owner}' — remove that binding on the \
+         Settings → Users page first, then attach it to this account",
+        describe_telegram_binding(identifier)
+    )
 }
 
 impl UserStore {
@@ -405,6 +416,9 @@ impl UserStore {
     /// Telegram binding (at most one — switching ways is remove-then-attach, so re-attaching
     /// even the same value is refused); and a value bound to another account (anti-steal:
     /// `bind_channel` would silently reassign it). The at-most-one rule is Telegram-only.
+    ///
+    /// Both refusals name the Settings page because any account's binding is removed there —
+    /// this serves every user's bind (`add_user` included), not only the owner's.
     pub async fn validate_telegram_bind(&self, user_name: &str, value: &str) -> Result<String> {
         let identifier = normalize_telegram_binding(value)?;
         if let Some(existing) = self.telegram_binding(user_name).await? {
@@ -417,11 +431,7 @@ impl UserStore {
         // The at-most-one check above proved this account holds no Telegram row, so an owner
         // found here is always someone else.
         if let Some(owner) = self.telegram_binding_owner(&identifier).await? {
-            anyhow::bail!(
-                "{} is already bound to user '{owner}' — remove that binding on the \
-                 Settings → Users page first, then attach it to this account",
-                describe_telegram_binding(&identifier)
-            );
+            return Err(telegram_taken_refusal(&identifier, &owner));
         }
         Ok(identifier)
     }
@@ -434,17 +444,73 @@ impl UserStore {
         Ok(identifier)
     }
 
-    /// For the admin alone, whose bind has always also recorded a nickname as its starting
-    /// address — kept for compatibility with how that address has always been stored, not
-    /// because a nickname is sendable (it only starts working once the admin writes to the
-    /// bot). A number is a real address on every path.
-    pub async fn bind_telegram_for_admin(&self, value: &str) -> Result<String> {
-        let identifier = self.bind_telegram(ADMIN_USER_NAME, value).await?;
-        if !telegram_identifier_is_number(&identifier) {
-            self.update_channel_contact("telegram", &identifier, &identifier)
-                .await?;
+    /// The admin's Telegram binding replaced in one step: the same account keeps at most one
+    /// binding, so this is remove-then-attach rather than the refusal
+    /// [`UserStore::validate_telegram_bind`] makes for a second attach — in one transaction, so a
+    /// failed attach cannot leave the admin with no binding at all.
+    ///
+    /// Idempotent — rebinding the value the admin already holds changes nothing, so a re-run of
+    /// `mahbot config setup --owner` leaves the binding, and the delivery address it has earned,
+    /// exactly as they were. The one exception is the legacy repair below, which writes to clear an
+    /// address an older bind stored as the nickname itself; the returned [`TelegramRebind`] says
+    /// which of the two happened, so a report of the run stays truthful. A value bound to ANOTHER
+    /// account is still refused (anti-steal: reattaching would silently take that account's routing
+    /// away).
+    pub(crate) async fn rebind_telegram_for_admin(&self, value: &str) -> Result<TelegramRebind> {
+        let identifier = normalize_telegram_binding(value)?;
+        if let Some(owner) = self.telegram_binding_owner(&identifier).await?
+            && owner != ADMIN_USER_NAME
+        {
+            return Err(telegram_taken_refusal(&identifier, &owner));
         }
-        Ok(identifier)
+        let Some(existing) = self.telegram_binding_row(ADMIN_USER_NAME).await? else {
+            self.attach_telegram_binding(ADMIN_USER_NAME, &identifier)
+                .await?;
+            return Ok(TelegramRebind {
+                identifier,
+                changed: true,
+            });
+        };
+        // Re-attaching a NUMBER would replace the row and drop the address it has earned, so the
+        // value the admin already holds is left exactly as it is. A nickname's own earned address
+        // (the chat id its first message recorded) is kept for the same reason; the one write worth
+        // making is the legacy repair — an address an older Settings bind stored as the nickname
+        // itself — which is cleared so the owner's first message records the real one and confirms
+        // the binding the report promised.
+        let replaced = existing.identifier != identifier;
+        let repaired = !replaced
+            && !telegram_identifier_is_number(&identifier)
+            && existing.reply_target.as_deref() == Some(identifier.as_str());
+        if !replaced && !repaired {
+            return Ok(TelegramRebind {
+                identifier,
+                changed: false,
+            });
+        }
+        let tx = self.conn.begin_tx().await?;
+        tx.execute(
+            "DELETE FROM user_channels \
+             WHERE user_name = ?1 AND channel = 'telegram' AND identifier = ?2",
+            db::params![ADMIN_USER_NAME, existing.identifier],
+        )
+        .await?;
+        attach_telegram_binding_in(&tx, ADMIN_USER_NAME, &identifier).await?;
+        tx.commit().await?;
+        Ok(TelegramRebind {
+            identifier,
+            changed: true,
+        })
+    }
+
+    /// Remove the admin's Telegram binding, reporting whether one existed. Idempotent: an admin
+    /// with no binding is the state asked for, not a failure.
+    pub(crate) async fn unbind_telegram_for_admin(&self) -> Result<bool> {
+        let Some(existing) = self.telegram_binding(ADMIN_USER_NAME).await? else {
+            return Ok(false);
+        };
+        self.unbind_channel(ADMIN_USER_NAME, "telegram", &existing)
+            .await?;
+        Ok(true)
     }
 
     /// When `identifier` is a number, that number is also the binding's delivery address: a
@@ -452,11 +518,9 @@ impl UserStore {
     /// conversation until that person writes). A nickname has no address yet, so nothing is
     /// recorded for it.
     pub async fn attach_telegram_binding(&self, user_name: &str, identifier: &str) -> Result<()> {
-        self.bind_channel(user_name, "telegram", identifier).await?;
-        if telegram_identifier_is_number(identifier) {
-            self.update_channel_contact("telegram", identifier, identifier)
-                .await?;
-        }
+        let tx = self.conn.begin_tx().await?;
+        attach_telegram_binding_in(&tx, user_name, identifier).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -464,14 +528,23 @@ impl UserStore {
     /// legacy account with several reports the first.
     pub(crate) async fn telegram_binding(&self, user_name: &str) -> Result<Option<String>> {
         Ok(self
+            .telegram_binding_row(user_name)
+            .await?
+            .map(|binding| binding.identifier))
+    }
+
+    /// The account's whole Telegram binding row, address included: what a rebind needs to tell a
+    /// binding already in place from one whose stored address is a legacy artifact.
+    async fn telegram_binding_row(&self, user_name: &str) -> Result<Option<ChannelBinding>> {
+        Ok(self
             .get_user_channels(user_name)
             .await?
             .into_iter()
-            .find(|c| c.channel == "telegram")
-            .map(|c| c.identifier))
+            .find(|c| c.channel == "telegram"))
     }
 
-    /// Under any spelling of the same number, matched as on the sender path.
+    /// The account that holds `identifier`, under any spelling of the same number, matched as on
+    /// the sender path.
     async fn telegram_binding_owner(&self, identifier: &str) -> Result<Option<String>> {
         let matched = match telegram_key(identifier) {
             Some(TelegramKey::Number(number)) => {
@@ -500,7 +573,8 @@ impl UserStore {
         let rows = self
             .conn
             .query(
-                "SELECT user_name, identifier FROM user_channels WHERE channel = 'telegram'",
+                "SELECT user_name, identifier, reply_target FROM user_channels \
+                 WHERE channel = 'telegram'",
                 db::params![],
             )
             .await?;
@@ -508,6 +582,7 @@ impl UserStore {
         for row in &rows {
             let user_name: String = row.get(0)?;
             let identifier: String = row.get(1)?;
+            let reply_target: Option<String> = row.get(2)?;
             match telegram_key(&identifier) {
                 // A stored service identity authorizes nobody.
                 Some(TelegramKey::Number(number)) if !is_telegram_service_id(&number) => {
@@ -515,6 +590,7 @@ impl UserStore {
                         return Ok(Some(TelegramMatch {
                             user_name,
                             identifier,
+                            reply_target,
                         }));
                     }
                 }
@@ -528,6 +604,7 @@ impl UserStore {
                     nickname_match = Some(TelegramMatch {
                         user_name,
                         identifier,
+                        reply_target,
                     });
                 }
                 _ => {}
@@ -850,6 +927,30 @@ fn parse_grants(raw: Option<String>) -> Vec<String> {
     grants
 }
 
+/// [`UserStore::attach_telegram_binding`] inside a transaction: the same two writes, on the guard
+/// that holds them.
+async fn attach_telegram_binding_in(
+    tx: &TxGuard<'_>,
+    user_name: &str,
+    identifier: &str,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO user_channels (user_name, channel, identifier) \
+         VALUES (?1, 'telegram', ?2)",
+        db::params![user_name, identifier],
+    )
+    .await?;
+    if telegram_identifier_is_number(identifier) {
+        tx.execute(
+            "UPDATE user_channels SET reply_target = ?1 \
+             WHERE channel = 'telegram' AND identifier = ?2",
+            db::params![identifier, identifier],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// `field` MUST be a compile-time string literal to prevent SQL injection.
 async fn upsert_user_column(
     tx: &TxGuard<'_>,
@@ -1013,6 +1114,18 @@ pub struct TelegramMatch {
     /// The stored identifier of the binding that matched — whose delivery address follows this
     /// sender's conversation.
     pub identifier: String,
+    /// The address the binding has earned so far (`None` until that account has written): read
+    /// with the match, since the caller's next question is always whether there is one.
+    pub reply_target: Option<String>,
+}
+
+/// What [`UserStore::rebind_telegram_for_admin`] left behind: the normalized identifier, and
+/// whether the store was written at all. A re-run of the value already in place writes nothing; the
+/// legacy repair clears a nickname stored as its own address, and says so.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TelegramRebind {
+    pub identifier: String,
+    pub changed: bool,
 }
 
 /// The userspaces root, `<storage_root>/userspaces`: the single resolution point, shared by
@@ -1536,6 +1649,11 @@ pub(crate) mod test_util {
 mod tests {
     use super::*;
 
+    /// The owner's Telegram delivery addresses, as the store holds them.
+    async fn owner_targets(store: &UserStore) -> Vec<String> {
+        telegram_reply_targets(store.get_user_channels(ADMIN_USER_NAME).await.unwrap())
+    }
+
     /// The admin test is the account's name, backed by the account's own row:
     /// a guest name, a name with no row, and a missing store are never the admin.
     #[tokio::test]
@@ -1961,6 +2079,178 @@ mod tests {
         assert!(
             err.to_string().contains("reserved"),
             "error must mention 'reserved': {err}"
+        );
+    }
+
+    /// The admin's binding is replaceable in one step — that is what makes
+    /// `mahbot config setup --owner` runnable at any time — while another account's
+    /// binding stays untouchable, and a nickname starts with no delivery address so
+    /// the first message from that account is what confirms it.
+    #[tokio::test]
+    async fn rebinding_the_admin_replaces_its_binding_but_never_steals_one() {
+        let (store, _dir) = crate::open_test_store!(UserStore, "admin_rebind");
+        store.ensure_admin_user().await.unwrap();
+        store.add_user("rebind_other").await.unwrap();
+
+        let first = store
+            .rebind_telegram_for_admin("@first_owner")
+            .await
+            .unwrap();
+        assert_eq!(first.identifier, "first_owner");
+        assert!(first.changed, "a first binding is a write");
+        assert_eq!(
+            store.telegram_binding(ADMIN_USER_NAME).await.unwrap(),
+            Some("first_owner".to_string())
+        );
+        assert!(
+            owner_targets(&store).await.is_empty(),
+            "a nickname has no address until that account writes to the bot"
+        );
+
+        // Rebinding the same value is the idempotent re-run of the same command: it writes
+        // nothing, so a report of the run says nothing changed.
+        let again = store
+            .rebind_telegram_for_admin("first_owner")
+            .await
+            .unwrap();
+        assert_eq!(again.identifier, "first_owner");
+        assert!(!again.changed, "a value already in place is no write");
+        assert_eq!(
+            store
+                .get_user_channels(ADMIN_USER_NAME)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a rebind must leave exactly one Telegram row"
+        );
+
+        // A different value replaces it rather than joining it.
+        let second = store
+            .rebind_telegram_for_admin("second_owner")
+            .await
+            .unwrap();
+        assert_eq!(second.identifier, "second_owner");
+        assert!(second.changed);
+        assert_eq!(
+            store.telegram_binding(ADMIN_USER_NAME).await.unwrap(),
+            Some("second_owner".to_string())
+        );
+
+        // A number is its own address from the start.
+        let numbered = store.rebind_telegram_for_admin(" 00123 ").await.unwrap();
+        assert_eq!(numbered.identifier, "123");
+        assert!(numbered.changed);
+        assert_eq!(owner_targets(&store).await, vec!["123".to_string()]);
+        // The idempotent re-run of that same command changes nothing — the address it earned
+        // stays, so the owner remains reachable and their next message is no first contact.
+        let unchanged = store.rebind_telegram_for_admin("123").await.unwrap();
+        assert_eq!(unchanged.identifier, "123");
+        assert!(!unchanged.changed);
+        assert_eq!(
+            owner_targets(&store).await,
+            vec!["123".to_string()],
+            "a same-value rebind must keep the delivery address"
+        );
+
+        // Anti-steal: another account's binding is never taken over.
+        store
+            .bind_telegram("rebind_other", "someone_else")
+            .await
+            .unwrap();
+        let err = store
+            .rebind_telegram_for_admin("@someone_else")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("rebind_other"),
+            "the refusal must name the account that holds it: {err}"
+        );
+        assert_eq!(
+            store.telegram_binding(ADMIN_USER_NAME).await.unwrap(),
+            Some("123".to_string()),
+            "a refused rebind must leave the admin's own binding alone"
+        );
+    }
+
+    /// The two writers of the admin's binding agree on what "no address yet" means: a nickname has
+    /// none. An address an older Settings bind stored as the nickname itself is cleared by the
+    /// idempotent re-run, so the owner's first message records the real one and confirms the
+    /// binding the report promised.
+    #[tokio::test]
+    async fn a_rebind_clears_an_address_stored_as_the_nickname() {
+        let (store, _dir) = crate::open_test_store!(UserStore, "admin_rebind_legacy");
+        store.ensure_admin_user().await.unwrap();
+        store
+            .bind_telegram(ADMIN_USER_NAME, "legacy_owner")
+            .await
+            .unwrap();
+        // What the old Settings bind wrote: the nickname as its own starting address.
+        store
+            .update_channel_contact("telegram", "legacy_owner", "legacy_owner")
+            .await
+            .unwrap();
+        assert_eq!(
+            owner_targets(&store).await,
+            vec!["legacy_owner".to_string()]
+        );
+
+        let repaired = store
+            .rebind_telegram_for_admin("legacy_owner")
+            .await
+            .unwrap();
+        assert_eq!(repaired.identifier, "legacy_owner");
+        assert!(
+            repaired.changed,
+            "clearing the stored nickname is a write, and the report must say so"
+        );
+        assert!(
+            owner_targets(&store).await.is_empty(),
+            "a nickname is no delivery address, so the re-run must leave none"
+        );
+
+        // With the address gone, the same run is a true no-op.
+        let settled = store
+            .rebind_telegram_for_admin("legacy_owner")
+            .await
+            .unwrap();
+        assert!(!settled.changed);
+
+        // An address the account EARNED at first contact is not the legacy artifact: the same
+        // idempotent re-run keeps it, so the owner stays reachable.
+        store
+            .update_channel_contact("telegram", "legacy_owner", "424242")
+            .await
+            .unwrap();
+        let kept = store
+            .rebind_telegram_for_admin("legacy_owner")
+            .await
+            .unwrap();
+        assert!(!kept.changed, "an earned address is not a repair");
+        assert_eq!(owner_targets(&store).await, vec!["424242".to_string()]);
+    }
+
+    /// Unbinding the admin removes its one Telegram binding and is idempotent: an
+    /// admin with no binding is the state the command asks for.
+    #[tokio::test]
+    async fn unbinding_the_admin_reports_whether_a_binding_was_there() {
+        let (store, _dir) = crate::open_test_store!(UserStore, "admin_unbind");
+        store.ensure_admin_user().await.unwrap();
+
+        assert!(
+            !store.unbind_telegram_for_admin().await.unwrap(),
+            "nothing was bound, so nothing was removed"
+        );
+
+        store
+            .rebind_telegram_for_admin("owner_to_remove")
+            .await
+            .unwrap();
+        assert!(store.unbind_telegram_for_admin().await.unwrap());
+        assert_eq!(store.telegram_binding(ADMIN_USER_NAME).await.unwrap(), None);
+        assert!(
+            !store.unbind_telegram_for_admin().await.unwrap(),
+            "the second run finds nothing to remove"
         );
     }
 
