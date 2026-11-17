@@ -1031,9 +1031,10 @@ enum ReaderTask {
 /// three things every run shape does with them — drain them under the output bound
 /// ([`Readers::drain`]), collect what they hold after a cancel ([`Readers::collect`]), and, when a
 /// leftover kept a pipe open past the bound, take what has arrived ([`Readers::take`]) and either
-/// let the pipes close once it is stopped (over [`DRAIN_CANCEL_GRACE`]) or keep the pending readers
-/// draining ([`Readers::retain_pending`]). The single-child runner has one reader per stream; the
-/// plan runner one per captured member stream ([`plan`]), all those of one stream on its budget.
+/// let the pipes close once it is stopped (over the grace [`stop_leftover`] is given) or keep the
+/// pending readers draining ([`Readers::retain_pending`]). The single-child runner has one reader
+/// per stream; the plan runner one per captured member stream ([`plan`]), all those of one stream
+/// on its budget.
 #[derive(Default)]
 struct Readers {
     readers: Vec<Reader>,
@@ -1563,15 +1564,15 @@ async fn stop_and_collect(
 /// End the process a finished run left holding its output channel, and say whether that took.
 ///
 /// The run's whole tree is ended — the process group on unix, the job on Windows — and the pending
-/// readers get [`DRAIN_CANCEL_GRACE`] to reach EOF. `true` means they all did; `false` is the
+/// readers get `grace` to reach EOF. `true` means they all did; `false` is the
 /// residual case, keeping both the channel and, on Windows, the job handle alive
 /// ([`Readers::retain_pending`], [`Tree::retain_after_completion`]). Success is the channel
 /// closing, never [`Tree::terminate`]'s return value. The caller snapshots the output before the
 /// stop ([`Readers::take`]), so the run reports what the channel held then, never bytes read during
 /// the grace.
-async fn stop_leftover(tree: Tree, readers: &mut Readers) -> bool {
+async fn stop_leftover(tree: Tree, readers: &mut Readers, grace: Duration) -> bool {
     tree.terminate();
-    if readers.drain(DRAIN_CANCEL_GRACE).await {
+    if readers.drain(grace).await {
         return true;
     }
     tree.retain_after_completion();
@@ -1601,7 +1602,7 @@ async fn leftover_result(
     match leftovers {
         LeftoverPolicy::Command => {
             let (stdout, stderr) = readers.take();
-            if stop_leftover(tree, readers).await {
+            if stop_leftover(tree, readers, DRAIN_CANCEL_GRACE).await {
                 tracing::debug!(
                     ?scope,
                     "stopped a process the command left holding its output channel"
@@ -6004,7 +6005,7 @@ mod tests {
 
         let result = run_command_with_timeout(
             &mut cmd,
-            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(1)),
             Duration::from_secs(5),
             mem::default_limit(),
             RunOwner::Agent,
@@ -6030,7 +6031,7 @@ mod tests {
 
         // The timeout drops the run's future, exactly as an aborted task does.
         let dropped = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(1),
             run_command_with_timeout(
                 &mut cmd,
                 Some(Duration::from_secs(30)),
@@ -6393,6 +6394,9 @@ mod tests {
     /// ([`Readers::retain_pending`]).
     #[tokio::test]
     async fn a_stop_takes_only_when_the_channel_closes() {
+        // Both cases below pay the grace — one waiting for it to pass — and how long it is is not
+        // what either asserts.
+        let grace = Duration::from_secs(1);
         let cancel = tokio_util::sync::CancellationToken::new();
 
         // Nothing holds this pipe's write end past the grace: EOF arrives, so the stop took.
@@ -6410,7 +6414,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         });
         assert!(
-            stop_leftover(Tree::new(RunOwner::Agent), &mut closed).await,
+            stop_leftover(Tree::new(RunOwner::Agent), &mut closed, grace).await,
             "a channel that closed is a stop"
         );
 
@@ -6425,7 +6429,7 @@ mod tests {
             cancel,
         );
         assert!(
-            !stop_leftover(Tree::new(RunOwner::Agent), &mut held).await,
+            !stop_leftover(Tree::new(RunOwner::Agent), &mut held, grace).await,
             "a channel nothing closed is the residual case"
         );
     }

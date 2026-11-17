@@ -2962,6 +2962,11 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial(provider, drain, recover_from_restart)]
     async fn cancel_stops_a_running_round_and_delivers_nothing() {
+        // The leader is gated, so the followers start on the stagger's bound — still after it.
+        // One second keeps that ordering without paying the production eight; the knob is
+        // process-global, so the env lock is held for this whole body, safe only because the two
+        // stagger-dependent pipeline checks share this check's `provider` and `drain` keys.
+        let _stagger = crate::util::test::set_env_var("MAHBOT_STAGGER_WAIT_SECS", Some("1"));
         crate::util::test::init_management_test_stores().await;
         let _policy_guard =
             crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());

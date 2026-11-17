@@ -4510,7 +4510,7 @@ exit 0
         // cannot protect them yet.
         {
             let case = "a restored release waits out the boot grace";
-            let grace = Duration::from_millis(800);
+            let grace = Duration::from_millis(400);
             let guard = ReleaseGuard::install_with(Duration::from_secs(10), grace).await;
             queue_names("run-grace", &["agent-tab-g-default"]);
             clear_pending_releases();
@@ -4544,7 +4544,7 @@ exit 0
         // it without waiting that hold out.
         {
             let case = "a held redriven run release waits out its hold";
-            let hold = Duration::from_millis(800);
+            let hold = Duration::from_millis(400);
             let guard = ReleaseGuard::install(Duration::from_secs(10)).await;
 
             queue_names_with_hold("run-held", &["agent-tab-h-default"], hold);

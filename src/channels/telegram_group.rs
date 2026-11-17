@@ -30,6 +30,30 @@ pub(super) const QUIET_WINDOW: Duration = Duration::from_secs(1);
 const EXTENDED_WINDOW: Duration = Duration::from_secs(3);
 /// Hard ceiling from the group's first part, so a long stream still moves.
 const CEILING: Duration = Duration::from_secs(5);
+
+/// The windows one collector releases on ([`OpenGroup::due`]).
+///
+/// The production values are the constants above. A check shortens all three and keeps the order
+/// [`OpenGroup::due`] asserts — quiet, then the longer extended wait, then the ceiling that bounds
+/// both. What does not move with them is the observation bound the listener checks' negative cases
+/// take, which is [`QUIET_WINDOW`] twice: a production value, not this struct's.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Windows {
+    pub(crate) quiet: Duration,
+    pub(crate) extended: Duration,
+    pub(crate) ceiling: Duration,
+}
+
+impl Default for Windows {
+    fn default() -> Self {
+        Self {
+            quiet: QUIET_WINDOW,
+            extended: EXTENDED_WINDOW,
+            ceiling: CEILING,
+        }
+    }
+}
+
 /// Release the group as soon as it holds this many parts...
 const MAX_PARTS: usize = 6;
 /// ...or more than this many characters of raw part text. Enrichment is added after this check,
@@ -198,18 +222,24 @@ impl OpenGroup {
     /// When the group is due and which rule decides it: the window from the last part, or from the
     /// end of the last preparation for this pair, and — for a group never held — the ceiling from
     /// the first part (see the module doc).
-    fn due(&self) -> (Instant, Release) {
+    fn due(&self, windows: &Windows) -> (Instant, Release) {
+        // The extended wait is the longer one on purpose — the user is evidently still sending —
+        // and the ceiling bounds both: out of order, the rules decide the other way round.
+        debug_assert!(
+            windows.quiet < windows.extended && windows.extended <= windows.ceiling,
+            "the windows must stay in order: {windows:?}"
+        );
         let baseline = self
             .held_until
             .map_or(self.last_at, |ended| ended.max(self.last_at));
         let extended = self.extended();
         let windowed = baseline
             + if extended {
-                EXTENDED_WINDOW
+                windows.extended
             } else {
-                QUIET_WINDOW
+                windows.quiet
             };
-        let ceiling = self.first_at + CEILING;
+        let ceiling = self.first_at + windows.ceiling;
         if self.held_until.is_some() || windowed <= ceiling {
             (
                 windowed,
@@ -315,6 +345,7 @@ impl Released {
 #[derive(Default)]
 struct Collector {
     open: Vec<OpenGroup>,
+    windows: Windows,
 }
 
 impl Collector {
@@ -348,17 +379,18 @@ impl Collector {
         self.open
             .iter()
             .filter(|group| !group.held)
-            .map(|group| group.due().0)
+            .map(|group| group.due(&self.windows).0)
             .min()
     }
 
     /// Every group whose window has closed. A held group is never due.
     fn release_due(&mut self, now: Instant) -> Vec<Released> {
+        let windows = self.windows;
         self.take_where(|group| {
             if group.held {
                 return None;
             }
-            let (due_at, release) = group.due();
+            let (due_at, release) = group.due(&windows);
             (due_at <= now).then_some(release)
         })
     }
@@ -455,8 +487,16 @@ pub(crate) fn spawn_collector(
     intake: Intake,
     preparations: std::sync::Arc<Preparations>,
     frame: ListenerFrame,
+    windows: Windows,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(run_collector(input, output, intake, preparations, frame))
+    tokio::spawn(run_collector(
+        input,
+        output,
+        intake,
+        preparations,
+        frame,
+        windows,
+    ))
 }
 
 async fn run_collector(
@@ -465,8 +505,12 @@ async fn run_collector(
     intake: Intake,
     preparations: std::sync::Arc<Preparations>,
     _frame: ListenerFrame,
+    windows: Windows,
 ) {
-    let mut collector = Collector::default();
+    let mut collector = Collector {
+        windows,
+        ..Collector::default()
+    };
     let mut holds_changed = preparations.watch();
     loop {
         // Everything the listener has already handed over belongs to the group it was sent to: a
@@ -793,7 +837,14 @@ mod tests {
         let (input, input_rx) = mpsc::channel(QUEUE_CAPACITY);
         let (output, mut output_rx) = mpsc::channel(8);
         let (intake, _store, _dir) = test_intake().await;
-        spawn_collector(input_rx, output, intake, no_preparations(), test_frame());
+        spawn_collector(
+            input_rx,
+            output,
+            intake,
+            no_preparations(),
+            test_frame(),
+            Windows::default(),
+        );
 
         input.send(part("alice", "chat", "one")).await.unwrap();
         input.send(part("alice", "chat", "two")).await.unwrap();
@@ -862,6 +913,7 @@ mod tests {
             intake.clone(),
             no_preparations(),
             test_frame(),
+            Windows::default(),
         );
 
         let mut first = part("alice", "chat", "[Forwarded from @bob] one");

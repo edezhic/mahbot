@@ -1211,6 +1211,12 @@ trait ImageSender: Send + Sync {
         body: &serde_json::Value,
         auth: &str,
     ) -> Result<serde_json::Value, AttemptFailure>;
+
+    /// The floor of the retry backoff, [`IMAGE_GEN_BACKOFF_MS`] for the production sender. A
+    /// check's scripted sender shortens it: what it drives is the retry itself, not the pause.
+    fn backoff_ms(&self) -> u64 {
+        IMAGE_GEN_BACKOFF_MS
+    }
 }
 
 /// The production sender: OpenRouter's dedicated Image API over the 10-minute client.
@@ -1253,12 +1259,11 @@ async fn generate_image_with_retries(
                 if !retryable || attempt == IMAGE_GEN_MAX_ATTEMPTS {
                     return Err(AttemptOutcome::of(failures));
                 }
+                let backoff = sender.backoff_ms();
                 let sleep_ms = failures
                     .last()
                     .and_then(AttemptFailure::retry_after_ms)
-                    .map_or(IMAGE_GEN_BACKOFF_MS, |ms| {
-                        ms.clamp(IMAGE_GEN_BACKOFF_MS, RETRY_AFTER_MAX_MS)
-                    });
+                    .map_or(backoff, |ms| ms.clamp(backoff, RETRY_AFTER_MAX_MS));
                 if !crate::shutdown::sleep_or_shutdown(Duration::from_millis(sleep_ms)).await {
                     return Err(AttemptOutcome::Aborted);
                 }
@@ -2423,6 +2428,11 @@ mod tests {
 
     #[async_trait]
     impl ImageSender for Scripted {
+        fn backoff_ms(&self) -> u64 {
+            // The retry is what these checks drive; the pause before it has no claim on them.
+            1
+        }
+
         async fn post(
             &self,
             url: &str,

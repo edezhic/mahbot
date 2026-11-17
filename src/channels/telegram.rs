@@ -1422,6 +1422,16 @@ pub struct TelegramChannel {
     /// Per-chat command-menu state: change detection plus in-flight coalescing, so a message flood
     /// does not trip Telegram's rate limiting. Fail-open.
     menu_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ChatMenuState>>>,
+
+    /// The burst windows this listener's collector runs with — the module's production values,
+    /// shortened by a check that drives a listener. Absent from a production build.
+    #[cfg(test)]
+    windows: crate::channels::telegram_group::Windows,
+    /// How long this listener pauses after a poll whose record could not be written for —
+    /// [`RECORD_FAILURE_BACKOFF`], shortened by a check that drives a listener. Absent from a
+    /// production build.
+    #[cfg(test)]
+    record_failure_backoff: Duration,
 }
 
 /// `(chat_id, reply_target)` from a message sub-object.
@@ -1742,6 +1752,10 @@ impl TelegramChannel {
             menu_cache: std::sync::Arc::new(
                 std::sync::Mutex::new(std::collections::HashMap::new()),
             ),
+            #[cfg(test)]
+            windows: crate::channels::telegram_group::Windows::default(),
+            #[cfg(test)]
+            record_failure_backoff: RECORD_FAILURE_BACKOFF,
         }
     }
 
@@ -1761,6 +1775,24 @@ impl TelegramChannel {
             intake_store: std::sync::OnceLock::from(store),
             ..Self::new_with(bot_token, api_base, false)
         }
+    }
+
+    /// Shorten this listener's burst windows: a check is about what a window holds together, not
+    /// about how long it is.
+    #[cfg(test)]
+    #[must_use]
+    fn with_windows(mut self, windows: crate::channels::telegram_group::Windows) -> Self {
+        self.windows = windows;
+        self
+    }
+
+    /// Shorten this listener's record-failure pause: a check is about what the pause holds back,
+    /// not about how long it is (that has its own check).
+    #[cfg(test)]
+    #[must_use]
+    fn with_record_failure_backoff(mut self, pause: Duration) -> Self {
+        self.record_failure_backoff = pause;
+        self
     }
 
     /// The channel the configured mode serves, or `None` while the local mode has no endpoint —
@@ -3173,7 +3205,11 @@ impl TelegramChannel {
         // The batch is handed to the processor rather than parsed here: parsing may spend minutes
         // on a download and the poll loop must keep acknowledging (see [`HeldBatch`]).
         if unrecorded.is_some() {
-            self.intake_pause(RECORD_FAILURE_BACKOFF).await;
+            #[cfg(test)]
+            let pause = self.record_failure_backoff;
+            #[cfg(not(test))]
+            let pause = RECORD_FAILURE_BACKOFF;
+            self.intake_pause(pause).await;
         }
         let polled = Polled {
             position,
@@ -3837,12 +3873,17 @@ impl Channel for TelegramChannel {
         // collector's.
         let (parts_tx, parts_rx) =
             tokio::sync::mpsc::channel(crate::channels::telegram_group::QUEUE_CAPACITY);
+        #[cfg(test)]
+        let windows = self.windows;
+        #[cfg(not(test))]
+        let windows = crate::channels::telegram_group::Windows::default();
         let collector = crate::channels::telegram_group::spawn_collector(
             parts_rx,
             tx,
             intake.clone(),
             std::sync::Arc::clone(&self.preparations),
             frame,
+            windows,
         );
 
         // Two halves, one future: the poll loop records a batch and queues it, the processor parses

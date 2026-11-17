@@ -3843,7 +3843,7 @@ where
 }
 
 /// The next message the pipeline receives, or a panic naming `what`: a released burst crosses the
-/// collector's quiet window, so its message is a second away, never immediate.
+/// collector's own window first, so its message is never immediate.
 async fn next_message(
     rx: &mut tokio::sync::mpsc::Receiver<ChannelMessage>,
     what: &str,
@@ -3852,7 +3852,8 @@ async fn next_message(
 }
 
 /// The next message the pipeline receives within `bound`, or a panic naming `what`: a released
-/// burst crosses the collector's windows first, so its message is a second (or a fetch) away.
+/// burst crosses the collector's windows first, so its message arrives once the group is released —
+/// a window, or the fetch a held part waits on, later.
 async fn next_message_within(
     bound: Duration,
     rx: &mut tokio::sync::mpsc::Receiver<ChannelMessage>,
@@ -3947,10 +3948,30 @@ fn run(store: &TelegramIntakeStore, claim_label: &str, account: &str) -> Intake 
     Intake::new(store.clone(), Arc::from(claim_label), account)
 }
 
+/// The burst windows a check's listener runs with: all three shortened, keeping the order
+/// production keeps — a short quiet window, the longer extended wait, and a ceiling above both. The
+/// observation bound the negative cases here take is the production [`QUIET_WINDOW`] twice, so it
+/// stays where production has it.
+fn check_windows() -> crate::channels::telegram_group::Windows {
+    crate::channels::telegram_group::Windows {
+        quiet: Duration::from_millis(300),
+        extended: Duration::from_millis(600),
+        ceiling: Duration::from_millis(1500),
+    }
+}
+
+/// How long a check's listener pauses after a poll whose record could not be written for: the
+/// pause is real and its length has its own check, so every other check that trips it only has to
+/// see the pause hold the position back. It is also the window a check has to mutate the store the
+/// write fails on, so it is far longer than the write it covers.
+const CHECK_RECORD_FAILURE_BACKOFF: Duration = Duration::from_millis(400);
+
 /// A listener pointed at `fake`, recording and claiming through `store`. Its claim is its own, as
-/// for a product listener, so a second listener over one store is a restart's other run.
+/// for a product listener, so a second listener over one store is a restart's other run. It
+/// collects a burst with [`check_windows`].
 fn channel(token: &str, fake: &FakeTelegram, store: &TelegramIntakeStore) -> TelegramChannel {
     TelegramChannel::for_test(token.into(), fake.base.clone(), store.clone())
+        .with_windows(check_windows())
 }
 
 async fn still_held(store: &TelegramIntakeStore, account: &str) -> Vec<i64> {
@@ -4956,7 +4977,8 @@ async fn control_input_in_a_reoffered_batch_is_not_executed() {
         )
         .await
         .expect("make the record unwritable");
-    let telegram = channel("token-a", &fake, &store);
+    let telegram =
+        channel("token-a", &fake, &store).with_record_failure_backoff(CHECK_RECORD_FAILURE_BACKOFF);
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let listener = tokio::spawn(async move {

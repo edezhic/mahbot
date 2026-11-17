@@ -704,10 +704,10 @@ impl Connection {
 
     /// Take the readers out of service for work that must not run while one is in use — a schema
     /// object dropped and recreated under a reader's own snapshot — returning `None` when they did
-    /// not fall idle within [`READERS_IDLE_WAIT`] (the caller then leaves that work for a later
-    /// round). While the guard is held reads are served by the writing connection and the readers
-    /// are closed. Dropping it puts them back — unless the store released them for good
-    /// ([`Self::release_readers`]), which a late guard must not undo.
+    /// not fall idle within [`READERS_IDLE_WAIT`] or the shortened wait a check sets; the caller
+    /// then leaves that work for a later round. While the guard is held reads are served by the
+    /// writing connection and the readers are closed. Dropping it puts them back — unless the store
+    /// released them for good ([`Self::release_readers`]), which a late guard must not undo.
     async fn quiet_readers(&self) -> Option<QuietReaders> {
         self.readers.quiet().await
     }
@@ -1673,6 +1673,9 @@ async fn read_only_connection(
 /// A reader serves one read at a time, so they fall idle in the time a read takes; a long wait
 /// means a read was abandoned by a caller that gave up, and giving up on the wait is what keeps a
 /// repair, and the exit round's checkpoint, from hanging behind it.
+///
+/// The pool carries it, so a check that holds a reader on purpose can shorten its own wait without
+/// touching this value.
 const READERS_IDLE_WAIT: Duration = Duration::from_secs(5);
 
 const TRANSACTION_READ_REFUSAL: &str = "a read issued while this task holds an open \
@@ -1889,6 +1892,10 @@ struct ReaderPool {
     /// Set by [`ReaderPool::release`], never cleared: keeps a repair's [`QuietReaders`] guard,
     /// dropped after the release, from putting readers back in service during the exit sequence.
     released: AtomicBool,
+    /// How long a quiet/release waits for the readers to fall idle — [`READERS_IDLE_WAIT`] unless a
+    /// check shortened it. Absent from a production build: no production code sets it.
+    #[cfg(test)]
+    idle_wait: std::sync::Mutex<Duration>,
 }
 
 struct ReaderPoolInner {
@@ -1922,7 +1929,16 @@ impl ReaderPool {
             freed: tokio::sync::Notify::new(),
             in_service: tokio::sync::watch::channel(false).0,
             released: AtomicBool::new(false),
+            #[cfg(test)]
+            idle_wait: std::sync::Mutex::new(READERS_IDLE_WAIT),
         }
+    }
+
+    /// Shorten how long a quiet/release waits for the readers to fall idle, for a check that holds
+    /// a reader on purpose and would otherwise pay the whole [`READERS_IDLE_WAIT`] for it.
+    #[cfg(test)]
+    fn shorten_idle_wait(&self, wait: Duration) {
+        *self.idle_wait.lock().unwrap_poison() = wait;
     }
 
     /// Put the readers in service (see [`Connection::enable_readers`]). `send_replace` rather than
@@ -1994,7 +2010,7 @@ impl ReaderPool {
 
     /// Take the readers out of service and wait for them to fall idle, closing them so nothing they
     /// hold predates the caller's work. `None` when they did not fall idle within
-    /// [`READERS_IDLE_WAIT`]: the caller then defers.
+    /// [`READERS_IDLE_WAIT`] or the shortened wait a check sets: the caller then defers.
     async fn quiet(self: &Arc<Self>) -> Option<QuietReaders> {
         if !*self.in_service.borrow() || self.released.load(Ordering::SeqCst) {
             return Some(QuietReaders { pool: None });
@@ -2022,10 +2038,14 @@ impl ReaderPool {
     }
 
     /// Close the readers once every one is idle; `false` when they did not all fall idle within
-    /// [`READERS_IDLE_WAIT`]. A reader still out keeps its own connection (and reading position)
-    /// until the runtime drops it.
+    /// [`READERS_IDLE_WAIT`] (or the shortened wait a check set). A reader still out keeps its own
+    /// connection (and reading position) until the runtime drops it.
     async fn drain_idle(&self) -> bool {
-        let deadline = tokio::time::Instant::now() + READERS_IDLE_WAIT;
+        #[cfg(test)]
+        let wait = *self.idle_wait.lock().unwrap_poison();
+        #[cfg(not(test))]
+        let wait = READERS_IDLE_WAIT;
+        let deadline = tokio::time::Instant::now() + wait;
         loop {
             {
                 let mut inner = self.inner.lock().await;
@@ -5575,6 +5595,7 @@ mod tests {
     #[tokio::test]
     async fn the_runtime_repair_defers_while_a_reader_is_still_out() {
         let (_tmp, conn) = open_reader_store().await;
+        conn.readers.shorten_idle_wait(Duration::from_millis(100));
         // A reader out of the pool is what a read in flight leaves behind.
         let held = conn
             .readers
@@ -5613,6 +5634,7 @@ mod tests {
         const PROBE_DDL: &str = "CREATE INDEX IF NOT EXISTS idx_tokenizer_migration_probe \
                                  ON tickets USING fts (title)";
         let (_tmp, conn) = open_reader_store().await;
+        conn.readers.shorten_idle_wait(Duration::from_millis(100));
         ensure_fts_index(
             &conn,
             TICKETS_FTS_INDEX_NAME,

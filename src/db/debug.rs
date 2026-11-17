@@ -2029,7 +2029,7 @@ mod tests {
 
     /// The read limit the child runs under: long enough that the timing assertions
     /// sit nowhere near the handshake's jitter, short enough to keep the test quick.
-    const WATCHDOG_CHILD_LIMIT_SECS: u64 = 5;
+    const WATCHDOG_CHILD_LIMIT_SECS: u64 = 1;
 
     /// The grace the watchdog promises, as this test expects it. Spelled out
     /// rather than read from [`read_limit::WATCHDOG_GRACE_SECS`], because a bound

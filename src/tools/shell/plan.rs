@@ -3513,10 +3513,13 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
         let target = dir.join(format!("plan-missing-{}/out.txt", std::process::id()));
         let result = run_plan(&program_plan(&[
-            // A member that would write its marker a second from now: the marker's absence is
-            // the kill having reached it.
+            // A member that would write its marker a third of a second from now: the marker's
+            // absence is the kill having reached it.
             (
-                &["-c", &format!("sleep 1; echo done > {}", marker.display())],
+                &[
+                    "-c",
+                    &format!("sleep 0.3; echo done > {}", marker.display()),
+                ],
                 &[],
                 Join::First,
             ),
@@ -3532,7 +3535,8 @@ mod tests {
         let ShellRunResult::SpawnFailed(_) = result else {
             panic!("expected a spawn failure, got {result:?}");
         };
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Twice the member's own delay: the marker would be there by now had it survived.
+        tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(
             !marker.exists(),
             "the group's earlier member must be killed, not left running"
