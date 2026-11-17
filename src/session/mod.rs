@@ -1311,11 +1311,10 @@ impl SessionStore {
     /// size/mtime/content-digest) for the Assistant's session.
     ///
     /// The baseline lives in its own table, a child of the session's `session_metadata` row
-    /// (`ON DELETE CASCADE`), split out by migration `62` so a bookkeeping update of that row no
-    /// longer rewrites it. The update branch runs first, the insert only when the session has no
-    /// baseline yet; the engine rejects the insert when the session row is gone (a `/clear` landing
-    /// between the refresh's read and this write), so a deleted session's identifier can never be
-    /// handed a stale baseline.
+    /// (`ON DELETE CASCADE`), so a bookkeeping update of that row no longer rewrites it. The update
+    /// branch runs first, the insert only when the session has no baseline yet; the engine rejects
+    /// the insert when the session row is gone (a `/clear` landing between the refresh's read and
+    /// this write), so a deleted session's identifier can never be handed a stale baseline.
     pub(crate) async fn update_personal_changes(&self, agent_id: &str, state: &str) -> Result<()> {
         let tx = self.conn.begin_tx().await?;
         tx.upsert_row(

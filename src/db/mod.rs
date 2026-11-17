@@ -3206,10 +3206,10 @@ async fn run_repairs(
 /// # Catalog, not SCHEMA
 /// The catalog is a current-shape baseline: entries create the exact current schema (every
 /// statement `IF NOT EXISTS`), so a fresh install converges in one pass and an existing one is a
-/// no-op except the upfill deltas. The baseline ids, deltas and resume point live in the
-/// [`crate::db::migrations`] module doc; the only control flow is the id-based applied check. A
-/// catalog failure is a hard boot failure — never a repair finding, never a reason to replace the
-/// store.
+/// no-op except the entries still pending on it. The catalog's entries, the id → release record
+/// and the resume point live in the [`crate::db::migrations`] module doc; the only control flow
+/// is the id-based applied check. A catalog failure is a hard boot failure — never a repair
+/// finding, never a reason to replace the store.
 ///
 /// # Why tables → ALTER → indexes is baked into the catalog order
 ///

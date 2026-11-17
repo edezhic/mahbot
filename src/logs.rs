@@ -1897,40 +1897,17 @@ mod tests {
 
     /// Boot-time refusal: a logs store whose main DB file is corrupt is never quarantined or
     /// recreated — `LogStore::open` errors with a `StoreRefusal` naming its integrity check and
-    /// leaves the file byte for byte as it was. The open only scans when the start has a reason
-    /// for it (see `db::open_present_store`); here it is one catalog entry still to apply, the
-    /// deterministic stand-in for a start that is not an ordinary clean one.
+    /// leaves the file byte for byte as it was. The trigger here is the marker a failed runtime
+    /// integrity check leaves beside the store; a fully migrated store must still owe and run the
+    /// scan rather than be blocked by an earlier gate.
     #[tokio::test]
     async fn test_log_store_open_refuses_corrupt_store() {
         let tmp = seeded_closed_store().await;
         let root = tmp.path();
 
-        let pending = crate::db::migrations::MIGRATIONS
-            .iter()
-            .rev()
-            .find(|migration| migration.target == crate::db::migrations::TargetDb::Logs)
-            .expect("the logs catalog has entries")
-            .id;
-        // Put the store one entry behind, then hand it off clean again (the checkpoint keeps the
-        // journal empty, so the pending catalog entry is the one reason left).
-        {
-            let store = LogStore::open(root).await.expect("reopen healthy store");
-            store
-                .conn
-                .execute(
-                    &format!("DELETE FROM schema_migrations WHERE id = '{pending}'"),
-                    (),
-                )
-                .await
-                .expect("record the newest logs migration as unapplied");
-            store
-                .conn
-                .checkpoint_ungated()
-                .await
-                .expect("checkpoint the fixture store");
-        }
-
         let db_path = db::store_db_path(root, "logs");
+        crate::db::wal_guard::note_integrity_scan_owed(&db_path);
+
         let bytes = std::fs::read(&db_path).expect("read db file");
         assert!(bytes.len() > 8192, "test needs a multi-page db file");
         let mut corrupted = bytes.clone();

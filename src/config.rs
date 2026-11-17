@@ -83,8 +83,8 @@ const OLD_DEFAULT_WORKER_MODELS: &[&str] = &[
 ];
 
 /// Used by every account with no explicit pick. The retired predecessor
-/// (`google/gemini-3.1-flash-image`) is rewritten out of the stored picker list and every
-/// account's pick by catalog entry `50`.
+/// (`google/gemini-3.1-flash-image`) is not in the seeded picker list, and a stored pick is
+/// never rewritten.
 pub(crate) const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-nano-banana-2.1";
 /// Used by every account with no explicit pick; a stored pick is never rewritten.
 pub(crate) const DEFAULT_VIDEO_MODEL: &str = "google/gemini-omni-1.2-flash";

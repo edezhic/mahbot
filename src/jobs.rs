@@ -63,8 +63,7 @@ impl std::str::FromStr for RowStatus {
 /// `temp_cleanup` rows are terminalized instead.
 ///
 /// The string values are intrinsic Rust/SQL coupling: `as_str()`, the SQL literals in
-/// [`find_owned_launched_jobs`] / [`abandon_session_jobs`] and migration delta `30`'s backfill
-/// CASE must stay in sync on a rename.
+/// [`find_owned_launched_jobs`] / [`abandon_session_jobs`] must stay in sync on a rename.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobMode {
     Sync,
