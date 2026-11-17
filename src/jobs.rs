@@ -209,8 +209,9 @@ fn job_row_from(row: &Row) -> anyhow::Result<JobRow> {
         caller_agent_id: row.get(COL_JOB_CALLER_AGENT_ID)?,
         exec_dir: row.get(COL_JOB_EXEC_DIR)?,
         created_at: row.get(COL_JOB_CREATED_AT)?,
-        // Defensive fallback: the migration backfills every row, so a NULL or bogus value
-        // here is a legacy edge — treat it as async rather than dropping the job at boot.
+        // Defensive fallback: the catalog entry that backfilled `jobs.mode` is retired, so
+        // nothing repairs a NULL or bogus value any more — treat it as async rather than
+        // dropping the job at boot.
         mode: match row.get::<Option<String>>(COL_JOB_MODE)? {
             Some(s) => s.parse().unwrap_or_else(|e| {
                 warn!(mode = %s, error = %e, "Invalid jobs.mode — falling back to async");

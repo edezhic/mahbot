@@ -32,11 +32,12 @@
 //! - `24` / `26` — the core and logs baselines. They always stay: they are what
 //!   a fresh install is built from, and the upgrade half alone would retire
 //!   them.
-//! - `69` — writes `audio_transcription_use_local = "false"` into every install
-//!   that never wrote the row (see [`seed_audio_transcription_disabled`]). It is
-//!   the only automatic writer of that row, and absence of the row means
-//!   "enabled", so retiring it would turn on a multi-gigabyte recogniser
-//!   download for untouched installations.
+//! - `69` — writes `audio_transcription_use_local = "false"` wherever the row is
+//!   absent, which on a supported store is only a brand-new database, since
+//!   every 0.10.x store recorded the entry (see
+//!   [`seed_audio_transcription_disabled`]). It is the only automatic writer of
+//!   that row, and absence of the row means "enabled", so retiring it would turn
+//!   on a multi-gigabyte recogniser download for a fresh install.
 //! - `79` — the `guest_reports` table, which arrived in 0.10.4 and is therefore
 //!   still pending on a store created by 0.10.0–0.10.3 (see
 //!   [`GUEST_REPORTS_TABLE`]).
@@ -58,19 +59,39 @@
 //! - `80`, `81` — added by 0.10.5.
 //! - Next id: `82`.
 //!
-//! Retired, and never to be reused: `25`, `27`, `28`, `29`, `30`, `31`, `32`,
-//! `33`, `34`, `35`, `36`, `37`, `38`, `39`, `40`, `41`, `42`, `43`, `44`, `45`,
-//! `46`, `47`, `48`, `49`, `50`, `51`, `52`, `53`, `54`, `55`, `56`, `57`, `58`,
-//! `59`, `60`, `61`, `62`, `63`, `64`, `65`, `66`, `67`, `68`, `70`, `71`, `72`,
-//! `73`, `74`, `75`, `76`, `77`, `78`.
+//! Retired, and never to be reused:
 //!
-//! Each is gone because every database that has run a 0.10.x build already
-//! recorded it — so it can never run again — and the baselines already produce
-//! its end state. Retired ids are retired, not recycled: the runner skips a
-//! recorded id, so a reused id would be silently skipped on every existing
-//! install and the database would diverge. A new id is no better: it would be
-//! pending on every existing database, costing each install a full integrity
-//! scan of its stores on the next boot.
+//! - before the collapse to the current-shape baseline: the 0.4.2→0.5.x chain
+//!   (`1`–`23`) and its named entries — `001_drop_ticket_pipeline_reservation`,
+//!   `001_session_token_length`, `002_drop_ticket_assigned_to`,
+//!   `002_session_message_count`, `003_drop_ticket_stage_jobs_round`,
+//!   `003_reset_nonterminal_tickets`, `004_drop_tickets_review_base_count`,
+//!   `004_reset_implementation_jobs`, `005_drop_ticket_stage_jobs_phase`,
+//!   `006_rename_ticket_stage_jobs_to_ticket_jobs`, `007_jobs_paused_frozen`,
+//!   `consolidate_002_drop_ticket_jobs_stage`, `consolidate_003_jobs_ticket_id`,
+//!   `consolidate_004_discard_old_ticket_jobs`,
+//!   `consolidate_005_drop_ticket_jobs`,
+//!   `consolidate_006_drop_jobs_paused_frozen`,
+//!   `consolidate_007_jobs_phase_ticket_index`,
+//!   `consolidate_008_create_ticket_chronicle` — plus the one-time consolidation
+//!   import (`consolidate_001_import_domain_stores`);
+//! - by that collapse: `25`, `27`, `28`, `29`, `30`, `31`, `32`, `33`, `34`, `35`,
+//!   `36`, `37`, `38`, `39`, `40`, `41`, `42`, `43`, `44`, `45`, `46`, `47`, `48`,
+//!   `49`, `50`, `51`, `52`, `53`, `54`, `55`, `56`, `57`, `58`, `59`, `60`, `61`,
+//!   `62`, `63`, `64`, `65`, `66`, `67`, `68`, `70`, `71`, `72`, `73`, `74`, `75`,
+//!   `76`, `77`, `78`.
+//!
+//! None of them is still needed on a supported store: a store a 0.10.0 release
+//! created is built by the baselines, and a store that ran the chain recorded
+//! whichever parts it ran — the parts it skipped were never needed, since it
+//! reached the current shape without them.
+//!
+//! Retired ids are retired, not recycled: the runner skips a recorded id, so a
+//! reused id would mean different things on different installations — skipped
+//! where its body already ran, executed where it did not, and always executed on
+//! a brand-new database, whose ledger is empty. A new id is no better: it would be
+//! pending on every existing database, costing each install a full integrity scan
+//! of its stores on the next boot.
 //!
 //! # Support floor
 //!
@@ -96,10 +117,10 @@
 //! The v0.10.0 fixture in the tests builds a database from that release's own
 //! baseline text with its ids recorded, and proves the survivors take it to a
 //! fresh install's schema and catalog-written rows. It replaces the shape
-//! coverage the per-entry tests gave, and it does not replace the per-entry data
-//! rewrites (`36`, `37`, `41`, `44`, `45`, `48`, `49`, `50`, `68`, `73`, `76`):
-//! those have no test any more because they can never run again on a supported
-//! store.
+//! coverage the per-entry tests gave. The retired entries that rewrote or moved
+//! stored data are gone with no test standing in for them, which is accepted:
+//! they can never run again on a supported store, and the fixture comparison
+//! pins the end state a store must reach.
 //!
 //! The fixture is a copy of the two baseline constants at tag `v0.10.0`. It must
 //! be regenerated whenever the support floor moves; that is the standing cost of
@@ -622,16 +643,16 @@ const GUEST_REPORTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS guest_reports (
 
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
-/// Six entries: the core baseline (`24`), the logs baseline (`26`), and the four
-/// entries that can still be pending on a store that has run a 0.10.x build
-/// (`69`, `79`, `80`, `81`). The module header carries the rule that selects
-/// them, the id → release record and the retired ids.
+/// Six entries, split by the module header's rule: the fresh-install half is
+/// `24`, `26` and `69`; the upgrade half is `79`, `80` and `81` — the entries
+/// that can still be pending on a store that has run a 0.10.x build. The header
+/// also carries the id → release record and the retired ids.
 ///
 /// - `24` builds the full core schema; on an existing store every statement is
 ///   `IF NOT EXISTS`, so it is a strict no-op.
 /// - `26` builds the full logs schema, likewise a strict no-op on an existing
 ///   logs store.
-/// - `69` seeds the transcription-off flag (see
+/// - `69` seeds the transcription-off flag a brand-new core store needs (see
 ///   [`seed_audio_transcription_disabled`]).
 /// - `79` creates `guest_reports` on an existing core store (see
 ///   [`GUEST_REPORTS_TABLE`]).
@@ -820,12 +841,12 @@ fn seed_audio_transcription_disabled(conn: &Connection) -> BoxFuture<'_, anyhow:
     Box::pin(run_seed_audio_transcription_disabled(conn))
 }
 
-/// Entry `69`: persist the transcription-off flag on every install that never
-/// wrote it, so an owner who never chose a value is no longer treated as having
-/// local speech enabled — the ~2 GB Qwen3-ASR recogniser is not loaded, and the
-/// voice stack (wake word, microphone recording, transcription) stays off until
-/// the owner turns it on. The row keeps its meaning afterwards: absence still
-/// means enabled, which is what enabling the setting writes.
+/// Entry `69`: persist the transcription-off flag wherever the row is absent, so
+/// an owner who never chose a value is not treated as having local speech
+/// enabled — the ~2 GB Qwen3-ASR recogniser is not loaded, and the voice stack
+/// (wake word, microphone recording, transcription) stays off until the owner
+/// turns it on. The row keeps its meaning afterwards: absence still means
+/// enabled, which is what enabling the setting writes.
 ///
 /// `DO NOTHING` makes this an insert-if-absent: an existing row (the user's
 /// `"false"` or anything else they wrote) is never overwritten, and a row the
@@ -844,15 +865,6 @@ async fn run_seed_audio_transcription_disabled(conn: &Connection) -> anyhow::Res
 mod tests {
     use super::*;
     use crate::db::Connection;
-
-    async fn column_names(conn: &Connection, table: &str) -> Vec<String> {
-        conn.query(&format!("PRAGMA table_info({table})"), ())
-            .await
-            .expect("read table_info")
-            .into_iter()
-            .map(|row| row.get::<String>(1).expect("column name"))
-            .collect()
-    }
 
     async fn recorded_ids(conn: &Connection) -> Vec<String> {
         conn.query("SELECT id FROM schema_migrations", ())
@@ -1347,9 +1359,9 @@ mod tests {
         assert!(extra.is_empty(), "{context}: unexpected tables {extra:?}");
 
         for (table, expected_cols) in expected_tables {
-            let actual = column_names(conn, table).await;
+            let actual = column_shapes(conn, table).await;
             let actual_set: std::collections::HashSet<&str> =
-                actual.iter().map(String::as_str).collect();
+                actual.keys().map(String::as_str).collect();
             let expected_set: std::collections::HashSet<&str> =
                 expected_cols.iter().copied().collect();
             let miss: Vec<&str> = expected_set.difference(&actual_set).copied().collect();
@@ -1402,7 +1414,7 @@ mod tests {
         assert_eq!(
             applied,
             ["24", "69", "79", "80", "81"].map(String::from),
-            "fresh core applies the baseline and the four upgrade entries exactly"
+            "fresh core applies the baseline, the 69 seed and the three upgrade entries exactly"
         );
     }
 
@@ -1563,10 +1575,11 @@ mod tests {
     // store the reduced catalog still supports.
     //
     // It coheres as an upgrade fixture only because 0.10.0's baseline already
-    // declared every column the later upfills add: a baseline cannot upfill an
-    // existing file, so the columns the survivors need must already be in the
-    // starting text. Never derive it from today's BASELINE_* constants — today's
-    // baseline already carries the later additions and would agree with itself.
+    // declared every column the retired upfills add: a baseline cannot upfill an
+    // existing file. The one survivor that adds columns (`80`) adds the provider
+    // pin, which the starting text does not have, and it runs on the fixture.
+    // Never derive it from today's BASELINE_* constants — today's baseline
+    // already carries the later additions and would agree with itself.
     // Regenerate it from the new floor's tag when the support floor moves.
     const V0_10_0_CORE_SCHEMA: &str = "\
 -- ── Board (tickets, comments, counters) ────────────────────────────────
