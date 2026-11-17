@@ -376,13 +376,18 @@ impl TelegramAttachmentKind {
     }
 }
 
-/// Image extensions the receive path routes as images; PNG/JPEG/WebP only — gif and bmp have no
-/// codec here, and the GIF picker's clips take the video path.
-pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
-
-/// MIME prefixes routed as images, mirroring [`IMAGE_EXTENSIONS`]: PNG/JPEG/WebP only, so no gif
-/// and no legacy bmp alias.
-const IMAGE_MIME_PREFIXES: &[&str] = &["image/png", "image/jpeg", "image/jpg", "image/webp"];
+/// Whether a declared media type names one of the delivery picture formats. Derived from
+/// [`crate::util::DELIVERABLE_IMAGE_EXTENSIONS`] rather than restated: `image/jpg` is the legacy
+/// spelling of `image/jpeg`, and both extensions are in the set. The subtype is matched as a
+/// prefix, as the removed list did, so a declared `image/jpeg2000` still routes here and is then
+/// refused by the decode gate rather than by a list.
+fn is_deliverable_picture_mime(mime: &str) -> bool {
+    mime.strip_prefix("image/").is_some_and(|subtype| {
+        crate::util::DELIVERABLE_IMAGE_EXTENSIONS
+            .iter()
+            .any(|ext| subtype.starts_with(ext))
+    })
+}
 
 /// Shared `@username` → `first_name` → `fallback` label chain; the two callers differ only in the
 /// sentinel they pass.
@@ -492,9 +497,10 @@ fn format_attachment_content(
     local_path: &Path,
     mime_type: Option<&str>,
 ) -> String {
-    // MIME fallback mirrors the extension whitelist: PNG/JPEG/WebP only.
-    let is_image = crate::util::has_extension(local_path, IMAGE_EXTENSIONS)
-        || mime_type.is_some_and(|m| IMAGE_MIME_PREFIXES.iter().any(|p| m.starts_with(p)));
+    // MIME fallback: the same delivery picture set, so a name and a declared type cannot disagree.
+    let is_image =
+        crate::util::has_extension(local_path, crate::util::DELIVERABLE_IMAGE_EXTENSIONS)
+            || mime_type.is_some_and(is_deliverable_picture_mime);
     let is_video = crate::util::is_video_extension(local_path)
         || mime_type.is_some_and(|m| m.starts_with("video/"));
     match kind {

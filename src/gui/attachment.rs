@@ -109,10 +109,9 @@ impl Attachment {
         if metadata.len() > crate::util::FILE_MAX_BYTES {
             return Err(Refusal::TooLarge(too_large(name)));
         }
-        // The receive path's own list decides: an image here must be an image there, or delivery
-        // refuses it.
-        let kind = if crate::util::has_extension(path, crate::channels::telegram::IMAGE_EXTENSIONS)
-        {
+        // The delivery picture set decides — the same one the receive path routes by: an image here
+        // must be an image there, or delivery refuses it.
+        let kind = if crate::util::has_extension(path, crate::util::DELIVERABLE_IMAGE_EXTENSIONS) {
             Kind::Image
         } else if crate::util::is_video_extension(path) {
             Kind::Video
@@ -411,6 +410,25 @@ fn file_chip<'a, M: Clone + 'a>(name: &'a str, remove: M) -> Element<'a, M> {
 mod tests {
     use super::*;
     use image_crate::ImageEncoder as _;
+
+    /// The composer classifies by the delivery picture set, so an attachment is a picture exactly
+    /// when delivery delivers one. gif and bmp — the two formats the local codecs cannot handle —
+    /// are not pictures.
+    #[test]
+    fn an_attachment_is_a_picture_exactly_when_delivery_delivers_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let attach = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, b"x").unwrap();
+            Attachment::from_path(&path).unwrap().kind
+        };
+        for ext in crate::util::DELIVERABLE_IMAGE_EXTENSIONS {
+            assert_eq!(attach(&format!("photo.{ext}")), Kind::Image, "{ext}");
+        }
+        for ext in ["gif", "bmp"] {
+            assert_eq!(attach(&format!("picture.{ext}")), Kind::File, "{ext}");
+        }
+    }
 
     #[test]
     fn a_preview_decodes_at_its_tile_size() {

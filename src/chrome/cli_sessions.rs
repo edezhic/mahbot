@@ -154,7 +154,7 @@ impl Ledger {
     /// stalling the runtime.
     fn open() -> Option<Self> {
         crate::util::with_block_in_place(|| {
-            let root = storage_root()?;
+            let root = crate::config::storage_root()?;
             let lock = lock_root(&root)?;
             let records = read_records(&root);
             Some(Self {
@@ -180,12 +180,6 @@ impl Ledger {
             warn!(error = %error, "chrome CLI session record not written");
         }
     }
-}
-
-fn storage_root() -> Option<PathBuf> {
-    crate::config::CONFIG
-        .try_storage_root()
-        .or_else(|| crate::config::default_config_dir().ok())
 }
 
 fn lock_root(root: &Path) -> Option<File> {

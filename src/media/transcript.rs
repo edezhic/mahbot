@@ -457,24 +457,10 @@ fn entry_path(path: &Path) -> Option<PathBuf> {
     Some(cache_dir()?.join(format!("{digest}.json")))
 }
 
-/// The directory the entries live in: the product's own storage root, and under `cargo test` the
-/// test root, so a test can never write into the owner's live tree.
-#[cfg_attr(
-    test,
-    expect(clippy::unnecessary_wraps, reason = "the test root always resolves")
-)]
+/// The directory the entries live in: the product's own storage root, which under `cargo test` is
+/// the shared test root — so a test can never write into the owner's live tree.
 fn cache_dir() -> Option<PathBuf> {
-    #[cfg(test)]
-    {
-        Some(crate::util::test::test_root().join(DIR))
-    }
-    #[cfg(not(test))]
-    {
-        crate::config::CONFIG
-            .try_storage_root()
-            .or_else(|| crate::config::default_config_dir().ok())
-            .map(|root| root.join(DIR))
-    }
+    crate::config::storage_root().map(|root| root.join(DIR))
 }
 
 async fn canonical(path: &Path) -> PathBuf {

@@ -1067,6 +1067,10 @@ pub(crate) async fn check_reference_total_input(paths: &[PathBuf]) -> anyhow::Re
     Ok(())
 }
 
+/// The cheap half of the reference gate: refuse a name that cannot be decoded BEFORE any read, so a
+/// 49 MB HEIC is never loaded just to be refused. Deliberately its own list rather than
+/// [`DELIVERABLE_IMAGE_EXTENSIONS`]: the refusal must stay ahead of the read, and a delivery list
+/// that later widened would silently turn the refusal into a full read.
 fn check_reference_extension(path: &Path) -> anyhow::Result<()> {
     let ext = path
         .extension()
@@ -1204,18 +1208,23 @@ pub(crate) const AUDIO_EXTENSIONS: &[&str] = &[
     "caf", "ac3",
 ];
 
-/// Recognized image extensions for the video tool's image inputs (reference images and frame
-/// anchors), matching the Telegram routing list for PNG/JPEG/WebP — the only locally decodable
-/// codecs — plus heic/heif, passed to the provider unmangled (never locally decoded).
+/// Recognized image extensions — what the product calls an image by name: the delivery picture set
+/// ([`DELIVERABLE_IMAGE_EXTENSIONS`]) plus heic/heif, passed to a provider unmangled (never locally
+/// decoded). Read by the video tool's image inputs (reference images and frame anchors) and by the
+/// OOXML reader's media classification.
 pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "webp", "heic", "heif"];
 
 /// Extensions of the pictures the product DELIVERS as pictures: a produced file of one of these
 /// formats travels to the user as one, and an embedded picture of one is written through to the
 /// document reader's output verbatim. Every other format would need a transcoding the readings
-/// avoid, and a reading names it instead. Asked of a produced picture's own name by every tool that
-/// delivers one — the photo tool's marker among them — and of an embedded picture's name by the
-/// document readers, so the set cannot drift. [`IMAGE_EXTENSIONS`] is the wider set of what can be
-/// read.
+/// avoid, and a reading names it instead.
+///
+/// The one statement of the set, so none of its callers can drift from the others: the photo
+/// tool's delivery marker, both document readers' write-through ([`crate::legacy`],
+/// [`crate::ooxml`]), the Telegram receive path's routing — by name and by declared media type —
+/// and the desktop composer's classification. PNG/JPEG/WebP are the only codecs the product
+/// decodes locally; gif and bmp are not (the GIF picker's clips take the video path), so neither
+/// is a delivery picture. [`IMAGE_EXTENSIONS`] is the wider set of what can be read.
 pub(crate) const DELIVERABLE_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 
 /// The product-level cap on one file wherever the product bounds one: the composer's attach limit,

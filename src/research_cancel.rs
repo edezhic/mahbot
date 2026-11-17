@@ -268,9 +268,8 @@ mod tests {
 
         /// The rest of the run's state: the folder, plus the persisted report (the `pending_jobs`
         /// envelope and its archive) when the run got that far. Every constructor reaches this only
-        /// after the test stores are up: `results_archive_path` falls back to the real `~/.mahbot`
-        /// root while `CONFIG` has none set, so resolving earlier would seed (and then delete) a
-        /// file in the owner's storage.
+        /// after the test stores are up, because the row insert needs them; the archive path itself
+        /// resolves under the test root either way, never the owner's storage.
         async fn seed(id: &'static str, folder: Folder, report: Report) -> Self {
             let root = crate::research_cleanup::ensure_run_root(id).await;
             match folder {

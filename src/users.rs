@@ -1018,29 +1018,22 @@ pub struct TelegramMatch {
 /// The userspaces root, `<storage_root>/userspaces`: the single resolution point, shared by
 /// [`personal_workspace_path`] and `research_cleanup::sweep_media` so both always agree.
 ///
-/// Resolves under the CONFIG storage root when set, else [`fallback_storage_root`] — so a test
-/// reaching the fallback (`add_user` without `init_test_stores`) still stays inside test-owned
-/// storage, never the real user config directory.
+/// Always a path, because a workspace path cannot represent "no root": it is
+/// [`crate::config::storage_root`] when that resolves, else [`fallback_storage_root`] — which is
+/// why this wrapper, and not the general statement, carries the last resort.
 #[must_use]
 pub(crate) fn userspaces_root() -> PathBuf {
-    let storage_root = crate::config::CONFIG
-        .try_storage_root()
-        .unwrap_or_else(fallback_storage_root);
-    storage_root.join("userspaces")
+    crate::config::storage_root()
+        .unwrap_or_else(fallback_storage_root)
+        .join("userspaces")
 }
 
-/// Production: the default config directory. Tests: the shared test root, so a test reaching this
-/// fallback never writes into the real config directory; production always sets the root at
-/// startup, so the divergence is unobservable in the shipped binary.
-#[cfg(test)]
+/// The last resort for a caller that must have a path: the OS temporary directory, under the
+/// product's own leaf. The leaf stays `mahbot_userspaces` rather than a bare `userspaces` because
+/// the temporary directory is shared with every other program, and a generic name there is one
+/// another program may already own.
 fn fallback_storage_root() -> PathBuf {
-    crate::util::test::test_root().clone()
-}
-
-#[cfg(not(test))]
-fn fallback_storage_root() -> PathBuf {
-    crate::config::default_config_dir()
-        .unwrap_or_else(|_| std::env::temp_dir().join("mahbot_userspaces"))
+    std::env::temp_dir().join("mahbot_userspaces")
 }
 
 /// Non-empty, no path separators, not a dot entry. Applied on both sides: the read-side callers

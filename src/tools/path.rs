@@ -675,14 +675,6 @@ fn is_grandparent_temp_root(path: &Path) -> bool {
         .is_some_and(is_os_temp_root)
 }
 
-/// The product's own storage root — where its stores, and the copies it keeps, live. Read
-/// from the running configuration, so no path is hard-coded here.
-fn storage_root() -> Option<PathBuf> {
-    crate::config::CONFIG
-        .try_storage_root()
-        .or_else(|| crate::config::default_config_dir().ok())
-}
-
 /// Sidecar suffixes of a store file — the write-ahead log and its journal siblings. They
 /// belong to the store and are refused with it.
 const STORE_SIDECAR_SUFFIXES: &[&str] = &["-wal", "-shm", "-journal"];
@@ -767,7 +759,7 @@ fn store_file_at(root: &Path, path: &Path) -> Option<StoreFile> {
 /// [`store_file_at`] against the running storage root. `None` when the root cannot be
 /// resolved at all — a case a running service cannot be in.
 fn product_store_file(path: &Path) -> Option<StoreFile> {
-    store_file_at(&storage_root()?, path)
+    store_file_at(&crate::config::storage_root()?, path)
 }
 
 /// The live-store refusal, worded once so the read and write sides cannot drift.
@@ -2060,9 +2052,7 @@ mod tests {
     /// product invariant, not a rule of a role.
     #[test]
     fn live_stores_are_refused_at_every_access_level() {
-        let Some(root) = storage_root() else {
-            return; // no HOME and no user directory: nothing to refuse
-        };
+        let root = crate::config::storage_root().expect("the test root always resolves");
         let tmp = TempDir::new().expect("tempdir");
         let workspace = tmp.path().to_path_buf();
 
@@ -2316,9 +2306,7 @@ mod tests {
     /// copies too, and nothing is opened to decide any of it.
     #[test]
     fn unrestricted_write_refuses_store_files() {
-        let Some(root) = storage_root() else {
-            return;
-        };
+        let root = crate::config::storage_root().expect("the test root always resolves");
         let own = TempDir::new().expect("tempdir");
         let own = own.path();
         let managed: Vec<(String, PathBuf)> = Vec::new();
@@ -2526,9 +2514,7 @@ mod tests {
         );
 
         // The same link aimed at a live store is refused, and nothing is created on the way.
-        let Some(root) = storage_root() else {
-            return;
-        };
+        let root = crate::config::storage_root().expect("the test root always resolves");
         let store_dir = root.join("db");
         let linked_dir = own.join("link-to-store");
         symlink(&store_dir, &linked_dir).unwrap();

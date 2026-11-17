@@ -607,8 +607,9 @@ impl ConfigReload {
             .clone()
     }
 
-    /// `None` instead of panicking when no root is set — for paths that tolerate
-    /// an uninitialized config (tests).
+    /// `None` instead of panicking when no root is set — for a caller that may run before
+    /// [`load_or_init`] and must still answer; the module's `storage_root` is that caller's entry
+    /// point, so it gets the fallback chain as well.
     #[must_use]
     pub fn try_storage_root(&self) -> Option<PathBuf> {
         self.storage_root.get().cloned()
@@ -730,6 +731,26 @@ pub fn default_config_dir() -> Result<PathBuf> {
         .map(|u| u.home_dir().to_path_buf())
         .context("Could not find home directory")?;
     Ok(home.join(".mahbot"))
+}
+
+/// The storage root for a caller that may run before the configuration is loaded: the loaded root
+/// ([`ConfigReload::try_storage_root`]) when it is set, else [`default_config_dir`] — a
+/// command-line entry point runs before [`load_or_init`], so that two-step chain is the answer,
+/// never a bare "maybe". Under `cargo test` the shared test root REPLACES the default-directory
+/// step, so every caller of this function resolves the same test-owned root and cannot reach the
+/// owner's `~/.mahbot`, even before the test stores are up.
+#[must_use]
+pub(crate) fn storage_root() -> Option<PathBuf> {
+    CONFIG.try_storage_root().or_else(|| {
+        #[cfg(test)]
+        {
+            Some(crate::util::test::test_root().clone())
+        }
+        #[cfg(not(test))]
+        {
+            default_config_dir().ok()
+        }
+    })
 }
 
 /// Resolve `~/.mahbot` as the storage root, create it, seed hardcoded defaults
@@ -1261,6 +1282,21 @@ pub(crate) fn model_routing(model: &str, provider_order: Option<&str>) -> ModelR
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one statement and the account module's always-a-path wrapper answer the same thing, and
+    /// under `cargo test` that answer is inside the shared test root — the cancelled-research
+    /// deletion path resolves its archive through it, so a test that resolves before the stores are
+    /// up still cannot reach the owner's tree.
+    #[test]
+    fn the_storage_root_and_the_userspaces_wrapper_agree_inside_the_test_root() {
+        let root = storage_root().expect("the test root always resolves");
+        assert!(
+            root.starts_with(crate::util::test::test_root()),
+            "resolved {} outside the test root",
+            root.display()
+        );
+        assert_eq!(crate::users::userspaces_root(), root.join("userspaces"));
+    }
 
     /// A typo in the pinned default fails here, before any request is built.
     #[test]
