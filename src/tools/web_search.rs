@@ -637,6 +637,48 @@ pub struct WebSearchTool {
     cache: WebSearchCache,
 }
 
+impl WebSearchBackend {
+    /// The providers' own words, for the settings read-back.
+    pub(crate) const DEEPSEEK: &str = "deepseek";
+    pub(crate) const EXA: &str = "exa";
+
+    /// The provider's own word, for the settings read-back.
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::DeepSeek { .. } => Self::DEEPSEEK,
+            Self::Exa { .. } => Self::EXA,
+        }
+    }
+}
+
+/// What the stored choice resolves to, for the settings read-back: the text backend's name, and
+/// the backend pictures get — [`WebSearchBackend::EXA`] when they go to the Exa key, `None` when
+/// they fall back to the text one. `None` for the whole call when the agents get no search tool at
+/// all. [`WebSearchTool::from_config`] is the one decision point, so a read-back cannot describe a
+/// toolset the product does not build.
+///
+/// The raw rows are normalised first — empty means absent, the way the accessors read them — since
+/// a value the owner just cleared is `Some("")` in the live snapshot until the next reload.
+#[must_use]
+pub(crate) fn backends_in_use(
+    provider: Option<&str>,
+    deepseek_key: Option<String>,
+    exa_key: Option<String>,
+) -> Option<(&'static str, Option<&'static str>)> {
+    let provider = provider
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty());
+    let tool = WebSearchTool::from_config(
+        provider,
+        deepseek_key.and_then(|key| crate::config::trimmed_or_none(&key)),
+        exa_key.and_then(|key| crate::config::trimmed_or_none(&key)),
+    )?;
+    let text = tool.text.name();
+    // Only Exa supplies pictures, so a picture key means the pictures go to Exa.
+    let pictures = tool.pictures.is_some().then_some(WebSearchBackend::EXA);
+    Some((text, pictures))
+}
+
 impl WebSearchTool {
     #[must_use]
     fn new(text: WebSearchBackend, pictures: Option<String>) -> Self {
@@ -655,10 +697,10 @@ impl WebSearchTool {
         exa_key: Option<String>,
     ) -> Option<Self> {
         match provider {
-            Some(p) if p.eq_ignore_ascii_case("deepseek") => {
+            Some(p) if p.eq_ignore_ascii_case(WebSearchBackend::DEEPSEEK) => {
                 deepseek_key.map(|key| Self::new(WebSearchBackend::DeepSeek { key }, None))
             }
-            Some(p) if p.eq_ignore_ascii_case("exa") => {
+            Some(p) if p.eq_ignore_ascii_case(WebSearchBackend::EXA) => {
                 exa_key.map(|key| Self::new(WebSearchBackend::Exa { key: key.clone() }, Some(key)))
             }
             Some(other) => {

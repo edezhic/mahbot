@@ -243,8 +243,9 @@ pub(crate) async fn warmup_provider_from_config(
 /// `background_warmup`: the provider-endpoint persist arm performs its own
 /// foreground warmup to surface the custom-endpoint warning (or deliberately skips
 /// it when reverting to the default), so it passes `false` to avoid a
-/// duplicate network call; the provider-key persist arm passes `true` so
-/// the new credential's pool is pre-warmed in the background.
+/// duplicate network call; the provider-key persist arm passes `true` for a saved
+/// value so the new credential's pool is pre-warmed, and `false` for a clear,
+/// which has no credential to warm.
 ///
 /// The local speech recogniser is deliberately not touched here: the model loads on
 /// first use (a voice message, the composer's microphone, or the voice stack's demand

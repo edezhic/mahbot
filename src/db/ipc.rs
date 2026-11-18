@@ -15,16 +15,17 @@
 //! [`crate::window_requests`]).
 //!
 //! The compatibility rule is why the operation rides the old frame: an operation frame carries a
-//! magic `store` value — the generation its family declares ([`CALL_STORE`] / [`CALL_STORE_BASE`] /
-//! [`CALL_STORE_VIDEO`] / [`CALL_STORE_PHOTO`]), never a store name — so a product that does not
-//! know it parses the frame as a diagnostic query and refuses it as an unknown store: an honest
-//! "this product does not serve that here" rather than a protocol complaint. A new frame type
-//! could be parsed as something else and answered misleadingly; a superset of the old frame is the
-//! only shape that degrades honestly. The value belongs to the FAMILY, so a family whose surface
-//! has not changed keeps working one build behind; a family added since — or one whose surface
-//! gained arguments a product built before it would ignore — carries a value that product does not
-//! know, so the call is refused instead of misanswered. This build serves every generation
-//! ([`CALL_STORES`]); its frontend sends the one its family declares.
+//! magic `store` value — the generation its family declares ([`CALL_STORE`] /
+//! [`CALL_STORE_BASE`] / [`CALL_STORE_VIDEO`] / [`CALL_STORE_PHOTO`] / [`CALL_STORE_SETTINGS`]),
+//! never a store name — so a product that does not know it parses the frame as a diagnostic query
+//! and refuses it as an unknown store: an honest "this product does not serve that here" rather
+//! than a protocol complaint. A new frame type could be parsed as something else and answered
+//! misleadingly; a superset of the old frame is the only shape that degrades honestly. The value
+//! belongs to the FAMILY, so a family whose surface has not changed keeps working one build
+//! behind; a family added since — or one whose surface gained arguments a product built before it
+//! would ignore — carries a value that product does not know, so the call is refused instead of
+//! misanswered. This build serves every generation ([`CALL_STORES`]); its frontend sends the one
+//! its family declares.
 //! The call channel is same-user-only, like the diagnostic one, and FAIL-CLOSED: when the socket
 //! could not be restricted to the instance's own user, queries keep working and operations are
 //! refused.
@@ -193,8 +194,9 @@ pub(crate) struct IpcRequest {
 /// ran) — instead of answering a call it cannot carry out.
 pub(crate) const CALL_STORE: &str = "cli2";
 
-/// The value every family the channel has already served carries: any product that knows the
-/// operation channel serves it, so those families keep working one build behind.
+/// The base generation: the value the channel's first families carried. No family of this build
+/// carries it any more, but the listener keeps serving it, so a frontend one build behind still
+/// reaches the product instead of being refused as an unknown store.
 pub(crate) const CALL_STORE_BASE: &str = "cli";
 
 /// The value the video family carries since its surface gained the reference, frame-anchor and
@@ -207,12 +209,22 @@ pub(crate) const CALL_STORE_VIDEO: &str = "cli3";
 /// generation: a product built before it refuses the frame as an unknown store.
 pub(crate) const CALL_STORE_PHOTO: &str = "cli4";
 
-/// Every protocol value this build serves — one per generation of the command line's surface.
+/// The value the two families whose surface this build widened carry: `config` gained the
+/// settings actions (`reference` / `get` / `list` / `set` and the account ones), and `workspace`
+/// gained its own settings and project actions. A product built before them knows neither those
+/// actions nor the arguments they carry — it would answer a `set` as an unknown action and drop a
+/// `set_diagnostics` field — so the frame is refused as an unknown store: nothing ran, the
+/// environment's class.
+pub(crate) const CALL_STORE_SETTINGS: &str = "cli5";
+
+/// Every protocol value this build serves — one per generation of the command line's surface,
+/// including the ones only a frontend one build behind still sends.
 pub(crate) const CALL_STORES: &[&str] = &[
     CALL_STORE,
     CALL_STORE_BASE,
     CALL_STORE_VIDEO,
     CALL_STORE_PHOTO,
+    CALL_STORE_SETTINGS,
 ];
 
 /// The store value a second launch's frame names: not a store, and nothing is queried — the frame
@@ -1095,9 +1107,9 @@ mod tests {
         );
 
         let operation = serde_json::to_value(IpcRequest {
-            // The `workspace` family's own protocol value: the generation that
-            // served it, not the current one the `send` family carries.
-            store: CALL_STORE_BASE.to_string(),
+            // The `workspace` family's own protocol value: the generation this build added for
+            // the settings surface, not the one the `send` family carries.
+            store: CALL_STORE_SETTINGS.to_string(),
             sql: String::new(),
             params: Vec::new(),
             call: Some(CallRequest {
@@ -1107,7 +1119,7 @@ mod tests {
             }),
         })
         .unwrap();
-        assert_eq!(operation["store"], CALL_STORE_BASE);
+        assert_eq!(operation["store"], CALL_STORE_SETTINGS);
         assert_eq!(operation["call"]["tool"], "workspace");
     }
 

@@ -61,7 +61,16 @@ A secret may be written `@path` to be read from a file (`--provider-key @openrou
 never lands in your shell's history. The same `@` is the file form for `--owner` too, which is
 what the `./` in `./@yourname` is for.
 
-From there everything happens in the bot: the assistant runs your work and can explain anything
+Everything else stays reachable from the same terminal, against the running service.
+`mahbot config` reads and writes the settings — `get` one whole, `list` them summarised, `set` one
+by name — covering the provider and its endpoint, the manager and worker model slots, the image
+and video catalogues and their per-model provider routing, web search, the Telegram bot
+including its local Bot API mode, the audio switches, auto-update and start-at-login; it also
+manages the accounts, their custom-tool grants and the custom roles. `mahbot config reference`
+prints every action and every setting name in full. `mahbot workspace` does the same for the
+managed projects: add or delete one, re-analyse it or re-detect its diagnostics commands, write
+those commands and the project rules by hand, choose the active project, and turn its background
+maintainer on or off. The assistant in the bot can do all of it too, and can explain anything
 left to set up. A host with a display gets the window from the same install instead, at login,
 with the same service behaviour underneath: the same updates, the same pause and resume.
 

@@ -24,3 +24,8 @@
 # too — so a CRLF checkout would break them: their endings are pinned like the prompt
 # texts above.
 /scripts/*.sh text eol=lf
+
+# The README is embedded with `include_str!` and served verbatim by the `about` action
+# and `mahbot config about`, so a checkout that rewrites its endings would ship text the
+# repository does not hold — the same rule as the prompt texts above.
+/README.md text eol=lf

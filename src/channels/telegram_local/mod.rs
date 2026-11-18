@@ -65,7 +65,7 @@ pub(crate) enum Mode {
 impl Mode {
     /// The mode a stored value names, strictly: anything else names none. A
     /// journal target that cannot be read must not be guessed at.
-    pub(super) fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         match value.trim() {
             value if value.eq_ignore_ascii_case("local") => Some(Mode::Local),
             value if value.eq_ignore_ascii_case("cloud") => Some(Mode::Cloud),
@@ -262,8 +262,10 @@ pub(crate) fn validate_credentials(api_id: &str, api_hash: &str) -> Result<(), S
 }
 
 /// `api_id` as the server takes it, or what is wrong with it. Shape only: an empty
-/// field, a pasted sentence, a number too large for the protocol.
-fn parse_api_id(api_id: &str) -> Result<(), String> {
+/// field, a pasted sentence, a number too large for the protocol. This is also the
+/// rule for writing that field alone, where the other half of the pair may still be
+/// unset — a caller judging one field reads its error.
+pub(crate) fn parse_api_id(api_id: &str) -> Result<(), String> {
     let api_id = api_id.trim();
     if api_id.is_empty() {
         return Err("api_id is missing — copy the number my.telegram.org shows".to_string());
@@ -280,7 +282,7 @@ fn parse_api_id(api_id: &str) -> Result<(), String> {
     }
 }
 
-fn parse_api_hash(api_hash: &str) -> Result<(), String> {
+pub(crate) fn parse_api_hash(api_hash: &str) -> Result<(), String> {
     let api_hash = api_hash.trim();
     if api_hash.is_empty() {
         return Err(
@@ -450,7 +452,10 @@ pub(crate) fn credentials_rejected(reason: &str) -> bool {
         || reason.contains("api_hash")
 }
 
-pub(crate) async fn request_switch(target: Mode) -> anyhow::Result<()> {
+/// Ask for the bot to be served from `target`. `false` means nothing was started because that
+/// side is already in force — a second cutover would log the bot out of the cloud again while it
+/// is being served locally — so a caller reporting the call must not announce a switch.
+pub(crate) async fn request_switch(target: Mode) -> anyhow::Result<bool> {
     if target == Mode::Local {
         if CONFIG.telegram_bot_token().is_none() {
             anyhow::bail!("Telegram is not configured yet: add a bot token first");
@@ -464,10 +469,10 @@ pub(crate) async fn request_switch(target: Mode) -> anyhow::Result<()> {
     // switch whose chat message is still pending is settled too: its own notice is on its way.
     let settled = configured_mode() == target && (!migrate::pending() || migrate::finishing());
     if settled {
-        return Ok(());
+        return Ok(false);
     }
     migrate::start(target).await?;
-    Ok(())
+    Ok(true)
 }
 
 /// The supervisor: keeps the server alive, updated and clean, and finishes any

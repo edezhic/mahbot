@@ -901,6 +901,20 @@ impl WorkspaceStore {
 
         // Canonicalize and validate the path so bad paths never enter the system.
         let path = canonicalize_workspace_path(path).map_err(|e| anyhow::anyhow!("{e}"))?;
+        // A folder or a name already managed is refused with the workspace that holds it: the
+        // engine's own UNIQUE error names a column, not something a person can act on. What is
+        // wrong and nothing about how to fix it: the same text reaches a tool caller, a terminal
+        // caller and a desktop toast, and only one of those has an action to name.
+        let managed = self.list().await?;
+        if let Some(existing) = managed.iter().find(|ws| ws.path == path) {
+            anyhow::bail!(
+                "the folder {path} is already managed as workspace '{}'",
+                existing.name
+            );
+        }
+        if managed.iter().any(|ws| ws.name == name) {
+            anyhow::bail!("a workspace named '{name}' already exists");
+        }
         let now = db::now();
         let pending = WorkspaceStatus::Pending.to_string();
         let ws = self
@@ -2294,6 +2308,50 @@ mod tests {
             fetched.status,
             WorkspaceStatus::Pending,
             "Persisted workspace must have status = pending"
+        );
+    }
+
+    /// A folder or a name that is already managed is refused with the workspace that holds it,
+    /// not with the engine's own UNIQUE error — the admin has to know which one it collides with.
+    #[tokio::test]
+    #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
+    async fn add_refuses_a_folder_or_name_that_is_already_managed() {
+        let (store, _tmp) = test_store().await;
+        let first = TempDir::new().expect("temp dir for the managed folder");
+        let second = TempDir::new().expect("temp dir for the second folder");
+        crate::workspace_index::init_global();
+        let _ = crate::config::CONFIG.try_set_storage_root(crate::util::test::test_root().clone());
+        crate::config::CONFIG.swap(crate::config::ConfigData::STRUCT_FIELDS_DEFAULT);
+
+        store
+            .add("dup_test", first.path().to_str().unwrap())
+            .await
+            .expect("the first add lands");
+
+        let same_folder = store
+            .add("dup_other", first.path().to_str().unwrap())
+            .await
+            .expect_err("the folder is already managed");
+        assert!(
+            same_folder
+                .to_string()
+                .contains("already managed as workspace 'dup_test'"),
+            "got: {same_folder}"
+        );
+        let same_name = store
+            .add("dup_test", second.path().to_str().unwrap())
+            .await
+            .expect_err("the name is already taken");
+        assert!(
+            same_name
+                .to_string()
+                .contains("a workspace named 'dup_test' already exists"),
+            "got: {same_name}"
+        );
+        assert_eq!(
+            store.list().await.expect("list").len(),
+            1,
+            "a refused add leaves no row behind"
         );
     }
 

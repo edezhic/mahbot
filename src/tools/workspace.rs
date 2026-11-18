@@ -1,6 +1,12 @@
 //! The admin's own view into the managed workspaces: list them, add one (which activates
-//! it), freeze/unfreeze their pipelines, read a board and a single ticket, and leave a
-//! clarification note on a ticket.
+//! it), inspect one, delete one, freeze/unfreeze their pipelines, switch maintenance on or
+//! off, restart discovery, write their rules and their diagnostics commands, make one the
+//! active project, read a board and a single ticket, and leave a clarification note on a
+//! ticket.
+//!
+//! The detail of that surface is not here: every action and every field is documented in the
+//! `reference` action ([`crate::settings::reference`], the same text `mahbot config reference`
+//! prints), so the standing description stays small and every field's description stays short.
 //!
 //! It manages no board. Adding a managed workspace activates it; the desktop itself moves
 //! the active project when the active one is deleted, and onto a project at start-up
@@ -28,9 +34,112 @@ const BOARD_LINE_LIMIT: usize = 100;
 /// wording, so `list` and a fleet-wide pause say the same thing.
 const NO_WORKSPACE: &str = "No managed workspaces exist.";
 
-/// The `workspace` tool: the admin's project view — list / add / board / ticket / comment /
-/// pause / resume.
+/// The `workspace` tool: the admin's project view and the settings of each project —
+/// `reference`, `list`, `show`, `add`, `delete`, `pause`, `resume`, `maintenance`,
+/// `rediscover`, `rediscover_diagnostics`, `set_diagnostics`, `set_rules`, `use`, `board`,
+/// `ticket`, `comment`.
 pub(crate) struct WorkspaceTool;
+
+/// This tool's schema, built once: [`Tool::parameters_schema`] hands out a copy, and the
+/// unknown-field guard reads the same list without rebuilding it on every call.
+fn schema() -> &'static serde_json::Value {
+    static SCHEMA: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(build_schema);
+    &SCHEMA
+}
+
+fn build_schema() -> serde_json::Value {
+    super::tool_params_schema(
+        &json!({
+            "action": {
+                "type": "string",
+                "enum": [
+                    "reference",
+                    "list",
+                    "show",
+                    "add",
+                    "delete",
+                    "pause",
+                    "resume",
+                    "maintenance",
+                    "rediscover",
+                    "rediscover_diagnostics",
+                    "set_diagnostics",
+                    "set_rules",
+                    "use",
+                    "board",
+                    "ticket",
+                    "comment"
+                ],
+                "description": "Which action to perform; each field's own description says which action it belongs to."
+            },
+            "workspace": {
+                "type": "string",
+                "description": "The managed workspace to act on, spelled exactly as `list` spells it; the `reference` says which actions take it."
+            },
+            "name": {
+                "type": "string",
+                "description": "(add) The new workspace's short unique name, used in ticket ids and the GUI."
+            },
+            "path": {
+                "type": "string",
+                "description": "(add) The project directory: absolute, relative, or `~` — resolved where the call runs."
+            },
+            "phase": {
+                "type": "string",
+                "description": "(board) Narrow the listing to one ticket phase (e.g. 'queued', 'in_development', 'done', 'cancelled'). Omit it to list every non-archived ticket."
+            },
+            "ticket_id": {
+                "type": "string",
+                "description": "(ticket / comment) The ticket's full id — `<workspace>-<number>`, which already carries its workspace. A bare number is refused."
+            },
+            "full": {
+                "type": "boolean",
+                "description": "(ticket) Return the ticket whole and unclipped. Default false."
+            },
+            "content": {
+                "type": "string",
+                "description": "(comment) The clarification note to leave on the ticket."
+            },
+            "rules": {
+                "type": "string",
+                "description": "(set_rules) The project rules; empty clears them."
+            },
+            "maintenance": {
+                "type": "boolean",
+                "description": "(maintenance) On to run the background maintainer, off to stop it."
+            },
+            "format": {
+                "type": "string",
+                "description": "(set_diagnostics) The format command; omit to keep it, empty to clear it."
+            },
+            "format_check": {
+                "type": "string",
+                "description": "(set_diagnostics) The format-check command; omit to keep it, empty to clear it."
+            },
+            "lint": {
+                "type": "string",
+                "description": "(set_diagnostics) The lint command; omit to keep it, empty to clear it."
+            },
+            "lint_fix": {
+                "type": "string",
+                "description": "(set_diagnostics) The lint-fix command; omit to keep it, empty to clear it."
+            },
+            "type_check": {
+                "type": "string",
+                "description": "(set_diagnostics) The type-check command; omit to keep it, empty to clear it."
+            },
+            "build": {
+                "type": "string",
+                "description": "(set_diagnostics) The build command; omit to keep it, empty to clear it."
+            },
+            "unit_test": {
+                "type": "string",
+                "description": "(set_diagnostics) The unit-test command; omit to keep it, empty to clear it."
+            }
+        }),
+        &["action"],
+    )
+}
 
 #[async_trait]
 impl Tool for WorkspaceTool {
@@ -39,44 +148,7 @@ impl Tool for WorkspaceTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        super::tool_params_schema(
-            &json!({
-                "action": {
-                    "type": "string",
-                    "enum": ["list", "add", "pause", "resume", "board", "ticket", "comment"],
-                    "description": "Which action to perform; the descriptions of `workspace`, `name`, `path`, `phase`, `ticket_id`, `full` and `content` say which action each field belongs to."
-                },
-                "workspace": {
-                    "type": "string",
-                    "description": "(list / board / pause / resume) The managed workspace to act on, spelled exactly as the `<managed-workspaces>` block or `list` spells it — matching is exact, never approximate. Omit it to cover every managed workspace, which for `pause` / `resume` is a fleet-wide freeze, so name the workspace whenever one was named to you."
-                },
-                "name": {
-                    "type": "string",
-                    "description": "(add) The new workspace's short unique name, used in ticket ids and the GUI."
-                },
-                "path": {
-                    "type": "string",
-                    "description": "(add) Absolute path to the software project directory to add."
-                },
-                "phase": {
-                    "type": "string",
-                    "description": "(board) Narrow the listing to one ticket phase (e.g. 'queued', 'in_development', 'done', 'cancelled'). Omit it to list every non-archived ticket."
-                },
-                "ticket_id": {
-                    "type": "string",
-                    "description": "(ticket / comment) The ticket's full id — `<workspace>-<number>`, which already carries its workspace. A bare number is refused."
-                },
-                "full": {
-                    "type": "boolean",
-                    "description": "(ticket) Return the ticket whole and unclipped. Default false."
-                },
-                "content": {
-                    "type": "string",
-                    "description": "(comment) The clarification note to leave on the ticket."
-                }
-            }),
-            &["action"],
-        )
+        schema().clone()
     }
 
     fn preserve_full_output(&self) -> bool {
@@ -103,13 +175,36 @@ impl WorkspaceTool {
     /// text, and [`Tool::execute_answer`] hands it over with the partiality flag a command-line
     /// caller reads. There is no second code path to drift from this one.
     async fn answer(&self, args: serde_json::Value) -> anyhow::Result<ToolAnswer> {
+        // Before anything is read: a field the schema does not declare is a usage error naming
+        // the reference, never silently ignored — a misspelled `workspace` would otherwise act
+        // on the whole fleet.
+        super::refuse_unknown_fields(schema(), &args)?;
         match super::get_str(&args, "action")? {
+            "reference" => Ok(ToolAnswer::done(crate::settings::reference())),
             "list" => Ok(ToolAnswer::done(
                 list_workspaces(super::get_opt_str_strict(&args, "workspace")?).await?,
             )),
+            "show" => Ok(ToolAnswer::done(
+                show_workspace(super::get_str(&args, "workspace")?).await?,
+            )),
             "add" => add_workspace(&args).await,
+            "delete" => Ok(ToolAnswer::done(
+                delete_workspace(super::get_str(&args, "workspace")?).await?,
+            )),
             "pause" => pause_or_resume(write_address(&args, "pause")?, true).await,
             "resume" => pause_or_resume(write_address(&args, "resume")?, false).await,
+            "maintenance" => Ok(ToolAnswer::done(set_maintenance(&args).await?)),
+            "rediscover" => Ok(ToolAnswer::done(
+                rediscover(super::get_str(&args, "workspace")?).await?,
+            )),
+            "rediscover_diagnostics" => Ok(ToolAnswer::done(
+                rediscover_diagnostics(super::get_str(&args, "workspace")?).await?,
+            )),
+            "set_diagnostics" => Ok(ToolAnswer::done(set_diagnostics(&args).await?)),
+            "set_rules" => Ok(ToolAnswer::done(set_rules(&args).await?)),
+            "use" => Ok(ToolAnswer::done(
+                use_workspace(super::get_str(&args, "workspace")?).await?,
+            )),
             "board" => Ok(ToolAnswer::done(
                 list_board(
                     super::get_opt_str_strict(&args, "workspace")?,
@@ -132,7 +227,7 @@ impl WorkspaceTool {
                 .await?,
             )),
             other => Err(anyhow!(
-                "unknown action '{other}' — expected one of: list, add, pause, resume, board, ticket, comment"
+                "unknown action '{other}' — call the `reference` action for every action and field"
             )),
         }
     }
@@ -142,11 +237,12 @@ impl WorkspaceTool {
 /// for every managed workspace when none is named.
 ///
 /// The one action pair that can act on a single workspace or on all of them must never widen
-/// because the address was spelled some other way — a folder path, a ticket id, `add`'s
-/// `name`, or a key no schema declares — so with no `workspace` argument such a call may name
-/// nothing else at all. An extra field is a usage error phrased around that rule, never around
-/// the key that carried it. The read actions take the same address but ignore a stray field;
-/// only a write that would cover the fleet has to say so.
+/// because the address was spelled some other way — a folder path, a ticket id, or `add`'s
+/// `name` — so with no `workspace` argument such a call may name nothing else at all. An
+/// extra declared field is a usage error phrased around that rule, never around the key that
+/// carried it; a key no schema declares is refused earlier, for every action
+/// ([`super::refuse_unknown_fields`]). The read actions take the same address but ignore a
+/// stray declared field; only a write that would cover the fleet has to say so.
 ///
 /// A JSON `null` counts as absent, as everywhere in the product (providers fill omitted
 /// arguments with nulls).
@@ -223,7 +319,9 @@ async fn managed_ticket_id(raw: &str) -> anyhow::Result<String> {
 /// at start-up and after a deletion, so the two surfaces agree in the steady state.
 async fn list_workspaces(only: Option<&str>) -> anyhow::Result<String> {
     let workspaces = crate::users::managed_workspaces().await?;
-    if workspaces.is_empty() {
+    // A named workspace is answered about itself: with none managed at all, that is the not-found
+    // refusal naming the name, not a report on the empty fleet.
+    if workspaces.is_empty() && only.is_none() {
         return Ok(NO_WORKSPACE.to_string());
     }
     let resolved =
@@ -269,7 +367,10 @@ async fn list_workspaces(only: Option<&str>) -> anyhow::Result<String> {
 async fn add_workspace(args: &serde_json::Value) -> anyhow::Result<ToolAnswer> {
     let name = super::get_str(args, "name")?;
     let path = super::get_str(args, "path")?;
-    crate::workspace::store().add(name, path).await?;
+    // The stored path, not the caller's spelling: the store canonicalises it, and an answer that
+    // echoed `./proj` back would read as a different folder from the one `list` shows.
+    let added = crate::workspace::store().add(name, path).await?;
+    let path = added.path;
     // Adding activates: the row exists by now, so a failed selection write is reported as the
     // partial outcome it is rather than as an add that did not happen.
     match crate::users::store()
@@ -283,10 +384,279 @@ async fn add_workspace(args: &serde_json::Value) -> anyhow::Result<ToolAnswer> {
         ))),
         Err(e) => Ok(ToolAnswer::partial(format!(
             "Added managed workspace '{name}' at {path}, but making it your active workspace \
-             failed: {e} — make it active again by choosing it in the workspace switcher at the \
-             bottom of the desktop window."
+             failed: {e} — make it active again with the `use` action."
         ))),
     }
+}
+
+/// One workspace in full: what `list` shows, plus the rules and the diagnostics commands, so
+/// the admin can see what an agent there is told and what verification will run.
+///
+/// The rules are the admin's own text, printed verbatim under an indented block (the store caps
+/// them at [`MAX_WORKSPACE_NOTES_CHARS`](crate::workspace::MAX_WORKSPACE_NOTES_CHARS)), and the
+/// commands come out label by label, an absent one spelled "not discovered".
+async fn show_workspace(name: &str) -> anyhow::Result<String> {
+    let ws = managed_workspace(name).await?;
+    // The read's two negatives are different facts: for the admin a successful read always yields
+    // `Some` (the personal workspace at worst), so `None` is a failed read and is reported as
+    // unknown — never as "not active".
+    let active = crate::users::resolve_selected_workspace_name(crate::users::ADMIN_USER_NAME).await;
+    let commands = crate::workspace::store().get_diagnostics(&ws.name).await?;
+    let mut out = format!("Workspace '{}':\n", ws.name);
+    let _ = writeln!(out, "- path: {}", ws.path);
+    let _ = writeln!(out, "- status: {}", ws.status);
+    let _ = writeln!(
+        out,
+        "- pipeline: {}",
+        if ws.paused { "paused" } else { "running" }
+    );
+    let _ = writeln!(
+        out,
+        "- maintenance: {}",
+        if ws.maintenance_enabled { "on" } else { "off" }
+    );
+    let _ = writeln!(
+        out,
+        "- active project: {}",
+        match active.as_deref() {
+            Some(active) if active == ws.name => "yes",
+            Some(_) => "no",
+            None => "unknown (the selection could not be read)",
+        }
+    );
+    if ws.notes.trim().is_empty() {
+        let _ = writeln!(out, "- rules: none");
+    } else {
+        let _ = writeln!(out, "- rules:");
+        for line in ws.notes.lines() {
+            let _ = writeln!(out, "  {line}");
+        }
+    }
+    match commands.as_ref().filter(|commands| !commands.is_empty()) {
+        Some(commands) => {
+            let _ = writeln!(out, "- diagnostics:");
+            write_commands(&mut out, commands, "  ");
+        }
+        None => {
+            let _ = writeln!(out, "- diagnostics: not discovered");
+        }
+    }
+    Ok(out.trim_end().to_string())
+}
+
+/// Delete a managed workspace: its row, its jobs and its research runs go; the project on disk
+/// is untouched, which the answer names so the admin knows the folder can be added back.
+///
+/// The active project afterwards is the store's own answer — the deletion resolves the admin's
+/// selection inside its transaction — so the reply reports where the product stands rather than
+/// a derivation of it.
+async fn delete_workspace(name: &str) -> anyhow::Result<String> {
+    let ws = managed_workspace(name).await?;
+    let active = match crate::workspace::store().delete(&ws.name).await? {
+        Some(next) => format!("Your active project is now '{next}'."),
+        None => "You are back on your personal workspace.".to_string(),
+    };
+    Ok(format!(
+        "Deleted managed workspace '{name}'. Its jobs and its research runs are gone with it. \
+         {folder_note} The tickets filed against it stay in the board but are no longer listed. \
+         {active}",
+        name = ws.name,
+        folder_note = folder_note(&ws.path)
+    ))
+}
+
+/// What a deleted workspace left on disk, as far as the folder itself can prove: a folder removed
+/// by hand is not reported as still there, and one that is no repository has none to name.
+fn folder_note(path: &str) -> String {
+    let folder = std::path::Path::new(path);
+    if !folder.exists() {
+        format!("The project folder at {path} is gone.")
+    } else if crate::git::commands::is_git_repo(folder) {
+        format!("The project folder at {path} (git repository included) stays.")
+    } else {
+        format!("The project folder at {path} stays.")
+    }
+}
+
+/// Turn the background maintainer on or off for one workspace.
+///
+/// Both effects are the store's own write: enabling clears the debounce so the maintainer runs
+/// on the next poll, and disabling cancels a maintainer agent already running there — so the
+/// answer reports the state, never a second implementation of either.
+async fn set_maintenance(args: &serde_json::Value) -> anyhow::Result<String> {
+    // The argument is judged before a store is read, so a bad call touches nothing.
+    let Some(on) = super::get_opt_bool(args, "maintenance")? else {
+        return Err(anyhow!(
+            "usage: missing required argument \"maintenance\" (expected a boolean) — hint: pass \
+             true to run the background maintainer or false to stop it"
+        ));
+    };
+    let ws = managed_workspace(super::get_str(args, "workspace")?).await?;
+    crate::workspace::store()
+        .set_maintenance_enabled(&ws.name, on)
+        .await?;
+    Ok(if on {
+        format!(
+            "Maintenance is now on for workspace '{}'. The debounce is cleared, so the maintainer \
+             runs on the next poll.",
+            ws.name
+        )
+    } else {
+        format!(
+            "Maintenance is now off for workspace '{}'. Any maintainer agent running there was \
+             cancelled.",
+            ws.name
+        )
+    })
+}
+
+/// Re-analyse a workspace: the store sets it back to `analyzing`, clears the per-role contexts
+/// and spawns a fresh discovery. The answer must say the pipeline is paused until that finishes
+/// — the pause is the store's, and the admin would otherwise read it as their own.
+async fn rediscover(name: &str) -> anyhow::Result<String> {
+    let ws = managed_workspace(name).await?;
+    crate::workspace::store().rediscover(&ws.name).await?;
+    Ok(format!(
+        "Discovery restarted for workspace '{}': its per-role contexts were cleared. The \
+         pipeline is paused until discovery finishes.",
+        ws.name
+    ))
+}
+
+/// Re-detect only the project's commands: the store leaves the status, the pause and the
+/// per-role contexts alone, which is the whole difference from [`rediscover`].
+async fn rediscover_diagnostics(name: &str) -> anyhow::Result<String> {
+    let ws = managed_workspace(name).await?;
+    crate::workspace::store()
+        .rediscover_diagnostics(&ws.name)
+        .await?;
+    Ok(format!(
+        "Diagnostics discovery restarted for workspace '{}': its stored commands were cleared and \
+         are being re-detected — its status, its pause and its per-role contexts are untouched.",
+        ws.name
+    ))
+}
+
+/// Apply one given command field over the stored one: absent keeps it, an empty string clears
+/// it, a value sets it.
+fn apply_command(slot: &mut Option<String>, given: Option<&str>) {
+    if let Some(value) = given {
+        *slot = crate::util::none_if_empty(value);
+    }
+}
+
+/// One line per diagnostics command, an absent one spelled "not discovered", indented under
+/// whatever header the caller printed.
+fn write_commands(out: &mut String, commands: &crate::DiagnosticsCommands, indent: &str) {
+    for (label, command) in commands.commands() {
+        let _ = writeln!(
+            out,
+            "{indent}- {label}: {}",
+            command.unwrap_or("not discovered")
+        );
+    }
+}
+
+/// Write the project's diagnostics commands by hand.
+///
+/// The stored blob is read first and the given fields applied over it, so a partial call can
+/// never blank the commands it did not name. A call naming no command field at all is refused
+/// before the store: it would re-write the identical blob and bump `diagnostics_generation`,
+/// cancelling an in-flight discovery for nothing. The store bumps that generation on a real write,
+/// which is what invalidates a discovery already in flight; the answer says so, because a
+/// hand-written command would otherwise seem to vanish when the stale discovery landed.
+async fn set_diagnostics(args: &serde_json::Value) -> anyhow::Result<String> {
+    let format = super::get_opt_str_strict(args, "format")?;
+    let format_check = super::get_opt_str_strict(args, "format_check")?;
+    let lint = super::get_opt_str_strict(args, "lint")?;
+    let lint_fix = super::get_opt_str_strict(args, "lint_fix")?;
+    let type_check = super::get_opt_str_strict(args, "type_check")?;
+    let build = super::get_opt_str_strict(args, "build")?;
+    let unit_test = super::get_opt_str_strict(args, "unit_test")?;
+    anyhow::ensure!(
+        [
+            format,
+            format_check,
+            lint,
+            lint_fix,
+            type_check,
+            build,
+            unit_test
+        ]
+        .iter()
+        .any(Option::is_some),
+        "usage: name at least one command field — format, format_check, lint, lint_fix, \
+         type_check, build, unit_test (an empty string clears one)"
+    );
+
+    let ws = managed_workspace(super::get_str(args, "workspace")?).await?;
+    let mut commands = crate::workspace::store()
+        .get_diagnostics(&ws.name)
+        .await?
+        .unwrap_or_default();
+    apply_command(&mut commands.format, format);
+    apply_command(&mut commands.format_check, format_check);
+    apply_command(&mut commands.lint, lint);
+    apply_command(&mut commands.lint_fix, lint_fix);
+    apply_command(&mut commands.type_check, type_check);
+    apply_command(&mut commands.build, build);
+    apply_command(&mut commands.unit_test, unit_test);
+    crate::workspace::store()
+        .set_diagnostics(&ws.name, &commands)
+        .await?;
+    let mut out = format!("Diagnostics for workspace '{}':\n", ws.name);
+    write_commands(&mut out, &commands, "");
+    let _ = write!(
+        out,
+        "\nWriting invalidated any diagnostics discovery already in flight, so its stale result \
+         cannot overwrite these."
+    );
+    Ok(out)
+}
+
+/// Write the project rules.
+///
+/// The store caps them at [`MAX_WORKSPACE_NOTES_CHARS`](crate::workspace::MAX_WORKSPACE_NOTES_CHARS)
+/// characters, so a longer input is reported as truncated rather than silently shortened.
+async fn set_rules(args: &serde_json::Value) -> anyhow::Result<String> {
+    let rules = super::get_str(args, "rules")?;
+    let ws = managed_workspace(super::get_str(args, "workspace")?).await?;
+    crate::workspace::store().set_notes(&ws.name, rules).await?;
+    // The stored length is the store's own truncation, read back through the same function it
+    // writes with, so the answer and the row cannot disagree.
+    let stored = crate::workspace::truncate_workspace_notes(rules);
+    let mut out = if stored.is_empty() {
+        format!("The rules of workspace '{}' are now empty.", ws.name)
+    } else {
+        format!(
+            "The rules of workspace '{}' are now {} characters long.",
+            ws.name,
+            stored.chars().count()
+        )
+    };
+    if rules.chars().count() > stored.chars().count() {
+        let _ = write!(
+            out,
+            " They were truncated to {} characters.",
+            crate::workspace::MAX_WORKSPACE_NOTES_CHARS
+        );
+    }
+    Ok(out)
+}
+
+/// Make one managed workspace the admin's active project — the same stored selection the
+/// desktop's own switcher writes, so it takes effect without a restart: the dashboard reads the
+/// selection back on a users change.
+async fn use_workspace(name: &str) -> anyhow::Result<String> {
+    let ws = managed_workspace(name).await?;
+    crate::users::store()
+        .set_selected_workspace(crate::users::ADMIN_USER_NAME, Some(&ws.name))
+        .await?;
+    Ok(format!(
+        "'{}' is now your active project at {}. It takes effect without a restart — the \
+         dashboard reads the stored selection back on a users change.",
+        ws.name, ws.path
+    ))
 }
 
 /// What a pause/resume request does to one workspace — the rule both forms follow, so the
@@ -686,10 +1056,11 @@ mod tests {
     }
 
     /// The unnamed form of `pause` / `resume` is the fleet-wide write, so it may only be
-    /// reached by a call that names nothing else: any other field — whether it names a place
-    /// (`name` and `path` belong to `add`, a ticket id to the ticket actions), nothing this
-    /// tool knows, or the ticket id the product's argument repair makes of a mistaken `id` — is
-    /// a usage error. The read actions take the same address and ignore such a field.
+    /// reached by a call that names nothing else: any other *declared* field — whether it names
+    /// a place (`name` and `path` belong to `add`, a ticket id to the ticket actions) or the
+    /// ticket id the product's argument repair makes of a mistaken `id` — is a usage error. A key
+    /// no schema declares is refused earlier, for every action. The read actions take the same
+    /// address and ignore a declared field they do not use.
     #[tokio::test]
     async fn a_misspelled_address_never_escalates_to_the_fleet() {
         let _guard = crate::util::test::STORE_LOCK.lock().await;
@@ -706,7 +1077,6 @@ mod tests {
             json!({ "action": "pause", "name": "ws_address" }),
             json!({ "action": "resume", "path": "/tmp/ws_address" }),
             json!({ "action": "resume", "ticket_id": "ws_address-1" }),
-            json!({ "action": "pause", "workspace_name": "ws_address" }),
             crate::tools::normalize_tool_call(
                 "workspace",
                 json!({ "action": "pause", "id": "ws_address" }),
@@ -719,6 +1089,23 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("usage:"), "for {call}: {err}");
+        }
+
+        // A key no schema declares never reaches the address rule at all: the one unknown-field
+        // check every action goes through refuses it first, naming the reference.
+        for call in [
+            json!({ "action": "pause", "workspace_name": "ws_address" }),
+            json!({ "action": "list", "workspace": "ws_address", "folder": "/tmp/ws_address" }),
+        ] {
+            let err = tool
+                .execute(&ws, call.clone())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("unknown field") && err.contains("reference"),
+                "for {call}: {err}"
+            );
         }
 
         // A wrong-typed address is a usage error too, and it names the field the caller wrote.
@@ -746,12 +1133,12 @@ mod tests {
             "a refused address must not pause anything"
         );
 
-        // A stray field on a read action is ignored rather than refused: the answer is the
-        // listing the call gives without it, neither widened nor dropped. (Narrowed to this one
-        // workspace, so a test running beside this one cannot change what is listed.)
+        // A stray *declared* field on a read action is ignored rather than refused: the answer is
+        // the listing the call gives without it, neither widened nor dropped. (Narrowed to this
+        // one workspace, so a test running beside this one cannot change what is listed.)
         for args in [
             json!({ "action": "list", "workspace": "ws_address" }),
-            json!({ "action": "list", "workspace": "ws_address", "folder": "/tmp/ws_address" }),
+            json!({ "action": "list", "workspace": "ws_address", "phase": "done" }),
         ] {
             let listing = tool.execute(&ws, args.clone()).await.expect("list");
             assert!(
@@ -961,5 +1348,514 @@ mod tests {
             }),
         )
         .await;
+    }
+
+    /// A named listing is answered about that workspace: it narrows to the one named, and a name
+    /// that is not managed is the not-found refusal naming it rather than a report on the fleet.
+    #[tokio::test]
+    async fn a_named_listing_answers_about_that_workspace() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        crate::users::test_util::with_test_workspaces(
+            &[("/tmp/ws_named", "ws_named"), ("/tmp/ws_other", "ws_other")],
+            async {
+                let listing = list_workspaces(Some("ws_named"))
+                    .await
+                    .expect("a named listing");
+                assert!(listing.contains("- ws_named ("), "got: {listing}");
+                assert!(
+                    !listing.contains("- ws_other ("),
+                    "a named listing narrows to the one named: {listing}"
+                );
+
+                let missing = list_workspaces(Some("ws_absent"))
+                    .await
+                    .expect_err("an unmanaged name")
+                    .to_string();
+                assert!(missing.contains("ws_absent"), "got: {missing}");
+                assert!(
+                    !missing.contains("No managed workspaces exist."),
+                    "a named listing answers about the name, not the fleet: {missing}"
+                );
+            },
+        )
+        .await;
+    }
+
+    /// `reference` hands over the settings reference verbatim.
+    #[tokio::test]
+    async fn reference_is_the_settings_reference_verbatim() {
+        let ws = crate::workspace::test_ws("/tmp/ws_reference");
+        let reply = WorkspaceTool
+            .execute(&ws, json!({ "action": "reference" }))
+            .await
+            .expect("reference");
+        assert_eq!(reply, crate::settings::reference());
+    }
+
+    /// `show` is the one read that carries a workspace's own settings: its address and state,
+    /// the rules an agent there is told, and the commands verification will run.
+    #[tokio::test]
+    async fn show_reports_a_workspaces_settings() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let tool = WorkspaceTool;
+        let ws = crate::workspace::test_ws("/tmp/ws_show");
+        crate::util::test::create_test_workspace("/tmp/ws_show", "ws_show").await;
+        crate::workspace::store()
+            .set_maintenance_enabled("ws_show", true)
+            .await
+            .expect("maintenance on");
+        crate::workspace::store()
+            .set_notes("ws_show", "be nice to the fixtures")
+            .await
+            .expect("rules");
+        crate::workspace::store()
+            .set_diagnostics(
+                "ws_show",
+                &crate::DiagnosticsCommands {
+                    format: Some("cargo fmt".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("diagnostics");
+
+        let reply = tool
+            .execute(&ws, tool_args("show", Some("ws_show")))
+            .await
+            .expect("show");
+        assert!(reply.starts_with("Workspace 'ws_show':"), "got: {reply}");
+        for expected in [
+            "- path: /tmp/ws_show",
+            "- status: pending",
+            "- pipeline: running",
+            "- maintenance: on",
+            "- active project: no",
+            "- rules:\n  be nice to the fixtures",
+            "  - format: cargo fmt",
+            "  - build: not discovered",
+        ] {
+            assert!(reply.contains(expected), "missing {expected:?} in: {reply}");
+        }
+
+        // No rules and no commands yet: both are spelled out rather than left blank.
+        crate::util::test::create_test_workspace("/tmp/ws_show_bare", "ws_show_bare").await;
+        let reply = tool
+            .execute(&ws, tool_args("show", Some("ws_show_bare")))
+            .await
+            .expect("show bare");
+        assert!(reply.contains("- rules: none"), "got: {reply}");
+        assert!(
+            reply.contains("- diagnostics: not discovered"),
+            "got: {reply}"
+        );
+        assert!(reply.contains("- maintenance: off"), "got: {reply}");
+    }
+
+    /// The store's 4000-character cap is reported, never applied silently.
+    #[tokio::test]
+    async fn set_rules_reports_the_stores_truncation() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let tool = WorkspaceTool;
+        let ws = crate::workspace::test_ws("/tmp/ws_rules");
+        crate::util::test::create_test_workspace("/tmp/ws_rules", "ws_rules").await;
+        let cap = crate::workspace::MAX_WORKSPACE_NOTES_CHARS;
+
+        let short = tool
+            .execute(
+                &ws,
+                json!({ "action": "set_rules", "workspace": "ws_rules", "rules": "be nice" }),
+            )
+            .await
+            .expect("set rules");
+        assert!(
+            short.contains("now 7 characters long") && !short.contains("truncated"),
+            "got: {short}"
+        );
+
+        let long = "r".repeat(cap + 10);
+        let reply = tool
+            .execute(
+                &ws,
+                json!({ "action": "set_rules", "workspace": "ws_rules", "rules": long }),
+            )
+            .await
+            .expect("set long rules");
+        assert!(
+            reply.contains(&format!("now {cap} characters long"))
+                && reply.contains(&format!("truncated to {cap} characters")),
+            "got: {reply}"
+        );
+        let stored = crate::workspace::get_by_name("ws_rules")
+            .await
+            .expect("read")
+            .expect("exists");
+        assert_eq!(stored.notes.chars().count(), cap);
+    }
+
+    /// An absent command keeps what the row holds and an empty string clears it, so a partial
+    /// `set_diagnostics` can never blank the commands it did not name.
+    #[tokio::test]
+    async fn set_diagnostics_keeps_an_omitted_field_and_clears_an_empty_one() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let tool = WorkspaceTool;
+        let ws = crate::workspace::test_ws("/tmp/ws_cmds");
+        crate::util::test::create_test_workspace("/tmp/ws_cmds", "ws_cmds").await;
+
+        let reply = tool
+            .execute(
+                &ws,
+                json!({
+                    "action": "set_diagnostics",
+                    "workspace": "ws_cmds",
+                    "format": "cargo fmt",
+                    "unit_test": "cargo test",
+                }),
+            )
+            .await
+            .expect("set diagnostics");
+        assert!(
+            reply.contains("- format: cargo fmt")
+                && reply.contains("- unit-test: cargo test")
+                && reply.contains("- build: not discovered"),
+            "got: {reply}"
+        );
+        assert!(reply.contains("invalidated"), "got: {reply}");
+
+        // `format` cleared by the empty string, `unit_test` kept by its absence.
+        let reply = tool
+            .execute(
+                &ws,
+                json!({ "action": "set_diagnostics", "workspace": "ws_cmds", "format": "" }),
+            )
+            .await
+            .expect("clear format");
+        assert!(reply.contains("- format: not discovered"), "got: {reply}");
+        let stored = crate::workspace::store()
+            .get_diagnostics("ws_cmds")
+            .await
+            .expect("read")
+            .expect("diagnostics");
+        assert_eq!(stored.format, None);
+        assert_eq!(stored.unit_test.as_deref(), Some("cargo test"));
+    }
+
+    /// `maintenance` judges its switch before it reads a workspace, and reports the state the
+    /// store itself wrote.
+    #[tokio::test]
+    async fn maintenance_needs_its_switch_before_a_workspace() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/ws_maint");
+        crate::util::test::create_test_workspace("/tmp/ws_maint", "ws_maint").await;
+
+        let err = WorkspaceTool
+            .execute(
+                &ws,
+                json!({ "action": "maintenance", "workspace": "ws_maint_ghost" }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("missing required argument \"maintenance\""),
+            "a bad call must not reach the workspace lookup: {err}"
+        );
+
+        let reply = WorkspaceTool
+            .execute(
+                &ws,
+                json!({ "action": "maintenance", "workspace": "ws_maint", "maintenance": true }),
+            )
+            .await
+            .expect("maintenance on");
+        assert!(
+            reply.contains("Maintenance is now on for workspace 'ws_maint'")
+                && reply.contains("next poll"),
+            "got: {reply}"
+        );
+        assert!(
+            crate::workspace::get_by_name("ws_maint")
+                .await
+                .expect("read")
+                .expect("exists")
+                .maintenance_enabled
+        );
+    }
+
+    /// A `set_diagnostics` naming no command field is refused before the store: re-writing the
+    /// identical blob would bump the generation and cancel an in-flight discovery for nothing.
+    /// The refusal comes before the workspace lookup, so nothing is read at all.
+    #[tokio::test]
+    async fn set_diagnostics_refuses_a_call_that_names_no_command() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/ws_cmds_none");
+        crate::util::test::create_test_workspace("/tmp/ws_cmds_none", "ws_cmds_none").await;
+
+        for address in ["ws_cmds_none", "ws_cmds_ghost"] {
+            let err = WorkspaceTool
+                .execute(
+                    &ws,
+                    json!({ "action": "set_diagnostics", "workspace": address }),
+                )
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("at least one command field") && err.contains("unit_test"),
+                "got: {err}"
+            );
+        }
+        assert!(
+            crate::workspace::store()
+                .get_diagnostics("ws_cmds_none")
+                .await
+                .expect("read")
+                .is_none(),
+            "a refused call must not write anything"
+        );
+    }
+
+    /// What a deleted workspace left on disk is read from the folder itself: a folder removed by
+    /// hand is not reported as still there, and only a repository names one.
+    #[test]
+    fn the_delete_answer_names_a_folder_only_as_it_really_is() {
+        let folder = tempfile::TempDir::new().expect("temp dir");
+        let path = folder.path().to_str().expect("utf-8 path");
+        assert_eq!(
+            folder_note(path),
+            format!("The project folder at {path} stays.")
+        );
+        std::fs::create_dir(folder.path().join(".git")).expect("make a repository");
+        assert_eq!(
+            folder_note(path),
+            format!("The project folder at {path} (git repository included) stays.")
+        );
+        std::fs::remove_dir_all(folder.path()).expect("remove the folder by hand");
+        assert_eq!(
+            folder_note(path),
+            format!("The project folder at {path} is gone.")
+        );
+    }
+
+    /// `delete` removes the row and names what it left behind, so the admin knows the folder can
+    /// be added back and the tickets are still there.
+    #[tokio::test]
+    #[serial_test::serial(gui_admin_workspace)] // writes the shared seeded admin row
+    async fn delete_names_what_remains_on_disk() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        crate::users::test_util::with_admin_workspace_restored(async {
+            let tool = WorkspaceTool;
+            let ws = crate::workspace::test_ws("/tmp/ws_del_gone");
+            let gone =
+                crate::util::test::create_test_workspace("/tmp/ws_del_gone", "ws_del_gone").await;
+            crate::util::test::create_test_workspace("/tmp/ws_del_keep", "ws_del_keep").await;
+            let ticket = crate::util::test::make_ticket(
+                board_store(),
+                &gone,
+                "delete leaves me",
+                TicketPhase::Queued,
+            )
+            .await;
+            crate::users::store()
+                .set_selected_workspace(crate::users::ADMIN_USER_NAME, Some("ws_del_gone"))
+                .await
+                .expect("select");
+
+            let reply = tool
+                .execute(&ws, tool_args("delete", Some("ws_del_gone")))
+                .await
+                .expect("delete");
+            assert!(
+                reply.contains("Deleted managed workspace 'ws_del_gone'"),
+                "got: {reply}"
+            );
+            assert!(reply.contains("/tmp/ws_del_gone"), "got: {reply}");
+            // The answer names a repository only when the folder really has one — a deleted
+            // project that is no repository has none to keep.
+            assert_eq!(
+                reply.contains("git repository"),
+                crate::git::commands::is_git_repo(std::path::Path::new("/tmp/ws_del_gone")),
+                "the repository half must match what is on disk: {reply}"
+            );
+            assert!(reply.contains("tickets"), "got: {reply}");
+            assert!(
+                reply.contains("Your active project is now '"),
+                "another managed workspace survives, so the selection must move to it: {reply}"
+            );
+            assert!(
+                crate::workspace::get_by_name("ws_del_gone")
+                    .await
+                    .expect("read")
+                    .is_none(),
+                "the row is gone"
+            );
+            assert!(
+                board_store()
+                    .get_ticket(&ticket)
+                    .await
+                    .expect("read")
+                    .is_some(),
+                "deleting a workspace must not delete its tickets"
+            );
+            assert_ne!(
+                crate::users::resolve_selected_workspace_name(crate::users::ADMIN_USER_NAME)
+                    .await
+                    .as_deref(),
+                Some("ws_del_gone"),
+                "the active project must not stay on the deleted workspace"
+            );
+
+            // A second delete is refused with the live set named.
+            let err = tool
+                .execute(&ws, tool_args("delete", Some("ws_del_gone")))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("No managed workspace exists"), "got: {err}");
+        })
+        .await;
+    }
+
+    /// `use` writes the admin's stored selection — the same row the desktop's switcher writes —
+    /// so it takes effect without a restart.
+    #[tokio::test]
+    #[serial_test::serial(gui_admin_workspace)] // writes the shared seeded admin row
+    async fn use_makes_a_workspace_the_active_project() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        crate::users::test_util::with_test_workspaces(
+            &[("/tmp/ws_use", "ws_use")],
+            crate::users::test_util::with_admin_workspace_restored(async {
+                let ws = crate::workspace::test_ws("/tmp/ws_use");
+                let reply = WorkspaceTool
+                    .execute(&ws, tool_args("use", Some("ws_use")))
+                    .await
+                    .expect("use");
+                assert!(
+                    reply.contains("'ws_use' is now your active project")
+                        && reply.contains("without a restart"),
+                    "got: {reply}"
+                );
+                assert_eq!(
+                    crate::users::resolve_selected_workspace_name(crate::users::ADMIN_USER_NAME)
+                        .await
+                        .as_deref(),
+                    Some("ws_use")
+                );
+
+                // A name that is not managed is refused, and the selection is left alone.
+                let err = WorkspaceTool
+                    .execute(&ws, tool_args("use", Some("ws_ghost")))
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                assert!(err.contains("No managed workspace exists"), "got: {err}");
+                assert_eq!(
+                    crate::users::resolve_selected_workspace_name(crate::users::ADMIN_USER_NAME)
+                        .await
+                        .as_deref(),
+                    Some("ws_use")
+                );
+            }),
+        )
+        .await;
+    }
+
+    /// The two re-analysis actions report what they started and what they touched: a full
+    /// rediscovery pauses the pipeline, while a diagnostics one leaves the status, the pause and the
+    /// per-role contexts alone and clears the stored commands.
+    #[tokio::test]
+    #[serial_test::serial(gui_admin_workspace)]
+    async fn the_reanalysis_actions_report_what_they_started() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        crate::users::test_util::with_test_workspaces(
+            &[("/tmp/ws_reanalyse", "ws_reanalyse")],
+            async {
+                let ws = crate::workspace::test_ws("/tmp/ws_reanalyse");
+                let commands = crate::DiagnosticsCommands {
+                    format: Some("cargo fmt".to_string()),
+                    ..crate::DiagnosticsCommands::default()
+                };
+                crate::workspace::store()
+                    .set_diagnostics("ws_reanalyse", &commands)
+                    .await
+                    .expect("seed the commands");
+
+                let reply = WorkspaceTool
+                    .execute(
+                        &ws,
+                        tool_args("rediscover_diagnostics", Some("ws_reanalyse")),
+                    )
+                    .await
+                    .expect("rediscover_diagnostics");
+                assert!(
+                    reply.contains("stored commands were cleared")
+                        && reply
+                            .contains("status, its pause and its per-role contexts are untouched"),
+                    "got: {reply}"
+                );
+                assert!(
+                    crate::workspace::store()
+                        .get_diagnostics("ws_reanalyse")
+                        .await
+                        .expect("read")
+                        .is_none(),
+                    "the stored commands are cleared while they are re-detected"
+                );
+
+                let reply = WorkspaceTool
+                    .execute(&ws, tool_args("rediscover", Some("ws_reanalyse")))
+                    .await
+                    .expect("rediscover");
+                assert!(
+                    reply.contains("per-role contexts were cleared")
+                        && reply.contains("pipeline is paused until discovery finishes"),
+                    "got: {reply}"
+                );
+                let row = crate::workspace::store()
+                    .get_by_name("ws_reanalyse")
+                    .await
+                    .expect("read")
+                    .expect("the workspace is still there");
+                assert!(row.paused, "a full rediscovery pauses the pipeline");
+            },
+        )
+        .await;
+    }
+
+    /// An action and a field this tool does not know both teach where the whole surface is: the
+    /// `reference` action, which is one text shared with `mahbot config reference`.
+    #[tokio::test]
+    async fn an_unknown_action_and_field_name_the_reference() {
+        let ws = crate::workspace::test_ws("/tmp/ws_unknown");
+        let err = WorkspaceTool
+            .execute(&ws, json!({ "action": "explode" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown action 'explode'") && err.contains("`reference` action"),
+            "got: {err}"
+        );
+
+        let err = WorkspaceTool
+            .execute(
+                &ws,
+                json!({ "action": "list", "folder": "/tmp/ws_unknown" }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown field 'folder'") && err.contains("reference"),
+            "got: {err}"
+        );
     }
 }

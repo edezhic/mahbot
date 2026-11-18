@@ -324,6 +324,25 @@ pub(crate) fn install_fake_provider(provider: Arc<dyn crate::Provider>) -> FakeP
     }
 }
 
+/// RAII guard for a test that rebuilds the process-global provider through a production path
+/// (a config save, which calls [`crate::providers::recreate_all`]): it restores whatever was
+/// installed before, on panic included, so a real provider never outlives the test that made it.
+/// The caller must be annotated `#[serial_test::serial(provider)]`.
+#[must_use]
+pub(crate) struct ProviderSnapshot(Option<Arc<dyn crate::Provider>>);
+
+impl ProviderSnapshot {
+    pub(crate) fn take() -> Self {
+        Self(crate::providers::snapshot_provider_for_test())
+    }
+}
+
+impl Drop for ProviderSnapshot {
+    fn drop(&mut self) {
+        crate::providers::restore_provider_for_test(self.0.take());
+    }
+}
+
 /// RAII guard for [`install_retry_seam`]: holds the tiny retry-policy override and the fake
 /// provider until dropped, restoring both at scope exit. Fields are ordered so the drop restores
 /// provider → policy, the reverse of install. The caller must be annotated

@@ -15,7 +15,7 @@
 //!
 //! A name is the account's identity AND its personal-workspace folder, so a name about to
 //! become a new account is refused when an existing account's or the admin's name is the
-//! same once case and Unicode composition are ignored ([`NAME_COLLISION_RULE`]). Only a
+//! same once case and Unicode composition are ignored ([`name_taken_message`]). Only a
 //! genuinely new name is judged; a stored account keeps its name.
 //!
 //! A NULL `selected_workspace` means a personal workspace at `~/.mahbot/userspaces/<name>/`
@@ -202,12 +202,13 @@ pub enum AddUserOutcome {
 }
 
 /// The refusal for a Telegram value another account already holds: `bind_channel` would silently
-/// take that account's routing away, and the remedy is the Settings page for either caller — the
-/// owner's rebind and any user's bind alike.
+/// take that account's routing away. What happened, and a remedy any surface can act on — unbind
+/// the binding already in place — because the same text reaches a tool caller, a terminal caller
+/// and the desktop's Users page.
 fn telegram_taken_refusal(identifier: &str, owner: &str) -> anyhow::Error {
     anyhow::anyhow!(
-        "{} is already bound to user '{owner}' — remove that binding on the \
-         Settings → Users page first, then attach it to this account",
+        "{} is already bound to user '{owner}' — a Telegram account reaches one user; unbind it \
+         from '{owner}' first",
         describe_telegram_binding(identifier)
     )
 }
@@ -417,14 +418,15 @@ impl UserStore {
     /// even the same value is refused); and a value bound to another account (anti-steal:
     /// `bind_channel` would silently reassign it). The at-most-one rule is Telegram-only.
     ///
-    /// Both refusals name the Settings page because any account's binding is removed there —
-    /// this serves every user's bind (`add_user` included), not only the owner's.
+    /// Both refusals say what happened and name a remedy any surface can act on — unbind the
+    /// binding already in place — because the same text reaches the tool, the command line and the
+    /// desktop's Users page, and none of them can be named without being wrong on the others.
     pub async fn validate_telegram_bind(&self, user_name: &str, value: &str) -> Result<String> {
         let identifier = normalize_telegram_binding(value)?;
         if let Some(existing) = self.telegram_binding(user_name).await? {
             anyhow::bail!(
-                "'{user_name}' already has a Telegram binding ({}) — remove it on the \
-                 Settings → Users page first, then attach the new one",
+                "'{user_name}' already has a Telegram binding ({}) — an account holds at most one; \
+                 unbind it first",
                 describe_telegram_binding(&existing)
             );
         }
@@ -502,13 +504,13 @@ impl UserStore {
         })
     }
 
-    /// Remove the admin's Telegram binding, reporting whether one existed. Idempotent: an admin
+    /// Remove an account's Telegram binding, reporting whether one existed. Idempotent: an account
     /// with no binding is the state asked for, not a failure.
-    pub(crate) async fn unbind_telegram_for_admin(&self) -> Result<bool> {
-        let Some(existing) = self.telegram_binding(ADMIN_USER_NAME).await? else {
+    pub async fn unbind_telegram(&self, user_name: &str) -> Result<bool> {
+        let Some(existing) = self.telegram_binding(user_name).await? else {
             return Ok(false);
         };
-        self.unbind_channel(ADMIN_USER_NAME, "telegram", &existing)
+        self.unbind_channel(user_name, "telegram", &existing)
             .await?;
         Ok(true)
     }
@@ -1015,13 +1017,6 @@ pub(crate) fn refuse_admin_name(name: &str) -> Result<()> {
     }
     Ok(())
 }
-
-/// The other half of the account-name rule, in the words the account-adding tool's schema
-/// answers with: a new account's name is refused when another account or the admin already holds
-/// it once case and Unicode composition are ignored.
-pub(crate) const NAME_COLLISION_RULE: &str = "A new account's name is also refused when another \
-     account or the admin already has it, ignoring case and Unicode composition — on macOS those \
-     spellings are one folder, on Windows a case difference alone already is.";
 
 /// The message every taken-name refusal carries — the exact duplicate and the case/composition
 /// collision alike, so a surface reports both the same way.
@@ -2060,15 +2055,15 @@ mod tests {
             "error must name the current owner: {err}"
         );
 
-        // At-most-one: even re-attaching the identical value is refused, and
-        // the refusal names the binding to remove first.
+        // At-most-one: even re-attaching the identical value is refused, and the refusal names the
+        // binding in the way — how to free it belongs to the surface, not to this message.
         let err = store
             .validate_telegram_bind("bind_guard_owner", "@guard_handle")
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("@guard_handle") && err.to_string().contains("remove"),
-            "error must name the existing binding and how to free the account: {err}"
+            err.to_string().contains("@guard_handle") && err.to_string().contains("at most one"),
+            "error must name the existing binding and the rule it breaks: {err}"
         );
 
         // Reserved sentinel is rejected, fail-closed.
@@ -2238,7 +2233,7 @@ mod tests {
         store.ensure_admin_user().await.unwrap();
 
         assert!(
-            !store.unbind_telegram_for_admin().await.unwrap(),
+            !store.unbind_telegram(ADMIN_USER_NAME).await.unwrap(),
             "nothing was bound, so nothing was removed"
         );
 
@@ -2246,10 +2241,10 @@ mod tests {
             .rebind_telegram_for_admin("owner_to_remove")
             .await
             .unwrap();
-        assert!(store.unbind_telegram_for_admin().await.unwrap());
+        assert!(store.unbind_telegram(ADMIN_USER_NAME).await.unwrap());
         assert_eq!(store.telegram_binding(ADMIN_USER_NAME).await.unwrap(), None);
         assert!(
-            !store.unbind_telegram_for_admin().await.unwrap(),
+            !store.unbind_telegram(ADMIN_USER_NAME).await.unwrap(),
             "the second run finds nothing to remove"
         );
     }

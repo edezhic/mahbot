@@ -459,6 +459,15 @@ pub(crate) fn flag_on(val: Option<&str>) -> bool {
     !val.is_some_and(|val| val.trim().eq_ignore_ascii_case("false"))
 }
 
+/// Whether an opt-in switch reads as on: only a stored `true` reads on and an absent
+/// row reads off — the opposite of [`flag_on`], and the reading every `voice_enabled`
+/// and `tts_enabled` consumer makes. A read-back that used [`flag_on`] here would
+/// answer "on" for a fresh install and for a switch the owner just turned off.
+#[must_use]
+pub(crate) fn flag_opt_in(val: Option<&str>) -> bool {
+    val == Some("true")
+}
+
 /// `val` when non-empty after trimming, else `fallback`.
 #[must_use]
 pub(crate) fn resolve_or(val: Option<String>, fallback: &str) -> String {
@@ -999,6 +1008,13 @@ pub struct PersistOutcome {
     pub warning: Option<String>,
 }
 
+/// The note a save appends when a custom endpoint did not answer: the value is saved anyway, and
+/// the caller is told what the warmup saw. Shared with the test that bounds a provider write's
+/// answer, so the sentence it measures is this one.
+pub(crate) fn warmup_warning(endpoint: &str, error: &anyhow::Error) -> String {
+    format!("Saved, but {endpoint} is unreachable right now: {error:#}")
+}
+
 /// Persist one settled field; `key` must be a `config_kv` key
 /// ([`ConfigData::string_fields`]).
 pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<PersistOutcome> {
@@ -1030,8 +1046,9 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
             // Settling a default or empty endpoint drops the custom key row —
             // it is only meaningful while a custom endpoint is active. The
             // endpoint row is written FIRST, so a failed write leaves the key row
-            // intact; a failed cascade leaves a stale row that is never read, so
-            // the cleanup is best-effort and never fails the save.
+            // intact; a failed cascade leaves the old row behind, which a later
+            // keyless custom endpoint would pick up as its credential, so the
+            // cleanup is best-effort and never fails the save.
             if trimmed.is_empty() || crate::config::is_default_endpoint(&trimmed) {
                 let store = crate::config_db::store();
                 match store.delete_kv(CONFIG_KEY_PROVIDER_ENDPOINT_KEY).await {
@@ -1041,7 +1058,8 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
-                            "failed to clear custom endpoint key row (harmless orphan)"
+                            "failed to clear custom endpoint key row — it stays on disk, and a \
+                             later keyless custom endpoint would pick it up as its credential"
                         );
                     }
                 }
@@ -1056,7 +1074,7 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
                 match crate::providers::warmup_provider_from_config(&probe).await {
                     Ok(()) => None,
                     Err(e) => {
-                        let msg = format!("Saved, but {effective} is unreachable right now: {e:#}");
+                        let msg = warmup_warning(&effective, &e);
                         tracing::warn!(key, endpoint = %effective, "Provider warmup failed (non-fatal, value saved): {e:#}");
                         Some(msg)
                     }
@@ -1078,7 +1096,9 @@ pub async fn persist_settled_string_field(key: &str, value: &str) -> Result<Pers
         // provider. That keeps the custom-endpoint warning channel off the key fields.
         CONFIG_KEY_PROVIDER_KEY | CONFIG_KEY_PROVIDER_ENDPOINT_KEY => {
             let _ = probe_validate_write(key, &trimmed).await?;
-            crate::providers::recreate_all(&CONFIG.snapshot(), true);
+            // A save pre-warms the new credential's pool; a clear has nothing to warm, and the
+            // provider is rebuilt either way.
+            crate::providers::recreate_all(&CONFIG.snapshot(), !trimmed.is_empty());
             return Ok(PersistOutcome {
                 value: canonical,
                 warning: None,

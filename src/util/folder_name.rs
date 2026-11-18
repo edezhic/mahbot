@@ -10,13 +10,6 @@
 //! over-long absolute path in verbatim form for every filesystem call (`tokio::fs` delegates to
 //! it), which lifts Windows' classic 260-character ceiling.
 
-/// The rule in the words the account-adding tool's schema uses, so what it asks for is what
-/// [`folder_name_problem`] accepts.
-pub(crate) const RULE_SUMMARY: &str = "not empty, not only dots, no / \\ : * ? \" < > |, no \
-     character below U+0020, nothing ending in a dot or a space, no reserved device name in any \
-     letter case (CON, NUL, PRN, AUX, COM1-9, LPT1-9, COM¹-³, LPT¹-³ — also with an extension — \
-     plus CONIN$ and CONOUT$), and at most 255 bytes";
-
 /// The tightest per-component limit among the platforms. A byte count is the safe side: a name's
 /// UTF-8 byte count is never below its UTF-16 code-unit count, so a name within this many bytes is
 /// within the other platforms' 255-unit component limit too.

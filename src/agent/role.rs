@@ -352,11 +352,13 @@ impl Role {
             // widening; on macOS the privacy grants belong to the terminal the daemon runs from and
             // are requested per call. A custom role is never offered it.
             t.push(Box::new(ComputerTool));
-            // The admin config surface: the merged `mahbot_config` setup tool and the read-only DB
-            // query tool.
+            // The admin's settings surface: `mahbot_config` (every setting, the setup, accounts,
+            // grants and custom roles) and the read-only DB query tool.
             t.push(Box::new(MahbotConfigTool));
             t.push(Box::new(MahbotDebugTool));
-            // The admin's own project view: list / add / board / ticket / comment / pause / resume.
+            // The admin's own project view and each workspace's settings: the reading actions, the
+            // pipeline controls, and the project's own settings — every action the tool's
+            // `reference` lists.
             t.push(Box::new(WorkspaceTool));
             // The voice: one short phrase spoken aloud, for the admin's own Assistant only — a
             // custom role is never offered it.

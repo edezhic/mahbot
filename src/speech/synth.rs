@@ -84,7 +84,7 @@ pub(crate) enum NotReady {
 /// caller can avoid an unnecessary fetch or device open. Speech output is opt-in:
 /// `tts_enabled` must be set to `"true"`.
 pub(crate) fn is_config_enabled() -> bool {
-    CONFIG.tts_enabled().as_deref() == Some("true")
+    crate::config::flag_opt_in(CONFIG.tts_enabled().as_deref())
 }
 
 /// The engine's lifecycle state: what the settings row reports.

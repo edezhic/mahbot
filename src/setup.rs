@@ -16,8 +16,8 @@
 //!
 //! A run that fails partway still reports both halves: what landed, and the step it stopped at.
 //!
-//! The action is terminal-only: it refuses outside a command-line call, so the admin Assistant
-//! cannot write the provider credential (it keeps every other `mahbot_config` action).
+//! The same action serves the terminal command and the admin's Assistant: on a server the
+//! assistant is the only way in, and it holds a shell that could run the command anyway.
 use crate::config::{
     CONFIG, CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
     CONFIG_KEY_PROVIDER_KEY, OnboardingState,
@@ -28,8 +28,9 @@ use anyhow::Context as _;
 use std::fmt::Write as _;
 use std::time::Duration;
 
-/// The action word the terminal command carries into the instance (`mahbot config setup`). It is
-/// not in the Assistant's tool schema: [`run`] refuses every other caller.
+/// The action word the terminal command carries into the instance (`mahbot config setup`). The
+/// admin's Assistant calls it as the `setup` action too — it is how the provider's credential, its
+/// custom endpoint and that endpoint's key are written from either route.
 pub(crate) const ACTION: &str = "setup";
 
 /// OpenRouter's own key record: the one authenticated call that tells a known key from an unknown
@@ -40,12 +41,35 @@ const OPENROUTER_KEY_CHECK: &str = "https://openrouter.ai/api/v1/key";
 /// socket that never answers is no reason to hold the command.
 const KEY_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many times a provider write's answer names the endpoint: the value line, the change, the
+/// current state, the unreachable warning and the URL inside that warning's error.
+const ENDPOINT_MENTIONS: usize = 5;
+
+/// The most a provider write's answer says besides the endpoint: the report's headings, its other
+/// current-state lines, the warning's wording and the next steps. The worst case measures about
+/// 1 KB today; the test below checks the answer against this allowance, so the slack stays visible
+/// and one more honest sentence has room instead of silently tightening the cap.
+const REPORT_PROSE_BYTES: usize = 1800;
+
+/// The longest custom endpoint a run accepts: one read-back's worth less the report's prose, split
+/// across the mentions above. A chat base URL needs nothing like this much, and the settings
+/// route's answer — [`crate::settings::answer_with_report`] — carries the value and the report
+/// whole; its worst case is the test below. The reference states the number, so a caller refused
+/// for it has somewhere to look.
+///
+/// The mentions are counted at the value's own length. An error carries the URL percent-encoded,
+/// so a value with characters that encode is named longer than that; the value still reads back
+/// whole, and an answer that would not fit is refused rather than cut.
+pub(crate) const MAX_ENDPOINT_BYTES: usize =
+    (crate::settings::MAX_READ_BACK_BYTES - REPORT_PROSE_BYTES) / ENDPOINT_MENTIONS;
+
 /// The arguments of one run: exactly the command line's flags, absent for a run that names nothing.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SetupArgs {
     provider_key: Option<String>,
     provider_endpoint: Option<String>,
     provider_endpoint_key: Option<String>,
+    clear_provider_endpoint: bool,
     telegram_token: Option<String>,
     owner: Option<String>,
     unbind_owner: bool,
@@ -53,7 +77,9 @@ struct SetupArgs {
 
 /// One optional text argument. Absent (or null) is no input; a present non-string is the shared
 /// reader's usage error; text that is blank once trimmed is refused rather than silently ignored,
-/// because a blank secret is never what the caller meant.
+/// because a blank secret is never what the caller meant — and, for the endpoint, because settling
+/// back to OpenRouter's own is a request of its own ([`SetupArgs::clear_provider_endpoint`]), never
+/// what an unset shell variable happens to say.
 fn text_arg(args: &serde_json::Value, key: &str) -> anyhow::Result<Option<String>> {
     match get_opt_str_strict(args, key)? {
         Some(value) if value.trim().is_empty() => anyhow::bail!(
@@ -70,6 +96,7 @@ impl SetupArgs {
             provider_key: text_arg(args, "provider_key")?,
             provider_endpoint: text_arg(args, "provider_endpoint")?,
             provider_endpoint_key: text_arg(args, "provider_endpoint_key")?,
+            clear_provider_endpoint: get_bool(args, "clear_provider_endpoint", false)?,
             telegram_token: text_arg(args, "telegram_token")?,
             owner: text_arg(args, "owner")?,
             unbind_owner: get_bool(args, "unbind_owner", false)?,
@@ -82,6 +109,16 @@ impl SetupArgs {
             "usage: \"provider_endpoint_key\" needs \"provider_endpoint\" — a custom endpoint's key \
              is saved with the endpoint it belongs to"
         );
+        if let Some(endpoint) = &parsed.provider_endpoint {
+            // The cap is the settings route's read-back bound: its answer names the endpoint five
+            // times, and the reference states the limit.
+            anyhow::ensure!(
+                endpoint.len() <= MAX_ENDPOINT_BYTES,
+                "usage: \"provider_endpoint\" takes at most {MAX_ENDPOINT_BYTES} bytes — got {} \
+                 (see the `reference` action)",
+                endpoint.len()
+            );
+        }
         // A key beside OpenRouter's own address names nothing: settling that endpoint drops the
         // custom key row, so the write would be undone before the report was rendered.
         anyhow::ensure!(
@@ -93,6 +130,14 @@ impl SetupArgs {
             "usage: \"provider_endpoint_key\" is a custom endpoint's own key — give it with a \
              \"provider_endpoint\" that is not OpenRouter's (an OpenRouter key goes in \
              \"provider_key\")"
+        );
+        // Going back to OpenRouter's own is a move of its own: it names no endpoint and no key,
+        // and the two cannot be meant together with a clear.
+        anyhow::ensure!(
+            !parsed.clear_provider_endpoint
+                || (parsed.provider_endpoint.is_none() && parsed.provider_endpoint_key.is_none()),
+            "usage: \"clear_provider_endpoint\" is the move back to OpenRouter's own — give it \
+             alone, with no \"provider_endpoint\" or \"provider_endpoint_key\""
         );
         anyhow::ensure!(
             !(parsed.owner.is_some() && parsed.unbind_owner),
@@ -381,16 +426,76 @@ async fn save_openrouter_key(
     Ok(())
 }
 
+/// Whether the custom endpoint's key row holds a value.
+fn is_key_row_set() -> bool {
+    CONFIG
+        .provider_endpoint_key()
+        .is_some_and(|key| !key.trim().is_empty())
+}
+
+/// What became of the custom key row an endpoint write drops, best effort — one table, said only
+/// where a removal was actually attempted (`dropped`: the write settled to OpenRouter's own or to
+/// empty), and only as far as the row's own state can prove. A custom endpoint rewritten to
+/// another one drops nothing and keeps its key, so it earns no sentence at all.
+#[derive(PartialEq, Eq, Debug)]
+enum KeyRowFate {
+    /// The row went with the endpoint.
+    Dropped,
+    /// The delete failed: the orphan is harmless but it is still on disk, and the answer says so
+    /// rather than claiming a delete that did not happen.
+    LeftBehind,
+}
+
+impl KeyRowFate {
+    /// The clause a sentence about the endpoint that moved appends to it.
+    const fn with_endpoint(self) -> &'static str {
+        match self {
+            Self::Dropped => ", and its key was dropped with it",
+            Self::LeftBehind => ", but its key row could not be removed and is left behind",
+        }
+    }
+}
+
+fn key_row_fate(dropped: bool, had_key: bool, still_set: bool) -> Option<KeyRowFate> {
+    match (dropped, had_key, still_set) {
+        (true, true, false) => Some(KeyRowFate::Dropped),
+        (true, true, true) => Some(KeyRowFate::LeftBehind),
+        _ => None,
+    }
+}
+
 /// Persist the provider arguments. The endpoint arm is the live reachability check for a custom
 /// endpoint — persisting it runs the provider warmup, keyless included, where reaching it is all
-/// there is to prove — and its warning is the window's own wording, reused rather than re-judged
-/// here. A write that leaves the value in force where it was is not reported as a change: the
-/// header promises one line per change the run made.
+/// there is to prove. A write that leaves the value in force where it was is not reported as a
+/// change: the header promises one line per change the run made.
 async fn apply_provider(
     args: &SetupArgs,
     changed: &mut Vec<String>,
     warnings: &mut Vec<String>,
 ) -> anyhow::Result<()> {
+    if args.clear_provider_endpoint {
+        let before = crate::config::effective_chat_endpoint(&CONFIG.snapshot());
+        let custom = crate::config::is_custom_endpoint(&before);
+        let had_key = is_key_row_set();
+        if custom {
+            crate::config::persist_settled_string_field(CONFIG_KEY_PROVIDER_ENDPOINT, "").await?;
+            let fate = key_row_fate(true, had_key, is_key_row_set());
+            changed.push(match fate {
+                Some(fate) => format!(
+                    "custom endpoint cleared — back to OpenRouter's own{}",
+                    fate.with_endpoint()
+                ),
+                None => "custom endpoint cleared — back to OpenRouter's own".to_string(),
+            });
+        } else if had_key {
+            // The endpoint is already OpenRouter's own, so only a leftover key row is left to
+            // remove — the endpoint row is not rewritten for a value that did not change, and a
+            // failed delete stops the run rather than being reported as a fate.
+            crate::config::persist_settled_string_field(CONFIG_KEY_PROVIDER_ENDPOINT_KEY, "")
+                .await?;
+            changed.push("nothing changed about the endpoint; its key row was removed".to_string());
+        }
+    }
     if let Some(endpoint) = &args.provider_endpoint {
         // The endpoint before its key: it is validated before it is written, so a URL the config
         // refuses stops the run with nothing saved, rather than leaving an orphan key row whose own
@@ -400,6 +505,7 @@ async fn apply_provider(
         // value already in force is no write, like the OpenRouter key below.
         let before = crate::config::effective_chat_endpoint(&CONFIG.snapshot());
         if before != endpoint.trim() {
+            let had_key = is_key_row_set();
             // Persisting it runs the provider warmup — a custom endpoint that is down right now
             // warns here, which is the one thing this flag can prove on its own.
             let outcome =
@@ -407,7 +513,14 @@ async fn apply_provider(
                     .await?;
             let after = crate::config::effective_chat_endpoint(&CONFIG.snapshot());
             if after != before {
-                changed.push(format!("provider endpoint set to {after}"));
+                // Only a write that settles to OpenRouter's own tries to drop the key row; a custom
+                // endpoint rewritten to another one keeps its key, so it earns no fate sentence.
+                let dropped = !crate::config::is_custom_endpoint(&after);
+                changed.push(format!(
+                    "provider endpoint set to {after}{}",
+                    key_row_fate(dropped, had_key, is_key_row_set())
+                        .map_or("", KeyRowFate::with_endpoint)
+                ));
             }
             warnings.extend(outcome.warning);
         }
@@ -468,7 +581,11 @@ async fn apply(
         apply_telegram_token(token, changed, warnings, bot).await?;
     }
 
-    if args.unbind_owner && crate::users::store().unbind_telegram_for_admin().await? {
+    if args.unbind_owner
+        && crate::users::store()
+            .unbind_telegram(crate::users::ADMIN_USER_NAME)
+            .await?
+    {
         changed.push("owner Telegram binding removed".to_string());
     }
     if let Some(value) = &args.owner {
@@ -493,14 +610,10 @@ async fn apply(
 
 /// Run the setup for the arguments given and render what it did.
 ///
-/// Terminal-only: this is the action behind `mahbot config setup`, and it refuses any other caller
-/// so the admin Assistant cannot write the provider credential.
+/// The same call serves `mahbot config setup` and the `mahbot_config` tool's `setup` action: the
+/// admin's Assistant may write the provider credential too, since on a server it is the only way
+/// in, and it has a shell that could run the command anyway.
 pub(crate) async fn run(args: &serde_json::Value) -> anyhow::Result<String> {
-    anyhow::ensure!(
-        crate::agent::tool_command_line(),
-        "forbidden: `setup` is the terminal setup command's action (`mahbot config setup`) — the \
-         Assistant must not use it"
-    );
     let args = SetupArgs::parse(args)?;
 
     let mut changed: Vec<String> = Vec::new();
@@ -556,6 +669,47 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A stand-in provider host: it answers one request with 405 — all a warmup asks, that the
+    /// socket answer at all — and then closes, so a test leaves no listener or thread behind. Both
+    /// its waits are bounded: the accept loop gives up on its own, and so does the read, so a client
+    /// that connects and never writes cannot hold the thread for the life of the test binary. A
+    /// test must never reach a real host, or a port nobody listens on, where a dropped packet would
+    /// hold it for the whole warmup timeout.
+    fn stand_in_provider() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a stand-in host");
+        let addr = listener.local_addr().expect("its address");
+        listener
+            .set_nonblocking(true)
+            .expect("a stand-in host that never blocks its thread");
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                        let mut buf = [0u8; 2048];
+                        let _ = std::io::Read::read(&mut stream, &mut buf);
+                        let _ = std::io::Write::write_all(
+                            &mut stream,
+                            b"HTTP/1.1 405 Method Not Allowed\r\ncontent-length: 0\r\nconnection: \
+                              close\r\n\r\n",
+                        );
+                        return;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() > deadline {
+                            return;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        format!("http://{addr}/v1")
+    }
+
     /// A report as a run leaves it with nothing to warn about, so a test names only the fields it
     /// is about.
     fn report() -> Report {
@@ -572,17 +726,247 @@ mod tests {
         }
     }
 
-    /// The one guard that makes this action terminal-only: outside a command-line call the run
-    /// stops before any store, any network or any write.
+    /// `settings::set` hands the provider's credential and endpoint here as one JSON argument named
+    /// by the setting's own config key; this pins each name to the field this module reads, so a
+    /// rename on either side cannot turn the bridge into a silent no-op. (The endpoint's own key is
+    /// not among them: `set` refuses it alone and names this action.)
+    #[test]
+    fn the_settings_bridge_names_the_arguments_this_module_reads() {
+        use crate::settings::Setting;
+        for setting in [Setting::ProviderKey, Setting::ProviderEndpoint] {
+            let args = json!({ setting.name(): "acme" });
+            let expected = match setting {
+                Setting::ProviderKey => SetupArgs {
+                    provider_key: Some("acme".to_string()),
+                    ..SetupArgs::default()
+                },
+                Setting::ProviderEndpoint => SetupArgs {
+                    provider_endpoint: Some("acme".to_string()),
+                    ..SetupArgs::default()
+                },
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                SetupArgs::parse(&args).unwrap(),
+                expected,
+                "the bridge's argument for `{}` is not the field this module reads",
+                setting.name()
+            );
+        }
+    }
+
+    /// The key row's fate is said only where a removal was attempted: a custom endpoint rewritten
+    /// to another one keeps its key, and the answer must not claim a removal that never happened.
+    /// One table, two sentences — the endpoint that moved, and the clear that found it already
+    /// where it asked.
+    #[test]
+    fn the_key_row_fate_is_said_only_where_a_removal_was_attempted() {
+        assert_eq!(
+            key_row_fate(false, true, true),
+            None,
+            "a custom-to-custom write drops nothing and keeps its key"
+        );
+        assert_eq!(key_row_fate(false, false, false), None);
+        assert_eq!(
+            key_row_fate(true, false, false),
+            None,
+            "there was nothing to drop"
+        );
+        assert_eq!(
+            key_row_fate(true, true, false).map(KeyRowFate::with_endpoint),
+            Some(", and its key was dropped with it")
+        );
+        assert_eq!(
+            key_row_fate(true, true, true).map(KeyRowFate::with_endpoint),
+            Some(", but its key row could not be removed and is left behind")
+        );
+    }
+
+    /// The write itself: a custom endpoint rewritten to another one keeps its key and says nothing
+    /// about it, while a write that settles back to OpenRouter's own names the drop. This is the
+    /// wiring `key_row_fate`'s truth table cannot cover — the claim must follow the write, not the
+    /// endpoint that was in force before it.
     #[tokio::test]
-    async fn setup_refuses_outside_a_command_line_call() {
-        let err = run(&json!({}))
-            .await
-            .expect_err("the Assistant must not reach the setup action");
-        let message = err.to_string();
+    // The persist path replaces the process-global provider, so this test joins the group that
+    // owns it: no test holding a fake there may have it swapped mid-run.
+    #[serial_test::serial(config_persist, provider)]
+    async fn a_custom_endpoint_rewritten_to_another_one_keeps_its_key() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        // The writes below rebuild the provider singleton; leave it as the test found it.
+        let _provider = crate::util::test::ProviderSnapshot::take();
+        let mut changed = Vec::new();
+        let mut warnings = Vec::new();
+        // Both endpoints answer, so neither write waits on a warmup: the fate of the key row is
+        // what this test is about, not the reachability warning.
+        let first = stand_in_provider();
+        let second = stand_in_provider();
+
+        apply_provider(
+            &SetupArgs {
+                provider_endpoint: Some(first),
+                provider_endpoint_key: Some("k1".to_string()),
+                ..SetupArgs::default()
+            },
+            &mut changed,
+            &mut warnings,
+        )
+        .await
+        .expect("the first custom endpoint");
+        assert_eq!(CONFIG.provider_endpoint_key().as_deref(), Some("k1"));
+        changed.clear();
+
+        apply_provider(
+            &SetupArgs {
+                provider_endpoint: Some(second),
+                ..SetupArgs::default()
+            },
+            &mut changed,
+            &mut warnings,
+        )
+        .await
+        .expect("the second custom endpoint");
         assert!(
-            message.contains("terminal setup command") && message.contains("Assistant"),
-            "the refusal must say whose action this is: {message}"
+            !changed.iter().any(|line| line.contains("key row")),
+            "nothing tried to remove the key, and it is the live one: {changed:?}"
+        );
+        assert_eq!(
+            CONFIG.provider_endpoint_key().as_deref(),
+            Some("k1"),
+            "the key belongs to the custom endpoint that replaced the old one"
+        );
+        changed.clear();
+
+        // Back to OpenRouter's own: now the drop is attempted and the answer names it.
+        apply_provider(
+            &SetupArgs {
+                clear_provider_endpoint: true,
+                ..SetupArgs::default()
+            },
+            &mut changed,
+            &mut warnings,
+        )
+        .await
+        .expect("the clear");
+        assert!(
+            changed
+                .iter()
+                .any(|line| line.contains("its key was dropped with it")),
+            "got: {changed:?}"
+        );
+        assert_eq!(CONFIG.provider_endpoint_key().as_deref(), None);
+
+        // A leftover key row beside OpenRouter's own endpoint — what a failed delete leaves — is
+        // the one thing a clear can still remove: the endpoint does not move, and the answer says
+        // exactly that. Seeded through the store, not the persist path: a key write there rebuilds
+        // the provider and warms it up against whatever endpoint is in force, which here is the
+        // real OpenRouter.
+        crate::config_db::store()
+            .set_kv(CONFIG_KEY_PROVIDER_ENDPOINT_KEY, "leftover")
+            .await
+            .expect("a leftover key row");
+        let _ = CONFIG.set_string_field(CONFIG_KEY_PROVIDER_ENDPOINT_KEY, "leftover");
+        changed.clear();
+        apply_provider(
+            &SetupArgs {
+                clear_provider_endpoint: true,
+                ..SetupArgs::default()
+            },
+            &mut changed,
+            &mut warnings,
+        )
+        .await
+        .expect("the clear of a leftover key row");
+        assert!(
+            changed
+                .iter()
+                .any(|line| line.contains("nothing changed about the endpoint")
+                    && line.contains("key row was removed")),
+            "got: {changed:?}"
+        );
+        assert_eq!(CONFIG.provider_endpoint_key().as_deref(), None);
+    }
+
+    /// A custom endpoint longer than one read-back could carry whole is refused before any write,
+    /// and the limit is written down where a caller can find it.
+    #[test]
+    fn an_endpoint_too_long_for_one_read_back_is_refused() {
+        let prefix = "https://acme.invalid/";
+        let long = format!("{prefix}{}", "p".repeat(MAX_ENDPOINT_BYTES));
+        let refused = SetupArgs::parse(&json!({ "provider_endpoint": long }))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains(&format!("at most {MAX_ENDPOINT_BYTES} bytes"))
+                && refused.contains("`reference` action"),
+            "the refusal says the limit and where it is written down: {refused}"
+        );
+        let longest = format!("{prefix}{}", "p".repeat(MAX_ENDPOINT_BYTES - prefix.len()));
+        assert_eq!(longest.len(), MAX_ENDPOINT_BYTES);
+        assert!(SetupArgs::parse(&json!({ "provider_endpoint": longest })).is_ok());
+        // The number a caller cannot discover any other way is stated in the reference, at the
+        // value this module enforces.
+        assert!(
+            crate::settings::reference().contains(&format!("capped at {MAX_ENDPOINT_BYTES} bytes")),
+            "the reference never states the custom endpoint's {MAX_ENDPOINT_BYTES} bytes"
+        );
+    }
+
+    /// The worst case a provider write can answer with — a keyless custom endpoint that does not
+    /// answer, so the report names it in the value line, the change, the current state and the
+    /// warning with the URL its error carries — still fits one read-back, with the prose allowance
+    /// to spare.
+    #[test]
+    fn the_longest_endpoint_answer_fits_one_read_back() {
+        let prefix = "https://acme.invalid/";
+        let endpoint = format!("{prefix}{}", "p".repeat(MAX_ENDPOINT_BYTES - prefix.len()));
+        let report = Report {
+            changed: vec![format!("provider endpoint set to {endpoint}")],
+            // The sentence the save itself appends, over the error chain a real warmup failure
+            // carries — URL and cause both.
+            warnings: vec![crate::config::warmup_warning(
+                &endpoint,
+                &anyhow::anyhow!(
+                    "error sending request for url ({endpoint}/chat/completions): client error \
+                     (Connect): dns error: failed to lookup address information: nodename nor \
+                     servname provided, or not known"
+                ),
+            )],
+            stopped: None,
+            provider: ProviderState::Custom {
+                key: false,
+                openrouter_key: false,
+            },
+            endpoint: endpoint.clone(),
+            bot_token_saved: false,
+            bot: None,
+            owner: OwnerBinding::None,
+            onboarding: OnboardingState::Init,
+        };
+        // The answer the settings route really prints, composed by its own helper.
+        let answer =
+            crate::settings::answer_with_report("provider_endpoint", &endpoint, &report.render());
+        // The fixture's report names the endpoint in its change line, its current state and twice
+        // in the warning; the value line above it is the fifth. A sentence added inside
+        // `Report::render` shows up as prose below, against the allowance; one added to
+        // `apply_provider`'s own `changed` lines is outside this fixture and relies on that
+        // allowance and on the answer's refusal instead.
+        assert_eq!(
+            report.render().matches(&endpoint).count(),
+            ENDPOINT_MENTIONS - 1,
+            "the report's endpoint mentions are what the cap's derivation counts"
+        );
+        assert!(
+            answer.len() <= crate::settings::MAX_READ_BACK_BYTES,
+            "a provider write's answer must fit one read-back, got {} bytes",
+            answer.len()
+        );
+        // What the answer says besides the endpoint is what the cap's derivation reserved. The
+        // report growing a sentence shows up here rather than silently eating the headroom.
+        let prose = answer.len() - ENDPOINT_MENTIONS * endpoint.len();
+        assert!(
+            prose <= REPORT_PROSE_BYTES,
+            "the report's prose is {prose} bytes against the {REPORT_PROSE_BYTES} its cap allows"
         );
     }
 
@@ -621,6 +1005,29 @@ mod tests {
             err.starts_with("usage:") && err.contains("provider_key"),
             "{err}"
         );
+
+        // A blank endpoint is refused like any other blank: going back to OpenRouter's own is the
+        // explicit request below, never what an empty expansion says.
+        let err = SetupArgs::parse(&json!({ "provider_endpoint": "  " }))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("provider_endpoint"), "{err}");
+
+        // The clear names no endpoint and no key, and is refused beside either.
+        assert!(
+            SetupArgs::parse(&json!({ "clear_provider_endpoint": true }))
+                .unwrap()
+                .clear_provider_endpoint
+        );
+        for args in [
+            json!({ "clear_provider_endpoint": true, "provider_endpoint": "https://llm.example/v1" }),
+            json!({ "clear_provider_endpoint": true, "provider_endpoint_key": "local-key" }),
+        ] {
+            assert!(
+                SetupArgs::parse(&args).is_err(),
+                "a clear cannot be meant beside an endpoint or a key: {args}"
+            );
+        }
 
         // A custom endpoint's key names nothing without its endpoint.
         let err = SetupArgs::parse(&json!({ "provider_endpoint_key": "k" }))
@@ -731,6 +1138,7 @@ mod tests {
                 json!("local-key"),
                 json!({ "provider_endpoint": "https://llm.example/v1" }),
             ),
+            ("clear_provider_endpoint", json!(true), json!({})),
             ("telegram_token", json!("1:A"), json!({})),
             ("owner", json!("12345"), json!({})),
             ("unbind_owner", json!(true), json!({})),

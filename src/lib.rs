@@ -103,6 +103,9 @@ pub mod gui;
 pub(crate) mod onboarding;
 // The one setup path: the terminal command's credentials, bot token and owner, in one run.
 pub(crate) mod setup;
+// The product's settings, changeable without a window: the one surface behind the config tool and
+// the command line.
+pub(crate) mod settings;
 // A broadcast that tells the dashboard an in-memory registry changed.
 pub(crate) mod runtime_events;
 // The macOS menu bar / Windows notification area icon, its click and quit menu.

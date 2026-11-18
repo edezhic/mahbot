@@ -153,8 +153,9 @@ pub mod image {
 
     /// Appended by the account's own-model paths only: a walk candidate's skip line
     /// leaves it out, since the model the account chose is not the one passed over.
-    const IMAGE_MODEL_REMEDIATION: &str =
-        " Set an image-capable model in Settings → Provider → Models settings and retry.";
+    /// What went wrong and nothing about which surface fixes it: the same text reaches the
+    /// desktop picker, the Telegram setter, the image-generation check and the settings route.
+    const IMAGE_MODEL_REMEDIATION: &str = " Set an image-capable model and retry.";
 
     /// Reject a catalog-listed model that explicitly declares text-only output. (Shape drift —
     /// missing/empty modalities — is tolerated as capable.)

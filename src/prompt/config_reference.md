@@ -1,0 +1,144 @@
+Every action and field of the `mahbot_config` and `workspace` tools; `mahbot config reference` and
+`mahbot workspace reference` print it.
+
+In a terminal the operation word is the action with `_` written `-` (`setup-telegram-bot`), each
+field a flag of the same name, `_` written `-`; `action` is no flag. A value starting with `@` names
+a file (`./@name` for a literal one), but a path field is resolved where the command runs and takes
+no file form; a boolean is a bare switch (`--maintenance`, `=false` for false); a list repeats.
+
+`get` reads one setting whole, `list` summarises every one — a long value is clipped — and `set`
+changes one. Values are effective — defaults resolved, never a stored row — and a change takes
+effect at once. A credential is never read back in full: `get` gives a hint, `list` omits it. A
+value too long for one read-back is refused. An unlisted name or field is refused, naming this
+reference; an unlisted terminal flag, by the command itself.
+
+## mahbot_config
+
+Bracketed fields are the ones the action reads.
+
+- `reference` — this text, whole.
+- `about` — the product's own README, whole: what this system is, what it does and how it is set
+  up. Static text, so it needs no running instance.
+- `get` (`setting`) — one setting's effective value, whole.
+- `list` — every setting summarised, credentials left out, `provider_order` for the two slot models
+  only.
+- `set` (`setting`, `value`) — change one setting, answering what it did. The provider's credential
+  and endpoint go through `setup`: the answer is the value, then its report; neither is cleared here,
+  and the endpoint's own key is refused alone, naming `setup`.
+- `setup` (`provider_key`, `provider_endpoint`, `provider_endpoint_key`, `clear_provider_endpoint`,
+  `telegram_token`, `owner`, `unbind_owner`) — the model provider (an OpenRouter key, or a custom
+  endpoint and its optional key), the bot token and the owner, changing only what it names; a
+  configured provider also finishes onboarding. The key is checked live; a rejected one is a warning
+  on a saved key. `clear_provider_endpoint` goes back to OpenRouter's own, dropping its key row,
+  leftover ones included.
+- `setup_telegram_bot` (`token`) — save the bot token; checked live, and the listener reloads.
+- `bind_telegram` (`handle`, `user`) / `unbind_telegram` (`user`) — bind a Telegram account (the
+  owner's own, or a guest named by `user`) or remove its binding. A numeric handle is an address at
+  once; a nickname gains one when its owner writes. One binding per account: a second is refused, so
+  `unbind_telegram` frees one first.
+- `add_user` (`name`, `telegram`) — create a guest account and, when `telegram` is given, bind it;
+  without one it has no way in yet. The name is the account's folder too; names are caseless
+  (`ALICE` collides with `Alice`), the owner's name is reserved, and an account already bound is
+  refused.
+- `delete_user` (`user`) — remove an account and its bindings; its sessions, chat history and folder
+  stay on disk, and the answer names them. The owner cannot be deleted.
+- `list_users` — every account with its Telegram binding.
+- `setup_web_search` (`provider`, `key`) — register `deepseek` or `exa` with its key; both are
+  required.
+- `grant_tool` / `revoke_tool` (`user`, `tool`) — grant or revoke one custom tool for one account;
+  idempotent.
+- `list_grants` (`user`) — the recorded grants: `user` for one account, omitted for every account
+  with any.
+- `create_custom_role` / `update_custom_role` / `list_custom_roles` / `delete_custom_role`
+  (`name`, `tools`, `behavior`, `prompt`) — the owner's own agents. `create_custom_role` needs
+  `prompt`, `update_custom_role` one of `prompt`, `tools`, `behavior`; a name is up to 32 letters,
+  digits, `_` and `-`, starting with a letter, and must not shadow an agent-id namespace (`role`,
+  `ticket`, `maintainer`, `discovery`, …); `tools` entries come from the custom-role catalogue, an
+  empty array clearing them.
+
+`user` names the account an action acts on: `bind_telegram` defaults to the owner and `list_grants`
+to every account; the other four require it.
+
+## settings for get / set
+
+- `provider_key` — the OpenRouter key. Secret; written by `setup`, which checks it live. Cannot be
+  cleared.
+- `provider_endpoint` — the chat endpoint; OpenRouter's own unless `setup` set a custom one, which
+  `get` reports as the value in use. `setup` probes it and warns when it does not answer;
+  `clear_provider_endpoint` settles it back. A custom endpoint is capped at 640 bytes.
+- `provider_endpoint_key` — the custom endpoint's own key. Secret; written by `setup` with the
+  endpoint (alone it names nothing, so `set` refuses it and names `setup`), and dropped when the
+  endpoint settles back.
+- `manager_model`, `worker_model` — the model slot for the manager-side roles and for workers; empty
+  means the built-in default, which `get` reports.
+- `image_gen_models`, `video_models` — catalogues of model names, newline- or comma-separated, at
+  most 32, each name at most 128 characters; empty means the default model, which `get` reports. An
+  image model the catalogue lacks or lists as text-only is refused (an unreachable catalogue passes
+  silently); video models are taken as given.
+- `provider_order:<model>` — that model's provider priority, comma-separated; empty means the
+  product's own order. Inert under a custom chat endpoint, and `get` says so.
+- `web_search_provider` — `deepseek`, `exa`, `auto` (or `automatic`), or empty for automatic. `get`
+  names the backends text and picture search really use, and says when there is no search tool.
+- `deepseek_key`, `exa_key` — the search backends' keys. Secrets.
+- `telegram_bot_token` — Secret; checked live, and the listener hot-reloads.
+- `telegram_local_server` — `local` or `cloud`: where the bot is served. `local` starts a switch and
+  answers at once; it needs a bot token and the two credentials below. `get` reports the side served
+  and whether a switch is in flight or blocked.
+- `telegram_api_id`, `telegram_api_hash` — the local server's credentials; the hash is a secret.
+  Each is shape-checked as the window's dialog does. Set the pair before switching.
+- `audio_transcription_use_local` — `on` or `off`: local speech recognition. An absent row means on,
+  but a fresh install starts off. Turning it on loads nothing: the recogniser is fetched when first
+  needed, and turning it off turns voice off too, since they share it.
+- `voice_enabled` — wake-word voice input; off unless turned on. Refuses to turn on while
+  transcription is off (they share the recogniser) or with an enrolment the current encoder cannot
+  score. Needs a microphone: without one the pipeline reports the device failure.
+- `tts_enabled` — spoken replies; off unless turned on. Turning it on fetches the voice model;
+  speaking needs an audio output, and says so.
+- `autoupdate` — install newer versions by itself. Only a downloaded build updates itself (a
+  registry-cache install included); elsewhere the window hides the control and `set` refuses for the
+  same reason.
+- `autolaunch` — start at login. Only a published copy registers itself (not a registry-cache
+  install), and a system-managed host refuses the registration, naming the command to run. `get`
+  reports the decision and whether the registration is in place; `list` the decision alone.
+
+Wake-word enrolment needs a microphone and stays in the window.
+
+## workspace
+
+Bracketed fields are the ones the action reads.
+
+- `reference` — this text, whole.
+- `list` (`workspace`) — the managed workspaces, the active one marked, or only the one named.
+- `show` (`workspace`) — one workspace: path, status, paused, maintenance, active, rules, commands.
+- `add` (`name`, `path`) — add a project directory and make it active; it starts pending and paused.
+  The name is up to 40 ASCII letters and underscores, starting with a letter; `path` must be an
+  existing directory (`~` allowed).
+- `delete` (`workspace`) — remove a workspace, its jobs and its research runs; the folder and the
+  tickets stay on disk.
+- `pause` / `resume` (`workspace`) — freeze or unfreeze a pipeline; only a `ready` workspace has
+  one, and a named one that is not ready is refused. With no `workspace`, all of them: the ready
+  ones are acted on, the rest skipped.
+- `maintenance` (`workspace`, `maintenance`) — turn the background maintainer on or off.
+- `rediscover` (`workspace`) — re-analyse a project: its per-role contexts are cleared and discovery
+  starts again; the pipeline is paused until it finishes, and the answer says so.
+- `rediscover_diagnostics` (`workspace`) — re-detect only the project's commands: the stored ones
+  are cleared while they are; status, pause and per-role contexts are untouched.
+- `set_diagnostics` (`workspace`, `format`, `format_check`, `lint`, `lint_fix`, `type_check`,
+  `build`, `unit_test`) — write the project's commands by hand: omit a field to keep it, pass an
+  empty string to clear it, and name at least one.
+- `set_rules` (`workspace`, `rules`) — write the project rules, at most 4000 characters (longer
+  text is truncated). They reach a session's prompt when it is built or next compacted, not a
+  running one.
+- `use` (`workspace`) — make a workspace the active project.
+- `board` (`workspace`, `phase`) — the tickets of the addressed workspaces, one line each: filer,
+  phase, id, title; without `workspace`, every managed workspace's, and archived tickets are never
+  listed. `phase` is one exact snake_case phase word (`in_development`, `done`, …); `archived` is
+  refused, and a long listing says it is partial.
+- `ticket` (`ticket_id`, `full`) / `comment` (`ticket_id`, `content`) — read one ticket, or leave a
+  note on it. `ticket_id` is the full `<workspace>-<number>` id, never a bare number. A ticket is
+  shortened by default — description cut at 500 characters, the three newest comments in full and
+  older ones at 200 — and `full: true` is it whole. A note reaches a working agent at its next round.
+
+`workspace` names the managed workspace an action covers, spelled exactly as `list` does. Omit it
+for `list` and `board` (every one) and for `pause` / `resume` (a fleet-wide freeze); `reference`,
+`add`, `ticket` and `comment` do not read it.

@@ -12,11 +12,11 @@ use crate::config::CONFIG_KEY_VOICE_ENABLED;
 use crate::config::{
     CONFIG, CONFIG_KEY_AUTOUPDATE, CONFIG_KEY_DEEPSEEK_KEY, CONFIG_KEY_EXA_KEY,
     CONFIG_KEY_MANAGER_MODEL, CONFIG_KEY_PROVIDER_ENDPOINT, CONFIG_KEY_PROVIDER_ENDPOINT_KEY,
-    CONFIG_KEY_PROVIDER_KEY, CONFIG_KEY_TELEGRAM_API_HASH, CONFIG_KEY_TELEGRAM_API_ID,
-    CONFIG_KEY_TELEGRAM_BOT_TOKEN, CONFIG_KEY_TTS_ENABLED, CONFIG_KEY_WEB_SEARCH_PROVIDER,
-    CONFIG_KEY_WORKER_MODEL, ConfigData, ModelRouting,
+    CONFIG_KEY_PROVIDER_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN, CONFIG_KEY_TTS_ENABLED,
+    CONFIG_KEY_WEB_SEARCH_PROVIDER, CONFIG_KEY_WORKER_MODEL, ConfigData, ModelRouting,
 };
 use crate::custom_role::{CustomRole, CustomRoleBehavior};
+use crate::settings::routing_slots;
 use crate::tools::custom::ToolListing;
 use crate::tools::media_catalog::image::validate_image_model;
 use crate::util::model_state::ModelState;
@@ -33,7 +33,8 @@ use iced::{Alignment, Element, Length, Task};
 
 use iced_fonts::lucide;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 
 use super::common::SingleLineEditorState;
 use super::custom_roles;
@@ -397,12 +398,12 @@ pub enum SettingsMessage {
     /// Toggle local transcription. OFF also turns Wake Word Detection off (both share the loaded
     /// recogniser); ON kicks the model load/download in the background.
     TranscriptionToggle(bool),
-    /// The toggle persist's result: the wake-word cascade flag lets a failure roll both keys
-    /// (and the pipeline) back; `generation` drops results from a superseded toggle.
+    /// The toggle persist's result: `Ok` says whether voice was turned off with it, so the
+    /// mirror follows the cascade the shared helper really threw; `generation` drops results from
+    /// a superseded toggle.
     TranscriptionToggleResult {
         generation: u64,
-        cascade_wake_word: bool,
-        result: Result<(), String>,
+        result: Result<bool, String>,
     },
     /// Retry the recogniser's model load after a failure — re-toggling alone cannot recover.
     RetryTranscription,
@@ -450,21 +451,6 @@ const CONFIG_FIELD_WEB_SEARCH_PROVIDER: &str = "config:web_search_provider";
 const CONFIG_FIELD_IMAGE_GEN_MODELS: &str = "config:image_gen_models";
 const CONFIG_FIELD_VIDEO_MODELS: &str = "config:video_models";
 const CONFIG_FIELD_AUTOUPDATE: &str = "config:autoupdate";
-
-/// The two routable model slots (manager + worker) as trimmed/default names. Saved routing
-/// rows for other models are inert orphans and are not rendered.
-fn routing_slots(config: &ConfigData) -> BTreeSet<String> {
-    let mut models = BTreeSet::new();
-    models.insert(crate::config::resolve_or(
-        config.manager_model.clone(),
-        crate::config::DEFAULT_MANAGER_MODEL,
-    ));
-    models.insert(crate::config::resolve_or(
-        config.worker_model.clone(),
-        crate::config::DEFAULT_WORKER_MODEL,
-    ));
-    models
-}
 
 /// A model's saved provider priority list from a config snapshot.
 fn routing_order_of(config: &ConfigData, model: &str) -> Option<String> {
@@ -564,29 +550,6 @@ pub struct SettingsState {
     tts_toggle_gen: u64,
 }
 
-/// Sync the voice pipeline state with `CONFIG.voice_enabled()` (after the toggle persists).
-fn sync_voice_state(enabled: bool) {
-    if enabled {
-        crate::audio::voice::set_enabled(true);
-        crate::audio::voice::send_command(crate::audio::voice::VoiceCommand::StartListening);
-    } else {
-        crate::audio::voice::set_enabled(false);
-        crate::audio::voice::send_command(crate::audio::voice::VoiceCommand::StopListening);
-    }
-}
-
-/// Persist the transcription toggle: enabled → the row is deleted (absence = enabled), disabled →
-/// `"false"`. `cascade_voice_off` clears the wake word's row in the same transaction.
-async fn persist_transcription_toggle(
-    enabled: bool,
-    cascade_voice_off: bool,
-) -> Result<(), String> {
-    crate::config_db::store()
-        .set_transcription_toggle(enabled, cascade_voice_off)
-        .await
-        .map_err(|e| e.to_string())
-}
-
 /// The custom-role prompt editor's resizing range: it grows with its text up to the maximum
 /// and gives that height back down to the minimum when the window runs out of room.
 const CUSTOM_ROLE_PROMPT_MIN_HEIGHT: f32 = 120.0;
@@ -670,7 +633,7 @@ impl SettingsState {
     fn read_system_autolaunch(&mut self) -> Task<SettingsMessage> {
         self.autolaunch = None;
         let epoch = self.autolaunch_epoch;
-        Task::perform(read_autolaunch(), move |state| {
+        Task::perform(crate::settings::registered_at_login(), move |state| {
             SettingsMessage::AutolaunchRead { epoch, state }
         })
     }
@@ -818,33 +781,24 @@ impl SettingsState {
         self.set_both(key, if enabled { "true" } else { "" });
     }
 
-    /// Shared voice/speech-output toggle arm: mirror, fire the side effect, bump generation,
-    /// persist.
+    /// Shared voice/speech-output toggle arm: mirror, bump the generation, then hand the switch to
+    /// the shared side effect ([`crate::settings`]) — the route from the terminal and the tool runs
+    /// the same one. The effect settles the stored row first and moves the pipeline second, one
+    /// switch at a time, so a failure moves nothing and two rapid toggles cannot leave the pipeline
+    /// disagreeing with what is stored; the generation only decides whose result may be shown.
     fn run_toggle(
         &mut self,
         key: &'static str,
         enabled: bool,
+        side_effect: impl Future<Output = Result<(), String>> + Send + 'static,
         bump_gen: fn(&mut SettingsState) -> u64,
         make_result: fn(u64, Result<(), String>) -> SettingsMessage,
-        on_toggle: fn(bool),
     ) -> Task<SettingsMessage> {
         self.set_toggle(key, enabled);
-        on_toggle(enabled);
         // Bump generation so stale results from a previous toggle are ignored.
         let toggle_gen = bump_gen(self);
 
-        // Persist async; delete the key on disable so it's absent (None on reload).
-        Task::perform(
-            async move {
-                let store = crate::config_db::store();
-                if enabled {
-                    store.set_kv(key, "true").await.map_err(|e| e.to_string())
-                } else {
-                    store.delete_kv(key).await.map_err(|e| e.to_string())
-                }
-            },
-            move |result| make_result(toggle_gen, result),
-        )
+        Task::perform(side_effect, move |result| make_result(toggle_gen, result))
     }
 
     /// Shared voice/speech-output result arm: stale generations are ignored; a DB error reverts
@@ -863,11 +817,14 @@ impl SettingsState {
             return Task::none();
         }
         match result {
+            // The switch landed; whether the pipeline could act on it is the answer's to report,
+            // not the window's — the window shows the switch itself.
             Ok(()) => Task::none(),
             Err(e) => {
                 self.error = Some(e);
                 // Revert both snapshots so the toggle isn't shown enabled but lost on restart.
-                let current_enabled = get_enabled(&self.config).as_deref() == Some("true");
+                let current_enabled =
+                    crate::config::flag_opt_in(get_enabled(&self.config).as_deref());
                 let target_state = !current_enabled;
                 self.set_toggle(key, target_state);
                 on_revert(target_state);
@@ -1214,7 +1171,11 @@ impl SettingsState {
                 self.autolaunch_applying = true;
                 self.autolaunch = Some(enabled);
                 Task::perform(
-                    save_and_apply_autolaunch(enabled),
+                    async move {
+                        crate::settings::apply_autolaunch(enabled)
+                            .await
+                            .map_err(|failure| failure.message)
+                    },
                     SettingsMessage::AutolaunchApplied,
                 )
             }
@@ -1283,7 +1244,7 @@ impl SettingsState {
                 self.telegram_switch_busy = true;
                 self.telegram_credentials_error = None;
                 Task::perform(
-                    save_credentials_and_switch_local(api_id, api_hash),
+                    async move { save_telegram_credentials_and_switch_local(&api_id, &api_hash).await },
                     |result| SettingsMessage::TelegramSwitchResult {
                         target: Mode::Local,
                         result,
@@ -1310,6 +1271,7 @@ impl SettingsState {
                     async {
                         telegram_local::request_switch(Mode::Cloud)
                             .await
+                            .map(|_| ())
                             .map_err(|e| e.to_string())
                     },
                     |result| SettingsMessage::TelegramSwitchResult {
@@ -1330,6 +1292,7 @@ impl SettingsState {
                     async move {
                         telegram_local::request_switch(target)
                             .await
+                            .map(|_| ())
                             .map_err(|e| e.to_string())
                     },
                     move |result| SettingsMessage::TelegramSwitchResult { target, result },
@@ -1362,56 +1325,42 @@ impl SettingsState {
             SettingsMessage::TranscriptionToggle(enabled) => {
                 self.transcription_toggle_gen += 1;
                 let generation = self.transcription_toggle_gen;
-                // Turning transcription OFF also turns Wake Word Detection OFF: they share the
-                // loaded recogniser.
-                let cascade_wake_word =
-                    !enabled && self.config.voice_enabled.as_deref() == Some("true");
                 // enabled → "" = absent row; disabled → "false": the persisted row semantics.
                 let transcription_value = if enabled { "" } else { "false" };
                 self.set_both(
                     CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL,
                     transcription_value,
                 );
-                if cascade_wake_word {
-                    self.set_both(CONFIG_KEY_VOICE_ENABLED, "");
-                    sync_voice_state(false);
-                }
-                // The pipeline's `ConfigChanged` wakes it, re-arms auto-start and demands the
-                // listening tier when the wake word is on — the one place the load decision is
-                // made. The full engine waits for its first transcription.
-                crate::audio::voice::send_command(crate::audio::voice::VoiceCommand::ConfigChanged);
+                // The shared helper decides the wake-word cascade under the switch lock, moves it,
+                // wakes the pipeline's `ConfigChanged` (the one place the load decision is made)
+                // and persists the row; the answer says whether voice went off with it.
                 Task::perform(
-                    persist_transcription_toggle(enabled, cascade_wake_word),
-                    move |result| SettingsMessage::TranscriptionToggleResult {
-                        generation,
-                        cascade_wake_word,
-                        result,
-                    },
+                    crate::settings::apply_transcription_toggle(enabled),
+                    move |result| SettingsMessage::TranscriptionToggleResult { generation, result },
                 )
             }
-            SettingsMessage::TranscriptionToggleResult {
-                generation,
-                cascade_wake_word,
-                result,
-            } => {
+            SettingsMessage::TranscriptionToggleResult { generation, result } => {
                 // Ignore results from a superseded toggle (rapid re-toggle).
                 if generation != self.transcription_toggle_gen {
                     return Task::none();
                 }
                 match result {
-                    Ok(()) => Task::none(),
+                    Ok(cascaded) => {
+                        // The helper cleared the wake-word row when it cascaded; mirror that so a
+                        // refresh does not resurrect the switch it turned off.
+                        if cascaded {
+                            self.set_toggle(CONFIG_KEY_VOICE_ENABLED, false);
+                        }
+                        Task::none()
+                    }
                     Err(e) => {
                         self.error = Some(e);
-                        // Revert the transcription snapshot to the opposite staged state.
+                        // Nothing was written, so only the optimistic transcription mirror is
+                        // reverted — the wake-word row was never touched.
                         let currently_off =
                             self.config.audio_transcription_use_local.as_deref() == Some("false");
                         let restore = if currently_off { "" } else { "false" };
                         self.set_both(CONFIG_KEY_AUDIO_TRANSCRIPTION_USE_LOCAL, restore);
-                        // Restore the wake-word state the cascade disabled.
-                        if cascade_wake_word {
-                            self.set_both(CONFIG_KEY_VOICE_ENABLED, "true");
-                            sync_voice_state(true);
-                        }
                         Task::none()
                     }
                 }
@@ -1421,51 +1370,37 @@ impl SettingsState {
                 Task::none()
             }
 
-            SettingsMessage::VoiceToggle(enabled) => {
-                // An enrolment from the old encoder cannot be scored: turning the toggle on goes
-                // back to the re-enrolment message instead of persisting a listening session that
-                // cannot start.
-                if enabled && crate::audio::voice::enrollment_unusable() {
-                    crate::audio::voice::set_enabled(false);
-                    return Task::none();
-                }
-                self.run_toggle(
-                    CONFIG_KEY_VOICE_ENABLED,
-                    enabled,
-                    |s| {
-                        s.voice_toggle_gen += 1;
-                        s.voice_toggle_gen
-                    },
-                    SettingsMessage::VoiceToggleResult,
-                    sync_voice_state,
-                )
-            }
+            // The gate (transcription off, an unscoreable enrolment) lives in the shared side
+            // effect, so the refusal reaches the same error surface the revert already handles.
+            SettingsMessage::VoiceToggle(enabled) => self.run_toggle(
+                CONFIG_KEY_VOICE_ENABLED,
+                enabled,
+                crate::settings::apply_voice_toggle(enabled),
+                |s| {
+                    s.voice_toggle_gen += 1;
+                    s.voice_toggle_gen
+                },
+                SettingsMessage::VoiceToggleResult,
+            ),
             SettingsMessage::VoiceToggleResult(g, result) => self.handle_toggle_result(
                 CONFIG_KEY_VOICE_ENABLED,
                 g,
                 result,
                 |s| s.voice_toggle_gen,
                 |c| &c.voice_enabled,
-                sync_voice_state,
+                |enabled| {
+                    crate::settings::sync_voice_state(enabled);
+                },
             ),
             SettingsMessage::TtsToggle(enabled) => self.run_toggle(
                 CONFIG_KEY_TTS_ENABLED,
                 enabled,
+                crate::settings::apply_speech_output_toggle(enabled),
                 |s| {
                     s.tts_toggle_gen += 1;
                     s.tts_toggle_gen
                 },
                 SettingsMessage::TtsToggleResult,
-                |enabled| {
-                    if enabled {
-                        // Open the OS audio output device so playback works without a restart.
-                        let _ = crate::audio::output::ensure_audio_output();
-                    }
-                    // ON with an unloaded model set starts the load-or-fetch chain now.
-                    if enabled && crate::speech::synth::state() != ModelState::Ready {
-                        crate::speech::synth::retry();
-                    }
-                },
             ),
             SettingsMessage::TtsToggleResult(g, result) => self.handle_toggle_result(
                 CONFIG_KEY_TTS_ENABLED,
@@ -3145,7 +3080,7 @@ impl SettingsState {
     /// only where it can do something; no row at all means no section.
     fn application_section(&self) -> Option<Element<'_, SettingsMessage>> {
         let mut rows: Vec<Element<'_, SettingsMessage>> = Vec::new();
-        if crate::self_update::is_published_copy() {
+        if crate::settings::autolaunch_available() {
             // The switch reports the system and nothing else, so an unknown state says so instead
             // of asserting "off".
             let control: Element<'_, SettingsMessage> = match self.autolaunch {
@@ -3170,7 +3105,7 @@ impl SettingsState {
                 Some("Starts MahBot when you log in"),
             ));
         }
-        if crate::self_update::update_mode() == crate::self_update::UpdateMode::Downloaded {
+        if crate::settings::autoupdate_available() {
             let autoupdate = crate::config::flag_on(self.config.autoupdate.as_deref());
             rows.push(field_row(
                 "Autoupdate",
@@ -3402,7 +3337,7 @@ impl SettingsState {
     /// The speech-output row: the toggle, and the engine's state in the same words and the same
     /// shape the transcription row uses — ready, loading, released, or a failure with its retry.
     fn tts_row(&self) -> Element<'_, SettingsMessage> {
-        let enabled = self.config.tts_enabled.as_deref() == Some("true");
+        let enabled = crate::config::flag_opt_in(self.config.tts_enabled.as_deref());
         let status: Element<'_, SettingsMessage> = if !enabled {
             disabled_status()
         } else {
@@ -4197,27 +4132,6 @@ fn delete_confirm_button<'a>(
     .into()
 }
 
-/// Read the system's registration off the update thread. `None` = unknown, not "off".
-async fn read_autolaunch() -> Option<bool> {
-    tokio::task::spawn_blocking(crate::autostart::registered)
-        .await
-        .ok()
-        .flatten()
-}
-
-/// Persist the Autolaunch decision and apply it to the system's registration in one go:
-/// the decision first, so a registration failure never loses the choice.
-async fn save_and_apply_autolaunch(enabled: bool) -> Result<Option<bool>, String> {
-    let value = if enabled { "true" } else { "false" };
-    crate::config::persist_settled_string_field(crate::config::CONFIG_KEY_AUTOLAUNCH, value)
-        .await
-        .map_err(|e| format!("The Autolaunch setting could not be saved: {e}"))?;
-    tokio::task::spawn_blocking(move || crate::autostart::set_enabled(enabled))
-        .await
-        .map_err(|e| format!("The login registration could not be changed: {e}"))?
-        .map_err(|e| format!("The login registration could not be changed: {e:#}"))
-}
-
 /// Dispatch a settled field to its per-field persistence function, keyed by
 /// `config:<key>` (string fields) or `routing_order:<model>` (per-model rows). Returns
 /// the canonical persisted value.
@@ -4238,37 +4152,42 @@ async fn persist_settled_field(
     anyhow::bail!("unknown settings field: {field}");
 }
 
-/// Save the pasted pair, then ask for the switch to the local server. api_id is written
-/// first and a failed save stops before the request; telegram_local re-checks both shapes
-/// before journaling. The error names the field that failed, never a value.
-async fn save_credentials_and_switch_local(api_id: String, api_hash: String) -> Result<(), String> {
-    // Saved as typed (trimmed): telegram_local::credentials is the one normalising place.
+const BUSY_ADDING: &str = "Adding…";
+const BUSY_SAVING: &str = "Saving…";
+const BUSY_SWITCHING: &str = "Switching…";
+
+/// Save a pasted api_id/api_hash pair and ask for the switch to the local server — the credentials
+/// dialog's own step. api_id is written first and a failed save stops before the request, with the
+/// id put back so a half-pair never lands; the error names the field that failed, never a value.
+async fn save_telegram_credentials_and_switch_local(
+    api_id: &str,
+    api_hash: &str,
+) -> Result<(), String> {
     let api_id = api_id.trim();
     let api_hash = api_hash.trim();
-    let previous_id = crate::config::CONFIG.telegram_api_id();
-    crate::config::persist_settled_string_field(CONFIG_KEY_TELEGRAM_API_ID, api_id)
+    let previous_id = CONFIG.telegram_api_id();
+    crate::config::persist_settled_string_field(crate::config::CONFIG_KEY_TELEGRAM_API_ID, api_id)
         .await
         .map_err(|e| format!("api_id could not be saved: {e}"))?;
-    if let Err(e) =
-        crate::config::persist_settled_string_field(CONFIG_KEY_TELEGRAM_API_HASH, api_hash).await
+    if let Err(e) = crate::config::persist_settled_string_field(
+        crate::config::CONFIG_KEY_TELEGRAM_API_HASH,
+        api_hash,
+    )
+    .await
     {
-        // Half a pair is worse than none: the id is put back before the error reaches the dialog,
-        // so the old hash is never left beside a new id.
+        let restore = previous_id.unwrap_or_default();
         let _ = crate::config::persist_settled_string_field(
-            CONFIG_KEY_TELEGRAM_API_ID,
-            previous_id.as_deref().unwrap_or_default(),
+            crate::config::CONFIG_KEY_TELEGRAM_API_ID,
+            &restore,
         )
         .await;
         return Err(format!("api_hash could not be saved: {e}"));
     }
     telegram_local::request_switch(Mode::Local)
         .await
-        .map_err(|e| e.to_string())
+        .map(|_| ())
+        .map_err(|e| format!("the switch to the local server could not start: {e:#}"))
 }
-
-const BUSY_ADDING: &str = "Adding…";
-const BUSY_SAVING: &str = "Saving…";
-const BUSY_SWITCHING: &str = "Switching…";
 
 struct DialogField<'a> {
     label: &'static str,
@@ -4507,9 +4426,9 @@ mod tests {
     #[test]
     #[serial_test::serial(voice)] // touches the process-global audio::voice pipeline via init_global()
     fn voice_toggle_generation_counter_and_rollback() {
-        // The update handler calls sync_voice_state which accesses voice pipeline
-        // globals.  Initialise the pipeline state (no-op if already initialised
-        // by another test — OnceCell::set only succeeds once).
+        // The revert arm of `handle_toggle_result` calls `sync_voice_state`, which accesses the
+        // voice pipeline globals. Initialise the pipeline state (no-op if already initialised by
+        // another test — `OnceCell::set` only succeeds once).
         assert_toggle_gen_counter_and_rollback(
             SettingsMessage::VoiceToggle,
             SettingsMessage::VoiceToggleResult,
@@ -5095,17 +5014,23 @@ mod tests {
         let key_key = CONFIG_KEY_PROVIDER_ENDPOINT_KEY;
         for &(name, staged, staged_key) in cases {
             let mut state = SettingsState::new();
-            assert_eq!(state.config.provider_endpoint, None, "case {name}: unset");
+            // The snapshot is process-global and another test may have just settled an endpoint
+            // row, so the case starts from the state it asserts — no custom endpoint, no key —
+            // rather than waiting for a lock this test does not share.
+            state.config.provider_endpoint = None;
+            state.config.provider_endpoint_key = None;
             assert!(!state.custom_revealed, "case {name}: closed");
             assert!(
                 state.routing_group().is_some(),
                 "case {name}: routing shown"
             );
-
             // ON reveals only: nothing persisted, no settle armed, the snapshot untouched.
             let _task = state.update(SettingsMessage::CustomEndpointToggle(true));
             assert!(state.custom_revealed, "case {name}: ON reveals");
-            assert_eq!(state.config.provider_endpoint, None, "case {name}: ON");
+            assert!(
+                !state.custom_endpoint_active_ui(),
+                "case {name}: ON persists nothing"
+            );
             assert!(!state.field_gen.contains_key(ep), "case {name}: no settle");
 
             if let Some(url) = staged {

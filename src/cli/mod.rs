@@ -52,11 +52,14 @@ Usage:
   mahbot bench-openrouter <args>
                          Standalone OpenRouter provider benchmark
   mahbot config <operation> [flags]
-                         Set the RUNNING product up: one command for the model
-                         provider, the Telegram bot and the owner, plus users,
-                         tool grants, web search, custom roles
+                         Read and write the RUNNING product's settings, set it up
+                         in one command, and manage its users, tool grants, web
+                         search and custom roles; 'mahbot config reference' lists
+                         every action and field
   mahbot workspace <operation> [flags]
-                         Work with the RUNNING product's workspaces and tickets
+                         Work with the RUNNING product's workspaces, their
+                         tickets and board, and each workspace's own settings;
+                         'mahbot workspace reference' lists every action and field
   mahbot send [flags]    Hand one message to an agent and finish — the answer
                          arrives later in your assistant's conversation, or
                          nothing does when the addressee is one-way
@@ -216,13 +219,13 @@ impl Exit {
 pub(crate) struct Family {
     pub(crate) word: &'static str,
     pub(crate) tool: &'static str,
-    /// The protocol value this family's operation frames carry: the generation of
-    /// the surface it needs. A family whose surface has not changed carries
-    /// [`CALL_STORE_BASE`](crate::db::ipc::CALL_STORE_BASE) and keeps working
-    /// against a product one build behind; a family added since, or one whose
-    /// surface gained arguments an older product would ignore, carries a newer
-    /// value, so a product that does not know it refuses the call as the
-    /// environment's class instead of misanswering it (see [`crate::db::ipc`]).
+    /// The protocol value this family's operation frames carry: the generation of the
+    /// surface it needs. A family whose surface has not changed since a generation the
+    /// channel already serves carries that generation's value and keeps working against
+    /// a product one build behind; a family added since, or one whose surface gained
+    /// arguments an older product would ignore, carries a newer value, so a product that
+    /// does not know it refuses the call as the environment's class instead of
+    /// misanswering it (see [`crate::db::ipc`]).
     pub(crate) protocol: &'static str,
     /// One line for `mahbot -h`, and the family's own help opening on it.
     pub(crate) purpose: &'static str,
@@ -357,8 +360,8 @@ pub(crate) struct Flag {
 /// kinds that say so ([`Self::has_file_form`]) — `@<file>` IS what that file
 /// holds. A kind whose value names a path also RESOLVES it (see [`caller_path`]):
 /// a `Path` its one value, a `PathList` every entry, a `Structured` every string
-/// the fields it carries name — and an `UncheckedPath` and an `Output` too, minus
-/// the proof that the path is there.
+/// the fields it carries name, a `Directory` its one folder — and an
+/// `UncheckedPath` and an `Output` too, minus the proof that the path is there.
 pub(crate) enum FlagKind {
     /// One value per occurrence: `--name bob`, read as text or — like the kinds
     /// below — taken from a FILE by writing `@<file>`.
@@ -378,6 +381,12 @@ pub(crate) enum FlagKind {
     /// whether it is usable is the tool's to judge.
     /// No `@<file>` form: the value already names the path.
     UncheckedPath,
+    /// One DIRECTORY per occurrence (`--path ./proj`): resolved exactly as
+    /// [`Path`](Self::Path) is, and it must be there — the folder a workspace is
+    /// asked to manage is one that exists, so a typo is the caller's misuse here
+    /// rather than a product-side "no such folder".
+    /// No `@<file>` form: the value names the folder.
+    Directory,
     /// One NUMBER per occurrence (`--duration 8`). A value that is no JSON number
     /// travels as the text it is, so the tool's own refusal — not this
     /// frontend's — is what the caller gets: whether a value is acceptable is the
@@ -455,10 +464,59 @@ pub(crate) const FAMILIES: &[Family] = &[
     Family {
         word: "config",
         tool: "mahbot_config",
-        protocol: crate::db::ipc::CALL_STORE_BASE,
-        purpose: "Set the running product up — its model provider and Telegram bot in one \
-                  command, plus its users and their tool grants, web search, custom roles",
+        // Both families whose surface this build widened carry the settings generation: a product
+        // built before it knows neither the settings actions nor the arguments they carry, and
+        // would answer a `set` as an unknown action — so it is refused as an unknown store
+        // instead, with nothing run.
+        protocol: crate::db::ipc::CALL_STORE_SETTINGS,
+        purpose: "Read and write the running product's settings — provider and endpoint, models, \
+                  media, web search, Telegram, audio, updates, accounts, grants, custom roles — \
+                  and set it all up in one command",
         surface: Surface::Operations(&[
+            Operation {
+                action: Some("reference"),
+                purpose: "Print every action and field of this surface, and of the workspace \
+                          settings — the same text `mahbot workspace reference` prints",
+                flags: &[],
+            },
+            Operation {
+                action: Some("about"),
+                purpose: "Print the product's own README — what this system is, for a machine you \
+                          are new to",
+                flags: &[],
+            },
+            Operation {
+                action: Some("get"),
+                purpose: "Read one setting's effective value, whole",
+                flags: &[Flag {
+                    arg: "setting",
+                    kind: FlagKind::Value,
+                    purpose: "The setting's name — `reference` lists every one; a credential \
+                              answers only that it is set, with a hint",
+                }],
+            },
+            Operation {
+                action: Some("list"),
+                purpose: "Summarise every setting's effective value — a long value is clipped; \
+                          credentials left out",
+                flags: &[],
+            },
+            Operation {
+                action: Some("set"),
+                purpose: "Change one setting; the new value is in use at once, with no restart",
+                flags: &[
+                    Flag {
+                        arg: "setting",
+                        kind: FlagKind::Value,
+                        purpose: "The setting to change — `reference` lists every one",
+                    },
+                    Flag {
+                        arg: "value",
+                        kind: FlagKind::Value,
+                        purpose: "Its new value; write `@file` to read a credential from a file",
+                    },
+                ],
+            },
             Operation {
                 action: Some(crate::setup::ACTION),
                 purpose: "Set the whole product up in one run — the model provider, the Telegram \
@@ -480,6 +538,12 @@ pub(crate) const FAMILIES: &[Family] = &[
                         kind: FlagKind::Value,
                         purpose: "The custom endpoint's own key; write `@file` to read it from a \
                                   file",
+                    },
+                    Flag {
+                        arg: "clear_provider_endpoint",
+                        kind: FlagKind::Present,
+                        purpose: "Go back to OpenRouter's own endpoint; the custom key goes with \
+                                  it",
                     },
                     Flag {
                         arg: "telegram_token",
@@ -511,17 +575,25 @@ pub(crate) const FAMILIES: &[Family] = &[
             },
             Operation {
                 action: Some("bind_telegram"),
-                purpose: "Bind your own Telegram account, so the bot's messages reach you",
-                flags: &[Flag {
-                    arg: "handle",
-                    kind: FlagKind::Value,
-                    purpose: "Your Telegram username or your numeric id — write './@name' for the \
-                              '@' spelling, which otherwise names a file",
-                }],
+                purpose: "Bind a Telegram account — your own, or a guest named with --user",
+                flags: &[
+                    Flag {
+                        arg: "handle",
+                        kind: FlagKind::Value,
+                        purpose: "Their Telegram username or numeric id — write './@name' for the \
+                                  '@' spelling, which otherwise names a file",
+                    },
+                    USER_FLAG,
+                ],
+            },
+            Operation {
+                action: Some("unbind_telegram"),
+                purpose: "Remove an account's Telegram binding",
+                flags: &[USER_FLAG],
             },
             Operation {
                 action: Some("add_user"),
-                purpose: "Create a guest account and bind its Telegram account",
+                purpose: "Create a guest account and, when a Telegram account is named, bind it",
                 flags: &[
                     Flag {
                         arg: "name",
@@ -532,10 +604,21 @@ pub(crate) const FAMILIES: &[Family] = &[
                     Flag {
                         arg: "telegram",
                         kind: FlagKind::Value,
-                        purpose: "Their Telegram username or their numeric id — write './@name' \
-                                  for the '@' spelling, which otherwise names a file",
+                        purpose: "Their Telegram username or their numeric id — omit it to create \
+                                  an account with no binding yet; write './@name' for the '@' \
+                                  spelling, which otherwise names a file",
                     },
                 ],
+            },
+            Operation {
+                action: Some("delete_user"),
+                purpose: "Delete a guest account",
+                flags: &[USER_FLAG],
+            },
+            Operation {
+                action: Some("list_users"),
+                purpose: "List the accounts and their Telegram bindings",
+                flags: &[],
             },
             Operation {
                 action: Some("setup_web_search"),
@@ -649,9 +732,19 @@ pub(crate) const FAMILIES: &[Family] = &[
     Family {
         word: "workspace",
         tool: "workspace",
-        protocol: crate::db::ipc::CALL_STORE_BASE,
-        purpose: "Work with the running product's workspaces, their tickets and their board",
+        // Its surface gained the workspace's own settings and project actions — see
+        // [`CALL_STORE_SETTINGS`](crate::db::ipc::CALL_STORE_SETTINGS).
+        protocol: crate::db::ipc::CALL_STORE_SETTINGS,
+        purpose: "Work with the running product's workspaces — add, delete or re-analyse one, \
+                  its commands and rules, the active project and its maintenance — plus their \
+                  tickets and board",
         surface: Surface::Operations(&[
+            Operation {
+                action: Some("reference"),
+                purpose: "Print every action and field of this surface, and of the product's \
+                          settings — the same text `mahbot config reference` prints",
+                flags: &[],
+            },
             Operation {
                 action: Some("list"),
                 purpose: "List the managed workspaces",
@@ -659,6 +752,15 @@ pub(crate) const FAMILIES: &[Family] = &[
                     arg: "workspace",
                     kind: FlagKind::Value,
                     purpose: "One managed workspace; omit it to list every one",
+                }],
+            },
+            Operation {
+                action: Some("show"),
+                purpose: "Show one managed workspace: its path, status, rules and commands",
+                flags: &[Flag {
+                    arg: "workspace",
+                    kind: FlagKind::Value,
+                    purpose: "The managed workspace to show",
                 }],
             },
             Operation {
@@ -673,10 +775,23 @@ pub(crate) const FAMILIES: &[Family] = &[
                     },
                     Flag {
                         arg: "path",
-                        kind: FlagKind::Value,
-                        purpose: "Absolute path to the project directory to add",
+                        // A folder, not a reference file: resolved where this command runs and
+                        // proved to be a directory there, so a mistyped path is refused in the
+                        // caller's own directory.
+                        kind: FlagKind::Directory,
+                        purpose: "Path to the project directory to add",
                     },
                 ],
+            },
+            Operation {
+                action: Some("delete"),
+                purpose: "Stop managing a workspace — its folder, repository and tickets stay on \
+                          disk",
+                flags: &[Flag {
+                    arg: "workspace",
+                    kind: FlagKind::Value,
+                    purpose: "The managed workspace to delete",
+                }],
             },
             // `pause` (and `resume`, which says the same) act on ONE workspace or
             // the whole fleet, told apart by ABSENCE: with no `--workspace` the
@@ -707,6 +822,121 @@ pub(crate) const FAMILIES: &[Family] = &[
                               managed workspace (the fleet-wide resume — a workspace that is \
                               not ready is skipped and left untouched, which makes that result \
                               a partial one)",
+                }],
+            },
+            Operation {
+                action: Some("maintenance"),
+                purpose: "Turn a workspace's background maintainer on or off",
+                flags: &[
+                    Flag {
+                        arg: "workspace",
+                        kind: FlagKind::Value,
+                        purpose: "The managed workspace whose maintainer is set",
+                    },
+                    Flag {
+                        arg: "maintenance",
+                        kind: FlagKind::Present,
+                        purpose: "Run the maintainer; write `--maintenance=false` to stop it",
+                    },
+                ],
+            },
+            Operation {
+                action: Some("rediscover"),
+                purpose: "Re-analyse a workspace's project layout — discovery starts again, and \
+                          the pipeline waits for it",
+                flags: &[Flag {
+                    arg: "workspace",
+                    kind: FlagKind::Value,
+                    purpose: "The managed workspace to re-analyse",
+                }],
+            },
+            Operation {
+                action: Some("rediscover_diagnostics"),
+                purpose: "Re-detect a workspace's diagnostics commands from its project files, \
+                          touching nothing else",
+                flags: &[Flag {
+                    arg: "workspace",
+                    kind: FlagKind::Value,
+                    purpose: "The managed workspace whose commands are re-detected",
+                }],
+            },
+            Operation {
+                action: Some("set_diagnostics"),
+                purpose: "Write a workspace's diagnostics commands by hand",
+                flags: &[
+                    Flag {
+                        arg: "workspace",
+                        kind: FlagKind::Value,
+                        purpose: "The managed workspace whose commands are written",
+                    },
+                    Flag {
+                        arg: "format",
+                        kind: FlagKind::Value,
+                        purpose: "The format command; omit it to keep the stored one, write \
+                                  '--format=' to clear it",
+                    },
+                    Flag {
+                        arg: "format_check",
+                        kind: FlagKind::Value,
+                        purpose: "The format-check command; omit it to keep the stored one, write \
+                                  '--format-check=' to clear it",
+                    },
+                    Flag {
+                        arg: "lint",
+                        kind: FlagKind::Value,
+                        purpose: "The lint command; omit it to keep the stored one, write \
+                                  '--lint=' to clear it",
+                    },
+                    Flag {
+                        arg: "lint_fix",
+                        kind: FlagKind::Value,
+                        purpose: "The lint-fix command; omit it to keep the stored one, write \
+                                  '--lint-fix=' to clear it",
+                    },
+                    Flag {
+                        arg: "type_check",
+                        kind: FlagKind::Value,
+                        purpose: "The type-check command; omit it to keep the stored one, write \
+                                  '--type-check=' to clear it",
+                    },
+                    Flag {
+                        arg: "build",
+                        kind: FlagKind::Value,
+                        purpose: "The build command; omit it to keep the stored one, write \
+                                  '--build=' to clear it",
+                    },
+                    Flag {
+                        arg: "unit_test",
+                        kind: FlagKind::Value,
+                        purpose: "The unit-test command; omit it to keep the stored one, write \
+                                  '--unit-test=' to clear it",
+                    },
+                ],
+            },
+            Operation {
+                action: Some("set_rules"),
+                purpose: "Write a workspace's project rules, which every agent there is told",
+                flags: &[
+                    Flag {
+                        arg: "workspace",
+                        kind: FlagKind::Value,
+                        purpose: "The managed workspace whose rules are written",
+                    },
+                    Flag {
+                        arg: "rules",
+                        kind: FlagKind::Value,
+                        purpose: "The rules text; write `@file` to read it from a file — an \
+                                  empty value clears them",
+                    },
+                ],
+            },
+            Operation {
+                action: Some("use"),
+                purpose: "Make a workspace the active project",
+                flags: &[Flag {
+                    arg: "workspace",
+                    kind: FlagKind::Value,
+                    purpose: "The managed workspace to make active",
                 }],
             },
             Operation {
@@ -1483,8 +1713,8 @@ const PHOTOCRAFT_TIFF_LAYERS_FLAG: Flag = Flag {
     purpose: "Keep layers in TIFF output — a `format` of tif or tiff keeps them anyway",
 };
 
-/// The `user` argument of the grant actions, shared by `grant-tool` and
-/// `revoke-tool` so the two cannot describe it differently.
+/// The `user` argument of the account actions, shared by `bind-telegram`, `unbind-telegram`,
+/// `delete-user`, `grant-tool` and `revoke-tool` so the five cannot describe it differently.
 const USER_FLAG: Flag = Flag {
     arg: "user",
     kind: FlagKind::Value,
@@ -1682,6 +1912,7 @@ fn parse_flags(
             FlagKind::Value
             | FlagKind::Path
             | FlagKind::UncheckedPath
+            | FlagKind::Directory
             | FlagKind::Output
             | FlagKind::Number
             | FlagKind::List
@@ -1745,6 +1976,12 @@ fn take_value(
         }
         FlagKind::UncheckedPath | FlagKind::Output => {
             args.insert(arg, serde_json::Value::String(resolved_path(value)));
+        }
+        FlagKind::Directory => {
+            args.insert(
+                arg,
+                serde_json::Value::String(caller_directory(flag, value)?),
+            );
         }
         FlagKind::Number => {
             args.insert(arg, number_or_text(value));
@@ -1872,6 +2109,26 @@ fn caller_path(flag: &Flag, value: &str) -> Result<String, String> {
         return Err(unreadable(&spelling));
     }
     Ok(path)
+}
+
+/// A DIRECTORY a flag names, as the caller meant it and checked: resolved like every path
+/// ([`resolve_against_cwd`]), and it must be there and be a directory — a folder the caller
+/// mistyped is their misuse, judged from metadata alone before anything is sent.
+fn caller_directory(flag: &Flag, value: &str) -> Result<String, String> {
+    if names_no_path(value) {
+        return Ok(value.to_string());
+    }
+    let path = resolve_against_cwd(value);
+    let spelling = flag_spelling(flag.arg);
+    match std::fs::metadata(&path) {
+        Ok(meta) if meta.is_dir() => Ok(path),
+        Ok(_) => Err(format!(
+            "flag '--{spelling}' names something that is not a directory"
+        )),
+        Err(_) => Err(format!(
+            "flag '--{spelling}' names a directory that is not there"
+        )),
+    }
 }
 
 /// Resolve every reference file a structured value names under one of `fields` (a
@@ -2012,12 +2269,24 @@ const EXIT_CLASS_HELP: &str = "\nExit codes:\n  0  the operation was carried out
      own answer on stdout, so only the code says whether the operation happened.\n";
 
 /// What one of these command lines IS — shared by every help, so a caller entering
-/// through an operation's help learns the same contract as one reading the family's.
-const RUNNING_CONTRACT_HELP: &str = "\nA frontend onto the RUNNING product, acting with the \
-     owner's authority and with no agent session behind it: the operation is carried into the \
-     instance that is already up and the product itself runs it there — the same validation, and \
-     the same immediate effect (a value it writes is in use at once, with no restart). The product \
-     must be running: there is no way to run these operations against its stores directly.\n";
+/// through an operation's help learns the same contract as one reading the family's. `excepted`
+/// qualifies the sentence that asks for the instance, and is empty where every operation crosses to
+/// it: a family that prints a text itself states the exception there, not in a line below it.
+fn running_contract_help(excepted: &str) -> String {
+    format!(
+        "\nA frontend onto the RUNNING product, acting with the \
+         owner's authority and with no agent session behind it: the operation is carried into the \
+         instance that is already up and the product itself runs it there — the same validation, and \
+         the same immediate effect (a value it writes is in use at once, with no restart). The product \
+         must be running{excepted}: there is no way to run these operations against its stores directly.\n"
+    )
+}
+
+/// What a static-text operation's help says instead of the running contract: this command answers
+/// it itself ([`StaticText`]), so nothing about it depends on the product being up.
+const LOCAL_TEXT_CONTRACT_HELP: &str = "\nA text this command carries itself, printed word for \
+     word: it needs no running instance, no lock and no source tree, and the tool of the same \
+     surface returns the same text.\n";
 
 /// Where the two streams go — shared by every help, like the contract blocks.
 const OUTPUT_HELP: &str = "\nOutput:\n  stdout  the product's answer, word for word\n  stderr  \
@@ -2054,17 +2323,39 @@ fn producing_help() -> String {
     out
 }
 
-/// `mahbot <word> -h`: what this family's command line is and what a caller reads.
+/// `mahbot <word> -h`: what this family's command line is and what a caller reads. A family that
+/// publishes a `reference` closes on where its whole surface is written down. The texts it prints
+/// itself ([`StaticText`]) are excepted in the sentence that asks for the instance, so no line of
+/// this help claims one they do not need.
 fn family_help(family: &Family) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "mahbot {} — {}", family.word, family.purpose);
-    out.push_str(RUNNING_CONTRACT_HELP);
     match family.surface {
         Surface::Operations(operations) => {
-            let _ = writeln!(
+            // Named from the operation list alone: the help must not load either text to say
+            // which operations skip the instance.
+            let static_texts: Vec<String> = operations
+                .iter()
+                .filter_map(static_text)
+                .map(|text| format!("`{}`", text.action()))
+                .collect();
+            let excepted = match static_texts.as_slice() {
+                [] => String::new(),
+                [only] => format!(
+                    " for everything but {only}, which it prints itself and answers with no instance"
+                ),
+                many => format!(
+                    " for everything but the texts it prints itself, {}, which it answers with no \
+                     instance",
+                    many.join(" and ")
+                ),
+            };
+            out.push_str(&running_contract_help(&excepted));
+            let _ = write!(
                 out,
-                "\nEvery operation below is carried out inside the product, by the same code the \
-                 owner's assistant runs — so this command line brings no behaviour of its own."
+                "\nEvery operation below that crosses to the product is carried out there, by the \
+                 same code the owner's assistant runs — so this command line brings no behaviour of \
+                 its own."
             );
             let _ = write!(out, "\nUsage: {}\n", family_syntax(family));
             out.push_str("\nOperations:\n");
@@ -2095,6 +2386,7 @@ fn family_help(family: &Family) -> String {
         }
         // The family word IS the operation: no operation list below.
         Surface::Standalone(flags) => {
+            out.push_str(&running_contract_help(""));
             let _ = write!(out, "\nUsage: {}\n", family_syntax(family));
             if produces_files(family) {
                 out.push_str(&producing_help());
@@ -2107,7 +2399,28 @@ fn family_help(family: &Family) -> String {
     out.push_str(EXIT_CLASS_HELP);
     out.push_str(OUTPUT_HELP);
     out.push_str(VALUE_FILE_HELP);
+    // Where the whole surface is written down: the asset a `reference` operation prints, here and
+    // with no instance behind it. The hint names `reference` because that is the operation it
+    // means — another locally printed text is not one.
+    if publishes_reference(family) {
+        let _ = writeln!(
+            out,
+            "\nEvery action and field in full: run 'mahbot {} reference'.",
+            family.word
+        );
+    }
     out
+}
+
+/// Whether `family` has a `reference` operation — the text its help closes by naming.
+fn publishes_reference(family: &Family) -> bool {
+    matches!(
+        family.surface,
+        Surface::Operations(operations)
+            if operations
+                .iter()
+                .any(|operation| operation.action == Some(REFERENCE))
+    )
 }
 
 /// A flag's purpose with the shared vocabulary filled in, from the rules themselves,
@@ -2129,7 +2442,10 @@ fn flag_rows<'a>(flags: impl IntoIterator<Item = &'a Flag>) -> String {
             let mut spelling = format!("--{}", flag_spelling(flag.arg));
             match flag.kind {
                 FlagKind::Value => spelling.push_str(" <value>"),
-                FlagKind::Path | FlagKind::UncheckedPath | FlagKind::Output => {
+                FlagKind::Path
+                | FlagKind::UncheckedPath
+                | FlagKind::Directory
+                | FlagKind::Output => {
                     spelling.push_str(" <path>");
                 }
                 FlagKind::Number => spelling.push_str(" <number>"),
@@ -2169,8 +2485,9 @@ fn flag_table(flags: &[Flag]) -> String {
     flag_rows(flags)
 }
 
-/// `mahbot <word> <operation> -h`: what one operation does and the flags it takes —
-/// plus the same contract the family help states, since a caller may enter here.
+/// `mahbot <word> <operation> -h`: what one operation does and the flags it takes — plus the
+/// contract that operation really has, since a caller may enter here: the running product for
+/// one carried to it, this command's own answer for a static text.
 fn operation_help(family: &Family, operation: &Operation) -> String {
     let word = operation_word(family, operation);
     let mut out = String::new();
@@ -2189,11 +2506,70 @@ fn operation_help(family: &Family, operation: &Operation) -> String {
     }
     out.push_str("\nFlags:\n");
     out.push_str(&flag_table(operation.flags));
-    out.push_str(RUNNING_CONTRACT_HELP);
+    // A static text is answered here, so the running contract would promise an instance this
+    // operation never asks for.
+    let contract = if static_text(operation).is_some() {
+        LOCAL_TEXT_CONTRACT_HELP.to_string()
+    } else {
+        running_contract_help("")
+    };
+    out.push_str(&contract);
     out.push_str(EXIT_CLASS_HELP);
     out.push_str(OUTPUT_HELP);
     out.push_str(VALUE_FILE_HELP);
     out
+}
+
+/// The action whose answer is static text this command prints itself, the way it prints its own
+/// help: the one embedded reference asset ([`crate::settings::reference`]), which names every
+/// action and field of both settings surfaces.
+const REFERENCE: &str = "reference";
+
+/// The action that answers with the product's own README ([`crate::settings::about`]): what the
+/// system is, for an assistant that has just met it on another machine.
+const ABOUT: &str = "about";
+
+/// The texts this command answers itself, the way it prints its own help.
+#[derive(Clone, Copy)]
+enum StaticText {
+    Reference,
+    About,
+}
+
+impl StaticText {
+    /// The action that publishes this text.
+    const fn action(self) -> &'static str {
+        match self {
+            Self::Reference => REFERENCE,
+            Self::About => ABOUT,
+        }
+    }
+
+    /// The text itself. Both are static, so printing them here is what makes the terminal's bytes
+    /// and the tool's the same, and what lets them answer with the product stopped or absent.
+    fn text(self) -> &'static str {
+        match self {
+            Self::Reference => crate::settings::reference(),
+            Self::About => crate::settings::about(),
+        }
+    }
+}
+
+/// The static text `operation` answers with — `None` for every operation carried to the running
+/// product. The operation itself decides: an answer must not depend on a word elsewhere, or a
+/// renamed family would route a text through the instance and fail for want of one.
+fn static_text(operation: &Operation) -> Option<StaticText> {
+    match operation.action? {
+        REFERENCE => Some(StaticText::Reference),
+        ABOUT => Some(StaticText::About),
+        _ => None,
+    }
+}
+
+/// What a static text is printed as: its own bytes without the one trailing line break, which
+/// [`crate::util::print_stdout`] puts back — so stdout carries the shipped text verbatim.
+fn printed_line(text: &str) -> &str {
+    text.strip_suffix('\n').unwrap_or(text)
 }
 
 /// Run one family's command line, returning the process exit code.
@@ -2221,7 +2597,17 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
                 return misuse(family, &format!("unknown operation '{named}'"));
             };
             match parse_flags(operation.action, named, operation.flags, &args[1..]) {
-                Ok(Tail::Call(parsed)) => (parsed, operation.flags),
+                Ok(Tail::Call(parsed)) => {
+                    // Static text — the reference or the README — is answered HERE, the way `-h`
+                    // is: no storage root, no lock and no call, and both routes print the same
+                    // bytes. The printer's own line break is the one the text already ends with, so
+                    // it is neither doubled nor run into the next prompt.
+                    if let Some(text) = static_text(operation) {
+                        crate::util::print_stdout(printed_line(text.text()));
+                        return Exit::Ok.code();
+                    }
+                    (parsed, operation.flags)
+                }
                 // A `-h` where a flag could stand is this operation's help — the rule
                 // the browser-automation command follows too, turning a would-be usage
                 // error into help. Where a VALUE stands it is that value instead (see
@@ -2674,20 +3060,6 @@ mod tests {
             .collect()
     }
 
-    /// The actions a tool publishes to the command line only. The Assistant's schema is what a model
-    /// may call, so an action the tool refuses everywhere else ([`crate::setup::ACTION`]) is
-    /// reachable from the terminal alone. Pinned rather than read back from a second schema: the
-    /// tool's own schema is the statement, and
-    /// [`command_line_only_actions_are_absent_from_the_assistants_schema`] holds this list to it.
-    const COMMAND_LINE_ONLY_ACTIONS: &[(&str, &str)] = &[("mahbot_config", crate::setup::ACTION)];
-
-    /// Whether this operation's action is one the tool publishes to the command line only.
-    fn command_line_only(family: &Family, operation: &Operation) -> bool {
-        operation
-            .action
-            .is_some_and(|action| COMMAND_LINE_ONLY_ACTIONS.contains(&(family.tool, action)))
-    }
-
     /// Whether a tool's actions declare their OWN arguments (`oneOf`) rather than
     /// sharing one set beside the action (`enum`): only the former sweeps per
     /// operation, the latter stating its arguments once for every action.
@@ -2698,25 +3070,17 @@ mod tests {
     }
 
     /// The arguments one command line can fill: the tool's whole top-level set, or —
-    /// where actions declare their own — the action's entry plus those beside it. `None` for an
-    /// action only the command line publishes: its arguments are the command line's own, and
-    /// [`crate::setup::tests::the_terminal_flags_are_exactly_what_the_parser_reads`] holds them to
-    /// the parser that reads them.
+    /// where actions declare their own — the action's entry plus those beside it.
     fn argument_schema(
         family: &Family,
         operation: &Operation,
-    ) -> Option<serde_json::Map<String, serde_json::Value>> {
-        if command_line_only(family, operation) {
-            return None;
-        }
+    ) -> serde_json::Map<String, serde_json::Value> {
         // The reader is no tool action: its arguments are the two inputs the reading takes.
         if operation.action == Some(DOCUMENT_READ) {
-            return Some(
-                ["path", "file_name"]
-                    .into_iter()
-                    .map(|name| (name.to_string(), serde_json::json!({ "type": "string" })))
-                    .collect(),
-            );
+            return ["path", "file_name"]
+                .into_iter()
+                .map(|name| (name.to_string(), serde_json::json!({ "type": "string" })))
+                .collect();
         }
         let schema = tool_schema(family.tool);
         let top = schema["properties"]
@@ -2724,12 +3088,12 @@ mod tests {
             .expect("the tool's properties")
             .clone();
         let Some(action) = operation.action else {
-            return Some(top);
+            return top;
         };
         // An enum-shaped action states only WHICH action runs: its arguments
         // stand beside it at the tool's top level.
         if !declares_per_action_arguments(family.tool) {
-            return Some(top.into_iter().filter(|(key, _)| key != "action").collect());
+            return top.into_iter().filter(|(key, _)| key != "action").collect();
         }
         let entries = schema["properties"]["action"]["oneOf"]
             .as_array()
@@ -2760,7 +3124,7 @@ mod tests {
             .filter(|(key, _)| key != "action" && !per_action.contains(&key.as_str()))
             .collect();
         args.extend(declared.clone());
-        Some(args)
+        args
     }
 
     /// The words appearing more than once in `words` — a registry bug equality hides.
@@ -2878,9 +3242,8 @@ mod tests {
     /// The command line and the tools must agree on what exists, in both directions:
     /// an operation the tool cannot run, an action the command line cannot reach, a
     /// duplicate on either side. A tool taking no `action` has none in the registry
-    /// either; an action only the command line may use is pinned in
-    /// [`COMMAND_LINE_ONLY_ACTIONS`]; the one operation no tool action backs is pinned
-    /// separately ([`the_reader_is_the_one_operation_no_tool_backs`]).
+    /// either; the one operation no tool action backs is pinned separately
+    /// ([`the_reader_is_the_one_operation_no_tool_backs`]).
     #[test]
     fn operations_match_the_tools_own_actions() {
         for family in FAMILIES {
@@ -2923,14 +3286,9 @@ mod tests {
                 duplicates(theirs.iter().copied()).is_empty(),
                 "'{tool}' repeats an action"
             );
-            // The command line's own surface is the Assistant's plus the actions only it may use.
+            // The command line's surface is the tool's own, action for action — no exception
+            // left but the reader, which is filtered out above and pinned in its own test.
             let mut theirs: Vec<String> = theirs.into_iter().map(str::to_string).collect();
-            theirs.extend(
-                COMMAND_LINE_ONLY_ACTIONS
-                    .iter()
-                    .filter(|(owner, _)| *owner == tool)
-                    .map(|(_, action)| (*action).to_string()),
-            );
             let mut ours: Vec<String> = taken.into_iter().map(str::to_string).collect();
             ours.sort_unstable();
             theirs.sort_unstable();
@@ -2977,23 +3335,34 @@ mod tests {
         );
     }
 
-    /// A pinned command-line-only action is really absent from the Assistant's schema — that
-    /// absence is the whole reason the pin exists, since the tool refuses the action everywhere
-    /// else — and the command line really exposes it.
+    /// A static operation is answered by this command itself — the embedded asset or the README,
+    /// printed the way `-h` is printed, so both routes serve the bytes the product ships. Every
+    /// other operation is carried to the running product.
     #[test]
-    fn command_line_only_actions_are_absent_from_the_assistants_schema() {
-        for (tool, action) in COMMAND_LINE_ONLY_ACTIONS {
-            assert!(
-                !tool_actions(&tool_schema(tool)).contains(action),
-                "'{tool}' publishes '{action}' to the Assistant, so it is not command-line only"
+    fn static_operations_print_the_embedded_text_locally() {
+        // The README is the config family's alone; the reference is both families'. The shipped
+        // file is the authority: comparing against the loader that reads it would prove only that
+        // the loader is called twice.
+        for (word, action, file) in [
+            ("config", "reference", "src/prompt/config_reference.md"),
+            ("workspace", "reference", "src/prompt/config_reference.md"),
+            ("config", "about", "README.md"),
+        ] {
+            let static_operation = operation(word, action);
+            let Some(text) = static_text(static_operation).map(StaticText::text) else {
+                panic!("'mahbot {word} {action}' must be answered by this command");
+            };
+            let shipped = std::fs::read_to_string(format!("{}/{file}", env!("CARGO_MANIFEST_DIR")))
+                .unwrap_or_else(|e| panic!("the shipped {file}: {e}"));
+            // What the printer is handed, so its own line break does not enter the comparison.
+            assert_eq!(
+                printed_line(text),
+                printed_line(&shipped),
+                "'mahbot {word} {action}' prints the shipped text, whole"
             );
             assert!(
-                FAMILIES.iter().any(|family| {
-                    family.tool == *tool
-                        && matches!(family.surface, Surface::Operations(operations)
-                            if operations.iter().any(|operation| operation.action == Some(action)))
-                }),
-                "no 'mahbot' operation runs '{action}' of '{tool}'"
+                static_operation.flags.is_empty(),
+                "'mahbot {word} {action}' takes no flag: the text is the whole answer"
             );
         }
     }
@@ -3064,9 +3433,11 @@ mod tests {
     fn fillable_types(kind: &FlagKind) -> &'static [&'static str] {
         match kind {
             // One string, so it fills a string argument — a path being one it resolves.
-            FlagKind::Value | FlagKind::Path | FlagKind::UncheckedPath | FlagKind::Output => {
-                &["string"]
-            }
+            FlagKind::Value
+            | FlagKind::Path
+            | FlagKind::UncheckedPath
+            | FlagKind::Directory
+            | FlagKind::Output => &["string"],
             FlagKind::Number => &["integer", "number"],
             // Entries, as an array — each one a path for a path list.
             FlagKind::List | FlagKind::PathList => &["array"],
@@ -3084,6 +3455,7 @@ mod tests {
             FlagKind::Value => "Value",
             FlagKind::Path => "Path",
             FlagKind::UncheckedPath => "UncheckedPath",
+            FlagKind::Directory => "Directory",
             FlagKind::Output => "Output",
             FlagKind::Number => "Number",
             FlagKind::List => "List",
@@ -3159,20 +3531,16 @@ mod tests {
         names
     }
 
-    /// The command lines of one family, as the ties sweep them: name, tool, arguments, flags. An
-    /// operation whose action the tool publishes to the command line only has no tool-declared
-    /// argument set to tie its flags to; `crate::setup`'s own test holds those to the parser.
+    /// The command lines of one family, as the ties sweep them: name, tool, arguments, flags.
     fn command_lines(family: &'static Family) -> Vec<CommandLine> {
         match family.surface {
             Surface::Operations(operations) => operations
                 .iter()
-                .filter_map(|operation| {
-                    Some(CommandLine {
-                        called: format!("{} {}", family.word, operation_word(family, operation)),
-                        tool: family.tool,
-                        arguments: argument_schema(family, operation)?,
-                        flags: operation.flags,
-                    })
+                .map(|operation| CommandLine {
+                    called: format!("{} {}", family.word, operation_word(family, operation)),
+                    tool: family.tool,
+                    arguments: argument_schema(family, operation),
+                    flags: operation.flags,
                 })
                 .collect(),
             Surface::Standalone(flags) => {
@@ -3190,9 +3558,9 @@ mod tests {
         }
     }
 
-    /// No operation repeats a flag. Swept over the registry itself rather than the tie below, so an
-    /// operation whose action the tool publishes only to the command line — which has no
-    /// tool-declared argument set to tie them to — is held to it too.
+    /// No operation repeats a flag. Swept over the registry itself rather than through the tie
+    /// below, so every operation is held to it — the tie judges a flag against the tool's own
+    /// arguments, which an operation need not have.
     #[test]
     fn no_operation_repeats_a_flag() {
         for family in FAMILIES {
@@ -3424,6 +3792,25 @@ mod tests {
             vec!["photocraft"],
             "the family added after the channel had served its second generation"
         );
+        let settings: Vec<&str> = FAMILIES
+            .iter()
+            .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE_SETTINGS)
+            .map(|cli| cli.word)
+            .collect();
+        assert_eq!(
+            settings,
+            vec!["config", "workspace"],
+            "the two families whose surface this build widened — a product built before them \
+             would answer a `set` as an unknown action and drop a `set_diagnostics` field"
+        );
+        // The base generation is served but carried by no family any more: a frontend one build
+        // behind still sends it, so the listener must keep answering it.
+        assert!(
+            FAMILIES
+                .iter()
+                .all(|cli| cli.protocol != crate::db::ipc::CALL_STORE_BASE),
+            "the base generation is served for older frontends only"
+        );
     }
 
     /// The instance serves a tool by NAME only when a family publishes it, so the
@@ -3439,20 +3826,63 @@ mod tests {
         }
     }
 
-    /// Both helps carry the whole contract — the product must be running, these
-    /// commands act with the owner's authority, and the exit classes — so a caller
-    /// entering through an operation's help learns no less. A standalone family has
-    /// no operation help, so its family help carries the usage line and every flag row.
+    /// A help states the contract its operation really has and the exit classes: the running
+    /// product for one carried to it, this command's own answer for a static text.
+    fn assert_help_contract(help: &str, is_static: bool) {
+        assert!(
+            !help.contains("{{"),
+            "a help placeholder was not expanded:\n{help}"
+        );
+        for required in [
+            "Exit codes:",
+            "0  the operation was carried out",
+            "3  this command was misused",
+            "Output:",
+        ] {
+            assert!(
+                help.contains(required),
+                "'{required}' is missing from:\n{help}"
+            );
+        }
+        // A static text is printed here and must not claim a running product.
+        if is_static {
+            assert!(
+                help.contains("needs no running instance"),
+                "a static text's help must say it needs no instance:\n{help}"
+            );
+            assert!(
+                !help.contains("must be running"),
+                "a static text's help must not claim a running product:\n{help}"
+            );
+        } else {
+            for required in ["must be running", "owner's authority"] {
+                assert!(
+                    help.contains(required),
+                    "'{required}' is missing from:\n{help}"
+                );
+            }
+        }
+    }
+
+    /// Both helps carry the whole contract — a running product, these commands acting with
+    /// the owner's authority, the exit classes — so a caller entering through an
+    /// operation's help learns no less. A static text is the exception on both: its own help
+    /// states that this command answers it, and the family help excepts it where it states
+    /// the contract, so neither claims an instance the text does not need. A standalone
+    /// family has no operation help, so its family help carries the usage line and every
+    /// flag row. The family help also closes by naming the detailed help where the family
+    /// publishes a `reference`, and says nothing of one where it does not.
     #[test]
-    fn every_help_states_the_running_product_and_the_exit_classes() {
+    fn every_help_states_the_contract_it_really_has_and_the_exit_classes() {
         for family in FAMILIES {
             let helps = match family.surface {
-                Surface::Operations(operations) => std::iter::once(family_help(family))
-                    .chain(
-                        operations
-                            .iter()
-                            .map(|operation| operation_help(family, operation)),
-                    )
+                Surface::Operations(operations) => std::iter::once((false, family_help(family)))
+                    .chain(operations.iter().map(|operation| {
+                        (
+                            static_text(operation).is_some(),
+                            operation_help(family, operation),
+                        )
+                    }))
                     .collect(),
                 Surface::Standalone(flags) => {
                     let help = family_help(family);
@@ -3465,27 +3895,54 @@ mod tests {
                             "'{spelling}' has no row in:\n{help}"
                         );
                     }
-                    vec![help]
+                    vec![(false, help)]
                 }
             };
-            for help in &helps {
-                assert!(
-                    !help.contains("{{"),
-                    "a help placeholder was not expanded:\n{help}"
+            for (is_static, help) in &helps {
+                assert_help_contract(help, *is_static);
+            }
+            // The family help states the exception in the sentence that claims the instance: a
+            // claim with a static text in the list, contradicted a paragraph later, is false.
+            if let Surface::Operations(operations) = family.surface {
+                let has_static = operations
+                    .iter()
+                    .any(|operation| static_text(operation).is_some());
+                let claim = helps[0]
+                    .1
+                    .split("\n\n")
+                    .find(|paragraph| paragraph.contains("must be running"))
+                    .unwrap_or_default();
+                assert_eq!(
+                    claim.contains("answers with no instance"),
+                    has_static,
+                    "'mahbot {}': the texts it prints itself must be excepted where the contract is \
+                     stated, not a paragraph later:\n{}",
+                    family.word,
+                    helps[0].1
                 );
-                for required in [
-                    "must be running",
-                    "owner's authority",
-                    "Exit codes:",
-                    "0  the operation was carried out",
-                    "3  this command was misused",
-                    "Output:",
-                ] {
-                    assert!(
-                        help.contains(required),
-                        "'{required}' is missing from:\n{help}"
-                    );
-                }
+            }
+            let helps: Vec<&String> = helps.iter().map(|(_, help)| help).collect();
+            // The family help closes by naming the detailed help where the family publishes one:
+            // the same asset its `reference` operation prints, so a caller reading the operation
+            // list learns where every action and field is written down.
+            let closing = format!(
+                "Every action and field in full: run 'mahbot {} reference'.",
+                family.word
+            );
+            if publishes_reference(family) {
+                assert!(
+                    helps[0].lines().last() == Some(closing.as_str()),
+                    "'mahbot {}' must close its help with '{closing}', got:\n{}",
+                    family.word,
+                    helps[0]
+                );
+            } else {
+                assert!(
+                    !helps[0].contains(&closing),
+                    "'mahbot {}' publishes no reference, so its help must not name one:\n{}",
+                    family.word,
+                    helps[0]
+                );
             }
             // A producing family states the destination wherever it applies: the family help always,
             // and an operation's own help exactly when that operation carries one — an operation

@@ -509,7 +509,7 @@ mod tests {
     /// endpoint can be configured before its server is reachable. Port 1 →
     /// immediate connection refused — fast, no external network.
     #[tokio::test]
-    #[serial_test::serial(config_persist, provider)] // snapshots/restores the process-global PROVIDER singleton
+    #[serial_test::serial(config_persist, provider)] // the persist rebuilds the process-global PROVIDER
     async fn test_persist_settled_unreachable_custom_endpoint_saves_with_warning() {
         crate::util::test::init_test_stores().await;
         let store = crate::config_db::store();
@@ -517,9 +517,8 @@ mod tests {
         let _ = store.delete_kv("provider_endpoint_key").await;
         // Restore the global CONFIG on exit: the persist below mutates it.
         let original = crate::config::CONFIG.snapshot();
-        // The persist path rebuilds the provider singleton too — snapshot it
-        // so the test leaves the process global untouched.
-        let prev_provider = crate::providers::snapshot_provider_for_test();
+        // The persist rebuilds the provider singleton too; the guard leaves it as it found it.
+        let _provider = crate::util::test::ProviderSnapshot::take();
 
         let outcome = crate::config::persist_settled_string_field(
             "provider_endpoint",
@@ -544,11 +543,9 @@ mod tests {
             "saved despite being unreachable"
         );
 
-        // Clean up the shared store and restore the global CONFIG + provider
-        // singleton.
+        // Clean up the shared store and restore the global CONFIG.
         let _ = store.delete_kv("provider_endpoint").await;
         let _ = store.delete_kv("provider_endpoint_key").await;
         crate::config::CONFIG.swap(original);
-        crate::providers::restore_provider_for_test(prev_provider);
     }
 }

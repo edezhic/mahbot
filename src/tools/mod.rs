@@ -274,6 +274,38 @@ pub(crate) fn tool_params_schema(
     schema
 }
 
+/// Refuse an argument the tool's own schema does not declare, naming the reference action.
+///
+/// A guessed field name is a mistake worth naming rather than ignoring: the call would otherwise
+/// silently do less than it asked for. `null` is exempt, because a provider may pad omitted
+/// arguments with nulls. The schema is the only list of what a tool accepts, so this cannot
+/// drift from it.
+///
+/// # Errors
+///
+/// The call names a field the schema's `properties` does not declare and gives it a non-null value.
+pub(crate) fn refuse_unknown_fields(
+    schema: &serde_json::Value,
+    args: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let Some(object) = args.as_object() else {
+        return Ok(());
+    };
+    let declared = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+    for (key, value) in object {
+        if value.is_null() || declared.is_some_and(|declared| declared.contains_key(key)) {
+            continue;
+        }
+        anyhow::bail!(
+            "unknown field '{key}' — the `reference` action of this tool lists every action and \
+             field it accepts"
+        );
+    }
+    Ok(())
+}
+
 /// Build one `oneOf` action entry: the name wrapped in the object envelope with
 /// `"additionalProperties": false` that the chrome and computer action schemas use.
 #[must_use]
@@ -1792,6 +1824,37 @@ mod tests {
     use crate::Tool;
     use crate::workspace::test_ws_named;
     use tempfile::TempDir;
+
+    /// The guard reads the schema's `properties` and refuses a guessed field by naming the
+    /// reference, leaves `null` padding alone, and refuses everything when the schema declares no
+    /// field to compare against.
+    #[test]
+    fn a_guessed_field_is_refused_by_name() {
+        let flat = tool_params_schema(
+            &serde_json::json!({ "action": {}, "path": {} }),
+            &["action"],
+        );
+        refuse_unknown_fields(&flat, &serde_json::json!({ "action": "read", "path": "a" }))
+            .expect("both fields are declared");
+        refuse_unknown_fields(&flat, &serde_json::json!({ "path": null, "folder": null }))
+            .expect("a provider may pad an omitted argument with null");
+
+        let err = refuse_unknown_fields(&flat, &serde_json::json!({ "folder": "a" }))
+            .expect_err("a guessed field is refused");
+        assert!(
+            err.to_string().contains("`reference` action"),
+            "the refusal says where the list is: {err}"
+        );
+
+        // A schema with no `properties` declares nothing, so every field is a guess.
+        let none = serde_json::json!({ "type": "object" });
+        assert!(
+            refuse_unknown_fields(&none, &serde_json::json!({ "action": "read" })).is_err(),
+            "a schema with no field to compare against refuses them all"
+        );
+        refuse_unknown_fields(&none, &serde_json::json!({ "action": null }))
+            .expect("null padding is exempt whatever the schema declares");
+    }
 
     #[test]
     fn failure_feedback_bounds_the_argument_preview_it_shows() {

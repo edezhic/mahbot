@@ -1385,7 +1385,7 @@ impl PipelineCtx {
             command_buffer: Vec::new(),
             silence_sample_count: 0,
             enrollment_mode: false,
-            auto_start_pending: CONFIG.voice_enabled().as_deref() == Some("true"),
+            auto_start_pending: crate::config::flag_opt_in(CONFIG.voice_enabled().as_deref()),
             last_model_retry: None,
             collecting_negatives: false,
             refractory_until: None,
