@@ -64,8 +64,9 @@ iced_term = "0.8.0"
 # same series. The family it depends on rides the same release, held by Cargo.lock.
 mahbot-inference = "=0.2.18-mahbot.3"
 # Microphone capture (`crate::audio::voice`): the platform's own host API —
-# CoreAudio, WASAPI, ALSA. The ALSA backend needs `libasound2-dev` (pkg-config
-# `alsa`) to build on Linux.
+# CoreAudio, WASAPI, ALSA. The ALSA backend's bindings come from the vendored
+# `alsa-sys` shim (`[patch.crates-io]` below), which commits them, so building on
+# Linux needs no ALSA headers.
 cpal = "0.18"
 # The wake word's voice-activity detector (the recogniser's own lives in the inference
 # crate).
@@ -438,11 +439,12 @@ http = "1.5"
 serial_test = "4"
 
 [patch.crates-io]
-# `alsa` 0.11 asks for `alsa-sys` 0.4, whose build script links `libasound` at load. The shim
-# keeps the package name and version — so no dependency or source change is needed — generates
-# the same bindings from the system header at build time, and resolves every symbol through
-# `dlopen`. The result: the file starts on a server without libasound and reports voice
-# unavailable, while a host that has it gets the same audio as before.
+# `alsa` 0.11 asks for `alsa-sys` 0.4, whose build script links `libasound` at load. The shim keeps
+# the package name and version — so no dependency or source change is needed — compiles the published
+# bindings committed in `vendor/alsa-sys-dlopen/src/generated.rs`, and resolves every symbol through
+# `dlopen`. The result: the file starts on a server without libasound and reports voice unavailable,
+# while a host that has it gets the same audio as before. The surface is committed rather than read
+# from the build machine's headers, so every machine compiles the same one.
 alsa-sys = { path = "vendor/alsa-sys-dlopen" }
 
 [profile.dev]

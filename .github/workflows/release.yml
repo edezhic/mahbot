@@ -67,7 +67,11 @@
 # registry never took must not look successful.
 #
 # `scripts/linux-cross-check.sh` and `scripts/windows-cross-check.sh` are local
-# manual gates, unrelated to this pipeline and not wired into it.
+# manual gates, unrelated to this pipeline and not wired into it. The Linux one is
+# how a Linux-only build failure is seen before a tag spends the version, since
+# nothing here compiles for Linux before the tag: it covers both targets, because
+# aarch64 fails where x86_64 does not, and needs no ALSA headers and no binding
+# toolchain — the audio shim commits its bindings.
 
 name: Release
 
@@ -176,10 +180,10 @@ jobs:
       - uses: actions/checkout@v4
 
       # The GUI stack's dependencies probe for these. The base itself is the image,
-      # so the file links against the glibc that image ships. `libasound2-dev` is ALSA's
-      # own headers and `libclang-dev` is what the audio shim's bindgen needs: the shim
-      # generates the bindings at build time and loads `libasound` on first use, so the
-      # file does not name it as a loader dependency and a bare server starts without it.
+      # so the file links against the glibc that image ships. No ALSA package is here:
+      # the audio shim commits its bindings (`vendor/alsa-sys-dlopen`) and loads
+      # `libasound` on first use, so this build reads no ALSA header and the file does
+      # not name the library as a loader dependency — a bare server starts without it.
       # `binutils` is what reads that list back off the built file below.
       - name: Install the Linux build prerequisites
         if: runner.os == 'Linux'
@@ -187,7 +191,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config ca-certificates curl binutils \
-            libasound2-dev libclang-dev clang \
             libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libfontconfig1-dev
 
       # `turso_sdk_kit`'s build script compiles a VERSIONINFO resource with `rc.exe`
@@ -423,14 +426,18 @@ jobs:
       - name: Install the toolchain
         uses: dtolnay/rust-toolchain@1.99.1
 
-      # Verification links the same Linux libraries the build legs install; the audio
-      # shim's bindgen needs the ALSA headers and libclang too.
+      # Verification links the same Linux libraries the build legs install, and it is
+      # the one job that still needs ALSA's own headers: the packaged crate cannot
+      # carry the vendored shim (it is excluded, and `[patch]` is stripped when
+      # packaging), so the registry `alsa-sys` is rebuilt here and its build script
+      # probes pkg-config for `alsa`. The compiler is not needed for that — no build in
+      # this pipeline runs a binding generator any more.
       - name: Install the Linux build prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential pkg-config ca-certificates curl \
-            libasound2-dev libclang-dev clang \
+            libasound2-dev \
             libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libfontconfig1-dev
 
       - name: Publish

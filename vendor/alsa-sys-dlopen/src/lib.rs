@@ -12,25 +12,28 @@
 //! soname itself (`mahbot::audio::library_available`) because the published package replaces this
 //! shim with the registry crate, which has no such function.
 //!
-//! The bindings are generated at build time from `<alsa/asoundlib.h>` with the allowlist the
-//! published `alsa-sys` uses — nothing here is a maintained copy of its source. The only
-//! hand-written items are the header macros `bindgen` does not emit, below.
+//! `src/generated.rs` holds the bindings themselves, committed rather than generated: they are the
+//! published `alsa-sys` 0.4.0 bindings — the surface the last release that linked the library
+//! shipped — with each `extern "C"` declaration replaced by its `dlopen` wrapper. Freezing them is
+//! what makes this crate compile the same on every machine: a build that reads
+//! `<alsa/asoundlib.h>` compiles whatever vintage that header is, and the release image's is older
+//! than the `alsa` crate expects. `regenerate.rs` is the transform, run by hand through
+//! `regenerate.sh` when the audio crate moves; it is not part of the build.
+// The bindings are bindgen's own spelling, and they are generated code: the naming lints and the
+// clippy families that a generated surface cannot satisfy are allowed rather than rewritten.
 #![allow(
     non_camel_case_types,
     non_snake_case,
-    non_upper_case_globals,
-    dead_code,
-    improper_ctypes,
     clippy::all,
     clippy::pedantic
 )]
 
 use libc::{pid_t, pollfd, timespec, timeval, FILE};
 
-include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+include!("generated.rs");
 
-// Header macros: `bindgen` emits functions and types, not the `#define`s the `alsa` crate names.
-// The values are the header's own, kept here because a macro has no symbol to look up.
+// Header macros: the published bindings carry functions and types, not the `#define`s the `alsa`
+// crate names. The values are the header's own, kept here because a macro has no symbol to look up.
 pub const SND_PCM_NONBLOCK: core::ffi::c_int = 0x1;
 pub const SND_PCM_ASYNC: core::ffi::c_int = 0x2;
 

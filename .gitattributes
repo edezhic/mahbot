@@ -29,3 +29,9 @@
 # and `mahbot config about`, so a checkout that rewrites its endings would ship text the
 # repository does not hold — the same rule as the prompt texts above.
 /README.md text eol=lf
+
+# The vendored audio shim commits its bindings (`vendor/alsa-sys-dlopen/src/generated.rs`)
+# instead of generating them, and they are compiled exactly as committed on every platform:
+# `regenerate.sh` reproduces them byte for byte from one pinned input. A checkout that
+# rewrote their endings would compile a surface the repository does not hold.
+/vendor/** text eol=lf
