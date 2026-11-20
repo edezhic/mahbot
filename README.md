@@ -4,7 +4,7 @@
 
 # MahBot
 
-Mahbot(i.e. __my bot__) is an agentic system that automates coding, design and office work, while also providing adaptive setup for your custom integrations and workflows. Batteries included:
+Mahbot(i.e. __my bot__) is an agentic system that automates coding, office work and design, while also providing adaptive setup for your custom integrations and workflows. Batteries included:
 
 - __One to rule them all__ assistant for automations, research, prototyping, and many other purposes
 - __Others to help him out__ specialized and custom agents that the assistant can delegate tasks to and remain responsive for any volume of your requests
@@ -29,13 +29,11 @@ On Windows (PowerShell):
 irm https://raw.githubusercontent.com/edezhic/mahbot/main/install.ps1 | iex
 ```
 
-This script will install the latest release and start it for you, and hand your terminal
-back while the product keeps running: anything it prints while starting lands in
-`~/.mahbot/daemon.log`. Further updates will be installed & restarted automatically, with graceful pause&resume and very little downtime for your agents. After the install mahbot asks you to provide one of:
+After the install mahbot asks you to provide one of:
 - OpenRouter API key, or
 - a custom OpenAI-compatible endpoint
 
-The rest of the onboarding will be explained and done through the assistant.
+The rest of the onboarding will be explained and done through the assistant. Further updates will be installed & applied automatically, with graceful pause&resume and very little downtime for your agents.
 
 ## Running as a service (Linux servers)
 
@@ -74,22 +72,6 @@ maintainer on or off. The assistant in the bot can do all of it too, and can exp
 left to set up. A host with a display gets the window from the same install instead, at login,
 with the same service behaviour underneath: the same updates, the same pause and resume.
 
-A host whose display exists but cannot be used runs the same service alone with
-`MAHBOT_HEADLESS=1` in its environment: the window is skipped, everything else is unchanged, and
-the service's own log says so once. A host with no display needs no such setting.
-
-# Host requirements
-
-- Linux with glibc 2.35 or newer, or macOS 14 or newer — the released files are built against
-  exactly those floors
-- a local filesystem for `~/.mahbot`: the databases and files live there, and network storage is
-  not supported
-- one operating-system user per machine — the data, the service and the registration are that
-  account's
-- no inbound network ports: MahBot talks out to its model provider and to Telegram, and Telegram
-  delivers your messages to it
-- for voice only, the audio library (`libasound2` on Linux) — the service itself does not need it
-
 # Software development
 
 Mahbot treats software engineering as a managed pipeline, not a chat session: you drop a request to your assistant about any of the projects while it orchestrates other agents to clarify the details and only escalates real product decisions to you.
@@ -110,10 +92,10 @@ Every request/ticket has a lifecycle with **redundant checks**:
 | **→ Development** | Engineer implements the ticket (or the required fixes) |
 | **→ Verification** | Deterministic checks with code reviewers and a tester |
 | **→ Sanitation** | Audit untracked/new files in the working tree |
-| **→ Done** | Auto git commit of the ticket's title behind its label (`[feat] `, `[fix] ` or `[maint] `) |
+| **→ Done** | Auto git commit of the ticket's title & label |
 
 Circuit breaker pauses the work if a ticket goes through too many bounces, escalates to the manager and he handles from there.
 
 # Command line
 
-MahBot's capabilities are also available from a terminal, so your own scripts and custom tools can use them: manage accounts, users, custom-tool grants and custom roles; list and add managed workspaces, pause or resume a pipeline, read the board or a ticket and comment on it; hand a message to any agent role; read a document with your assistant's own reader — a PDF, a Word, Excel or PowerPoint file (modern or old binary), or any other file — its full text and every image it produces written into a folder of their own; produce documents (Word, Excel, PowerPoint and PDF — creating, filling your own template, editing, merging, splitting, rotating, cropping, resizing, rendering pages, filling forms), pictures and video; edit an existing photograph deterministically with PhotoCraft's own engine — crop, resize, rotate, convert formats (HEIC included), adjust colour and tone, sharpen, work on layers of a PSD or TIFF, batch a folder, and inspect a file's size, mode, depth and layers; transcribe speech and turn text into audio; drive the browser you are already logged in to; and run read-only queries against MahBot's own live stores with `mahbot debug`. Produced files land where you ask and nothing you already have is overwritten. Most commands work against the running product; speech, the browser and debug work on their own. Every command reports its outcome in its exit code; run `mahbot -h`, then `<command> -h`, for the operations and flags.
+MahBot's capabilities are also available from a terminal, so your own scripts and custom tools can use them: manage accounts, users, custom-tool grants and custom roles; list and add managed workspaces, pause or resume a pipeline, read the board or a ticket and comment on it; hand a message to any agent role; read a document with your assistant's own reader — a PDF, a Word, Excel or PowerPoint file (modern or old binary), or any other file — its full text and every image it produces written into a folder of their own; produce documents (Word, Excel, PowerPoint and PDF — creating, filling your own template, editing, merging, splitting, rotating, cropping, resizing, rendering pages, filling forms), pictures and video; edit an existing photograph deterministically — crop, resize, rotate, convert formats, adjust colour and tone, sharpen, work on layers and many more; transcribe speech and turn text into audio; drive the browser you are already logged in to; and run read-only queries against MahBot's own live stores with `mahbot debug`. Produced files land where you ask and nothing you already have is overwritten. Most commands work against the running product; speech, the browser and debug work on their own. Every command reports its outcome in its exit code; run `mahbot -h`, then `<command> -h`, for the operations and flags.
