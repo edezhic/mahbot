@@ -241,13 +241,14 @@ use crate::tools::{
     GetTicketTool, HyperframesTool, ImageGenTool, ListAutomationsTool, ListTicketsTool,
     MahbotConfigTool, MahbotDebugTool, PhotocraftTool, RasterizeTool, ReadTool,
     RemoveAutomationTool, ReportGapTool, SearchArchivedTicketsTool, SearchTool, SendTool,
-    ShellMode, ShellTool, SleepTool, UpdateTicketTool, VideoGenTool, WebSearchTool, WorkspaceTool,
+    ShellMode, ShellTool, ShowTabTool, SleepTool, UpdateTicketTool, VideoGenTool, WebSearchTool,
+    WorkspaceTool,
 };
 
 /// Tools in the admin Assistant's set that a custom role is never offered or built: the `computer`
-/// surface and the `say` voice are the administrator's Assistant's alone. A stored entry naming one
-/// stays on the record and builds nothing.
-const CUSTOM_ROLE_WITHHELD_TOOLS: &[&str] = &["computer", "say"];
+/// surface, the `say` voice and the `show_tab` raise are the administrator's Assistant's alone. A
+/// stored entry naming one stays on the record and builds nothing.
+const CUSTOM_ROLE_WITHHELD_TOOLS: &[&str] = &["computer", "say", "show_tab"];
 
 impl Role {
     /// Core read/search tools — plus the shell in `shell` mode when one is requested — for the
@@ -289,10 +290,10 @@ impl Role {
 
     /// The Assistant's static core tool set: the admin's own minus `web_search` ([`Role::tools`]
     /// appends that afterwards), plus the guest-only `files` and `report_gap`. `is_admin` widens it
-    /// with the admin-only shell, send, computer, config, pipeline and voice tools, and narrows it
-    /// in two places — `files`, which exists only because a guest has no shell, and `report_gap`,
-    /// the guest's only route to the owner. A custom role's derivation starts from this set minus
-    /// [`CUSTOM_ROLE_WITHHELD_TOOLS`].
+    /// with the admin-only shell, send, computer, browser-raise, config, pipeline and voice tools,
+    /// and narrows it in two places — `files`, which exists only because a guest has no shell, and
+    /// `report_gap`, the guest's only route to the owner. A custom role's derivation starts from
+    /// this set minus [`CUSTOM_ROLE_WITHHELD_TOOLS`].
     fn assistant_core_tools(is_admin: bool) -> Vec<Box<dyn Tool>> {
         // The optional `place` argument belongs to the admin's Assistant: a guest's round always
         // runs in its own workspace, and a custom role's dispatch tools come from its own grants.
@@ -352,6 +353,11 @@ impl Role {
             // widening; on macOS the privacy grants belong to the terminal the daemon runs from and
             // are requested per call. A custom role is never offered it.
             t.push(Box::new(ComputerTool));
+            // Raising a browser tab takes the owner's focus, and no CLI verb could carry it: a
+            // command-line verb would be open to anything that can run a command. So it stays with
+            // the admin's Assistant like `computer`, and the chrome tool never holds it because an
+            // analyst's tool reaches guest workspaces and has no identity to refuse on.
+            t.push(Box::new(ShowTabTool));
             // The admin's settings surface: `mahbot_config` (every setting, the setup, accounts,
             // grants and custom roles) and the read-only DB query tool.
             t.push(Box::new(MahbotConfigTool));
@@ -380,10 +386,11 @@ impl Role {
     /// Build the tool set for this role. Ticket tools are bound to `ws` at construction — every
     /// operation is confined to it, except that the archive search spans the installation and
     /// `get_ticket` opens a prefixed ID from any workspace. `is_admin` widens the Assistant's set
-    /// with `shell`, `send`, `computer`, `mahbot_config`, `mahbot_debug`, `workspace` and (on
-    /// macOS) `say`, and removes the guest-only `files` and `report_gap`; every other role's set is
-    /// byte-identical whatever its value. `computer` is offered where the platform can serve it and
-    /// `say` where the speech engine lives — [`Tool::is_advertised`] decides the rest.
+    /// with `shell`, `send`, `computer`, `show_tab`, `mahbot_config`, `mahbot_debug`, `workspace`
+    /// and `say`, and removes the guest-only `files` and `report_gap`; every other role's set is
+    /// byte-identical whatever its value. [`Tool::is_advertised`] then drops a tool this machine
+    /// cannot serve: `computer` without a supported platform backend, `document` and `hyperframes`
+    /// without the bun runtime, `chrome` and `show_tab` while the browser daemon is down.
     /// `chrome_sessions` is the run-scoped tracker shared with the agent's `ChromeTool`, so every
     /// session the run opens is handed to the run-end release queue.
     #[must_use]
@@ -993,6 +1000,7 @@ mod tests {
             ("report_gap", guest_assistant),
             ("sleep", assistant_or_manager),
             ("say", admin_assistant),
+            ("show_tab", admin_assistant),
         ];
         for (name, may_hold) in rules {
             for role in Role::iter() {
@@ -1014,6 +1022,10 @@ mod tests {
         assert!(
             !Role::custom_role_tool_catalog().contains(&"say"),
             "a custom role must not be offered the voice"
+        );
+        assert!(
+            !Role::custom_role_tool_catalog().contains(&"show_tab"),
+            "a custom role must not be offered the browser raise"
         );
         assert!(
             Role::custom_role_tool_catalog().contains(&"photocraft"),

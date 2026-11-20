@@ -46,9 +46,10 @@ use crate::chrome::spawn::{
     spawn_cli,
 };
 use crate::chrome::{
-    CHROME_USE_DECLARED_BUDGET, CHROME_USE_OWN_BUDGET, CLI_EPHEMERAL_PREFIX, CLI_SESSION_PREFIX,
-    ChromeCallClocks, CliRecovery, DEFAULT_OPEN_TIMEOUT, DEFAULT_STEP_TIMEOUT, KILL_SLACK,
-    SESSION_STOP_TIMEOUT, clocks, is_blank_page_url, kill_bound, probe_clocks,
+    CHROME_USE_DECLARED_BUDGET, CHROME_USE_OWN_BUDGET, CLI_EPHEMERAL_PREFIX, ChromeCallClocks,
+    CliRecovery, DEFAULT_OPEN_TIMEOUT, DEFAULT_STEP_TIMEOUT, KILL_SLACK, SESSION_STOP_TIMEOUT,
+    clocks, is_blank_page_url, is_protected_session, kill_bound, physical_session_name,
+    probe_clocks,
 };
 use crate::tools::chrome_daemon::{
     CliStatus, SessionRecovery, cli_path, cli_probe, cli_version, ensure_ready_for_actions,
@@ -1520,25 +1521,13 @@ fn parse_limit_flag(flags: &Flags) -> Result<Option<usize>, String> {
 /// `mahbot-chrome-ephemeral-<suffix>`. The value is validated at extraction.
 fn resolve_session(flag: Option<&str>) -> (String, bool) {
     match flag {
-        Some(name) => {
-            let name = if name.starts_with(CLI_SESSION_PREFIX) {
-                name.to_string()
-            } else {
-                format!("{CLI_SESSION_PREFIX}{name}")
-            };
-            (name, false)
-        }
+        Some(name) => (physical_session_name(name), false),
         None => (
             format!("{CLI_EPHEMERAL_PREFIX}{}", crate::generate_suffix()),
             true,
         ),
     }
 }
-
-/// Session namespaces the CLI must never stop without an explicit `--force`: the
-/// interactive tool's per-run sessions and link enrichment's.
-const PROTECTED_SESSION_PREFIXES: [&str; 2] = ["agent-tab-", "link-enricher-"];
-
 /// Validate a caller-supplied session name. It becomes part of a command recipe the
 /// agent is told to run (`session stop <name> --force` in a leftover note), so it is
 /// restricted to chrome-use's own alphabet (`validation::is_valid_session_name`:
@@ -1559,27 +1548,19 @@ fn validate_session_name(name: &str) -> Result<(), String> {
 }
 
 /// Resolve a session name for a session-word subcommand: a bare name is prefixed like
-/// `--session`, while CLI-namespace and protected names pass through as-is (status may
-/// probe protected sessions read-only; only stop gates on `--force`).
+/// `--session`, while another agent's protected namespace passes through as-is (status may probe
+/// protected sessions read-only; only stop gates on `--force`).
 fn resolve_session_target(name: &str) -> String {
-    if name.starts_with(CLI_SESSION_PREFIX)
-        || PROTECTED_SESSION_PREFIXES
-            .iter()
-            .any(|p| name.starts_with(p))
-    {
+    if is_protected_session(name) {
         return name.to_string();
     }
-    format!("{CLI_SESSION_PREFIX}{name}")
+    physical_session_name(name)
 }
 
 /// `session stop` gating on top of [`resolve_session_target`].
 fn resolve_stop_target(name: &str, force: bool) -> Result<String, String> {
     let target = resolve_session_target(name);
-    if !force
-        && PROTECTED_SESSION_PREFIXES
-            .iter()
-            .any(|p| target.starts_with(p))
-    {
+    if !force && is_protected_session(&target) {
         return Err(format!(
             "{name} is not a mahbot-chrome session; pass --force to stop it anyway"
         ));
@@ -3406,7 +3387,7 @@ async fn session_running(path: &std::path::Path, name: &str) -> bool {
     )
     .await
     {
-        Ok(resp) => session_listed(&resp, name),
+        Ok(resp) => resp.lists_session(name),
         Err(_) => false,
     }
 }
@@ -3463,7 +3444,7 @@ async fn session_status(name: &str) -> OutEnvelope {
             );
         }
     };
-    if !session_listed(&list, &target) {
+    if !list.lists_session(&target) {
         return out_env(
             "session",
             true,
@@ -3516,38 +3497,13 @@ async fn session_status(name: &str) -> OutEnvelope {
 /// protected (`agent-tab-*` / `link-enricher-*`) target: the recovery flow's
 /// `session stop <name>` is only actionable with `--force` there. Pure, so tests pin both.
 fn append_protected_stop_note(message: &mut String, target: &str) {
-    if PROTECTED_SESSION_PREFIXES
-        .iter()
-        .any(|p| target.starts_with(p))
-        && is_session_unresponsive_error(message)
-    {
+    if is_protected_session(target) && is_session_unresponsive_error(message) {
         write!(
             message,
             " (protected namespace: stopping '{target}' requires `session stop {target} --force`)"
         )
         .expect("writing to a String cannot fail");
     }
-}
-
-/// Tolerance-first membership check over a `session list` envelope: only an explicit failure
-/// verdict rules the target out. Handles both shapes — latest
-/// `{"ok":true,"sessions":[{"name":..}]}` and legacy `{"data":{"sessions":["name"]}}`.
-fn session_listed(resp: &ChromeResponse, target: &str) -> bool {
-    if resp.verdict() == Some(false) {
-        return false;
-    }
-    let names = resp
-        .extra
-        .get("sessions")
-        .or_else(|| resp.data.as_ref().and_then(|d| d.get("sessions")));
-    let Some(Value::Array(arr)) = names else {
-        return false;
-    };
-    arr.iter().any(|entry| match entry {
-        Value::String(s) => s == target,
-        Value::Object(_) => entry.get("name").and_then(Value::as_str) == Some(target),
-        _ => false,
-    })
 }
 
 /// Best-effort close of an ephemeral session AFTER the envelope — never changes the exit
@@ -4002,50 +3958,6 @@ mod tests {
                     "unknown session subcommand 'destroy' (expected 'stop', 'status' or 'list')"
                 ),
                 "case {case}: unexpected error: {err}"
-            );
-        }
-
-        {
-            let case = "session listed handles both shapes";
-            // Latest shape: the top-level `sessions` array of objects (lands in `extra`).
-            let latest: ChromeResponse = serde_json::from_value(json!({
-                "ok": true, "sessions": [{ "name": "mahbot-chrome-docs" }]
-            }))
-            .expect("deserialize latest shape");
-            assert!(
-                session_listed(&latest, "mahbot-chrome-docs"),
-                "case {case}: the latest shape lists the session"
-            );
-            assert!(
-                !session_listed(&latest, "mahbot-chrome-other"),
-                "case {case}: a name it does not carry is not listed"
-            );
-
-            // Legacy shape: `data.sessions` array of strings.
-            let legacy: ChromeResponse = serde_json::from_value(json!({
-                "success": true, "data": { "sessions": ["mahbot-chrome-docs"] }
-            }))
-            .expect("deserialize legacy shape");
-            assert!(
-                session_listed(&legacy, "mahbot-chrome-docs"),
-                "case {case}: the legacy shape lists the session too"
-            );
-
-            // An explicit failure verdict rules the target out.
-            let failed: ChromeResponse =
-                serde_json::from_value(json!({ "success": false })).expect("deserialize failure");
-            assert!(
-                !session_listed(&failed, "mahbot-chrome-docs"),
-                "case {case}: a failure verdict rules the target out"
-            );
-
-            // No sessions key at all → not listed.
-            let no_sessions: ChromeResponse =
-                serde_json::from_value(json!({ "success": true, "data": {} }))
-                    .expect("deserialize empty payload");
-            assert!(
-                !session_listed(&no_sessions, "mahbot-chrome-docs"),
-                "case {case}: no sessions key lists nothing"
             );
         }
     }

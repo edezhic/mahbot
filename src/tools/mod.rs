@@ -41,6 +41,8 @@ pub(crate) mod search;
 pub(crate) mod search_archived_tickets;
 pub(crate) mod send;
 pub(crate) mod shell;
+// Raises the browser tab the admin's Assistant is working in, in front of the owner's windows.
+pub(crate) mod show_tab;
 pub(crate) mod sleep;
 pub(crate) mod ticket;
 pub(crate) mod video_gen;
@@ -176,6 +178,7 @@ pub(crate) use search::SearchTool;
 pub(crate) use search_archived_tickets::SearchArchivedTicketsTool;
 pub(crate) use send::{Addressee, SendTool};
 pub(crate) use shell::{ShellMode, ShellTool};
+pub(crate) use show_tab::ShowTabTool;
 pub(crate) use sleep::SleepTool;
 pub(crate) use ticket::{
     AddCommentTool, CreateTicketTool, GetTicketTool, ListTicketsTool, UpdateTicketTool,

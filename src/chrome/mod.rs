@@ -65,6 +65,31 @@ pub(crate) mod spawn;
 /// interactive tool keeps `agent-tab-*`; link enrichment keeps `link-enricher-*`.
 pub(crate) const CLI_SESSION_PREFIX: &str = "mahbot-chrome-";
 
+/// Session namespaces the CLI must never stop without an explicit `--force`: the interactive
+/// tool's per-run sessions and link enrichment's.
+const PROTECTED_SESSION_PREFIXES: [&str; 2] = ["agent-tab-", "link-enricher-"];
+
+/// Whether a caller-supplied session name is another agent's (`PROTECTED_SESSION_PREFIXES`).
+/// Checked on the name as given, before [`physical_session_name`] prefixes it — the prefixed
+/// `mahbot-chrome-agent-tab-1` is this CLI's own session, not the interactive tool's.
+#[must_use]
+pub(crate) fn is_protected_session(name: &str) -> bool {
+    PROTECTED_SESSION_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// The physical chrome-use session name a `mahbot chrome --session <name>` invocation creates:
+/// `<name>` prefixed with [`CLI_SESSION_PREFIX`] unless it already carries that prefix.
+#[must_use]
+pub(crate) fn physical_session_name(name: &str) -> String {
+    if name.starts_with(CLI_SESSION_PREFIX) {
+        name.to_string()
+    } else {
+        format!("{CLI_SESSION_PREFIX}{name}")
+    }
+}
+
 /// The margin by which the product's own kill rides above the clock a step runs to: the declared
 /// chrome-side deadline ([`CHROME_USE_DECLARED_BUDGET`] for a verb mahbot forwards no `--timeout`
 /// to, the forwarded deadline otherwise), or the product's own bound for a best-effort sub-step. It
@@ -352,6 +377,22 @@ mod tests {
                 "case {case}: a real page is not an error page"
             );
         }
+    }
+
+    /// A caller's session name becomes the daemon's name with the CLI prefix, once; another
+    /// agent's namespace is recognised on the name as given, before any prefix is applied.
+    #[test]
+    fn session_names_get_the_cli_prefix_once_and_protected_names_are_recognised() {
+        assert_eq!(physical_session_name("docs"), "mahbot-chrome-docs");
+        assert_eq!(
+            physical_session_name("mahbot-chrome-docs"),
+            "mahbot-chrome-docs"
+        );
+        assert!(is_protected_session("agent-tab-1"));
+        assert!(is_protected_session("link-enricher-7"));
+        // A CLI session whose name merely starts like a protected one is our own.
+        assert!(!is_protected_session("mahbot-chrome-agent-tab-1"));
+        assert!(!is_protected_session("docs"));
     }
 
     /// A selector is escaped for a single-quoted JS literal: a backslash is

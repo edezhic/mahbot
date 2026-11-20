@@ -31,7 +31,9 @@
 //! on. A named profile that is not running is brought up as a pre-step with its own bound
 //! ([`BRING_UP_BUDGET`]); only the caller's own call may let the extension open an unfocused window
 //! (`AGENT_BROWSER_OPEN_PROFILE_WINDOW`), never an internal one. A missing or disabled extension is
-//! refused before either path. The product never asks for the focus to move.
+//! refused before either path. Focus is taken only when the admin's Assistant deliberately raises a
+//! tab for the owner (the `show_tab` tool); chrome-use's own profile-window bring-up briefly
+//! foregrounding Chrome is the helper's behaviour, not the product's call.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -280,7 +282,7 @@ pub(crate) async fn prepare(
         return Ok(None);
     }
 
-    let rows = list(cli, Some(session))
+    let rows = list(cli, Some(session), LIST_BOUND)
         .await
         .map_err(Refusal::environment)?;
     let target = match (requested, pinned.clone()) {
@@ -362,7 +364,7 @@ pub(crate) async fn prepare(
         })?;
         // `connect` returns once the relay answered; the list is the helper's own confirmation
         // that the profile is really reachable before the action is dispatched.
-        let confirmed = list(cli, Some(session))
+        let confirmed = list(cli, Some(session), LIST_BOUND)
             .await
             .map_err(Refusal::environment)?;
         if !confirmed
@@ -387,9 +389,11 @@ pub(crate) async fn prepare(
 }
 
 /// The profile that actually served the session, from the helper's own report. `None` when the
-/// helper cannot answer or the session is not bound (yet) — the caller then claims nothing.
-async fn serving(cli: &Path, session: &str) -> Option<Profile> {
-    let rows = list(cli, Some(session)).await.ok()?;
+/// helper cannot answer or the session is not bound (yet) — the caller then claims nothing. `bound`
+/// is the caller's own: one sharing a deadline across a whole action must not let this read spend
+/// the helper's whole list bound.
+pub(crate) async fn of_session(cli: &Path, session: &str, bound: Duration) -> Option<Profile> {
+    let rows = list(cli, Some(session), bound).await.ok()?;
     rows.iter().find(|row| row.session).map(Profile::from_row)
 }
 
@@ -415,7 +419,7 @@ pub(crate) async fn served(
     named: &Profile,
     reader: Reader,
 ) -> Result<Option<Profile>, Refusal> {
-    let Some(actual) = serving(cli, session).await else {
+    let Some(actual) = of_session(cli, session, LIST_BOUND).await else {
         return Ok(None);
     };
     if actual.dir == named.dir {
@@ -579,21 +583,21 @@ fn unreadable_pins() -> Refusal {
     ))
 }
 
-/// Read every Chrome profile the helper knows, optionally asking which one `session` is bound to.
-async fn list(cli: &Path, session: Option<&str>) -> Result<Vec<Row>, String> {
-    let value =
-        crate::tools::chrome_daemon::run_cli_json_at(cli, &["browsers"], session, LIST_BOUND)
-            .await
-            .map_err(|verdict| {
-                // The helper's own error text can name profile accounts; a product-terms reason is
-                // all a refusal needs, and the other legs' texts are factual.
-                match verdict {
-                    crate::tools::chrome_daemon::NoVerdict::Reported(_) => {
-                        "could not list Chrome profiles: the helper refused the read".to_string()
-                    }
-                    other => format!("could not list Chrome profiles: {}", other.text()),
+/// Read every Chrome profile the helper knows, optionally asking which one `session` is bound to,
+/// each helper call bounded by `bound`.
+async fn list(cli: &Path, session: Option<&str>, bound: Duration) -> Result<Vec<Row>, String> {
+    let value = crate::tools::chrome_daemon::run_cli_json_at(cli, &["browsers"], session, bound)
+        .await
+        .map_err(|verdict| {
+            // The helper's own error text can name profile accounts; a product-terms reason is
+            // all a refusal needs, and the other legs' texts are factual.
+            match verdict {
+                crate::tools::chrome_daemon::NoVerdict::Reported(_) => {
+                    "could not list Chrome profiles: the helper refused the read".to_string()
                 }
-            })?;
+                other => format!("could not list Chrome profiles: {}", other.text()),
+            }
+        })?;
     parse_rows(&value).ok_or_else(|| "chrome-use returned no profile list".to_string())
 }
 

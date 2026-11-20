@@ -59,6 +59,41 @@ impl ChromeResponse {
     pub(crate) fn from_value(v: &Value) -> Self {
         serde_json::from_value(v.clone()).unwrap_or_default()
     }
+
+    /// Tolerance-first membership check over a `session list` envelope: only an explicit failure
+    /// verdict rules the target out. Handles both shapes — latest
+    /// `{"ok":true,"sessions":[{"name":..}]}` and legacy `{"data":{"sessions":["name"]}}`.
+    #[must_use]
+    pub(crate) fn lists_session(&self, target: &str) -> bool {
+        if self.verdict() == Some(false) {
+            return false;
+        }
+        let names = self
+            .extra
+            .get("sessions")
+            .or_else(|| self.data.as_ref().and_then(|data| data.get("sessions")));
+        let Some(Value::Array(rows)) = names else {
+            return false;
+        };
+        rows.iter().any(|row| match row {
+            Value::String(name) => name == target,
+            row => row.get("name").and_then(Value::as_str) == Some(target),
+        })
+    }
+}
+
+/// The Chrome tab id one row of a `tab list --all` answer names: the row's own `chromeTabId`, or
+/// the id the relay's `handle` carries (`chrome-tab:<id>`). Any other shape is a row a caller cannot
+/// act on.
+#[must_use]
+pub(crate) fn tab_id_of(row: &Value) -> Option<i64> {
+    row.get("chromeTabId").and_then(Value::as_i64).or_else(|| {
+        row.get("handle")?
+            .as_str()?
+            .strip_prefix("chrome-tab:")?
+            .parse()
+            .ok()
+    })
 }
 
 /// chrome-use's `warning` field — the degraded-success signal for `type` (the page rewrote or
@@ -828,6 +863,38 @@ mod tests {
         let mixed: ChromeResponse =
             serde_json::from_str(r#"{"success":false,"ok":true}"#).expect("tolerant deserialize");
         assert!(!mixed.is_success());
+    }
+
+    /// The `session list` membership reader, over both envelope shapes the helper has used.
+    #[test]
+    fn lists_session_reads_both_session_list_shapes() {
+        // Latest shape: the top-level `sessions` array of objects (lands in `extra`).
+        let latest: ChromeResponse = serde_json::from_value(json!({
+            "ok": true, "sessions": [{ "name": "mahbot-chrome-docs" }]
+        }))
+        .expect("deserialize latest shape");
+        assert!(latest.lists_session("mahbot-chrome-docs"));
+        assert!(!latest.lists_session("mahbot-chrome-other"));
+
+        // Legacy shape: `data.sessions` array of strings.
+        let legacy: ChromeResponse = serde_json::from_value(json!({
+            "success": true, "data": { "sessions": ["mahbot-chrome-docs"] }
+        }))
+        .expect("deserialize legacy shape");
+        assert!(legacy.lists_session("mahbot-chrome-docs"));
+
+        // An explicit failure verdict rules the target out, even when it names sessions.
+        let failed: ChromeResponse = serde_json::from_value(json!({
+            "success": false, "sessions": [{ "name": "mahbot-chrome-docs" }]
+        }))
+        .expect("deserialize failure");
+        assert!(!failed.lists_session("mahbot-chrome-docs"));
+
+        // No sessions key at all lists nothing.
+        let no_sessions: ChromeResponse =
+            serde_json::from_value(json!({ "success": true, "data": {} }))
+                .expect("deserialize empty payload");
+        assert!(!no_sessions.lists_session("mahbot-chrome-docs"));
     }
 
     /// The tolerant parse keeps a leftover process from deciding the call, while an answer the

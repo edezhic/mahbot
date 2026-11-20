@@ -328,7 +328,7 @@ fn own_tabs(envelope: &Value) -> Result<Vec<OwnTab>, NoVerdict> {
 /// One owned row: the id the door takes, the group it sits in (`-1` is Chrome's ungrouped
 /// spelling), and whether the relay says this session created it.
 fn own_tab(row: &Value) -> Result<OwnTab, NoVerdict> {
-    let tab = tab_id_of(row).ok_or(NoVerdict::Unreadable)?;
+    let tab = crate::chrome::contract::tab_id_of(row).ok_or(NoVerdict::Unreadable)?;
     let group = match row.get("groupId") {
         None | Some(Value::Null) => None,
         Some(id) => Some(id.as_i64().ok_or(NoVerdict::Unreadable)?),
@@ -390,18 +390,6 @@ fn groups_of(tabs: &[OwnTab]) -> Vec<i64> {
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
-}
-
-/// The Chrome tab id one row names: the row's own `chromeTabId`, or the id the relay's `handle`
-/// carries (`chrome-tab:<id>`). Any other shape is a row this answer cannot act on.
-fn tab_id_of(row: &Value) -> Option<i64> {
-    row.get("chromeTabId").and_then(Value::as_i64).or_else(|| {
-        row.get("handle")?
-            .as_str()?
-            .strip_prefix("chrome-tab:")?
-            .parse()
-            .ok()
-    })
 }
 
 /// The live state a write is decided from: the title the owner reads, when the answer carries one,
