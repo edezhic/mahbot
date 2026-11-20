@@ -387,6 +387,10 @@ mod tests {
             Some("google-vertex/global"),
             "the image default must be pinned to the provider that serves this region"
         );
+        assert_eq!(
+            media_pin("google/gemini-omni-1.2-flash").as_deref(),
+            Some("google-ai-studio")
+        );
         assert_eq!(media_pin("minimax/hailuo-3").as_deref(), Some("minimax"));
         assert_eq!(
             media_pin("openrouter/auto"),

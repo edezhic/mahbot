@@ -12,8 +12,7 @@ use serde_json::json;
 use std::io::{Read, Seek, SeekFrom};
 
 /// The resolution asked for when the caller names none: sent only to a model whose catalog
-/// declares it, so a fixed-tier model — the `minimax/hailuo-3` default offers 2K alone — is sent
-/// none and keeps the provider's own tier.
+/// declares it, so a fixed-tier model is sent none and keeps the provider's own tier.
 const DEFAULT_RESOLUTION: &str = "720p";
 
 /// Maximum length of the prompt in characters (per-model limits surface via the model nuances).
@@ -47,21 +46,30 @@ const GENERATION_ONLY: &[&str] = &[
 enum VideoModel {
     /// minimax/hailuo-3: 5-15s output, 2K fixed, always audio, no seed.
     Hailuo3,
+    /// google/gemini-omni-1.2-flash: 3-15 s output, 360p-4K, 16:9/9:16, first/last frame anchors,
+    /// audio and seed accepted. Its output envelope is the catalog's; the arm carries the one bound
+    /// the catalog does not state — the input-clip ceiling. Matching is the `gemini-omni-1.2`
+    /// substring, so a future `-1.2` variant classifies here and inherits it; only the flash slug
+    /// is shipped.
+    Omni,
     /// runway/aleph-2: output mirrors input, preserves audio, seed best-effort.
     Aleph2,
     /// bytedance/seedance-2.5: whole-frame restyle, 480p/720p; edits require duration 'auto'.
     Seedance,
     /// bytedance/seedance-2.0-mini: whole-frame restyle; edits accept explicit 4-15s durations.
     SeedanceMini,
-    /// Any other configured model — permissive validation.
+    /// Any other configured model: no hand-verified rules of its own, so only the live catalog's
+    /// declared envelope applies.
     Unknown,
 }
 
 fn classify_model(model: &str) -> VideoModel {
     let m = model.to_ascii_lowercase();
-    // Substring match (not exact) so vendor-prefixed IDs like "minimax/hailuo-3" resolve;
-    // Unknown covers every other model permissively.
-    if m.contains("hailuo") {
+    // Substring match (not exact) so vendor-prefixed IDs like "minimax/hailuo-3" resolve; an
+    // unrecognised model keeps only the catalog-driven checks.
+    if m.contains("gemini-omni-1.2") {
+        VideoModel::Omni
+    } else if m.contains("hailuo") {
         VideoModel::Hailuo3
     } else if m.contains("aleph") {
         VideoModel::Aleph2
@@ -74,23 +82,38 @@ fn classify_model(model: &str) -> VideoModel {
     }
 }
 
+/// A model's input-clip duration bounds in milliseconds — the single table backing the pre-flight
+/// local-clip check. An unbounded side is `None`, so the all-`None` value enforces nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ClipBounds {
+    min_ms: Option<i64>,
+    max_ms: Option<i64>,
+}
+
 impl VideoModel {
-    /// The input-clip duration bounds in milliseconds — the single table backing the pre-flight
-    /// local-clip check.
+    /// The input-clip bounds of the model actually called.
     ///
-    /// `None` fails open: the seedance family trims over-long inputs instead of rejecting them,
-    /// and an unrecognised model lands on the same arm.
-    fn input_duration_limit_ms(self) -> Option<std::ops::RangeInclusive<i64>> {
+    /// An unbounded model yields the all-`None` value and fails open: the seedance family trims
+    /// over-long inputs instead of rejecting them, and an unrecognised model lands on the same arm.
+    fn input_clip_bounds(self) -> ClipBounds {
         match self {
-            // minimax/hailuo-3: 2000–15000 ms per clip (provider and MiniMax docs); the same bound
-            // behind the 50 MB input cap.
-            VideoModel::Hailuo3 => Some(2_000..=15_000),
+            // minimax/hailuo-3: 2–15 s per clip (provider and MiniMax docs).
+            VideoModel::Hailuo3 => ClipBounds {
+                min_ms: Some(2_000),
+                max_ms: Some(15_000),
+            },
+            // google/gemini-omni-1.2-flash: clips up to 15 s, and no source minimum is documented,
+            // so none is enforced — an inferred floor would refuse a clip the provider accepts.
+            VideoModel::Omni => ClipBounds {
+                min_ms: None,
+                max_ms: Some(15_000),
+            },
             // aleph-2 mirrors its input's duration; the seedance models TRIM over-long inputs —
             // never hard-reject; an unrecognised model has no bound.
             VideoModel::Aleph2
             | VideoModel::Seedance
             | VideoModel::SeedanceMini
-            | VideoModel::Unknown => None,
+            | VideoModel::Unknown => ClipBounds::default(),
         }
     }
 }
@@ -113,7 +136,7 @@ pub(crate) fn video_model_nuances(model: &str) -> Option<&'static str> {
             "whole-frame restyle; output 480p/720p via OpenRouter; edit-mode duration \
              is explicit (4-15s, same range as generation)",
         ),
-        VideoModel::Aleph2 | VideoModel::Unknown => None,
+        VideoModel::Aleph2 | VideoModel::Omni | VideoModel::Unknown => None,
     }
 }
 
@@ -153,7 +176,8 @@ struct Request<'a> {
     /// The exact first and/or last frame — present only on [`Shape::Anchors`].
     first_frame: Option<&'a str>,
     last_frame: Option<&'a str>,
-    /// The output length; a fresh generation's range is the catalog's to state.
+    /// The output length: a fresh generation's is measured against the model's declared durations,
+    /// while an edit takes its length from the source clip.
     duration: Option<i64>,
     /// The fresh-generation parameters, refused on the other two shapes.
     resolution: Option<&'a str>,
@@ -259,7 +283,7 @@ impl<'a> Request<'a> {
         if spec == VideoModel::Aleph2 && self.shape != Shape::Generate && image_inputs {
             anyhow::bail!(
                 "aleph-2 does not support image inputs (reference images or frame \
-                 anchors). Retry without images or switch to hailuo-3."
+                 anchors). Retry without images or switch to a model that takes them."
             );
         }
         if spec == VideoModel::Hailuo3 {
@@ -278,6 +302,58 @@ impl<'a> Request<'a> {
             }
         }
         validate_duration(spec, self.shape, self.duration)
+    }
+
+    /// The live catalog's envelope for the model actually called: every output field it declares —
+    /// `aspect_ratio`, `resolution`, `size`, and a fresh generation's `duration`. The provider
+    /// answers an undeclared value with a 400 at submit time, so a declared mismatch is refused
+    /// here, before anything is uploaded or submitted.
+    ///
+    /// The catalog is the only source, and the stance is the same for every field: a field it does
+    /// not declare, a list it declares empty (exactly as [`offers_default`] and the capability block
+    /// read it), and a catalog that cannot answer all refuse nothing — so nothing here can reject a
+    /// value the model actually takes. A refusal names the supported set, so the caller can still
+    /// recover when the snapshot has moved on; the hand-verified per-model rules in
+    /// [`Self::validate`] are what remains without a catalog.
+    ///
+    /// Only a fresh generation is measured against the model's generation range: an edit's length
+    /// comes from its source clip, and an anchor-shaped call is not a fresh generation either.
+    fn validate_declared(&self, model: &str, info: Option<&VideoModelInfo>) -> anyhow::Result<()> {
+        let Some(info) = info else {
+            return Ok(());
+        };
+        for (named, supported, label) in [
+            (
+                self.aspect_ratio,
+                info.aspect_ratios.as_ref(),
+                "aspect_ratio",
+            ),
+            (self.resolution, info.resolutions.as_ref(), "resolution"),
+            (self.size, info.sizes.as_ref(), "size"),
+        ] {
+            if let (Some(named), Some(supported)) = (named, supported)
+                && !supported.is_empty()
+                && !supported.iter().any(|s| s.eq_ignore_ascii_case(named))
+            {
+                anyhow::bail!(
+                    "{model} does not render `{label}: {named}` — it supports {}. Retry with one \
+                     of those, or leave the argument out.",
+                    super::join_capped(supported, super::MAX_LIST_VALUES)
+                );
+            }
+        }
+        if self.shape == Shape::Generate
+            && let (Some(named), Some(supported)) = (self.duration, info.durations.as_ref())
+            && !supported.is_empty()
+            && !supported.contains(&named)
+        {
+            anyhow::bail!(
+                "{model} does not render {named} s clips — it supports {} seconds. Retry with one \
+                 of those, or leave the duration out.",
+                super::format_durations(supported)
+            );
+        }
+        Ok(())
     }
 }
 
@@ -305,8 +381,8 @@ fn ensure_duration_in(
     Ok(())
 }
 
-/// Per-model duration validation: a fresh generation's range is the catalog's to state, and the
-/// seedance-2.5 rule is shape-dependent, so the two decide the arm together.
+/// Per-model duration validation: a fresh generation's range is the catalog's to state, so these
+/// arms are the hand-verified rules for the shapes it does not cover.
 fn validate_duration(spec: VideoModel, shape: Shape, duration: Option<i64>) -> anyhow::Result<()> {
     match (spec, shape) {
         // A fresh generation's range is the catalog's to state, and a seedance-2.5 edit takes
@@ -332,7 +408,8 @@ fn validate_duration(spec: VideoModel, shape: Shape, duration: Option<i64>) -> a
         (VideoModel::Seedance, Shape::Anchors) => {
             ensure_duration_in(duration, 4..=30, "seedance-2.5 image-to-video duration")?;
         }
-        (VideoModel::Unknown, _) => {
+        // No hand-verified range of its own: only the shared positive-integer rule.
+        (VideoModel::Omni | VideoModel::Unknown, _) => {
             if let Some(d) = duration
                 && d <= 0
             {
@@ -447,17 +524,15 @@ async fn resolve_image_input(
 /// Pre-flight input-duration gate for a local clip, run after containment, extension and size
 /// validation and before any upload.
 ///
-/// Hard-rejects only when the active model has a verified input-duration limit AND the parsed
-/// MP4/MOV duration falls outside it. Fails open for everything uncertain: other containers,
-/// fragmented or corrupt files, unreadable metadata, and models without a verified limit.
+/// Hard-rejects only when the model carries a bound (see [`VideoModel::input_clip_bounds`]) and a
+/// parsed MP4/MOV duration falls outside it. Fails open for everything uncertain: other containers,
+/// fragmented or corrupt files, unreadable metadata, and models with no bound.
 fn check_local_input_duration(
     canonical: &std::path::Path,
     model: &str,
     spec: VideoModel,
 ) -> anyhow::Result<()> {
-    let Some(limit_ms) = spec.input_duration_limit_ms() else {
-        return Ok(());
-    };
+    let bounds = spec.input_clip_bounds();
     // Only ISO-BMFF containers carry a readable mvhd duration; the other accepted extensions
     // (webm/mkv/avi) are skipped by design.
     if !crate::util::has_extension(canonical, &["mp4", "mov"]) {
@@ -472,30 +547,27 @@ fn check_local_input_duration(
         );
         return Ok(());
     };
-    if duration_ms > *limit_ms.end() {
-        // Rounded tenths of a second for readability; the exact ms the
-        // provider validates against is stated too.
-        let tenths = (duration_ms + 50) / 100;
+    // Rounded tenths of a second for readability; the exact ms the provider validates against is
+    // stated too.
+    let tenths = (duration_ms + 50) / 100;
+    if let Some(max) = bounds.max_ms
+        && duration_ms > max
+    {
         anyhow::bail!(
             "Source clip duration is {}.{} s ({duration_ms} ms), which exceeds {model}'s \
-             verified input limit of {} ms ({}–{} ms). Trim the clip and retry.",
+             input limit of {max} ms. Trim the clip and retry.",
             tenths / 10,
-            tenths % 10,
-            limit_ms.end(),
-            limit_ms.start(),
-            limit_ms.end()
+            tenths % 10
         );
     }
-    if duration_ms < *limit_ms.start() {
-        let tenths = (duration_ms + 50) / 100;
+    if let Some(min) = bounds.min_ms
+        && duration_ms < min
+    {
         anyhow::bail!(
             "Source clip duration is {}.{} s ({duration_ms} ms), which is below {model}'s \
-             verified input minimum of {} ms ({}–{} ms). Use a longer clip and retry.",
+             input minimum of {min} ms. Use a longer clip and retry.",
             tenths / 10,
-            tenths % 10,
-            limit_ms.start(),
-            limit_ms.start(),
-            limit_ms.end()
+            tenths % 10
         );
     }
     Ok(())
@@ -863,12 +935,15 @@ impl VideoGenTool {
         let spec = classify_model(&model);
         request.validate(spec)?;
 
-        // The catalog only matters to a fresh generation: it states the default resolution tier.
+        // The catalog states a fresh generation's envelope — the four output fields and the default
+        // tier it may take. An edit or an anchor-shaped call names none of those and its length
+        // comes from elsewhere, so neither waits on the fetch.
         let catalog = match request.shape {
             Shape::Generate => super::media_catalog::video::get_catalog().await,
-            Shape::Anchors | Shape::Edit => None,
+            Shape::Edit | Shape::Anchors => None,
         };
         let info = catalog.as_deref().and_then(|catalog| catalog.find(&model));
+        request.validate_declared(&model, info)?;
         let body = request_body(ws, &request, &model, spec, info).await?;
 
         // Video work always targets OpenRouter — a custom chat endpoint never serves video models.
@@ -899,6 +974,22 @@ mod tests {
         }
     }
 
+    /// The fields of gemini-omni-1.2-flash's live catalog entry that the pre-flight reads.
+    fn omni_info() -> VideoModelInfo {
+        VideoModelInfo {
+            resolutions: Some(vec![
+                "360p".into(),
+                "720p".into(),
+                "1080p".into(),
+                "4K".into(),
+            ]),
+            aspect_ratios: Some(vec!["16:9".into(), "9:16".into()]),
+            durations: Some((3..=15).collect()),
+            sizes: Some(vec!["1280x720".into(), "1920x1080".into()]),
+            ..VideoModelInfo::default()
+        }
+    }
+
     fn shape(args: &serde_json::Value) -> Shape {
         Request::parse(args).expect("a valid call").shape
     }
@@ -911,6 +1002,15 @@ mod tests {
 
     #[test]
     fn classify_model_matches_known_and_unknown() {
+        assert_eq!(
+            classify_model("google/gemini-omni-1.2-flash"),
+            VideoModel::Omni
+        );
+        assert_eq!(
+            classify_model("google/gemini-omni-1.2-flash-20261105"),
+            VideoModel::Omni,
+            "the canonical slug resolves too"
+        );
         assert_eq!(classify_model("minimax/hailuo-3"), VideoModel::Hailuo3);
         assert_eq!(classify_model("MINIMAX/HAILUO-3"), VideoModel::Hailuo3);
         assert_eq!(classify_model("runway/aleph-2"), VideoModel::Aleph2);
@@ -1116,9 +1216,11 @@ mod tests {
         // Other models never omit duration.
         assert!(!omit_duration(VideoModel::Hailuo3, Shape::Edit));
         assert!(!omit_duration(VideoModel::Unknown, Shape::Edit));
-        // A fresh generation's duration is the catalog's to bound, never this table's.
+        // A fresh generation's duration is the catalog's to bound for every model, so no model has
+        // a local range there.
         assert!(validate_duration(VideoModel::Hailuo3, Shape::Generate, Some(3)).is_ok());
         assert!(validate_duration(VideoModel::Aleph2, Shape::Generate, Some(8)).is_ok());
+        assert!(validate_duration(VideoModel::Omni, Shape::Generate, Some(2)).is_ok());
     }
 
     fn validated(args: &serde_json::Value, spec: VideoModel) -> anyhow::Result<()> {
@@ -1176,6 +1278,75 @@ mod tests {
                 VideoModel::Unknown
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn the_live_catalog_envelope_refuses_undeclared_values() {
+        let info = omni_info();
+        let omni = "google/gemini-omni-1.2-flash";
+        let declared = |args: &serde_json::Value| {
+            Request::parse(args)
+                .unwrap()
+                .validate_declared(omni, Some(&info))
+        };
+
+        // Every declared field refuses an undeclared value the same way, naming the model and the
+        // supported set. Strings compare case-insensitively.
+        for (args, expected) in [
+            (
+                json!({"prompt": "p", "aspect_ratio": "1:1"}),
+                ["aspect_ratio", "16:9", "9:16"],
+            ),
+            (
+                json!({"prompt": "p", "resolution": "2K"}),
+                ["resolution", "720p", "4K"],
+            ),
+            (
+                json!({"prompt": "p", "size": "640x480"}),
+                ["size", "1280x720", "1920x1080"],
+            ),
+            (
+                json!({"prompt": "p", "duration": 20}),
+                ["duration", "3-15", "leave the duration out"],
+            ),
+        ] {
+            let err = declared(&args).expect_err("undeclared").to_string();
+            for part in [omni].into_iter().chain(expected) {
+                assert!(err.contains(part), "message: {err}");
+            }
+        }
+        assert!(
+            declared(&json!({"prompt": "p", "aspect_ratio": "16:9", "resolution": "4K"})).is_ok(),
+            "a declared value passes"
+        );
+
+        // Fail open: no catalog entry at all, a field the catalog does not declare, and a list it
+        // declares empty — "the catalog states nothing", never "supports nothing".
+        let args = json!({"prompt": "p", "aspect_ratio": "1:1", "resolution": "2K", "size": "640x480",
+                          "duration": 20});
+        let empty = VideoModelInfo {
+            resolutions: Some(Vec::new()),
+            aspect_ratios: Some(Vec::new()),
+            sizes: Some(Vec::new()),
+            durations: Some(Vec::new()),
+            ..VideoModelInfo::default()
+        };
+        for info in [None, Some(VideoModelInfo::default()), Some(empty)] {
+            assert!(
+                Request::parse(&args)
+                    .unwrap()
+                    .validate_declared(omni, info.as_ref())
+                    .is_ok(),
+                "nothing declared refuses nothing"
+            );
+        }
+
+        // Only a fresh generation is measured against the generation range: an edit's length comes
+        // from its source clip.
+        assert!(
+            declared(&json!({"prompt": "p", "video_url": "c.mp4", "duration": 20})).is_ok(),
+            "an edit's duration is not the generation table's to bound"
         );
     }
 
@@ -1253,9 +1424,9 @@ mod tests {
         assert!(body.get("duration").is_none());
     }
 
-    /// The submission carries the model's pinned provider as the videos API's allow-list, and the
-    /// default model's audio/seed behaviour is refused up front instead of by the provider after
-    /// a bill.
+    /// The submission carries the model's pinned provider as the videos API's allow-list, the
+    /// default tier a declaring model offers, and hailuo-3's audio/seed behaviour is refused up
+    /// front instead of by the provider after a bill.
     #[tokio::test]
     async fn a_body_pins_the_provider_and_hailuo_refuses_what_it_rejects() {
         let ws = crate::workspace::test_ws("video-gen-pin");
@@ -1265,6 +1436,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body["provider"], json!({"only": ["minimax"]}));
+        let body = request_body(
+            &ws,
+            &request,
+            "google/gemini-omni-1.2-flash",
+            VideoModel::Omni,
+            Some(&omni_info()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            body["provider"],
+            json!({"only": ["google-ai-studio"]}),
+            "omni's only live endpoint is google-ai-studio"
+        );
+        assert_eq!(
+            body["resolution"], DEFAULT_RESOLUTION,
+            "a declaring model is asked for the default tier"
+        );
         let body = request_body(&ws, &request, "vendor/unpinned", VideoModel::Unknown, None)
             .await
             .unwrap();
@@ -1296,18 +1485,34 @@ mod tests {
     }
 
     #[test]
-    fn input_duration_limit_table_bounds_hailuo3_only() {
-        // Hailuo-3 input clips: 2000–15000 ms.
+    fn input_clip_bounds_cover_only_the_documented_models() {
+        // Hailuo-3 input clips: 2–15 s per the provider's docs.
         assert_eq!(
-            VideoModel::Hailuo3.input_duration_limit_ms(),
-            Some(2_000..=15_000)
+            VideoModel::Hailuo3.input_clip_bounds(),
+            ClipBounds {
+                min_ms: Some(2_000),
+                max_ms: Some(15_000),
+            }
+        );
+        // gemini-omni-1.2-flash: a 15 s ceiling, no documented minimum — an inferred floor would
+        // refuse a clip the provider accepts.
+        assert_eq!(
+            VideoModel::Omni.input_clip_bounds(),
+            ClipBounds {
+                min_ms: None,
+                max_ms: Some(15_000),
+            }
         );
         // Aleph-2 (its output mirrors the input) and the trimming seedance models
         // fail open.
-        assert_eq!(VideoModel::Aleph2.input_duration_limit_ms(), None);
-        assert_eq!(VideoModel::Seedance.input_duration_limit_ms(), None);
-        assert_eq!(VideoModel::SeedanceMini.input_duration_limit_ms(), None);
-        assert_eq!(VideoModel::Unknown.input_duration_limit_ms(), None);
+        for unbounded in [
+            VideoModel::Aleph2,
+            VideoModel::Seedance,
+            VideoModel::SeedanceMini,
+            VideoModel::Unknown,
+        ] {
+            assert_eq!(unbounded.input_clip_bounds(), ClipBounds::default());
+        }
     }
 
     fn box_bytes(box_type: [u8; 4], payload: &[u8]) -> Vec<u8> {
@@ -1457,10 +1662,7 @@ mod tests {
         assert!(msg.contains("35.2 s"), "message: {msg}");
         assert!(msg.contains("35200 ms"), "message: {msg}");
         assert!(msg.contains("minimax/hailuo-3"), "message: {msg}");
-        assert!(
-            msg.contains("2000") && msg.contains("15000"),
-            "message: {msg}"
-        );
+        assert!(msg.contains("15000"), "message: {msg}");
         assert!(msg.contains("exceeds"), "message: {msg}");
         assert!(msg.contains("Trim"), "message: {msg}");
 
@@ -1489,6 +1691,24 @@ mod tests {
         )
         .unwrap();
         assert!(check_local_input_duration(&mov_path, hailuo.0, hailuo.1).is_err());
+
+        // gemini-omni-1.2-flash carries a documented 15 s ceiling: the same over-long clip is
+        // refused with its own name, while a 15 s clip and a 2 s one both pass — no minimum is
+        // documented, so nothing shorter is refused.
+        let omni = ("google/gemini-omni-1.2-flash", VideoModel::Omni);
+        let err = check_local_input_duration(&overlong, omni.0, omni.1).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("google/gemini-omni-1.2-flash") && msg.contains("15000"),
+            "message: {msg}"
+        );
+        let (_dir, omni_max) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 15_000))]);
+        assert!(check_local_input_duration(&omni_max, omni.0, omni.1).is_ok());
+        let (_dir, omni_short) = write_mp4(&[box_bytes(*b"mvhd", &mvhd_payload(0, 1000, 2_500))]);
+        assert!(
+            check_local_input_duration(&omni_short, omni.0, omni.1).is_ok(),
+            "no documented minimum means a short clip is not refused"
+        );
 
         // Unknown model: no check, even for the same over-long clip.
         assert!(

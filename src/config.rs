@@ -89,20 +89,20 @@ const OLD_DEFAULT_WORKER_MODELS: &[&str] = &[
 pub(crate) const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-nano-banana-2.1";
 /// Used by every account with no explicit pick; a stored pick is never rewritten. Every default
 /// must be one of [`SHIPPED_VIDEO_MODELS`].
-pub(crate) const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
+pub(crate) const DEFAULT_VIDEO_MODEL: &str = "google/gemini-omni-1.2-flash";
 
 /// The shipped image-generation model list: newline-separated, in picker order. It is the set
-/// that works on this machine, written once for both consumers — the fresh-install seed and
-/// migration `82`, which overwrites hand-edited lists on purpose (see
+/// that works on this machine, written once for both consumers — the fresh-install seed and the
+/// media-list migrations `82`/`83`, which overwrite hand-edited lists on purpose (see
 /// [`crate::db::migrations`]). Every model here has a provider pin of its own
 /// ([`built_in_model_routing`]).
 pub(crate) const SHIPPED_IMAGE_GEN_MODELS: &str =
     "google/gemini-nano-banana-2.1\nmicrosoft/mai-image-2.7\nopenai/gpt-image-2.6-sunburst";
 
-/// The shipped video-generation model list: newline-separated, in picker order. `minimax/hailuo-3`
-/// is the only model that works here, so it is also the default, and it has a provider pin of its
-/// own ([`built_in_model_routing`]).
-pub(crate) const SHIPPED_VIDEO_MODELS: &str = "minimax/hailuo-3";
+/// The shipped video-generation model list: newline-separated, in picker order. Its first entry is
+/// [`DEFAULT_VIDEO_MODEL`]. `minimax/hailuo-3` stays so an account that already picked it keeps it,
+/// and every model here has a provider pin of its own ([`built_in_model_routing`]).
+pub(crate) const SHIPPED_VIDEO_MODELS: &str = "google/gemini-omni-1.2-flash\nminimax/hailuo-3";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRouting {
@@ -814,13 +814,15 @@ fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
 const DEFAULT_CHAT_MODEL_ROUTING: &str = "deepinfra/fp8/flex,deepinfra/fp8,stepfun/fp8";
 
 /// The media models' provider pins, checked by hand once per model against OpenRouter's endpoint
-/// directory: the one provider that serves the model on this machine. Media always targets
-/// OpenRouter, so a pin applies whatever the chat endpoint is.
+/// directory. Media always targets OpenRouter, so a pin applies whatever the chat endpoint is.
 const MEDIA_MODEL_ROUTINGS: &[(&str, &str)] = &[
     // `google-ai-studio` refuses this machine's region; `google-vertex/global` serves it.
     ("google/gemini-nano-banana-2.1", "google-vertex/global"),
     ("microsoft/mai-image-2.7", "azure"),
     ("openai/gpt-image-2.6-sunburst", "openai"),
+    // `google-ai-studio` is omni's only endpoint in OpenRouter's live directory, so the pin is
+    // what the data says.
+    ("google/gemini-omni-1.2-flash", "google-ai-studio"),
     ("minimax/hailuo-3", "minimax"),
 ];
 
@@ -875,7 +877,7 @@ async fn seed_default_routing_row(
 /// no built-in list of its own, its routing row. The active selection is
 /// per-user (`crate::users`), so no singular key is seeded.
 /// The transcription-off flag belongs to catalog `69`, the single owner of that
-/// initial value; catalog `82` writes the same two model lists here from the same
+/// initial value; catalog `82`/`83` write the same two model lists here from the same
 /// constants, so fresh and upgraded installs agree. `fresh` is the pre-open
 /// discriminator from [`load_or_init`] — the seed writes nothing to existing
 /// databases.
@@ -1398,17 +1400,15 @@ mod tests {
             image_models.contains(&DEFAULT_IMAGE_GEN_MODEL),
             "the image default must be one of the shipped image models"
         );
-        assert!(
-            SHIPPED_VIDEO_MODELS
-                .lines()
-                .any(|model| model == DEFAULT_VIDEO_MODEL),
-            "the video default must be one of the shipped video models"
+        // Picker order: the default first, and `minimax/hailuo-3` behind it so an account that
+        // already picked it keeps it.
+        let video_models: Vec<&str> = SHIPPED_VIDEO_MODELS.lines().collect();
+        assert_eq!(
+            video_models,
+            [DEFAULT_VIDEO_MODEL, "minimax/hailuo-3"],
+            "the shipped video list is the default followed by the pick it replaces"
         );
-        for model in image_models
-            .iter()
-            .copied()
-            .chain(SHIPPED_VIDEO_MODELS.lines())
-        {
+        for model in image_models.iter().copied().chain(video_models) {
             assert!(
                 built_in_model_routing(model).is_some(),
                 "shipped media model `{model}` needs a pinned provider"
@@ -1763,7 +1763,7 @@ mod tests {
             "an existing install must not be classified fresh"
         );
         CONFIG_DB_FRESH_AT_BOOT.store(fresh_existing, Ordering::Release);
-        // Catalog 82 already replaced the lists on open; a value written after that is the
+        // Catalog 82/83 already replaced the lists on open; a value written after that is the
         // owner's, and the seed of an existing database must leave it alone.
         existing_store
             .set_kv(CONFIG_KEY_IMAGE_GEN_MODELS, "hand/pick")

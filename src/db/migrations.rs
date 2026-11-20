@@ -27,7 +27,7 @@
 //! if it can still be pending on a database that has run a 0.10.x build. The
 //! two halves select different entries, and confusing them is how a column,
 //! table or default disappears from an installation that has not yet reached
-//! the newest release. The catalog holds seven entries:
+//! the newest release. The catalog holds eight entries:
 //!
 //! - `24` / `26` — the core and logs baselines. They always stay: they are what
 //!   a fresh install is built from, and the upgrade half alone would retire
@@ -53,6 +53,8 @@
 //!   have edited, because otherwise the new defaults never reach such an install.
 //!   Its body reads the same constants as the fresh-install seed, so the two
 //!   cannot drift.
+//! - `83` — re-runs the same body as `82` because `82` never shipped in a release,
+//!   so a store that already recorded it would otherwise keep the old list.
 //!
 //! # The id → release record, and the retired ids
 //!
@@ -62,8 +64,8 @@
 //! - `24`–`78` — recorded by 0.10.0 (0.10.1–0.10.3 shipped the same catalog).
 //! - `79` — added by 0.10.4.
 //! - `80`, `81` — added by 0.10.5.
-//! - `82` — added by 0.10.6.
-//! - Next id: `83`.
+//! - `82`, `83` — added after the 0.10.6 tag, so no shipped build records either.
+//! - Next id: `84`.
 //!
 //! Retired, and never to be reused:
 //!
@@ -649,8 +651,8 @@ const GUEST_REPORTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS guest_reports (
 
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
-/// Seven entries, split by the module header's rule: the fresh-install half is
-/// `24`, `26` and `69`; the upgrade half is `79`, `80`, `81` and `82` — the
+/// Eight entries, split by the module header's rule: the fresh-install half is
+/// `24`, `26` and `69`; the upgrade half is `79`, `80`, `81`, `82` and `83` — the
 /// entries that can still be pending on a store that has run a 0.10.x build. The
 /// header also carries the id → release record and the retired ids.
 ///
@@ -667,6 +669,8 @@ const GUEST_REPORTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS guest_reports (
 /// - `81` deletes one stored routing row (see
 ///   [`DROP_DEEPSEEK_V41_FLASH_1017_ROUTING`]).
 /// - `82` overwrites the image/video model lists (see
+///   [`run_set_media_model_lists`]).
+/// - `83` re-runs the same body, because `82` never shipped in a release (see
 ///   [`run_set_media_model_lists`]).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
@@ -701,6 +705,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         id: "82",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(set_media_model_lists),
+    },
+    Migration {
+        id: "83",
         target: TargetDb::Core,
         body: MigrationBody::Rust(set_media_model_lists),
     },
@@ -874,10 +883,12 @@ async fn run_seed_audio_transcription_disabled(conn: &Connection) -> anyhow::Res
     Ok(())
 }
 
-/// Entry `82`: bring every installation to the shipped image/video model lists, discarding lists
-/// edited by hand — that is intended, because otherwise the new defaults never reach an existing
-/// install. `DO UPDATE` reaches installs whose `config_kv` has no row for either key at all. The
-/// fresh-install seed writes the same two constants, so both paths end on one list.
+/// Entries `82` and `83`: bring every installation to the shipped image/video model lists,
+/// discarding lists edited by hand — that is intended, because otherwise the new defaults never
+/// reach an existing install. `DO UPDATE` reaches installs whose `config_kv` has no row for either
+/// key at all. The fresh-install seed writes the same two constants, so both paths end on one
+/// list. Entry `83` exists because `82` never shipped in a release: a store built from the source
+/// tree may already have recorded `82`, and it must still arrive at the shipped list.
 async fn run_set_media_model_lists(conn: &Connection) -> anyhow::Result<()> {
     for (key, list) in [
         (
@@ -1455,8 +1466,8 @@ mod tests {
         applied.sort();
         assert_eq!(
             applied,
-            ["24", "69", "79", "80", "81", "82"].map(String::from),
-            "fresh core applies the baseline, the 69 seed and the four upgrade entries exactly"
+            ["24", "69", "79", "80", "81", "82", "83"].map(String::from),
+            "fresh core applies the baseline, the 69 seed and the five upgrade entries exactly"
         );
     }
 
@@ -2283,6 +2294,46 @@ CREATE TABLE IF NOT EXISTS llm_failures (
             lists(config_kv_rows(&conn).await),
             shipped,
             "an install predating the rows must receive them too"
+        );
+    }
+
+    /// A store built from the source tree can already have recorded `82` with the old list. Entry
+    /// `83` re-runs the same body, so such a store still arrives at the shipped list.
+    #[tokio::test]
+    async fn a_store_that_recorded_the_media_list_step_still_arrives_at_the_new_list() {
+        let video_key = crate::config::CONFIG_KEY_VIDEO_MODELS;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_consolidated_store(tmp.path())
+            .await
+            .expect("fresh store");
+        conn.execute(
+            "UPDATE config_kv SET value = 'minimax/hailuo-3' WHERE key = ?1",
+            params![video_key],
+        )
+        .await
+        .unwrap();
+        conn.execute("DELETE FROM schema_migrations WHERE id = '83'", ())
+            .await
+            .unwrap();
+
+        run_migrations(&conn, TargetDb::Core)
+            .await
+            .expect("re-run the core catalog");
+
+        let video = config_kv_rows(&conn)
+            .await
+            .into_iter()
+            .find(|(key, _)| key == video_key)
+            .map(|(_, value)| value);
+        assert_eq!(
+            video.as_deref(),
+            Some(crate::config::SHIPPED_VIDEO_MODELS),
+            "a store that already recorded 82 must still reach the shipped video list"
+        );
+        assert!(
+            recorded_ids(&conn).await.iter().any(|id| id == "83"),
+            "entry 83 must be recorded again"
         );
     }
 }

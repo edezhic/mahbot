@@ -3257,7 +3257,7 @@ impl SettingsState {
                 ModelPickerTarget::Video,
                 self.config.video_models.as_deref(),
                 &self.model_picker_inputs[ModelPickerTarget::Video.idx()],
-                "model name (e.g. minimax/hailuo-...)",
+                "model name (e.g. google/gemini-omni-...)",
                 self.field_errors
                     .get(CONFIG_FIELD_VIDEO_MODELS)
                     .map(String::as_str),

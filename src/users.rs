@@ -2528,4 +2528,25 @@ mod tests {
         })
         .await;
     }
+
+    /// The video model a generation runs with: the shipped default when the account never picked
+    /// one, and the stored pick verbatim when it did — `minimax/hailuo-3` stopped being the
+    /// default, and an account that picked it keeps generating with it.
+    #[tokio::test]
+    async fn video_model_falls_back_to_the_shipped_default_and_never_rewrites_a_pick() {
+        crate::util::test::init_test_stores().await;
+        assert_eq!(
+            resolve_video_model("u_video_model").await,
+            crate::config::DEFAULT_VIDEO_MODEL
+        );
+        store()
+            .set_video_model("u_video_model", "minimax/hailuo-3")
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_video_model("u_video_model").await,
+            "minimax/hailuo-3",
+            "a stored pick is taken as given, never moved to the new default"
+        );
+    }
 }

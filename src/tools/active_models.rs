@@ -9,10 +9,9 @@
 
 use std::fmt::Write;
 
+use super::{MAX_LIST_VALUES, format_durations, join_capped};
 use crate::tools::media_catalog::image::{self, ImageModelInfo, ParameterConstraint};
 use crate::tools::media_catalog::video::{self, VideoModelInfo};
-
-const MAX_LIST_VALUES: usize = 16;
 
 /// Snapshot of the model ids rendered in the current block, persisted to
 /// `session_metadata.active_models` and compared against live config reads on each user
@@ -248,37 +247,6 @@ fn render_video_section(model: &str, info: Option<&VideoModelInfo>) -> Option<St
         let _ = writeln!(out, "- editing: {nuance}");
     }
     (out.len() > header).then_some(out)
-}
-
-/// Join values, capping the rendered list so future catalogs cannot bloat
-/// every Assistant turn.
-fn join_capped(values: &[String], cap: usize) -> String {
-    if values.len() <= cap {
-        values.join(", ")
-    } else {
-        format!("{}, +{} more", values[..cap].join(", "), values.len() - cap)
-    }
-}
-
-/// Compact durations: a contiguous set of values renders as "min-max",
-/// otherwise as a capped comma list. Duplicates are collapsed before the
-/// contiguity check so `[5,6,6,8]` never renders as "5-8" (7 would be
-/// advertised as supported).
-#[expect(clippy::cast_possible_wrap)]
-fn format_durations(durations: &[i64]) -> String {
-    if let [single] = durations {
-        return single.to_string();
-    }
-    let mut distinct: Vec<i64> = durations.to_vec();
-    distinct.sort_unstable();
-    distinct.dedup();
-    if let (Some(&min), Some(&max)) = (distinct.first(), distinct.last())
-        && distinct.len() as i64 == max.saturating_sub(min).saturating_add(1)
-    {
-        return format!("{min}-{max}");
-    }
-    let values: Vec<String> = distinct.iter().map(i64::to_string).collect();
-    join_capped(&values, MAX_LIST_VALUES)
 }
 
 #[cfg(test)]

@@ -78,6 +78,39 @@ pub(crate) fn effective_reference_max(catalog_max: i64) -> i64 {
     catalog_max.min(MAX_REFERENCE_IMAGES_PER_REQUEST as i64)
 }
 
+/// Cap on the values one catalog list renders with, so a future catalog cannot bloat every
+/// Assistant turn — in the `<active-models-opts>` block and in a refusal message alike.
+pub(crate) const MAX_LIST_VALUES: usize = 16;
+
+/// Join catalog values, capping the rendered list at `cap`.
+pub(crate) fn join_capped(values: &[String], cap: usize) -> String {
+    if values.len() <= cap {
+        values.join(", ")
+    } else {
+        format!("{}, +{} more", values[..cap].join(", "), values.len() - cap)
+    }
+}
+
+/// Compact durations: a contiguous set of values renders as "min-max", otherwise as a capped comma
+/// list. Duplicates are collapsed before the contiguity check so `[5,6,6,8]` never renders as "5-8"
+/// (7 would be advertised as supported).
+#[expect(clippy::cast_possible_wrap)]
+pub(crate) fn format_durations(durations: &[i64]) -> String {
+    if let [single] = durations {
+        return single.to_string();
+    }
+    let mut distinct: Vec<i64> = durations.to_vec();
+    distinct.sort_unstable();
+    distinct.dedup();
+    if let (Some(&min), Some(&max)) = (distinct.first(), distinct.last())
+        && distinct.len() as i64 == max.saturating_sub(min).saturating_add(1)
+    {
+        return format!("{min}-{max}");
+    }
+    let values: Vec<String> = distinct.iter().map(i64::to_string).collect();
+    join_capped(&values, MAX_LIST_VALUES)
+}
+
 /// Argument aliases for file path parameters: `"file"` and `"filename"` are remapped to `"path"` by
 /// [`normalize_tool_arguments`] — but not for the document and computer tools, which refuse a stray
 /// key.
