@@ -114,17 +114,17 @@ pub(crate) fn ensure_chat_completions_url(url: &str) -> String {
 /// Strip the `/chat/completions` suffix from an endpoint URL to obtain the API base URL.
 ///
 /// This is the complement of [`ensure_chat_completions_url`] — it undoes the addition
-/// of `/chat/completions` so that sibling API paths (e.g. `/videos` or `/embeddings`)
-/// can be appended. Image generation uses the chat-completions endpoint directly
-/// (it mimics a chat-format tool-use API), while video generation uses a dedicated
-/// `/videos` endpoint under the same API base.
+/// of `/chat/completions` so that sibling API paths (e.g. `/images` or `/videos`)
+/// can be appended. Image generation uses the dedicated `/images` Image API while
+/// video generation uses the async `/videos` API, both under the same API base.
 ///
 /// Normalization and edge-case behavior: see [`crate::config::normalize_endpoint_url`].
 pub(crate) fn ensure_base_url(url: &str) -> String {
     normalize_endpoint_url(url)
 }
 
-/// Build a `provider` routing JSON value for OpenAI-compatible chat requests.
+/// Build a `provider` routing JSON value for an OpenAI-compatible request — chat completions and
+/// the `/images` API, both of which take `order` with `allow_fallbacks`.
 ///
 /// The product pins exactly one provider — one entry of the model's priority list (see
 /// [`selection`]) — so the router is never handed a list to walk. Returns `None` for an
@@ -143,6 +143,19 @@ pub(crate) fn provider_routing_json(provider: &str) -> Option<serde_json::Value>
         "order": [provider],
         "allow_fallbacks": false,
     }))
+}
+
+/// The `provider` block of a media call: the same one-entry pin as
+/// [`provider_routing_json`], expressed as the `/videos` API's allow-list. That API documents
+/// `order`, `only` and `ignore` and no `allow_fallbacks`, and `only` is what makes the pin
+/// exclusive there — every provider outside the list is excluded, so a refusal is a failure the
+/// caller reports rather than a silent re-route. Returns `None` for an empty slug.
+pub(crate) fn media_provider_json(provider: &str) -> Option<serde_json::Value> {
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({ "only": [provider] }))
 }
 
 // Global singletons (recreatable via RwLock)

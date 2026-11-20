@@ -76,7 +76,8 @@ to every account; the other four require it.
   image model the catalogue lacks or lists as text-only is refused (an unreachable catalogue passes
   silently); video models are taken as given.
 - `provider_order:<model>` — that model's provider priority, comma-separated; empty means the
-  product's own order. Inert under a custom chat endpoint, and `get` says so.
+  product's own order. Inert for chat under a custom chat endpoint (a media model's order keeps
+  applying — media always talks to OpenRouter), and `get` says so.
 - `web_search_provider` — `deepseek`, `exa`, `auto` (or `automatic`), or empty for automatic. `get`
   names the backends text and picture search really use, and says when there is no search tool.
 - `deepseek_key`, `exa_key` — the search backends' keys. Secrets.

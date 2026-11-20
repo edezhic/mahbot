@@ -966,6 +966,13 @@ impl ImageWalk<'_> {
             self.request.references,
             info,
         );
+        // The model's own provider pin travels with the call: media always targets OpenRouter, so
+        // the chat endpoint cannot switch it off, and the walk's next model carries its own pin.
+        if let Some(pin) = crate::providers::selection::media_pin(model)
+            && let Some(block) = crate::providers::provider_routing_json(&pin)
+        {
+            body["provider"] = block;
+        }
         // Per-image caps do not bound multi-reference totals, so compress further until the
         // serialized request fits the ~2 MB client-side body budget (not a documented OpenRouter
         // number). The references belong to the REQUEST, so the first fit releases their bytes.
@@ -1985,6 +1992,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Every model's body carries its own provider pin, and the chat endpoint cannot switch it
+    /// off: media always targets OpenRouter, so the pin is sent even when chat runs elsewhere.
+    #[tokio::test]
+    #[serial_test::serial(active_models, config_persist)]
+    async fn a_models_body_carries_its_provider_pin() {
+        let _config = ConfigFixture(Some(crate::config::CONFIG.snapshot()));
+        let _ = crate::config::CONFIG
+            .set_string_field("provider_endpoint", "http://127.0.0.1:11434/v1");
+        let scripted = Scripted::new();
+        let mut walk = ImageWalk {
+            request: RequestMaterial {
+                prompt: "a cat",
+                aspect_ratio: None,
+                size_arg: None,
+                references: &mut [],
+            },
+            own_model: "google/gemini-nano-banana-2.1",
+            url: "https://example.invalid/images",
+            auth: "Bearer test",
+            sender: &scripted,
+            trail: Vec::new(),
+            stopped: None,
+        };
+
+        assert_eq!(
+            walk.body("google/gemini-nano-banana-2.1", None, None)
+                .expect("a body")["provider"],
+            json!({"order": ["google-vertex/global"], "allow_fallbacks": false}),
+            "the hand-checked provider is sent, and fallbacks are off"
+        );
+        assert_eq!(
+            walk.body("microsoft/mai-image-2.7", None, None)
+                .expect("a body")["provider"]["order"],
+            json!(["azure"]),
+            "each walk step carries its own model's pin"
+        );
+
+        // The coded pin is a default, exactly like the chat model's list: a stored per-model order
+        // for this model wins.
+        let mut overridden = crate::config::CONFIG.snapshot();
+        overridden.model_routings = vec![crate::config::ModelRouting {
+            model: "google/gemini-nano-banana-2.1".to_string(),
+            provider_order: Some("custom/host".to_string()),
+        }];
+        crate::config::CONFIG.swap(overridden);
+        assert_eq!(
+            walk.body("google/gemini-nano-banana-2.1", None, None)
+                .expect("a body")["provider"]["order"],
+            json!(["custom/host"]),
+            "a stored order for the model overrides the coded pin"
+        );
+
+        assert!(
+            walk.body("vendor/unpinned", None, None)
+                .expect("a body")
+                .get("provider")
+                .is_none(),
+            "a model with no list keeps the router's own choice"
+        );
     }
 
     /// A generation's settings are read strictly, before anything is planned or sent: a

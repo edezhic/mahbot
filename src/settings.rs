@@ -292,8 +292,9 @@ async fn summary(config: &ConfigData) -> String {
 const NO_BUILT_IN_ORDER: &str = "the product's own order (none for this model)";
 
 /// Why a stored priority order is inert: a custom chat endpoint does no provider routing. The
-/// read-back appends it.
-const ROUTING_INERT: &str = " (inert — a custom chat endpoint uses no provider routing)";
+/// read-back appends it, scoped to chat because a media model's order keeps applying — media
+/// always targets OpenRouter.
+const ROUTING_INERT: &str = " (inert for chat — a custom chat endpoint uses no provider routing)";
 
 /// A model's provider priority as the product actually uses it: the saved row, else the built-in
 /// list the row would fall back to. A custom chat endpoint has one provider and never consults
@@ -1280,7 +1281,7 @@ mod tests {
     }
 
     /// The routing read-back reports the order in use, and says a custom chat endpoint makes it
-    /// inert.
+    /// inert for chat.
     #[test]
     fn the_routing_read_back_says_when_it_is_inert() {
         let mut config = ConfigData::STRUCT_FIELDS_DEFAULT;
@@ -1289,7 +1290,7 @@ mod tests {
         config.provider_endpoint = Some("https://acme.invalid/v1".to_string());
         let order = effective_order(&config, crate::config::DEFAULT_MANAGER_MODEL);
         assert!(
-            order.contains("inert — a custom chat endpoint"),
+            order.contains("inert for chat — a custom chat endpoint"),
             "got: {order}"
         );
     }

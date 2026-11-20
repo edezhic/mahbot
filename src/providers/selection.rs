@@ -177,10 +177,25 @@ fn candidates(model: &str) -> Vec<String> {
     if !is_default_endpoint(&CONFIG.provider_endpoint()) {
         return Vec::new();
     }
-    let Some(order) = CONFIG.model_routing(model).provider_order else {
-        return Vec::new();
-    };
-    parse_priority_list(&order)
+    priority_list(model)
+}
+
+/// The provider pinned to a one-off media call: the first entry of the model's priority list —
+/// a stored override first, else the model's built-in pin. Only that entry is used, because a
+/// media call has no ladder to walk: the pin is exclusive, so a refusal is reported rather than
+/// re-routed. Media always targets OpenRouter, so this ignores the chat endpoint and stays in
+/// force whatever that endpoint is.
+#[must_use]
+pub(crate) fn media_pin(model: &str) -> Option<String> {
+    priority_list(model).into_iter().next()
+}
+
+/// The model's effective priority list, without the chat endpoint's guard.
+fn priority_list(model: &str) -> Vec<String> {
+    CONFIG
+        .model_routing(model)
+        .provider_order
+        .map_or_else(Vec::new, |order| parse_priority_list(&order))
 }
 
 /// The comma-separated priority list as slugs, highest priority first. Empty entries are dropped, so
@@ -360,6 +375,23 @@ mod tests {
             ),
             candidates_of(&["deepinfra/fp8/flex", "deepinfra/fp8", "stepfun/fp8"]),
             "the built-in list must reach the selection as the three endpoints in priority order"
+        );
+    }
+
+    /// A media call takes its pin from the model's own list, read without the chat endpoint's
+    /// guard: media always targets OpenRouter, so a custom chat endpoint must not unpin it.
+    #[test]
+    fn a_media_call_pins_the_models_first_provider() {
+        assert_eq!(
+            media_pin("google/gemini-nano-banana-2.1").as_deref(),
+            Some("google-vertex/global"),
+            "the image default must be pinned to the provider that serves this region"
+        );
+        assert_eq!(media_pin("minimax/hailuo-3").as_deref(), Some("minimax"));
+        assert_eq!(
+            media_pin("openrouter/auto"),
+            None,
+            "a model with no list keeps the router's own choice"
         );
     }
 

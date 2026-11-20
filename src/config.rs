@@ -31,7 +31,8 @@
 //! optional key — many servers are keyless — and is **only** ever sent to it,
 //! never to OpenRouter. Media features (image/video generation, catalogs) always
 //! use `DEFAULT_PROVIDER_ENDPOINT` + `provider_key` regardless of the custom chat
-//! endpoint.
+//! endpoint, and each shipped media model carries a built-in single-provider pin
+//! that is sent with the call for the same reason ([`MEDIA_MODEL_ROUTINGS`]).
 //!
 //! [`ConfigReload::role_model`] maps `Role::Manager`, `Assistant`, `Discovery`,
 //! `Engineer` and `Maintainer` to the manager slot; every other role to the
@@ -84,19 +85,24 @@ const OLD_DEFAULT_WORKER_MODELS: &[&str] = &[
 
 /// Used by every account with no explicit pick. The retired predecessor
 /// (`google/gemini-3.1-flash-image`) is not in the seeded picker list, and a stored pick is
-/// never rewritten.
+/// never rewritten. Every default must be one of [`SHIPPED_IMAGE_GEN_MODELS`].
 pub(crate) const DEFAULT_IMAGE_GEN_MODEL: &str = "google/gemini-nano-banana-2.1";
-/// Used by every account with no explicit pick; a stored pick is never rewritten.
-pub(crate) const DEFAULT_VIDEO_MODEL: &str = "google/gemini-omni-1.2-flash";
+/// Used by every account with no explicit pick; a stored pick is never rewritten. Every default
+/// must be one of [`SHIPPED_VIDEO_MODELS`].
+pub(crate) const DEFAULT_VIDEO_MODEL: &str = "minimax/hailuo-3";
 
-/// Fresh-install seeded image-generation model list: newline-separated, in picker order; mirrors
-/// the curated set the live install ships.
-const FRESH_INSTALL_IMAGE_GEN_MODELS: &str = "google/gemini-nano-banana-2.1\nmicrosoft/mai-image-2.6\nopenai/gpt-image-2.5-sunburst\nqwen/qwen-image-3-pro";
+/// The shipped image-generation model list: newline-separated, in picker order. It is the set
+/// that works on this machine, written once for both consumers — the fresh-install seed and
+/// migration `82`, which overwrites hand-edited lists on purpose (see
+/// [`crate::db::migrations`]). Every model here has a provider pin of its own
+/// ([`built_in_model_routing`]).
+pub(crate) const SHIPPED_IMAGE_GEN_MODELS: &str =
+    "google/gemini-nano-banana-2.1\nmicrosoft/mai-image-2.7\nopenai/gpt-image-2.6-sunburst";
 
-/// Fresh-install seeded video-generation model list: newline-separated, in picker order, the
-/// default model first (as in the image list).
-const FRESH_INSTALL_VIDEO_MODELS: &str =
-    "google/gemini-omni-1.2-flash\nbytedance/seedance-2.0-mini\nminimax/hailuo-3";
+/// The shipped video-generation model list: newline-separated, in picker order. `minimax/hailuo-3`
+/// is the only model that works here, so it is also the default, and it has a provider pin of its
+/// own ([`built_in_model_routing`]).
+pub(crate) const SHIPPED_VIDEO_MODELS: &str = "minimax/hailuo-3";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelRouting {
@@ -807,11 +813,28 @@ fn config_db_is_fresh(mahbot_dir: &std::path::Path) -> bool {
 /// "simplified" to a single host.
 const DEFAULT_CHAT_MODEL_ROUTING: &str = "deepinfra/fp8/flex,deepinfra/fp8,stepfun/fp8";
 
-/// The built-in priority list of a model that has one of its own, keyed by exact model id;
-/// `None` for every other model. Only the default chat model has one, and matching is exact: its
-/// id is a prefix of the other DeepSeek identifiers.
+/// The media models' provider pins, checked by hand once per model against OpenRouter's endpoint
+/// directory: the one provider that serves the model on this machine. Media always targets
+/// OpenRouter, so a pin applies whatever the chat endpoint is.
+const MEDIA_MODEL_ROUTINGS: &[(&str, &str)] = &[
+    // `google-ai-studio` refuses this machine's region; `google-vertex/global` serves it.
+    ("google/gemini-nano-banana-2.1", "google-vertex/global"),
+    ("microsoft/mai-image-2.7", "azure"),
+    ("openai/gpt-image-2.6-sunburst", "openai"),
+    ("minimax/hailuo-3", "minimax"),
+];
+
+/// The built-in priority list of a model that has one of its own, keyed by exact model id; `None`
+/// for every other model. The default chat model's id is a prefix of the other DeepSeek
+/// identifiers, so matching is exact.
 fn built_in_model_routing(model: &str) -> Option<&'static str> {
-    (model == DEFAULT_CHAT_MODEL).then_some(DEFAULT_CHAT_MODEL_ROUTING)
+    if model == DEFAULT_CHAT_MODEL {
+        return Some(DEFAULT_CHAT_MODEL_ROUTING);
+    }
+    MEDIA_MODEL_ROUTINGS
+        .iter()
+        .find(|(id, _)| *id == model)
+        .map(|(_, order)| *order)
 }
 
 /// The provider priority list that serves a model unless the user chose one: a model's own
@@ -852,8 +875,10 @@ async fn seed_default_routing_row(
 /// no built-in list of its own, its routing row. The active selection is
 /// per-user (`crate::users`), so no singular key is seeded.
 /// The transcription-off flag belongs to catalog `69`, the single owner of that
-/// initial value. `fresh` is the pre-open discriminator from [`load_or_init`] —
-/// the seed writes nothing to existing databases.
+/// initial value; catalog `82` writes the same two model lists here from the same
+/// constants, so fresh and upgraded installs agree. `fresh` is the pre-open
+/// discriminator from [`load_or_init`] — the seed writes nothing to existing
+/// databases.
 async fn seed_fresh_install_defaults(
     fresh: bool,
     store: &crate::config_db::ConfigStore,
@@ -862,10 +887,10 @@ async fn seed_fresh_install_defaults(
         return Ok(());
     }
     store
-        .set_kv(CONFIG_KEY_IMAGE_GEN_MODELS, FRESH_INSTALL_IMAGE_GEN_MODELS)
+        .set_kv(CONFIG_KEY_IMAGE_GEN_MODELS, SHIPPED_IMAGE_GEN_MODELS)
         .await?;
     store
-        .set_kv(CONFIG_KEY_VIDEO_MODELS, FRESH_INSTALL_VIDEO_MODELS)
+        .set_kv(CONFIG_KEY_VIDEO_MODELS, SHIPPED_VIDEO_MODELS)
         .await?;
     // Only the manager/worker slots are seeded: the selection is per-user.
     for default_model in [DEFAULT_MANAGER_MODEL, DEFAULT_WORKER_MODEL] {
@@ -1363,6 +1388,41 @@ mod tests {
         );
     }
 
+    /// The shipped media lists, the picker defaults and the coded pins move together: a default
+    /// outside its list is a model no user could pick, and a listed model without a pin is one
+    /// OpenRouter routes itself.
+    #[test]
+    fn shipped_media_lists_defaults_and_pins_move_together() {
+        let image_models: Vec<&str> = SHIPPED_IMAGE_GEN_MODELS.lines().collect();
+        assert!(
+            image_models.contains(&DEFAULT_IMAGE_GEN_MODEL),
+            "the image default must be one of the shipped image models"
+        );
+        assert!(
+            SHIPPED_VIDEO_MODELS
+                .lines()
+                .any(|model| model == DEFAULT_VIDEO_MODEL),
+            "the video default must be one of the shipped video models"
+        );
+        for model in image_models
+            .iter()
+            .copied()
+            .chain(SHIPPED_VIDEO_MODELS.lines())
+        {
+            assert!(
+                built_in_model_routing(model).is_some(),
+                "shipped media model `{model}` needs a pinned provider"
+            );
+        }
+        for (model, pin) in MEDIA_MODEL_ROUTINGS {
+            assert_eq!(
+                default_model_routing(model),
+                Some(*pin),
+                "`{model}` must resolve to its hand-checked provider"
+            );
+        }
+    }
+
     #[test]
     fn onboarding_from_raw_maps_legacy_welcomed_to_finished() {
         assert_eq!(
@@ -1676,16 +1736,11 @@ mod tests {
                 ),
                 (
                     "image_gen_models".to_string(),
-                    "google/gemini-nano-banana-2.1\nmicrosoft/mai-image-2.6\nopenai/gpt-image-2.5-sunburst\nqwen/qwen-image-3-pro"
-                        .to_string()
+                    SHIPPED_IMAGE_GEN_MODELS.to_string()
                 ),
-                (
-                    "video_models".to_string(),
-                    "google/gemini-omni-1.2-flash\nbytedance/seedance-2.0-mini\nminimax/hailuo-3"
-                        .to_string()
-                ),
+                ("video_models".to_string(), SHIPPED_VIDEO_MODELS.to_string()),
             ],
-            "a fresh config database must hold catalog 69's transcription row plus the fresh-install defaults"
+            "a fresh config database must hold catalog 69's transcription row plus the shipped model lists"
         );
         // The only routable default has a built-in list of its own, so the seed
         // writes no routing row at all: a row would freeze that list at install
@@ -1708,16 +1763,26 @@ mod tests {
             "an existing install must not be classified fresh"
         );
         CONFIG_DB_FRESH_AT_BOOT.store(fresh_existing, Ordering::Release);
+        // Catalog 82 already replaced the lists on open; a value written after that is the
+        // owner's, and the seed of an existing database must leave it alone.
+        existing_store
+            .set_kv(CONFIG_KEY_IMAGE_GEN_MODELS, "hand/pick")
+            .await
+            .unwrap();
         seed_fresh_install_defaults_from_flag(&existing_store)
             .await
             .unwrap();
         assert_eq!(
             existing_store.get_all_kv().await.unwrap(),
-            vec![(
-                "audio_transcription_use_local".to_string(),
-                "false".to_string()
-            )],
-            "an existing config database receives only catalog 69's transcription row; the seed adds nothing"
+            vec![
+                (
+                    "audio_transcription_use_local".to_string(),
+                    "false".to_string()
+                ),
+                ("image_gen_models".to_string(), "hand/pick".to_string()),
+                ("video_models".to_string(), SHIPPED_VIDEO_MODELS.to_string()),
+            ],
+            "the seed adds nothing to an existing config database"
         );
         assert!(
             existing_store

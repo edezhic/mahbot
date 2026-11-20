@@ -27,7 +27,7 @@
 //! if it can still be pending on a database that has run a 0.10.x build. The
 //! two halves select different entries, and confusing them is how a column,
 //! table or default disappears from an installation that has not yet reached
-//! the newest release. The catalog holds six entries:
+//! the newest release. The catalog holds seven entries:
 //!
 //! - `24` / `26` — the core and logs baselines. They always stay: they are what
 //!   a fresh install is built from, and the upgrade half alone would retire
@@ -48,6 +48,11 @@
 //!   still pending on a store created before 0.10.5, so it stays: "only touches
 //!   data" retires an entry the upgrade half has already retired, it is never a
 //!   reason by itself.
+//! - `82` — overwrites the image/video model lists with the shipped ones (see
+//!   [`run_set_media_model_lists`]). It deliberately discards a list the owner may
+//!   have edited, because otherwise the new defaults never reach such an install.
+//!   Its body reads the same constants as the fresh-install seed, so the two
+//!   cannot drift.
 //!
 //! # The id → release record, and the retired ids
 //!
@@ -57,7 +62,8 @@
 //! - `24`–`78` — recorded by 0.10.0 (0.10.1–0.10.3 shipped the same catalog).
 //! - `79` — added by 0.10.4.
 //! - `80`, `81` — added by 0.10.5.
-//! - Next id: `82`.
+//! - `82` — added by 0.10.6.
+//! - Next id: `83`.
 //!
 //! Retired, and never to be reused:
 //!
@@ -643,10 +649,10 @@ const GUEST_REPORTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS guest_reports (
 
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
-/// Six entries, split by the module header's rule: the fresh-install half is
-/// `24`, `26` and `69`; the upgrade half is `79`, `80` and `81` — the entries
-/// that can still be pending on a store that has run a 0.10.x build. The header
-/// also carries the id → release record and the retired ids.
+/// Seven entries, split by the module header's rule: the fresh-install half is
+/// `24`, `26` and `69`; the upgrade half is `79`, `80`, `81` and `82` — the
+/// entries that can still be pending on a store that has run a 0.10.x build. The
+/// header also carries the id → release record and the retired ids.
 ///
 /// - `24` builds the full core schema; on an existing store every statement is
 ///   `IF NOT EXISTS`, so it is a strict no-op.
@@ -660,6 +666,8 @@ const GUEST_REPORTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS guest_reports (
 ///   [`add_session_metadata_provider`]).
 /// - `81` deletes one stored routing row (see
 ///   [`DROP_DEEPSEEK_V41_FLASH_1017_ROUTING`]).
+/// - `82` overwrites the image/video model lists (see
+///   [`run_set_media_model_lists`]).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -690,6 +698,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "81",
         target: TargetDb::Core,
         body: MigrationBody::Sql(DROP_DEEPSEEK_V41_FLASH_1017_ROUTING),
+    },
+    Migration {
+        id: "82",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(set_media_model_lists),
     },
 ];
 
@@ -859,6 +872,35 @@ async fn run_seed_audio_transcription_disabled(conn: &Connection) -> anyhow::Res
     )
     .await?;
     Ok(())
+}
+
+/// Entry `82`: bring every installation to the shipped image/video model lists, discarding lists
+/// edited by hand — that is intended, because otherwise the new defaults never reach an existing
+/// install. `DO UPDATE` reaches installs whose `config_kv` has no row for either key at all. The
+/// fresh-install seed writes the same two constants, so both paths end on one list.
+async fn run_set_media_model_lists(conn: &Connection) -> anyhow::Result<()> {
+    for (key, list) in [
+        (
+            crate::config::CONFIG_KEY_IMAGE_GEN_MODELS,
+            crate::config::SHIPPED_IMAGE_GEN_MODELS,
+        ),
+        (
+            crate::config::CONFIG_KEY_VIDEO_MODELS,
+            crate::config::SHIPPED_VIDEO_MODELS,
+        ),
+    ] {
+        conn.execute(
+            "INSERT INTO config_kv (key, value) VALUES (?1, ?2) \
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            params![key, list],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn set_media_model_lists(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_set_media_model_lists(conn))
 }
 
 #[cfg(test)]
@@ -1413,8 +1455,8 @@ mod tests {
         applied.sort();
         assert_eq!(
             applied,
-            ["24", "69", "79", "80", "81"].map(String::from),
-            "fresh core applies the baseline, the 69 seed and the three upgrade entries exactly"
+            ["24", "69", "79", "80", "81", "82"].map(String::from),
+            "fresh core applies the baseline, the 69 seed and the four upgrade entries exactly"
         );
     }
 
@@ -2153,8 +2195,14 @@ CREATE TABLE IF NOT EXISTS llm_failures (
         let conn = crate::db::open_consolidated_store(tmp.path())
             .await
             .expect("fresh store");
+        // Rows other catalog entries write are not this entry's business.
+        let transcription = |rows: Vec<(String, String)>| {
+            rows.into_iter()
+                .filter(|(stored, _)| stored == key)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            config_kv_rows(&conn).await,
+            transcription(config_kv_rows(&conn).await),
             vec![(key.to_string(), "false".to_string())],
             "a fresh install ships transcription off"
         );
@@ -2169,9 +2217,72 @@ CREATE TABLE IF NOT EXISTS llm_failures (
             .await
             .expect("re-run entry 69");
         assert_eq!(
-            config_kv_rows(&conn).await,
+            transcription(config_kv_rows(&conn).await),
             vec![(key.to_string(), "true".to_string())],
             "an owner's value is never overwritten"
+        );
+    }
+
+    /// Entry `82` puts every install on the shipped image/video model lists: a hand-edited list is
+    /// overwritten by design, and an install with no row at all gets the same lists.
+    #[tokio::test]
+    async fn set_media_model_lists_overwrites_hand_edited_lists() {
+        let image_key = crate::config::CONFIG_KEY_IMAGE_GEN_MODELS;
+        let video_key = crate::config::CONFIG_KEY_VIDEO_MODELS;
+        let shipped = vec![
+            (
+                image_key.to_string(),
+                crate::config::SHIPPED_IMAGE_GEN_MODELS.to_string(),
+            ),
+            (
+                video_key.to_string(),
+                crate::config::SHIPPED_VIDEO_MODELS.to_string(),
+            ),
+        ];
+        let lists = |rows: Vec<(String, String)>| {
+            rows.into_iter()
+                .filter(|(key, _)| key == image_key || key == video_key)
+                .collect::<Vec<_>>()
+        };
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = crate::db::open_consolidated_store(tmp.path())
+            .await
+            .expect("fresh store");
+        assert_eq!(
+            lists(config_kv_rows(&conn).await),
+            shipped,
+            "a fresh store must run the catalog onto the shipped lists"
+        );
+
+        conn.execute(
+            "UPDATE config_kv SET value = 'hand/pick' WHERE key IN (?1, ?2)",
+            params![image_key, video_key],
+        )
+        .await
+        .unwrap();
+        run_set_media_model_lists(&conn)
+            .await
+            .expect("re-run entry 82");
+        assert_eq!(
+            lists(config_kv_rows(&conn).await),
+            shipped,
+            "a hand-edited list is replaced, otherwise the new defaults never reach the install"
+        );
+
+        conn.execute(
+            "DELETE FROM config_kv WHERE key IN (?1, ?2)",
+            params![image_key, video_key],
+        )
+        .await
+        .unwrap();
+        run_set_media_model_lists(&conn)
+            .await
+            .expect("re-run entry 82 with no rows");
+        assert_eq!(
+            lists(config_kv_rows(&conn).await),
+            shipped,
+            "an install predating the rows must receive them too"
         );
     }
 }

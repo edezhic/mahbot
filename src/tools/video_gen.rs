@@ -11,7 +11,9 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom};
 
-/// The resolution asked for when the caller names none: the omni default's native tier.
+/// The resolution asked for when the caller names none: sent only to a model whose catalog
+/// declares it, so a fixed-tier model — the `minimax/hailuo-3` default offers 2K alone — is sent
+/// none and keeps the provider's own tier.
 const DEFAULT_RESOLUTION: &str = "720p";
 
 /// Maximum length of the prompt in characters (per-model limits surface via the model nuances).
@@ -248,8 +250,9 @@ impl<'a> Request<'a> {
         }
     }
 
-    /// The per-model gates, run before any upload: an image-incompatible model and a duration
-    /// outside the model's own range are refused here rather than by the provider after a bill.
+    /// The per-model gates, run before any upload: an image-incompatible model, a duration
+    /// outside the model's own range, and a parameter the model rejects outright are refused here
+    /// rather than by the provider after a bill.
     fn validate(&self, spec: VideoModel) -> anyhow::Result<()> {
         let image_inputs =
             !self.images.is_empty() || self.first_frame.is_some() || self.last_frame.is_some();
@@ -258,6 +261,21 @@ impl<'a> Request<'a> {
                 "aleph-2 does not support image inputs (reference images or frame \
                  anchors). Retry without images or switch to hailuo-3."
             );
+        }
+        if spec == VideoModel::Hailuo3 {
+            if self.generate_audio == Some(false) {
+                anyhow::bail!(
+                    "hailuo-3 always generates audio, so the provider rejects \
+                     `generate_audio: false`. Remove the argument, or switch to a model that can \
+                     mute its output."
+                );
+            }
+            if self.seed.is_some() {
+                anyhow::bail!(
+                    "hailuo-3 takes no `seed` — the provider rejects the parameter. Remove it and \
+                     retry."
+                );
+            }
         }
         validate_duration(spec, self.shape, self.duration)
     }
@@ -708,6 +726,13 @@ async fn request_body(
         && !omit_duration(spec, request.shape)
     {
         body["duration"] = json!(duration);
+    }
+    // The model's own provider pin travels with the submission: video always targets OpenRouter,
+    // so the chat endpoint cannot switch it off.
+    if let Some(pin) = crate::providers::selection::media_pin(model)
+        && let Some(block) = crate::providers::media_provider_json(&pin)
+    {
+        body["provider"] = block;
     }
     Ok(body)
 }
@@ -1226,6 +1251,48 @@ mod tests {
             .await
             .unwrap();
         assert!(body.get("duration").is_none());
+    }
+
+    /// The submission carries the model's pinned provider as the videos API's allow-list, and the
+    /// default model's audio/seed behaviour is refused up front instead of by the provider after
+    /// a bill.
+    #[tokio::test]
+    async fn a_body_pins_the_provider_and_hailuo_refuses_what_it_rejects() {
+        let ws = crate::workspace::test_ws("video-gen-pin");
+        let args = json!({ "prompt": "a wave" });
+        let request = Request::parse(&args).unwrap();
+        let body = request_body(&ws, &request, "minimax/hailuo-3", VideoModel::Hailuo3, None)
+            .await
+            .unwrap();
+        assert_eq!(body["provider"], json!({"only": ["minimax"]}));
+        let body = request_body(&ws, &request, "vendor/unpinned", VideoModel::Unknown, None)
+            .await
+            .unwrap();
+        assert!(
+            body.get("provider").is_none(),
+            "a model with no list keeps the router's own choice"
+        );
+
+        for (args, expected) in [
+            (
+                json!({ "prompt": "p", "generate_audio": false }),
+                "hailuo-3 always generates audio",
+            ),
+            (
+                json!({ "prompt": "p", "seed": 7 }),
+                "hailuo-3 takes no `seed`",
+            ),
+        ] {
+            let request = Request::parse(&args).unwrap();
+            let err = request
+                .validate(VideoModel::Hailuo3)
+                .expect_err("hailuo-3 rejects the parameter")
+                .to_string();
+            assert!(err.contains(expected), "message: {err}");
+            // The same arguments are fine on a model that accepts them.
+            let request = Request::parse(&args).unwrap();
+            assert!(request.validate(VideoModel::Unknown).is_ok());
+        }
     }
 
     #[test]
