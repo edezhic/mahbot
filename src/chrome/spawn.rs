@@ -58,8 +58,33 @@ pub(crate) struct CliSpawn<'a> {
     /// The chrome-side deadline this call DECLARES to chrome-use (always applied as
     /// `AGENT_BROWSER_DEFAULT_TIMEOUT`, in ms) — the clock chrome-use works to.
     pub(crate) chrome_side: Duration,
+    /// The Chrome profile directory this call must be pinned to, or `None` for a session-less call
+    /// and for a session that never named one. Every session-scoped caller passes the session's
+    /// pin ([`crate::chrome::profile::browser_arg`]) so the helper never re-binds the session to
+    /// another profile behind the caller's back.
+    pub(crate) browser: Option<&'a str>,
+    /// Whether this call may let the extension open an unfocused window for a named profile that is
+    /// connected but has no window.
+    pub(crate) profile_window: ProfileWindow,
     /// Whether this call may run chrome-use's own relay self-heal.
     pub(crate) recovery: CliRecovery,
+}
+
+/// Whether a chrome-use call may open an unfocused window for a named profile that is connected but
+/// has no window. Only the caller's own action may: an internal probe, settle, capture or recovery
+/// read must never open a window as a side effect of cleanup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProfileWindow {
+    /// The caller's own action: a named profile running without a window is brought up.
+    Caller,
+    /// A product-internal step: never open a window.
+    Internal,
+}
+
+impl ProfileWindow {
+    const fn allows(self) -> bool {
+        matches!(self, Self::Caller)
+    }
 }
 
 /// The result of one chrome-use CLI invocation. `status` is the child's own exit status and
@@ -205,6 +230,20 @@ fn apply_recovery_env(cmd: &mut Command, recovery: CliRecovery) {
     }
 }
 
+/// Let the extension open an UNFOCUSED window for a named profile that is connected but has no
+/// window (`profile_not_open` otherwise). Applied to the caller's own named-profile action so a
+/// recycled daemon and a later command keep the same behaviour; an internal step passes
+/// [`ProfileWindow::Internal`] so cleanup never opens a window.
+fn apply_profile_window_env(
+    cmd: &mut Command,
+    browser: Option<&str>,
+    profile_window: ProfileWindow,
+) {
+    if browser.is_some() && profile_window.allows() {
+        cmd.env("AGENT_BROWSER_OPEN_PROFILE_WINDOW", "1");
+    }
+}
+
 /// Declare `chrome_side` as this call's chrome-use-side deadline (`AGENT_BROWSER_DEFAULT_TIMEOUT`,
 /// ms). Applied to EVERY call — the declaration is what lets chrome-use's own verdict, rather
 /// than the product's kill, normally reach the caller.
@@ -215,17 +254,26 @@ pub(crate) fn apply_chrome_side(cmd: &mut Command, chrome_side: Duration) {
     );
 }
 
-/// Caller args with the global `--json` / `--session <s>` flags folded in, before a `--`
-/// end-of-options marker when there is one (a fill/type leading-dash text shield): chrome-use
-/// drops everything after `--`, so appended flags would be swallowed into the text value.
-/// Without a `--` the flags go last.
-fn build_argv(args: &[&str], json: bool, session: Option<&str>) -> Vec<String> {
+/// Caller args with the global `--json` / `--session <s>` / `--browser <profile>` flags folded in,
+/// before a `--` end-of-options marker when there is one (a fill/type leading-dash text shield):
+/// chrome-use drops everything after `--`, so appended flags would be swallowed into the text value.
+/// Without a `--` the flags go last. `browser` is the session's pinned profile DIRECTORY — the
+/// helper's profile picker is `--browser`, deliberately not its `--profile` (the launch/auth axis).
+fn build_argv(
+    args: &[&str],
+    json: bool,
+    session: Option<&str>,
+    browser: Option<&str>,
+) -> Vec<String> {
     let mut global: Vec<String> = Vec::new();
     if json {
         global.push("--json".to_string());
     }
     if let Some(s) = session {
         global.extend(["--session".to_string(), s.to_string()]);
+    }
+    if let Some(profile) = browser {
+        global.extend(["--browser".to_string(), profile.to_string()]);
     }
     if global.is_empty() {
         return args.iter().map(|a| (*a).to_string()).collect();
@@ -249,7 +297,11 @@ pub(crate) async fn spawn_cli(spec: CliSpawn<'_>) -> CliRun {
     ensure_chrome_env(&mut cmd);
     apply_chrome_side(&mut cmd, spec.chrome_side);
     apply_recovery_env(&mut cmd, spec.recovery);
-    cmd.args(build_argv(spec.args, spec.json, spec.session));
+    // A named-profile call lets the extension open an UNFOCUSED window when the profile is
+    // connected but has no window; `--browser` alone would fail `profile_not_open`. The whole
+    // browser-control namespace was cleared above, so this is the product's own value.
+    apply_profile_window_env(&mut cmd, spec.browser, spec.profile_window);
+    cmd.args(build_argv(spec.args, spec.json, spec.session, spec.browser));
     if spec.json {
         cmd.stdout(std::process::Stdio::piped());
     } else {
@@ -570,7 +622,8 @@ mod tests {
             build_argv(
                 &["fill", "#q", "--", "-tail"],
                 true,
-                Some("mahbot-chrome-abc")
+                Some("mahbot-chrome-abc"),
+                Some("Profile 8")
             ),
             [
                 "fill",
@@ -578,22 +631,49 @@ mod tests {
                 "--json",
                 "--session",
                 "mahbot-chrome-abc",
+                "--browser",
+                "Profile 8",
                 "--",
                 "-tail"
             ]
         );
         assert_eq!(
-            build_argv(&["open", "https://x"], true, Some("s")),
-            ["open", "https://x", "--json", "--session", "s"]
+            build_argv(&["open", "https://x"], true, Some("s"), Some("Default")),
+            [
+                "open",
+                "https://x",
+                "--json",
+                "--session",
+                "s",
+                "--browser",
+                "Default"
+            ]
         );
         assert_eq!(
-            build_argv(&["session", "list"], false, None),
+            build_argv(&["session", "list"], false, None, None),
             ["session", "list"]
         );
         assert_eq!(
-            build_argv(&["session", "list"], false, Some("s")),
+            build_argv(&["session", "list"], false, Some("s"), None),
             ["session", "list", "--session", "s"]
         );
+    }
+
+    #[test]
+    fn a_named_profile_lets_the_extension_open_an_unfocused_window() {
+        let mut cmd = Command::new("true");
+        apply_profile_window_env(&mut cmd, Some("Profile 8"), ProfileWindow::Caller);
+        assert_eq!(
+            cmd_env(&cmd, "AGENT_BROWSER_OPEN_PROFILE_WINDOW").as_deref(),
+            Some("1")
+        );
+        let mut cmd = Command::new("true");
+        apply_profile_window_env(&mut cmd, None, ProfileWindow::Caller);
+        assert_eq!(cmd_env(&cmd, "AGENT_BROWSER_OPEN_PROFILE_WINDOW"), None);
+        // An internal step carries the pin but never opens a window.
+        let mut cmd = Command::new("true");
+        apply_profile_window_env(&mut cmd, Some("Profile 8"), ProfileWindow::Internal);
+        assert_eq!(cmd_env(&cmd, "AGENT_BROWSER_OPEN_PROFILE_WINDOW"), None);
     }
 
     #[test]
@@ -751,6 +831,8 @@ mod tests {
             path: Path::new("/bin/sh"),
             args: &["-c", "sleep 5 & echo answered"],
             session: None,
+            browser: None,
+            profile_window: ProfileWindow::Internal,
             json: true,
             capture_stderr: true,
             cancel_kills: true,
@@ -772,6 +854,8 @@ mod tests {
             path: Path::new("/bin/sh"),
             args: &["-c", "echo answered"],
             session: None,
+            browser: None,
+            profile_window: ProfileWindow::Internal,
             json: true,
             capture_stderr: true,
             cancel_kills: true,

@@ -58,13 +58,11 @@
 //! design.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::io;
-use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::chrome::lock_json::LockedJson;
 use crate::tools::chrome_daemon::SessionRecovery;
 
 /// How long a session this CLI created lives after its last use.
@@ -139,12 +137,7 @@ pub(crate) struct UseOutcome {
     pub(crate) kept: bool,
 }
 
-struct Ledger {
-    root: PathBuf,
-    records: Records,
-    /// Held until this value drops; the O.S. releases the lock when the file closes.
-    _lock: File,
-}
+struct Ledger(LockedJson<Records>);
 
 impl Ledger {
     /// Take the record under its whole-file lock. The lock is deliberately held across a close
@@ -153,78 +146,30 @@ impl Ledger {
     /// the helper moves the wait off the async worker, so a service tick waits here without
     /// stalling the runtime.
     fn open() -> Option<Self> {
-        crate::util::with_block_in_place(|| {
-            let root = crate::config::storage_root()?;
-            let lock = lock_root(&root)?;
-            let records = read_records(&root);
-            Some(Self {
-                root,
-                records,
-                _lock: lock,
-            })
-        })
+        LockedJson::open(SESSIONS_FILE_NAME, LOCK_FILE_NAME).map(Self)
     }
 
     fn persist(&self) {
-        let json = match serde_json::to_string(&self.records) {
-            Ok(json) => json,
-            Err(error) => {
-                warn!(error = %error, "chrome CLI session record not written: serialization failed");
-                return;
-            }
-        };
-        let path = self.root.join(SESSIONS_FILE_NAME);
-        if let Err(error) =
-            crate::util::with_block_in_place(|| crate::util::write_json_record(&path, &json))
-        {
-            warn!(error = %error, "chrome CLI session record not written");
-        }
+        self.0.persist();
+    }
+
+    /// Take the record out of the lock, for a caller that consumes it (a listing).
+    fn into_records(self) -> Records {
+        self.0.value
     }
 }
 
-fn lock_root(root: &Path) -> Option<File> {
-    if let Err(error) = std::fs::create_dir_all(root) {
-        warn!(error = %error, "chrome CLI session record unavailable: storage root not creatable");
-        return None;
-    }
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(root.join(LOCK_FILE_NAME))
-    {
-        Ok(file) => file,
-        Err(error) => {
-            warn!(error = %error, "chrome CLI session record unavailable: lock file not openable");
-            return None;
-        }
-    };
-    match file.lock() {
-        Ok(()) => Some(file),
-        Err(error) => {
-            warn!(error = %error, "chrome CLI session record unavailable: lock not taken");
-            None
-        }
+impl std::ops::Deref for Ledger {
+    type Target = Records;
+
+    fn deref(&self) -> &Records {
+        &self.0.value
     }
 }
 
-fn read_records(root: &Path) -> Records {
-    let path = root.join(SESSIONS_FILE_NAME);
-    let json = match std::fs::read_to_string(&path) {
-        Ok(json) => json,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Records::new(),
-        Err(error) => {
-            warn!(error = %error, path = %path.display(), "chrome CLI session record unreadable — starting empty");
-            return Records::new();
-        }
-    };
-    match serde_json::from_str(&json) {
-        Ok(records) => records,
-        Err(error) => {
-            warn!(error = %error, path = %path.display(), "chrome CLI session record unparsable — starting empty");
-            Records::new()
-        }
+impl std::ops::DerefMut for Ledger {
+    fn deref_mut(&mut self) -> &mut Records {
+        &mut self.0.value
     }
 }
 
@@ -307,7 +252,7 @@ pub(crate) fn check_keep(name: &str, keep: bool) -> Result<bool, String> {
     let Some(ledger) = Ledger::open() else {
         return Ok(false);
     };
-    match ledger.records.get(name) {
+    match ledger.get(name) {
         Some(record) if !record.kept => Err(mark_refusal(name)),
         other => Ok(other.is_some()),
     }
@@ -322,8 +267,8 @@ pub(crate) fn note_use(name: &str, keep: bool) -> Result<UseOutcome, String> {
         });
     };
     let now = crate::util::unix_millis();
-    let outcome = apply_use(&mut ledger.records, name, keep, now)?;
-    if let Some(record) = ledger.records.get_mut(name) {
+    let outcome = apply_use(&mut ledger, name, keep, now)?;
+    if let Some(record) = ledger.get_mut(name) {
         let pid = std::process::id();
         record.in_flight.retain(|mark| mark.pid != pid);
         record.in_flight.push(InFlight::new(now));
@@ -339,7 +284,7 @@ pub(crate) fn note_end(name: &str) {
         return;
     };
     let pid = std::process::id();
-    let Some(record) = ledger.records.get_mut(name) else {
+    let Some(record) = ledger.get_mut(name) else {
         return;
     };
     let marks = record.in_flight.len();
@@ -357,7 +302,7 @@ pub(crate) fn note_end(name: &str) {
 pub(crate) fn touch(name: &str) -> Option<bool> {
     let mut ledger = Ledger::open()?;
     let kept = {
-        let record = ledger.records.get_mut(name)?;
+        let record = ledger.get_mut(name)?;
         record_use(record, crate::util::unix_millis());
         record.kept
     };
@@ -366,14 +311,16 @@ pub(crate) fn touch(name: &str) -> Option<bool> {
 }
 
 pub(crate) fn recorded_names() -> BTreeSet<String> {
-    Ledger::open().map_or_else(BTreeSet::new, |ledger| ledger.records.into_keys().collect())
+    Ledger::open().map_or_else(BTreeSet::new, |ledger| {
+        ledger.into_records().into_keys().collect()
+    })
 }
 
 pub(crate) fn forget(name: &str) {
     let Some(mut ledger) = Ledger::open() else {
         return;
     };
-    if ledger.records.remove(name).is_some() {
+    if ledger.remove(name).is_some() {
         ledger.persist();
     }
 }
@@ -384,7 +331,7 @@ pub(crate) fn list() -> Vec<SessionRow> {
     let now = crate::util::unix_millis();
     Ledger::open().map_or_else(Vec::new, |ledger| {
         ledger
-            .records
+            .into_records()
             .into_iter()
             .map(|(name, record)| SessionRow {
                 name: display_name(&name).to_string(),
@@ -406,8 +353,8 @@ pub(crate) async fn sweep_expired() {
     let now = crate::util::unix_millis();
     // A mark left by a call that is gone (crashed, killed outright, or past its own deadline) is no
     // evidence of anything: dropping it keeps a dead pid out of the record.
-    let mut changed = prune_stale_marks(&mut ledger.records, now);
-    let Some(name) = due_for_close(&ledger.records, now) else {
+    let mut changed = prune_stale_marks(&mut ledger, now);
+    let Some(name) = due_for_close(&ledger, now) else {
         if changed {
             ledger.persist();
         }
@@ -415,7 +362,7 @@ pub(crate) async fn sweep_expired() {
     };
     match crate::tools::chrome_daemon::stop_session_by_name(&name).await {
         SessionRecovery::Stopped => {
-            ledger.records.remove(&name);
+            ledger.remove(&name);
             changed = true;
             info!(session = %name, "closed an idle chrome session");
         }
@@ -423,13 +370,16 @@ pub(crate) async fn sweep_expired() {
             debug!(session = %name, "idle chrome session not closed: chrome-use could not be started");
         }
         SessionRecovery::Unanswered => {
-            let given_up = ledger.records.get_mut(&name).is_some_and(|record| {
+            let given_up = ledger.get_mut(&name).is_some_and(|record| {
                 record.unconfirmed_closes = record.unconfirmed_closes.saturating_add(1);
                 record.unconfirmed_closes >= CLOSE_ATTEMPT_LIMIT
             });
             changed = true;
             if given_up {
-                ledger.records.remove(&name);
+                ledger.remove(&name);
+                // The record is gone, so the session is: a pin with no session to serve would
+                // otherwise outlive it in the launch target.
+                crate::chrome::profile::forget(&name);
                 warn!(
                     session = %name,
                     "idle chrome session close not confirmed — dropping its record"

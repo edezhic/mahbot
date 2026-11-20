@@ -82,7 +82,7 @@ MahBot's command line gives a script or a custom tool the same work you can do y
 
 ### Chrome automations
 
-Use the product's own `mahbot chrome` CLI when the data has no API/RSS/JSON endpoint for regular scripting; it drives the real user's browser with real sessions, avoiding bot protections and sharing access to resources. Run `mahbot chrome -h` for actions and flags — don't guess syntax. Every action returns one-line JSON (`{schema, action, ok, kind, ...}`) with exit codes: 0 success/empty, 1 step failure (`kind`: timeout, network, redesign, not-found, error), 2 environment failure, 3 usage error.
+Use the product's own `mahbot chrome` CLI when the data has no API/RSS/JSON endpoint for regular scripting; it drives the real user's browser with real sessions, avoiding bot protections and sharing access to resources. Run `mahbot chrome -h` for actions and flags — don't guess syntax. Every action returns one-line JSON (`{schema, action, ok, kind, ...}`) with exit codes: 0 success/empty, 1 step failure (`kind`: timeout, network, redesign, not-found, error), 2 environment failure or a profile conflict (`kind`: conflict), 3 usage error. Name a Chrome profile with `--profile <name>` (display name, directory such as `Profile 8`, a unique name prefix, e-mail or id) when the machine has several; it binds that session for its life, the result carries `profile`/`profile_dir`, and a tab already in another profile is a conflict — never a silent switch. A name matching nothing or several is refused with the available profiles as display name and directory, so ask for a bad name to discover them.
 
 #### Building a recipe
 

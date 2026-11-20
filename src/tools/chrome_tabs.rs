@@ -25,12 +25,13 @@
 //!
 //! An `extension call` goes through a chrome-use session, and a call naming none gets one derived
 //! from the working directory — a name no product rule owns, whose daemon opens an `about:blank`
-//! group in the owner's real browser. Every call here therefore names a session, and the caller's
-//! choice ([`close_sessions`]'s `session`) keeps the product from opening anything of its own: it
-//! is a name the work already has — the run whose tabs are being closed — and a live session brings
-//! no new page. A name whose daemon chrome-use had recycled is started by the call and opens the
-//! page it works in inside that session's group; the caller borrows only names a record holds, so
-//! that record's close removes the group again — except the protected-namespace case below.
+//! group in the owner's real browser. Every call here therefore names a session, and the choice
+//! ([`close_sessions`]) keeps the product from opening anything of its own: a tab group lives in
+//! the Chrome profile its session is pinned to, so the close runs one pass per profile and each
+//! pass reads through one of that profile's own names — a name the work already has, so a live
+//! session brings no new page. A name whose daemon chrome-use had recycled is started by the call
+//! and opens the page it works in inside that session's group; that group is the one the pass
+//! closes, so the close removes the page again — except the protected-namespace case below.
 //!
 //! [`OWN_SESSION`] is what is left for a pass with no name to borrow, and such a pass lets it go
 //! ([`release_own_session`]) through the same connection-independent route a run's tabs are closed
@@ -112,7 +113,7 @@
 use super::chrome_daemon::{ExtensionState, NoVerdict, extension_state_from, run_cli_json_at};
 use crate::tools::chrome::AGENT_TAB_PREFIX;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -395,21 +396,50 @@ async fn close_own_scratch_group(cli: &Path, deadline: Instant) -> bool {
     groups_gone(door, &ids).await
 }
 
-/// Close the tabs of `names`, one outcome per name, in the order given. `deadline` bounds the whole
-/// sequence: a call whose remaining budget is spent is not spawned (those names come back `Retry`).
-/// `session` is the chrome-use session every read runs in — the caller passes one the work itself
-/// already has wherever one exists, since an existing name opens no new page; [`OWN_SESSION`] is
-/// what is left for a caller with nothing to borrow.
+/// Close the tabs of `names`, one outcome per name. `deadline` bounds the whole sequence: a call
+/// whose remaining budget is spent is not spawned (those names come back `Retry`).
+///
+/// One pass per profile: a tab group lives in the Chrome profile its session is pinned to, and an
+/// `extension call` reaches only the profile its own session is bound to. Each group is read in one
+/// of its own names — a pinned one carries the pin, an unpinned one is profile-blind like the group.
 pub(crate) async fn close_sessions(
     cli: &Path,
     names: &[String],
-    session: &str,
     deadline: Instant,
     owned_again: OwnedAgain<'_>,
 ) -> Vec<(String, TabOutcome)> {
     if names.is_empty() {
         return Vec::new();
     }
+    let mut groups: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
+    let pins = crate::chrome::profile::pins();
+    for name in names {
+        groups
+            .entry(pins.get(name).map(|profile| profile.dir.clone()))
+            .or_default()
+            .push(name.clone());
+    }
+    let mut outcomes = Vec::with_capacity(names.len());
+    for group in groups.into_values() {
+        outcomes.extend(close_group(cli, &group, deadline, owned_again).await);
+    }
+    outcomes
+}
+
+/// One profile's share of a close pass: the reads and the acts all run through the group's own first
+/// name, which carries the profile the whole group is in.
+async fn close_group(
+    cli: &Path,
+    names: &[String],
+    deadline: Instant,
+    owned_again: OwnedAgain<'_>,
+) -> Vec<(String, TabOutcome)> {
+    // The group's first name is the one whose session the whole group is read and acted in. A group
+    // is built from at least one name, but this routine also runs from a detached eviction, where a
+    // panic would be silent, so the empty case ends the pass instead.
+    let Some(session) = names.first().map(String::as_str) else {
+        return Vec::new();
+    };
     let door = Door {
         cli,
         session,
@@ -587,6 +617,7 @@ pub(crate) async fn forget_settled_sessions(
                 if let Some(calls) = calls_before_stop {
                     DOOR_RELEASED.fetch_max(calls, Ordering::SeqCst);
                 }
+                outcome.settled.push(name.clone());
             }
             Err(verdict) => {
                 if whole {
@@ -615,9 +646,12 @@ pub(crate) async fn forget_settled_sessions(
 }
 
 /// What one [`forget_settled_sessions`] sequence came to, one class per name it did not let go of —
-/// the four a caller acts on differently.
+/// the four a caller acts on differently — and the names it DID let go of.
 #[derive(Default)]
 pub(crate) struct LetGoOutcome {
+    /// Names the helper settled: the session's record is gone (and, for [`OWN_SESSION`], its group
+    /// with it), so nothing is owed for them and their profile pin ends with the session.
+    pub(crate) settled: Vec<String>,
     /// Names a `session stop` RAN for — with its whole bound — and did not settle. Only these are
     /// charged a failed attempt: the stop is the helper not answering, not a budget the pass never
     /// spent.

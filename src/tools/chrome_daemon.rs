@@ -579,10 +579,13 @@ fn release_asset_name() -> Result<String, String> {
         .ok_or_else(|| format!("chrome-use has no release asset for {os}-{arch}"))
 }
 
-/// Parse the local chrome-use version from `--version` stdout, bounded by
-/// [`CLI_TIMEOUT`]. `None` when the CLI is missing, the probe fails (timeout or
-/// non-zero exit), or the banner holds no parseable semver — a missing or
-/// unusable copy, which the start-time policy treats as needing (re)install.
+/// The local chrome-use version, read from `--version` (bounded by [`CLI_TIMEOUT`]). `None` when
+/// the CLI is missing, the probe fails (timeout or non-zero exit), or the banner holds no parseable
+/// semver — a missing or unusable copy, which the start-time policy treats as needing (re)install.
+///
+/// Deliberately not memoized: the product replaces its own copy in-process
+/// ([`install_chrome_use`]), so a cached version would keep every named-profile call refusing "too
+/// old … retry after it does" until restart, and the retry it promises could never succeed.
 pub(crate) async fn cli_version() -> Option<semver::Version> {
     let path = cli_path()?;
     let mut cmd = Command::new(&path);
@@ -620,10 +623,13 @@ pub(crate) async fn run_cli_bounded_at(
     timeout: Duration,
 ) -> CliRun {
     let clocks = probe_clocks(timeout);
+    let browser = crate::chrome::profile::browser_arg(args, session);
     spawn_cli(CliSpawn {
         path,
         args,
         session,
+        browser: browser.as_deref(),
+        profile_window: crate::chrome::spawn::ProfileWindow::Internal,
         json: true,
         capture_stderr: false,
         timeout: clocks.kill,
@@ -751,6 +757,17 @@ pub(crate) struct Readiness {
     pub(crate) display: Option<bool>,
 }
 
+/// The `browsers --json` profile list, however the envelope nests it. One shape reader, shared by
+/// the readiness fact and the profile module.
+pub(crate) fn real_browser_list(browsers: &Value) -> Option<&[Value]> {
+    browsers
+        .get("data")
+        .and_then(|data| data.get("browsers"))
+        .or_else(|| browsers.get("browsers"))
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+}
+
 impl Readiness {
     /// Whether the connection is PROVEN — every decisive fact established and positive.
     /// [`Self::outcome`] reports `Healthy` for this alone, so an unanswered decisive fact
@@ -805,13 +822,7 @@ impl Readiness {
     /// real profiles, `Some(false)` for an empty one, `None` when the snapshot did
     /// not answer or carries no list (a missing fact is never "reachable").
     fn real_browser_from(browsers: Option<&Value>) -> Option<bool> {
-        let browsers = browsers?;
-        let list = browsers
-            .get("data")
-            .and_then(|d| d.get("browsers"))
-            .or_else(|| browsers.get("browsers"))?
-            .as_array()?;
-        Some(!list.is_empty())
+        Some(!real_browser_list(browsers?)?.is_empty())
     }
 
     /// The cause a fact ESTABLISHES, or `None` when none established anything wrong
@@ -1376,6 +1387,9 @@ pub(crate) async fn sweep_session(name: &str) {
             if tabs.len() == 1 && scratch.as_deref() != Some(tabs[0].target_id.as_str()) {
                 clear_sweep_warn();
                 let _ = stop_session_daemon(name, deadline).await;
+                // The sweep proved the session gone, so its profile pin has no owner left. Only
+                // here: a skipped or failed sweep keeps the pin its profile-scoped reads need.
+                crate::chrome::profile::forget(name);
                 return;
             }
             stopped = false;
@@ -1682,10 +1696,16 @@ pub(super) async fn session_stop_outcome(
     bound: Duration,
 ) -> SessionRecovery {
     let clocks = probe_clocks(bound);
+    // `session stop` is name-addressed and profile-agnostic: the session's own binding decides
+    // which profile's tabs it closes, so a `--browser` here would add a profile resolution that
+    // could refuse the stop (e.g. a profile removed since the pin) for no gain. What the product
+    // owes is that the tabs get closed, and this closes them in whichever profile they are in.
     match spawn_cli(CliSpawn {
         path,
         args: &["session", "stop"],
         session: Some(session),
+        browser: None,
+        profile_window: crate::chrome::spawn::ProfileWindow::Internal,
         json: true,
         capture_stderr: false,
         timeout: clocks.kill,
@@ -1709,7 +1729,12 @@ pub(crate) async fn stop_session_by_name(session: &str) -> SessionRecovery {
     let Some(path) = cli_path() else {
         return SessionRecovery::NotStarted;
     };
-    session_stop_outcome(&path, session, SESSION_STOP_TIMEOUT).await
+    let recovered = session_stop_outcome(&path, session, SESSION_STOP_TIMEOUT).await;
+    if recovered == SessionRecovery::Stopped {
+        // The session ended: its profile pin ends with it.
+        crate::chrome::profile::forget(session);
+    }
+    recovered
 }
 
 /// The shared recovery for a session that stopped answering: record the wedge (which
@@ -2300,13 +2325,29 @@ pub(crate) async fn relay_up() -> Option<bool> {
         .and_then(Value::as_bool)
 }
 
-/// Chrome launch flags for auto-launch: deliberately minimal, no daemon/profile/home
-/// overrides, since the launch inherits the user's real profile and environment.
+/// Chrome launch flags for auto-launch: deliberately minimal, no daemon or home overrides, since
+/// the launch inherits the user's real profile and environment. The profile is the one the pinned
+/// sessions share, appended separately as `--profile-directory` when there is one.
 const CHROME_LAUNCH_FLAGS: [&str; 3] = [
     "--no-first-run",
     "--no-default-browser-check",
     "--silent-debugger-extension-api",
 ];
+
+/// The liveness half of the launch-target decision: a pin belongs to a live agent run when its
+/// session sits under that run's namespace, so a run idle on a tab for hours keeps it. A
+/// command-line session is owned by the CLI record instead, which the profile module checks.
+fn live_pin_owner() -> impl Fn(&str) -> bool {
+    let live: Vec<String> = crate::agent::registry::AGENT_REGISTRY
+        .list()
+        .iter()
+        .map(|handle| crate::tools::chrome::run_session_namespace(&handle.agent_id))
+        .collect();
+    move |session| {
+        live.iter()
+            .any(|namespace| session.starts_with(namespace.as_str()))
+    }
+}
 
 /// Launch the user's real Chrome when [`ProbeFailure::ChromeNotRunning`], under its own
 /// bounded launch budget. Display-less hosts are paused with no budget consumed. The
@@ -2318,6 +2359,21 @@ async fn attempt_chrome_launch() {
         debug!("chrome daemon: headless host — Chrome launch skipped; start Chrome manually");
         return;
     }
+    // A session-less launch must never start a browser in a profile other than the named one: with
+    // pinned sessions that disagree, it does not launch at all (each named session brings its own
+    // browser up), and with one shared pin it starts exactly that profile. Decided BEFORE the gate,
+    // so a launch that never happens does not spend the budget.
+    let profile_dir = match crate::chrome::profile::launch_target(live_pin_owner()) {
+        crate::chrome::profile::LaunchTarget::None => None,
+        crate::chrome::profile::LaunchTarget::Single(profile) => Some(profile.dir),
+        crate::chrome::profile::LaunchTarget::Mixed => {
+            debug!(
+                "chrome daemon: pinned sessions want different Chrome profiles — no session-less \
+                 launch; a named session brings its own browser up"
+            );
+            return;
+        }
+    };
     let gate = { health().lock().unwrap_poison().gate_launch(Instant::now()) };
     let RecoveryGate::Allowed(attempt) = gate else {
         log_gate_denied(gate, "chrome launch", MAX_LAUNCH_ATTEMPTS);
@@ -2328,7 +2384,7 @@ async fn attempt_chrome_launch() {
         warn!("no Chrome/Chromium binary found — start Chrome manually");
         return;
     };
-    if let Err(e) = spawn_chrome_detached(&binary) {
+    if let Err(e) = spawn_chrome_detached(&binary, profile_dir.as_deref()) {
         record_launch_outcome(ChromeLaunchOutcome::Failed);
         warn!(error = %e, "failed to launch Chrome — start Chrome manually");
         return;
@@ -2444,14 +2500,19 @@ fn chrome_binary() -> Option<PathBuf> {
 /// Spawn Chrome independent of mahbot: the child leads its own process group on Unix,
 /// so terminal signals to mahbot's group must not kill the browser, and on Windows it
 /// gets the same windowless-console flag as every other spawn (inert for this GUI image
-/// — see the window guarantee in `tools::shell::tree`). Dropped without wait or
+/// — see the window guarantee in `tools::shell::tree`). `profile_dir` pins the launch to a
+/// Chrome profile when every pinned session wants the same one; a profile-blind launch would
+/// otherwise start the wrong browser for a named-profile run. Dropped without wait or
 /// kill_on_drop, so Chrome survives mahbot restarts.
-fn spawn_chrome_detached(binary: &Path) -> std::io::Result<()> {
+fn spawn_chrome_detached(binary: &Path, profile_dir: Option<&str>) -> std::io::Result<()> {
     let mut cmd = std::process::Command::new(binary);
     cmd.args(CHROME_LAUNCH_FLAGS)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(dir) = profile_dir {
+        cmd.arg(format!("--profile-directory={dir}"));
+    }
     // Inherit the real env — do NOT touch HOME or add AGENT_BROWSER_*/CHROMIUM_FLAGS.
     #[cfg(unix)]
     {

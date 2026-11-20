@@ -28,12 +28,12 @@ use crate::chrome::actions::{self, CliFlag};
 use crate::chrome::cli_sessions;
 use crate::chrome::contract::{
     ChromeResponse, ERROR_PAGE_PROBE_JS, EXPECT_TIMEOUT_NOTE, ErrorPageProbe, ExpectOutcome,
-    OutEnvelope, OutKind, chrome_leftover_pipe_note, chrome_use_warning, classify_call_failure,
-    eval_count, eval_result, expect_outcome, extract_net_error_code, extract_output,
-    extract_snapshot_text, is_session_unresponsive_error, is_unreachable_tab_error,
-    net_error_phrase, parse_error_page_probe, parse_first, sanitize_timeout_message,
-    self_launched_browser_cli_error, self_launched_browser_note, truncated_output_error,
-    unreachable_tab_message, with_condition_timeout_note,
+    OutEnvelope, OutKind, Reader, chrome_leftover_pipe_note, chrome_use_warning,
+    classify_call_failure, eval_count, eval_result, expect_outcome, extract_net_error_code,
+    extract_output, extract_snapshot_text, is_session_unresponsive_error, is_unreachable_tab_error,
+    net_error_phrase, parse_error_page_probe, parse_first, self_launched_browser_cli_error,
+    self_launched_browser_note, truncated_output_error, unreachable_tab_message,
+    with_condition_timeout_note,
 };
 use crate::chrome::files::OneFileTarget;
 use crate::chrome::forms::{
@@ -42,7 +42,8 @@ use crate::chrome::forms::{
     wait_args, wait_target,
 };
 use crate::chrome::spawn::{
-    CliRun, CliSpawn, clear_group_cleanup_backstop, set_group_cleanup_backstop, spawn_cli,
+    CliRun, CliSpawn, ProfileWindow, clear_group_cleanup_backstop, set_group_cleanup_backstop,
+    spawn_cli,
 };
 use crate::chrome::{
     CHROME_USE_DECLARED_BUDGET, CHROME_USE_OWN_BUDGET, CLI_EPHEMERAL_PREFIX, CLI_SESSION_PREFIX,
@@ -222,26 +223,32 @@ fn top_help() -> String {
         let _ = writeln!(out, "      {}", d.purpose);
     }
     out.push_str("\nGlobal flags:\n");
-    out.push_str(
-        "  --session <name>   use/name a session — letters, digits, '-' or '_' only (not valid for status / session subcommands)\n",
+    print_flags(
+        &mut out,
+        actions::SESSION_FLAGS
+            .iter()
+            .map(|f| (f.spelling, f.description.as_str())),
     );
-    out.push_str(
-        "  --keep             keep the named session open until it is stopped — only with --session, and only on the call that creates the session (not valid for status / session subcommands)\n\n",
-    );
+    out.push('\n');
     out.push_str("Sessions:\n");
     let minutes = cli_sessions::LIFETIME_MINUTES;
     let _ = write!(
         out,
-        "  Without --session a call runs in a throwaway session whose tabs are closed right after the call.\n  With --session <name> the session's tabs live {minutes} minutes after its last use and are then closed;\n  any later call with the same name starts those {minutes} minutes again. With --keep the session never\n  expires: it stays until 'mahbot chrome session stop <name>'. 'mahbot chrome session list' shows the\n  sessions this CLI created, whether each is kept, and how long since it was last used.\n  A second call is not the first one's page: without --session, 'screenshot' or 'upload' after a\n  separate 'open' sees a blank tab — name the same --session in both calls.\n  Stopping, restarting or updating mahbot closes no browser tabs.\n\n"
+        "  Without --session a call runs in a throwaway session whose tabs are closed right after the call.\n  With --session <name> the session's tabs live {minutes} minutes after its last use and are then closed;\n  any later call with the same name starts those {minutes} minutes again. With --keep the session never\n  expires: it stays until 'mahbot chrome session stop <name>'. 'mahbot chrome session list' shows the\n  sessions this CLI created, whether each is kept, and how long since it was last used.\n  A second call is not the first one's page: without --session, 'screenshot' or 'upload' after a\n  separate 'open' sees a blank tab — name the same --session in both calls.\n  --profile pins a session to one Chrome profile: a display name, a directory ('Profile 8'), a unique\n  prefix, an e-mail or an id. Once named, every later call of that session keeps that profile — across\n  helper restarts and separate invocations — and a profile that is not running is started. A name\n  matching nothing or several is refused with the available profiles (display name and directory),\n  which is how you discover them; a session already working in another profile is refused, never\n  switched.\n  Stopping, restarting or updating mahbot closes no browser tabs.\n\n"
     );
     out.push_str("Output (stdout, one JSON line):\n");
     out.push_str(
         "  {\"schema\":1,\"action\":\"...\",\"ok\":true|false,\"kind\":\"...\",...payload}\n\n",
     );
+    // The profile fields are not in the schema's own line because only a pinned call carries them.
+    out.push_str(
+        "  A call in a pinned session also reports \"profile\" and \"profile_dir\": the Chrome \
+         profile\n  the helper reported for that session, which is what actually served the call.\n\n",
+    );
     out.push_str("Exit codes:\n");
     out.push_str("  0  ok / empty (including a legitimately empty region)\n");
     out.push_str("  1  site/data step failure (timeout, network, redesign, not-found, error)\n");
-    out.push_str("  2  environment failure (no chrome-use CLI/relay/Chrome/display)\n");
+    out.push_str("  2  environment failure (no chrome-use CLI/relay/Chrome/display), or a profile conflict\n");
     out.push_str("  3  usage error\n");
     out.push_str("  128+N  interrupted by signal N (a throwaway session is closed first)\n\n");
     out.push_str("Help:\n");
@@ -274,11 +281,8 @@ fn action_help(name: &str) -> String {
         .map(|f| (f.spelling, f.description.as_str()))
         .collect();
     if !flag_rows.is_empty() {
-        let width = flag_rows.iter().map(|(f, _)| f.len()).max().unwrap_or(0);
         out.push_str("\nFlags:\n");
-        for (flag, desc) in flag_rows {
-            let _ = writeln!(out, "  {flag:<width$}  {desc}");
-        }
+        print_flags(&mut out, flag_rows.into_iter());
     }
 
     out.push_str("\nKinds (stdout \"kind\" → exit code):\n");
@@ -299,6 +303,15 @@ fn action_help(name: &str) -> String {
         let _ = writeln!(out, "  {ex}");
     }
     out
+}
+
+/// Print flag rows, one per line, descriptions aligned under the widest flag.
+fn print_flags<'a>(out: &mut String, rows: impl Iterator<Item = (&'a str, &'a str)>) {
+    let rows: Vec<(&str, &str)> = rows.collect();
+    let width = rows.iter().map(|(flag, _)| flag.len()).max().unwrap_or(0);
+    for (flag, description) in rows {
+        let _ = writeln!(out, "  {flag:<width$}  {description}");
+    }
 }
 
 /// A per-action help request: the first positional names a CLI action and a later
@@ -415,7 +428,7 @@ impl Action {
     /// Whether this action drives the browser in a session; the report/repair verbs
     /// (`status`, `session …`) run in none — the parser and the help both read it.
     fn runs_in_session(&self) -> bool {
-        session_refusal_for(self.name()).is_none()
+        global_refusal_for(self.name()).is_none()
     }
 
     /// The shared-registry name of this action — the envelope's `action` field and the
@@ -561,7 +574,7 @@ pub async fn run_cli(args: &[String]) -> i32 {
     // The lifetime's CLI-side trigger: it works where no service process runs.
     crate::chrome::cli_sessions::sweep_expired().await;
 
-    let (invocation, keep) = match parse_invocation(args) {
+    let (invocation, keep, profile) = match parse_invocation(args) {
         Ok(parsed) => parsed,
         Err(msg) => {
             let action = recognized_action(args);
@@ -575,7 +588,7 @@ pub async fn run_cli(args: &[String]) -> i32 {
     let session = call_session(&invocation, keep);
     // The action's call races the interruption signals, so an interrupted call still
     // closes the throwaway session it created.
-    let mut call = Box::pin(dispatch(&invocation, &session));
+    let mut call = Box::pin(dispatch(&invocation, &session, profile.as_deref()));
     let mut interrupted = Box::pin(wait_for_interruption());
     let outcome = tokio::select! {
         biased;
@@ -594,6 +607,7 @@ pub async fn run_cli(args: &[String]) -> i32 {
     let materialized = record_materialized();
     if !materialized && let Some(s) = outcome.session.as_ref() {
         cli_sessions::forget(&s.name);
+        crate::chrome::profile::forget(&s.name);
     }
     if outcome.marked
         && materialized
@@ -701,6 +715,7 @@ async fn close_throwaway_then_exit(session: &CliSession, code: i32) -> ! {
         close_ephemeral_unless_interrupted(&session.name).await;
     } else if !record_materialized() {
         cli_sessions::forget(&session.name);
+        crate::chrome::profile::forget(&session.name);
     }
     // The process is going: its mark must not outlive it (a sweep calls a dead pid's mark
     // stale); a named session stays alive on the ordinary clock.
@@ -723,33 +738,57 @@ async fn close_ephemeral_unless_interrupted(name: &str) -> bool {
     }
 }
 
-/// The flags `word` declares — the same rows its help prints. The session-wide
-/// pair is not here: [`session_refusal_for`] carries that decision.
+/// The flags `word` declares — the same rows its help prints. The session-wide flags are not
+/// here: [`global_refusal_for`] carries that decision.
 fn declared_flags(word: &str) -> &'static [CliFlag] {
     actions::desc(word)
         .and_then(|d| d.cli.as_ref())
         .map_or(&[], |c| c.declared.as_slice())
 }
 
-/// Why `word`'s action refuses the session-wide pair, or `None` when it takes them.
-fn session_refusal_for(word: &str) -> Option<&'static str> {
-    actions::desc(word)?.cli.as_ref()?.session_refusal
+/// The phrase naming the actions that refuse the session-wide flags, or `None` when `word` takes
+/// them.
+fn global_refusal_for(word: &str) -> Option<&'static str> {
+    actions::desc(word)?.cli.as_ref()?.global_refusal
 }
 
-/// Parse one command line into the action invocation and the global `--keep` request
-/// (which needs a session name and is applied when the call resolves its session).
-fn parse_invocation(args: &[String]) -> Result<(Invocation, bool), String> {
-    let (session, keep, remaining) = extract_global_flags(args)?;
+/// Parse one command line into the action invocation, the global `--keep` request (which needs a
+/// session name and is applied when the call resolves its session) and the optional `--profile`.
+fn parse_invocation(args: &[String]) -> Result<(Invocation, bool, Option<String>), String> {
+    let GlobalFlags {
+        session,
+        profile,
+        keep,
+        remaining,
+    } = extract_global_flags(args)?;
     let action_word = remaining
         .first()
         .ok_or_else(|| "no action given".to_string())?;
     let rest = &remaining[1..];
     let allowed: Vec<&CliFlag> = declared_flags(action_word).iter().collect();
-    // The one declaration decision on which actions take the session-wide pair.
-    if session.is_some()
-        && let Some(refusal) = session_refusal_for(action_word)
-    {
-        return Err(refusal.to_string());
+    // The one declaration decision on which actions take the session-wide flags; only the flags
+    // this call actually supplied are named.
+    if let Some(phrase) = global_refusal_for(action_word) {
+        let supplied: Vec<&str> = [
+            session.as_ref().map(|_| "--session"),
+            profile.as_ref().map(|_| "--profile"),
+            keep.then_some("--keep"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        match supplied.as_slice() {
+            [] => {}
+            [flag] => return Err(format!("{flag} is not valid for {phrase}")),
+            [first, second] => {
+                return Err(format!("{first} and {second} are not valid for {phrase}"));
+            }
+            [first, second, third, ..] => {
+                return Err(format!(
+                    "{first}, {second} and {third} are not valid for {phrase}"
+                ));
+            }
+        }
     }
     let invocation = match action_word.as_str() {
         "status" => parse_status(rest, &allowed),
@@ -768,26 +807,30 @@ fn parse_invocation(args: &[String]) -> Result<(Invocation, bool), String> {
         "session" => parse_session(rest, &allowed),
         other => Err(format!("unknown action '{other}'")),
     }?;
-    if keep {
-        // The mark needs both a browser-driving action and a name, checked once the action is
-        // known so the refusal never names a flag the action itself forbids.
-        if !invocation.action.runs_in_session() {
-            return Err(format!("--keep is not valid for {action_word}"));
-        }
-        if invocation.session.is_none() {
-            return Err(
-                "--keep needs a session name: an unnamed call closes its session when it ends — pass --session <name>"
-                    .to_string(),
-            );
-        }
+    if keep && invocation.session.is_none() {
+        // The mark needs a name: an unnamed call closes its session when it ends.
+        return Err(
+            "--keep needs a session name: an unnamed call closes its session when it ends — pass --session <name>"
+                .to_string(),
+        );
     }
-    Ok((invocation, keep))
+    Ok((invocation, keep, profile))
 }
 
-/// Pull the global `--session` (last wins) and `--keep` out of anywhere before `--`,
-/// returning the rest with everything from `--` on kept verbatim.
-fn extract_global_flags(args: &[String]) -> Result<(Option<String>, bool, Vec<String>), String> {
+/// The global flags one command line carries, and the rest of the arguments with everything from
+/// `--` on kept verbatim. Named fields, so `--session` and `--profile` cannot be transposed.
+struct GlobalFlags {
+    session: Option<String>,
+    profile: Option<String>,
+    keep: bool,
+    remaining: Vec<String>,
+}
+
+/// Pull the global `--session`, `--profile` (both last wins) and `--keep` out of anywhere before
+/// `--`, returning the rest with everything from `--` on kept verbatim.
+fn extract_global_flags(args: &[String]) -> Result<GlobalFlags, String> {
     let mut session: Option<String> = None;
+    let mut profile: Option<String> = None;
     let mut keep = false;
     let mut remaining = Vec::new();
     let mut i = 0;
@@ -813,6 +856,18 @@ fn extract_global_flags(args: &[String]) -> Result<(Option<String>, bool, Vec<St
             validate_session_name(val)?;
             session = Some(val.to_string());
             i += 1;
+        } else if a == "--profile" {
+            i += 1;
+            let val = args
+                .get(i)
+                .ok_or_else(|| "missing value for --profile".to_string())?;
+            // An empty name is a request like any other: the profile module refuses it as a bad
+            // argument and lists the profiles, exactly as the tool does.
+            profile = Some(val.trim().to_string());
+            i += 1;
+        } else if let Some(val) = a.strip_prefix("--profile=") {
+            profile = Some(val.trim().to_string());
+            i += 1;
         } else if a == "--keep" {
             keep = true;
             i += 1;
@@ -821,16 +876,21 @@ fn extract_global_flags(args: &[String]) -> Result<(Option<String>, bool, Vec<St
             i += 1;
         }
     }
-    Ok((session, keep, remaining))
+    Ok(GlobalFlags {
+        session,
+        profile,
+        keep,
+        remaining,
+    })
 }
 
-/// Index and token of the first positional argument: skips `--session <name>`
-/// (with its value), `--session=<name>`, and any other `-`-prefixed flag.
+/// Index and token of the first positional argument: skips `--session <name>` /
+/// `--profile <name>` (with their values), the `=` forms, and any other `-`-prefixed flag.
 fn first_positional(args: &[String]) -> Option<(usize, &str)> {
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
-        if a == "--session" {
+        if a == "--session" || a == "--profile" {
             i += 2;
         } else if a.starts_with('-') {
             i += 1;
@@ -1572,9 +1632,13 @@ fn resolve_upload_files(files: &[String]) -> Result<Vec<std::path::PathBuf>, (Ou
 
 /// One parsed call: the verbs that run in no session are answered as they are; every
 /// other action drives the browser in the call's session via [`run_action`].
-async fn dispatch(invocation: &Invocation, session: &CliSession) -> DispatchOutcome {
+async fn dispatch(
+    invocation: &Invocation,
+    session: &CliSession,
+    requested_profile: Option<&str>,
+) -> DispatchOutcome {
     if invocation.action.runs_in_session() {
-        run_action(&invocation.action, session).await
+        run_action(&invocation.action, session, requested_profile).await
     } else {
         // Still clocked for their envelope; none opens a page, so no tab report is kept.
         let started = Instant::now();
@@ -1587,13 +1651,18 @@ async fn dispatch(invocation: &Invocation, session: &CliSession) -> DispatchOutc
 /// One action that drives the browser in its session: the pre-flight, the record of
 /// this call's use, the step, and the envelope's post-step facts. `elapsed_ms` covers
 /// the pre-flight, `open`'s baseline read and the step.
-async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
+async fn run_action(
+    action: &Action,
+    session: &CliSession,
+    requested_profile: Option<&str>,
+) -> DispatchOutcome {
     // The action's own clock: every envelope it returns is stamped with it.
     let started = Instant::now();
-    let use_outcome = match preflight(action, session, started).await {
-        Ok(outcome) => outcome,
-        Err(refused) => return refused,
-    };
+    let (use_outcome, resolved_profile) =
+        match preflight(action, session, requested_profile, started).await {
+            Ok(outcome) => outcome,
+            Err(refused) => return refused,
+        };
     // The session exists from here on: chrome-use is handed the lifetime as its cleanup
     // backstop, or the cleanup switched off for a kept one.
     set_group_cleanup_backstop(cli_sessions::backstop_ms(use_outcome.kept));
@@ -1617,9 +1686,37 @@ async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
         surface_leftover_note(&mut env, &session.name);
     }
     // A session that stopped answering is RECOVERED here — the one place the resolved name
-    // is in scope. It runs before the group tail below: a wedged session answers no listing,
-    // so the tail would spend its bound on a daemon about to be replaced.
+    // is in scope. It runs before the profile read and the group tail: a wedged session answers no
+    // listing, so either would spend its bound on a daemon about to be replaced.
     recover_session_wedge(&mut env, &session.name, !session.ephemeral, killed_by_clock).await;
+    // The profile that ACTUALLY served the call, from the helper's own report — never echoed
+    // from the request. A helper that reports another profile than the pinned one is the conflict
+    // refusal, not a quiet success. It is decided here but applied AFTER the group tail below, so
+    // the tab this step created still leaves chrome-use's group. A step that failed on its
+    // environment never reached the browser, so its report is not read.
+    let conflict = if let Some(pinned) = resolved_profile.as_ref()
+        && env.kind != OutKind::Environment
+        && let Some(cli) = cli_path()
+    {
+        match crate::chrome::profile::served(
+            &cli,
+            &session.name,
+            cli_sessions::display_name(&session.name),
+            pinned,
+            Reader::Cli,
+        )
+        .await
+        {
+            Ok(Some(actual)) => {
+                surface_profile(&mut env, &actual);
+                None
+            }
+            Ok(None) => None,
+            Err(refused) => Some(refused),
+        }
+    } else {
+        None
+    };
     // The tab this step created leaves chrome-use's group here, before the caller sees the
     // result, and the session's groups are collapsed ([`chrome_groups`]). Best-effort and
     // silent; a step with no established tab leaves it to the post-envelope tail.
@@ -1632,6 +1729,10 @@ async fn run_action(action: &Action, session: &CliSession) -> DispatchOutcome {
     if let (Some(opened), Some(cli)) = (opened, tail_cli(&env, session).as_deref()) {
         tail_ran = true;
         chrome_groups::leave_command_line_tabs(cli, &session.name, opened).await;
+    }
+    if let Some(refused) = conflict {
+        // The conflict replaces the step's answer, not the facts around it.
+        apply_profile_refusal(&mut env, &refused);
     }
     DispatchOutcome {
         envelope: env,
@@ -1721,13 +1822,21 @@ async fn execute(action: &Action, name: &str) -> (OutEnvelope, Option<String>) {
 }
 
 /// The action's pre-flight: the pure argument checks, the keep contract, the helper's
-/// presence, this call's record of use and the readiness gate. An `Err` is the refusal
-/// envelope; the early refusals come before anything is recorded.
+/// presence, this call's record of use, the profile resolution/bring-up and the readiness gate.
+/// An `Err` is the refusal envelope; the argument and keep refusals come before anything is
+/// recorded.
 async fn preflight(
     action: &Action,
     session: &CliSession,
+    requested_profile: Option<&str>,
     started: Instant,
-) -> Result<cli_sessions::UseOutcome, DispatchOutcome> {
+) -> Result<
+    (
+        cli_sessions::UseOutcome,
+        Option<crate::chrome::profile::Profile>,
+    ),
+    DispatchOutcome,
+> {
     let name = session.name.as_str();
     // A malformed URL or `--expect` selector is a usage error whatever the environment, so
     // it is answered without a readiness probe that would bury it.
@@ -1755,7 +1864,8 @@ async fn preflight(
         ));
     };
     // `--keep` on an unseen session creates only if chrome-use is not already running it:
-    // one predating the record keeps the idle cleanup its daemon started with.
+    // one predating the record keeps the idle cleanup its daemon started with. This is a usage
+    // check, answered before the profile is resolved or anything is launched.
     if session.keep && !recorded && session_running(&path, name).await {
         return Err(refusal(
             action,
@@ -1765,14 +1875,53 @@ async fn preflight(
             started,
         ));
     }
-    // This call's use restarts the lifetime, applies `--keep` and adds the in-flight mark:
-    // from here no sweep closes the session, not even during the gate below.
+    // This call's use restarts the lifetime, applies `--keep` and adds the in-flight mark BEFORE
+    // the profile bring-up: a sweep must not close the session while a profile is being started,
+    // which can take the bring-up's whole bound.
     let use_outcome = match cli_sessions::note_use(name, session.keep) {
         Ok(outcome) => outcome,
         Err(error) => return Err(refusal(action, name, OutKind::Usage, &error, started)),
     };
     SESSION_RECORD_CREATED.store(use_outcome.created, Ordering::Relaxed);
-    if let Err(why) = ensure_ready_for_actions().await {
+    // The profile is resolved, refused and brought up BEFORE the readiness gate: a bad name must
+    // be a bad argument (nothing opened, nothing launched), and a named profile must not be
+    // refused by a profile-blind preflight. The session's pin is read once here and handed to
+    // `prepare`, which refuses a damaged record only for a call that named a profile.
+    let resolved = crate::chrome::profile::prepare(
+        &path,
+        name,
+        cli_sessions::display_name(name),
+        requested_profile,
+        crate::chrome::profile::pinned(name),
+        Reader::Cli,
+    )
+    .await;
+    let resolved = match resolved {
+        Ok(profile) => profile,
+        Err(refused) => {
+            // No step: the mark goes, and a record this call created is dropped as every
+            // unmaterialized tail does.
+            if use_outcome.created {
+                cli_sessions::forget(name);
+            } else {
+                cli_sessions::note_end(name);
+            }
+            return Err(refusal_envelope(
+                action,
+                name,
+                refused.kind(),
+                refused.message(),
+                started,
+                refused.profile(),
+            ));
+        }
+    };
+    // A named profile was brought up above, so the profile-blind relay gate is skipped: it would
+    // refuse a working named profile because ANOTHER profile is not connected, and its recovery
+    // restarts every session's daemon.
+    if resolved.is_none()
+        && let Err(why) = ensure_ready_for_actions().await
+    {
         // No step: the mark goes and an unmaterialized record is dropped, as the tail does.
         if record_materialized() {
             cli_sessions::note_end(name);
@@ -1781,11 +1930,12 @@ async fn preflight(
         }
         return Err(refusal(action, name, OutKind::Environment, &why, started));
     }
-    Ok(use_outcome)
+    Ok((use_outcome, resolved))
 }
 
 /// An action's refusal envelope: printed on stderr, carrying the resolved session (so a
-/// swallowed or defaulted `--session` is observable) and the action's own clock.
+/// swallowed or defaulted `--session` is observable), the action's own clock and, for a profile
+/// conflict, the profile the tab is actually in.
 fn refusal(
     action: &Action,
     name: &str,
@@ -1793,9 +1943,39 @@ fn refusal(
     error: &str,
     started: Instant,
 ) -> DispatchOutcome {
+    refusal_envelope(action, name, kind, error, started, None)
+}
+
+/// Replace a step's answer with a profile conflict: the envelope keeps the facts about the CALL
+/// (session, wall time, a leftover note) and the profile the tab is in, and drops the step's own
+/// answer — that answer came from the wrong profile.
+fn apply_profile_refusal(env: &mut OutEnvelope, refused: &crate::chrome::profile::Refusal) {
+    eprintln!("mahbot chrome: {}", refused.message());
+    if let Some(payload) = env.payload.as_object_mut() {
+        payload.retain(|key, _| matches!(key.as_str(), "session" | "elapsed_ms" | "leftover"));
+        payload.insert("error".into(), json!(refused.message()));
+    }
+    env.ok = false;
+    env.kind = refused.kind();
+    if let Some(actual) = refused.profile() {
+        surface_profile(env, actual);
+    }
+}
+
+fn refusal_envelope(
+    action: &Action,
+    name: &str,
+    kind: OutKind,
+    error: &str,
+    started: Instant,
+    profile: Option<&crate::chrome::profile::Profile>,
+) -> DispatchOutcome {
     eprintln!("mahbot chrome: {error}");
     let mut env = out_env(action.name(), false, kind, json!({ "error": error }));
     situate(&mut env, name, started);
+    if let Some(actual) = profile {
+        surface_profile(&mut env, actual);
+    }
     DispatchOutcome::plain(env)
 }
 
@@ -1813,6 +1993,15 @@ fn surface_leftover_note(env: &mut OutEnvelope, name: &str) {
     if let Some(obj) = env.payload.as_object_mut() {
         let name = cli_sessions::display_name(name);
         obj.insert("leftover".into(), json!(chrome_leftover_pipe_note(name)));
+    }
+}
+
+/// Insert the profile that actually served the call as top-level envelope fields. It is the
+/// helper's own report, never echoed from the request, and it carries no e-mail address.
+fn surface_profile(env: &mut OutEnvelope, profile: &crate::chrome::profile::Profile) {
+    if let Some(obj) = env.payload.as_object_mut() {
+        obj.insert("profile".into(), json!(profile.display));
+        obj.insert("profile_dir".into(), json!(profile.dir));
     }
 }
 
@@ -1912,13 +2101,40 @@ impl StepClocks {
     }
 }
 
-/// Run one chrome-use step under `clocks` and classify its output. `session` scopes the
-/// call; `None` leaves it unscoped; `input` pipes a stdin payload.
+/// Run one product-internal chrome-use step under `clocks` and classify its output: a probe, a
+/// settle, a capture or a recovery read. `session` scopes the call; `None` leaves it unscoped;
+/// `input` pipes a stdin payload. An internal step never opens an unfocused window for the pinned
+/// profile — only the caller's own action may ([`spawn_action_step`]).
 async fn spawn_step(
     path: &Path,
     args: &[&str],
     session: Option<&str>,
     clocks: StepClocks,
+    input: Option<&[u8]>,
+) -> StepOutcome {
+    spawn_step_kind(path, args, session, clocks, ProfileWindow::Internal, input).await
+}
+
+/// Run one chrome-use step that IS the caller's own action, so a named profile connected without a
+/// window is brought up rather than refused (`profile_not_open`).
+async fn spawn_action_step(
+    path: &Path,
+    args: &[&str],
+    session: Option<&str>,
+    clocks: StepClocks,
+    input: Option<&[u8]>,
+) -> StepOutcome {
+    spawn_step_kind(path, args, session, clocks, ProfileWindow::Caller, input).await
+}
+
+/// The one spawn funnel: [`spawn_step`] and [`spawn_action_step`] differ only in whether the
+/// extension may open an unfocused window for the pinned profile.
+async fn spawn_step_kind(
+    path: &Path,
+    args: &[&str],
+    session: Option<&str>,
+    clocks: StepClocks,
+    window: ProfileWindow,
     input: Option<&[u8]>,
 ) -> StepOutcome {
     // A session-scoped spawn attempt may materialize the ephemeral session (a
@@ -1927,10 +2143,17 @@ async fn spawn_step(
         CHROME_USE_SPAWNED.store(true, Ordering::Relaxed);
     }
     let failed = |kind: OutKind, message: String| Err(StepFailure { kind, message });
+    // The session's pin rides EVERY session-scoped page call, internal ones included, so nothing
+    // re-binds the session to another profile behind the caller's back. Read per step rather than
+    // threaded through every action body: it is one small local file, read without the lock, and a
+    // process-wide copy could carry a pin another process has already dropped.
+    let browser = crate::chrome::profile::browser_arg(args, session);
     match spawn_cli(CliSpawn {
         path,
         args,
         session,
+        browser: browser.as_deref(),
+        profile_window: window,
         json: true,
         capture_stderr: true,
         timeout: clocks.call.kill,
@@ -1971,6 +2194,7 @@ async fn spawn_step(
                 out.status.success(),
                 &out.stdout,
                 String::from_utf8_lossy(&out.stderr).trim(),
+                browser.is_some().then_some(Reader::Cli),
             )
         }
     }
@@ -1979,7 +2203,8 @@ async fn spawn_step(
 /// Classify one chrome-use output into a step outcome. `expect` is the one action whose
 /// envelope can succeed on a non-zero exit (the verdict rides in `data`), so there — and
 /// nowhere else — envelope-success is trusted over the code. `truncated` names an answer
-/// the product cut off; the parse is the shared tolerant one ([`parse_first`]). Pure so
+/// the product cut off; `profile` is `Some` when this step carried a session profile pin, so a
+/// profile diagnostic is rewritten and classified and a profile-blind step is not. Pure so
 /// tests pin the mapping.
 fn classify_step_output(
     expect_style: bool,
@@ -1988,6 +2213,7 @@ fn classify_step_output(
     status_success: bool,
     stdout: &[u8],
     stderr: &str,
+    profile: Option<Reader>,
 ) -> StepOutcome {
     let failed = |kind: OutKind, message: String| Err(StepFailure { kind, message });
     // Fallback message for a non-success exit / unparseable stdout.
@@ -1998,8 +2224,8 @@ fn classify_step_output(
             .error
             .filter(|e| !e.trim().is_empty())
             .unwrap_or_else(fallback);
-        let kind = classify_call_failure(code.as_deref(), &msg);
-        failed(kind, sanitize_timeout_message(kind, &msg))
+        let (kind, message) = classify_call_failure(code.as_deref(), &msg, profile);
+        failed(kind, message)
     };
     let parsed: Option<ChromeResponse> = parse_first::<ChromeResponse>(stdout);
     if !status_success {
@@ -2012,10 +2238,9 @@ fn classify_step_output(
             None => {
                 // The stderr fallback can carry a timeout phrasing plus the canned hint
                 // (chrome-use prints diagnostics there when stdout is non-JSON), so it is
-                // classified and sanitized.
-                let msg = fallback();
-                let kind = classify_call_failure(None, &msg);
-                failed(kind, sanitize_timeout_message(kind, &msg))
+                // classified like stdout's.
+                let (kind, message) = classify_call_failure(None, &fallback(), profile);
+                failed(kind, message)
             }
         };
     }
@@ -2291,7 +2516,8 @@ async fn open(
     // above that budget; `total` (`timeout` plus the error-page slack) is the operation's own
     // bookkeeping for the probe, the settle and the capture.
     let operation = StepClocks::operation();
-    let resp = match spawn_step(&path, &["open", url], Some(session), operation, None).await {
+    let resp = match spawn_action_step(&path, &["open", url], Some(session), operation, None).await
+    {
         Ok(resp) => resp,
         Err(f) => return f.envelope("open", json!({ "url": url }), operation),
     };
@@ -2482,7 +2708,7 @@ async fn count_via_eval(
     let js = count_eval_js(selector);
     let args = ["eval".to_string(), js];
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let resp = spawn_step(path, &refs, Some(session), clocks, None).await?;
+    let resp = spawn_action_step(path, &refs, Some(session), clocks, None).await?;
     eval_count(&resp).ok_or(StepFailure {
         kind: OutKind::Error,
         message: "count eval returned a non-numeric result".to_string(),
@@ -2522,7 +2748,7 @@ async fn wait(target: &WaitTarget, timeout: Duration, session: &str) -> OutEnvel
     let clocks = StepClocks::forwarded(timeout);
     let args = wait_args(target, timeout.as_millis());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), clocks, None).await {
+    match spawn_action_step(&path, &refs, Some(session), clocks, None).await {
         Ok(_) => out_env(
             "wait",
             true,
@@ -2574,7 +2800,7 @@ async fn expect(cond: &ExpectCond, timeout: Duration, session: &str) -> OutEnvel
     let clocks = StepClocks::forwarded(timeout);
     let args = expect_args(cond, timeout.as_millis());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), clocks, None).await {
+    match spawn_action_step(&path, &refs, Some(session), clocks, None).await {
         Ok(resp) => match resp.data.as_ref().and_then(expect_outcome) {
             Some(outcome) => expect_envelope(&condition, outcome),
             None => out_env(
@@ -2599,7 +2825,7 @@ async fn eval(js: &str, bound: Option<Duration>, session: &str) -> OutEnvelope {
         Err(e) => return e,
     };
     let clocks = StepClocks::tool_clock(bound);
-    match spawn_step(&path, &["eval", js], Some(session), clocks, None).await {
+    match spawn_action_step(&path, &["eval", js], Some(session), clocks, None).await {
         Ok(resp) => {
             let result = eval_result(&resp).cloned().unwrap_or(Value::Null);
             out_env("eval", true, OutKind::Ok, json!({ "result": result }))
@@ -2674,7 +2900,7 @@ async fn extract(
         schema_file.to_string(),
     ];
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    match spawn_step(&path, &refs, Some(session), clocks, None).await {
+    match spawn_action_step(&path, &refs, Some(session), clocks, None).await {
         Ok(resp) => out_env(
             "extract",
             true,
@@ -2703,7 +2929,7 @@ async fn click(
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let clocks = StepClocks::tool_clock(bound);
-    match spawn_step(&path, &refs, Some(session), clocks, None).await {
+    match spawn_action_step(&path, &refs, Some(session), clocks, None).await {
         Ok(resp) => {
             // A page the click opens is reported by chrome-use (its reply names the tab); the tail
             // takes it out of the group, which is why the id rides back with the envelope.
@@ -2810,7 +3036,7 @@ async fn fill(
     };
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let clocks = StepClocks::tool_clock(bound);
-    match spawn_step(&path, &refs, Some(session), clocks, input.as_deref()).await {
+    match spawn_action_step(&path, &refs, Some(session), clocks, input.as_deref()).await {
         Ok(resp) => text_input_ok_envelope(action, &Value::Object(base.clone()), resp),
         Err(f) => f.envelope(action, Value::Object(base), clocks),
     }
@@ -2838,7 +3064,7 @@ async fn r#type(
     argv.extend(text_value_argv(text));
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let clocks = StepClocks::tool_clock(bound);
-    match spawn_step(&path, &refs, Some(session), clocks, None).await {
+    match spawn_action_step(&path, &refs, Some(session), clocks, None).await {
         Ok(resp) => text_input_ok_envelope(action, &Value::Object(base.clone()), resp),
         Err(f) => f.envelope(action, Value::Object(base), clocks),
     }
@@ -2876,7 +3102,7 @@ async fn press(
     }
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let clocks = StepClocks::tool_clock(bound);
-    match spawn_step(&path, &refs, Some(session), clocks, None).await {
+    match spawn_action_step(&path, &refs, Some(session), clocks, None).await {
         Ok(resp) => text_input_ok_envelope(action, &Value::Object(base.clone()), resp),
         Err(f) => f.envelope(action, Value::Object(base), clocks),
     }
@@ -2989,7 +3215,7 @@ async fn upload(
     let argv = crate::chrome::files::upload_argv(selector, &resolved);
     let refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let clocks = StepClocks::tool_clock(bound);
-    match spawn_step(&path, &refs, Some(session), clocks, None).await {
+    match spawn_action_step(&path, &refs, Some(session), clocks, None).await {
         Ok(resp) => upload_ok_envelope(selector, files, &resolved, &resp, unchecked),
         Err(f) => {
             let note = if f.kind == OutKind::Timeout {
@@ -3090,7 +3316,7 @@ async fn screenshot(output_dir: Option<&str>, session: &str) -> OutEnvelope {
     };
     let written = file_path.to_string_lossy().into_owned();
     let clocks = StepClocks::tool_clock(None);
-    match spawn_step(
+    match spawn_action_step(
         &path,
         &["screenshot", written.as_str()],
         Some(session),
@@ -3161,6 +3387,7 @@ async fn session_stop(name: &str, force: bool) -> OutEnvelope {
         Ok(_) => {
             // The mark holds only until an explicit stop.
             cli_sessions::forget(&target);
+            crate::chrome::profile::forget(&target);
             out_env("session", true, OutKind::Ok, json!({ "session": shown }))
         }
         Err(f) => f.envelope("session", json!({ "session": shown }), clocks),
@@ -3350,6 +3577,7 @@ async fn close_ephemeral(name: &str) {
             CHROME_USE_LEFTOVER_PIPES.fetch_or(out.leftover_pipes, Ordering::Relaxed);
             if out.status.success() {
                 cli_sessions::forget(name);
+                crate::chrome::profile::forget(name);
             } else {
                 eprintln!("mahbot chrome: failed to close ephemeral session '{display}'");
             }
@@ -3378,7 +3606,7 @@ mod tests {
 
     /// [`parse_invocation`] for a test that only cares about the action.
     fn parse_action(args: &[String]) -> Result<Invocation, String> {
-        parse_invocation(args).map(|(invocation, _)| invocation)
+        parse_invocation(args).map(|(invocation, _, _)| invocation)
     }
 
     /// The rows `help` prints under `Flags:` — `(spelling, description)`, in order. An
@@ -3484,9 +3712,9 @@ mod tests {
             .collect()
     }
 
-    /// The session-wide pair — handled outside the common flag path (`extract_global_flags`),
-    /// so it has its own guard rather than a shape probe.
-    const SESSION_PAIR: [&str; 2] = ["session", "keep"];
+    /// The session-wide flags — handled outside the common flag path (`extract_global_flags`),
+    /// so they have their own guard rather than a shape probe.
+    const GLOBAL_FLAGS: [&str; 3] = ["session", "profile", "keep"];
 
     #[test]
     fn eval_count_unwraps_chrome_use_result_envelope() {
@@ -3718,7 +3946,8 @@ mod tests {
                 _ => panic!("case {case}: expected SessionStatus"),
             }
 
-            // The global --session flag is rejected for session subcommands.
+            // The global --session flag is rejected for session subcommands, naming only the flag
+            // the call supplied.
             let err = parse_action(&[
                 "session".into(),
                 "status".into(),
@@ -3731,6 +3960,18 @@ mod tests {
             assert_eq!(
                 err, "--session is not valid for session stop/status/list",
                 "case {case}: --session is not a session subcommand's flag"
+            );
+            let err = parse_action(&[
+                "session".into(),
+                "list".into(),
+                "--profile".into(),
+                "Work".into(),
+            ])
+            .err()
+            .expect("--profile must be rejected for session subcommands");
+            assert_eq!(
+                err, "--profile is not valid for session stop/status/list",
+                "case {case}: --profile is not a session subcommand's flag"
             );
 
             // `--force` is `stop`'s flag alone: the other subcommands accept no flags.
@@ -4134,6 +4375,7 @@ mod tests {
                 case.status_success,
                 &case.stdout,
                 &case.stderr,
+                None,
             );
             match case.want {
                 Want::Ok => assert!(r.is_ok(), "{}: must be a success, got {r:?}", case.name),
@@ -4456,8 +4698,9 @@ mod tests {
     fn parse_dash_separator_takes_text_verbatim() {
         // Post-`--` tokens are verbatim text, never scanned for `--session` by either layer.
         let after_dash = argv(&["fill", "#q", "--", "--session", "sneaky", "rest"]);
-        let (session, _, remaining) =
-            extract_global_flags(&after_dash).expect("the terminator parses");
+        let GlobalFlags {
+            session, remaining, ..
+        } = extract_global_flags(&after_dash).expect("the terminator parses");
         assert_eq!(session, None, "--session after -- is text, not a binding");
         assert_eq!(remaining, after_dash, "every post--- token stays verbatim");
         let inv =
@@ -4811,7 +5054,7 @@ mod tests {
             .err()
             .expect("keep without a session must be refused");
         assert!(err.contains("--session"), "{err}");
-        let (inv, keep) =
+        let (inv, keep, _) =
             parse_invocation(&argv(&["--keep", "--session", "docs", "open", "https://x"]))
                 .expect("keep with a session parses");
         assert!(keep);
@@ -4828,6 +5071,44 @@ mod tests {
             .err()
             .expect("keep on a session-less action must be refused");
         assert!(err.contains("--keep is not valid for status"), "{err}");
+    }
+
+    #[test]
+    fn profile_is_a_global_flag_only_for_session_actions() {
+        let (inv, _, profile) =
+            parse_invocation(&argv(&["--profile", "Profile 8", "open", "https://x"]))
+                .expect("a profile before the action parses");
+        assert_eq!(profile.as_deref(), Some("Profile 8"));
+        assert_eq!(inv.session, None);
+        let (_, _, profile) = parse_invocation(&argv(&["open", "https://x", "--profile=Work"]))
+            .expect("the = form parses");
+        assert_eq!(profile.as_deref(), Some("Work"));
+        // The report/repair verbs take none of the session-wide flags.
+        assert!(parse_invocation(&argv(&["--profile", "Work", "status"])).is_err());
+        assert!(
+            parse_invocation(&argv(&["session", "stop", "docs", "--profile", "Work"])).is_err()
+        );
+        assert!(parse_invocation(&argv(&["--profile"])).is_err());
+        // An empty name is carried to the resolver, which refuses it with the profile list — the
+        // same discovery-by-refusal the agent tool gives.
+        let (_, _, empty) = parse_invocation(&argv(&["--profile", "", "open", "https://x"]))
+            .expect("an empty profile name parses");
+        assert_eq!(empty.as_deref(), Some(""));
+        let (_, _, empty) = parse_invocation(&argv(&["open", "https://x", "--profile="]))
+            .expect("an empty = form parses");
+        assert_eq!(empty.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn top_help_names_the_profile_flag_and_the_conflict_kind() {
+        let help = top_help();
+        assert!(help.contains("--profile <name>"), "{help}");
+        assert!(help.contains("profile conflict"), "{help}");
+        let action = action_help("open");
+        assert!(action.contains("conflict (2)"), "{action}");
+        // `session status` probes with the session's pin, so the session action can emit it too.
+        let session = action_help("session");
+        assert!(session.contains("conflict (2)"), "{session}");
     }
 
     #[test]
@@ -4880,7 +5161,7 @@ mod tests {
             let help = action_help(d.name);
             for (spelling, _) in printed_flag_rows(&help) {
                 let name = flag_name_in(spelling).expect("a printed row spells a flag");
-                if SESSION_PAIR.contains(&name) {
+                if GLOBAL_FLAGS.contains(&name) {
                     continue; // its own guard: it never reaches the common flag path
                 }
                 // The printed placeholder is the shape a reader is promised; the declaration's
@@ -4926,18 +5207,25 @@ mod tests {
     fn session_flags_are_printed_exactly_where_the_parser_takes_them() {
         let mut checked = [0usize; 2]; // takes them, refuses them
         for d in actions::ACTIONS.iter().filter(|a| a.cli.is_some()) {
+            let cli = d.cli.as_ref().expect("filtered to cli actions");
             let help = action_help(d.name);
             let printed = printed_flag_names(&help);
             let prints_session = printed.contains(&"session");
+            let prints_profile = printed.contains(&"profile");
             let prints_keep = printed.contains(&"keep");
             assert_eq!(
+                prints_session, prints_profile,
+                "{}: the session-wide flags are printed together",
+                d.name
+            );
+            assert_eq!(
                 prints_session, prints_keep,
-                "{}: the pair is printed as a pair",
+                "{}: the session-wide flags are printed together",
                 d.name
             );
             // A documented example is a valid invocation, so it proves acceptance.
             let example = printed_examples(&help).first().map_or_else(
-                || panic!("{}: no documented example to probe the pair with", d.name),
+                || panic!("{}: no documented example to probe the flags with", d.name),
                 |example| shell_words(example),
             );
             assert_eq!(
@@ -4964,6 +5252,11 @@ mod tests {
                     "{}: prints --keep so it must take it",
                     d.name
                 );
+                assert!(
+                    parse_invocation(&with(&["--profile", "Work", "--session", "docs"])).is_ok(),
+                    "{}: prints --profile so it must take it",
+                    d.name
+                );
             } else {
                 checked[1] += 1;
                 let err = parse_invocation(&with(&["--session", "docs"]))
@@ -4974,12 +5267,23 @@ mod tests {
                     "{}: --session refusal message: {err}",
                     d.name
                 );
+                let err = parse_invocation(&with(&["--profile", "Work"]))
+                    .err()
+                    .expect("refuses --profile");
+                assert!(
+                    err.starts_with("--profile is not valid for "),
+                    "{}: --profile refusal message: {err}",
+                    d.name
+                );
                 let err = parse_invocation(&with(&["--keep"]))
                     .err()
                     .expect("refuses --keep");
                 assert_eq!(
                     err,
-                    format!("--keep is not valid for {}", d.name),
+                    format!(
+                        "--keep is not valid for {}",
+                        cli.global_refusal.expect("refusing action")
+                    ),
                     "{}: --keep refusal message",
                     d.name
                 );
@@ -4998,7 +5302,7 @@ mod tests {
             for example in printed_examples(&action_help(d.name)) {
                 let words = shell_words(&example);
                 assert_eq!(&words[..2], &["mahbot", "chrome"], "{}: {example}", d.name);
-                let (invocation, _) = parse_invocation(&words[2..]).unwrap_or_else(|err| {
+                let (invocation, _, _) = parse_invocation(&words[2..]).unwrap_or_else(|err| {
                     panic!("{}: documented example refuses: {example}: {err}", d.name)
                 });
                 // The parsed action's name is also the declaration key the session-wide decision
@@ -5013,6 +5317,37 @@ mod tests {
             }
         }
         assert!(ran > 0, "the guard must have run examples");
+    }
+
+    /// The refusal for a session-wide flag an action does not take names only the flags the call
+    /// actually supplied.
+    #[test]
+    fn the_session_wide_flag_refusal_names_only_the_flags_supplied() {
+        let error = |args: &[&str]| {
+            parse_invocation(&argv(args))
+                .err()
+                .expect("a session-wide flag on status is refused")
+        };
+        assert_eq!(
+            error(&["--session", "docs", "status"]),
+            "--session is not valid for status"
+        );
+        assert_eq!(
+            error(&["--profile", "Work", "status"]),
+            "--profile is not valid for status"
+        );
+        assert_eq!(
+            error(&["--session", "docs", "--profile", "Work", "status"]),
+            "--session and --profile are not valid for status"
+        );
+        assert_eq!(
+            error(&["--keep", "status"]),
+            "--keep is not valid for status"
+        );
+        assert_eq!(
+            error(&["--session", "docs", "--profile", "Work", "--keep", "status"]),
+            "--session, --profile and --keep are not valid for status"
+        );
     }
 
     #[test]

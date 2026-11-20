@@ -28,9 +28,9 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 
 use crate::chrome::contract::ChromeResponse;
-use crate::chrome::spawn::CliRun;
+use crate::chrome::spawn::{CliRun, ProfileWindow};
 use crate::chrome::{CliRecovery, SESSION_STOP_TIMEOUT};
-use crate::tools::chrome::ChromeTool;
+use crate::tools::chrome::{ChromeTool, Gate};
 use crate::tools::path::PathAccess;
 #[cfg(test)]
 use crate::util::UnwrapPoison;
@@ -113,7 +113,7 @@ async fn capture(
             super::chrome_daemon::CHROME_USE_INSTALL_HINT
         )
     })?;
-    ChromeTool::ensure_available()
+    ChromeTool::ensure_available(Gate::ProfileBlind)
         .await
         .map_err(|error| anyhow::anyhow!("cannot render {name}: {error:#}"))?;
     let mut session = RenderSession::new(cli, render_session_name());
@@ -331,6 +331,7 @@ async fn step(
         session,
         args,
         crate::chrome::clocks(None, CliRecovery::Allowed),
+        ProfileWindow::Internal,
         workspace,
     )
     .await

@@ -381,6 +381,12 @@ pub(crate) enum OutKind {
     Error,
     Environment,
     Usage,
+    /// A tab is already working in a different Chrome profile than the one named. Distinct from
+    /// `Usage` (the name is fine) and from `Environment` (nothing about the host is broken): the
+    /// caller must use a new session or the profile the tab is in. Decided before dispatch from the
+    /// helper's own report for the session, and re-checked from that report after the step, so a
+    /// helper that quietly bound elsewhere can never pass as success.
+    Conflict,
 }
 
 impl OutKind {
@@ -397,17 +403,19 @@ impl OutKind {
             Self::Error => "error",
             Self::Environment => "environment",
             Self::Usage => "usage",
+            Self::Conflict => "conflict",
         }
     }
 
     /// Process exit code for this kind: site/data problems rc 1 and retryable, environment
-    /// problems rc 2, usage rc 3.
+    /// problems rc 2, usage rc 3. A profile conflict shares the environment class (the caller has
+    /// to decide), but keeps its own `kind`.
     #[must_use]
     pub(crate) const fn exit_code(self) -> i32 {
         match self {
             Self::Ok | Self::Empty => 0,
             Self::Timeout | Self::Network | Self::Redesign | Self::NotFound | Self::Error => 1,
-            Self::Environment => 2,
+            Self::Environment | Self::Conflict => 2,
             Self::Usage => 3,
         }
     }
@@ -520,22 +528,160 @@ pub(crate) fn unreachable_tab_message(error: &str) -> String {
     )
 }
 
-/// Classify a chrome-use step failure into an [`OutKind`]. Environment signatures win because
-/// rc 2 must not be masked by a page-level wrapper text.
-pub(crate) fn classify_call_failure(code: Option<&str>, error: &str) -> OutKind {
+/// Which frontend reads a rewritten refusal: the agent tool addresses a `tab`, the command line a
+/// `session`. A profile diagnostic is worded for its reader rather than carrying one frontend's
+/// term into the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reader {
+    Tool,
+    Cli,
+}
+
+impl Reader {
+    /// What this reader calls the thing a profile pin belongs to.
+    pub(crate) const fn noun(self) -> &'static str {
+        match self {
+            Self::Tool => "tab",
+            Self::Cli => "session",
+        }
+    }
+}
+
+/// chrome-use's session-binding refusal when it names two DIFFERENT Chrome profiles: the bound
+/// profile and the one the call asked for. The text embeds the bound and the requested relay
+/// endpoints, each followed by the Chrome profile it belongs to (`… (Chrome profile Default); … is
+/// Chrome profile Profile 8. Cannot switch …`), so the two ids decide. The same profile on both
+/// sides is a relay-endpoint rebind — the relay-recovery path's business — and yields `None`. The
+/// bound id is returned (the first the helper names).
+fn profile_switch(msg: &str) -> Option<String> {
+    if !msg
+        .to_ascii_lowercase()
+        .contains("already bound to profile")
+    {
+        return None;
+    }
+    let ids = profile_ids(msg);
+    let bound = *ids.first()?;
+    ids.iter().any(|id| *id != bound).then(|| bound.to_string())
+}
+
+/// The Chrome profile ids the helper names in a binding refusal, in the order it names them. The
+/// marker is matched case-insensitively, but each id is returned as the helper spelled it.
+fn profile_ids(msg: &str) -> Vec<&str> {
+    const MARKER: &str = "chrome profile ";
+    let lower = msg.to_ascii_lowercase();
+    let mut ids = Vec::new();
+    let mut at = 0;
+    while let Some(found) = lower[at..].find(MARKER) {
+        let start = at + found + MARKER.len();
+        let after = &msg[start..];
+        // The id ends at the closing bracket, the next clause, or a sentence period.
+        let end = after
+            .char_indices()
+            .find(|(i, c)| match c {
+                ')' | ';' | ',' => true,
+                '.' => after[i + 1..]
+                    .chars()
+                    .next()
+                    .is_none_or(char::is_whitespace),
+                _ => false,
+            })
+            .map_or(after.len(), |(i, _)| i);
+        let id = after[..end].trim().trim_matches(|c| c == '\'' || c == '"');
+        if !id.is_empty() {
+            ids.push(id);
+        }
+        at = start + end;
+    }
+    ids
+}
+
+/// The one wording for a profile conflict, for its reader. `subject` names the tab/session when
+/// the caller knows its display name (`None` says "this tab/session"); `actual` and `named` are
+/// profile descriptions (`"Your Chrome" (Profile 8)`), `named` absent when only the helper's id is
+/// known. The helper's own advice ("start a new session with --session …") is never relayed.
+pub(crate) fn profile_conflict_message(
+    reader: Reader,
+    subject: Option<&str>,
+    actual: &str,
+    named: Option<&str>,
+) -> String {
+    let noun = reader.noun();
+    let subject = subject.map_or_else(
+        || format!("this {noun}"),
+        |name| format!("{noun} \"{name}\""),
+    );
+    match named {
+        Some(named) => format!(
+            "{subject} is working in profile {actual}; this call asked for {named}. A {noun} is \
+             never switched silently — use a new {noun} for a different profile."
+        ),
+        None => format!(
+            "{subject} is working in profile {actual}. A {noun} is never switched silently — use \
+             a new {noun} for a different profile, or name {actual}."
+        ),
+    }
+}
+
+/// chrome-use's advice for a profile that is not connected (it names `chrome-use connect
+/// --browser …`, a verb this product does not have). Rewritten in product terms; the condition is
+/// an environment one (the pinned profile cannot be reached right now).
+fn is_profile_unavailable_advice(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("connect --browser")
+}
+
+/// The product-terms rewrite of a helper profile-unavailable advice.
+fn profile_unavailable_message(reader: Reader) -> String {
+    format!(
+        "the Chrome profile this {} is pinned to is not reachable right now. The product brings a \
+         named profile up before the call, so retry once; if it persists, open that profile's \
+         window and make sure its chrome-use extension is enabled there.",
+        reader.noun()
+    )
+}
+
+/// Classify a chrome-use step failure and word the message the caller sees — one decision, so a
+/// message can never carry one kind's wording under another kind's name. Environment signatures win
+/// because rc 2 must not be masked by a page-level wrapper text. The profile-specific arms apply
+/// only when a profile is in force (`profile`): a profile-blind call keeps the classification and
+/// the verbatim text it had before profiles existed.
+pub(crate) fn classify_call_failure(
+    code: Option<&str>,
+    error: &str,
+    profile: Option<Reader>,
+) -> (OutKind, String) {
     if is_daemon_unavailable_error(error)
         || is_daemon_unavailable_code(code)
         || is_relay_unavailable_error(error)
     {
-        return OutKind::Environment;
+        return (OutKind::Environment, error.to_string());
     }
+    // The profile conditions are recognised HERE, with the text they are shown as: the helper's
+    // advice ("start a new session with --session …", "chrome-use connect --browser …") is never
+    // relayed, and one message can never carry one kind's wording under another kind's name.
+    if let Some(reader) = profile {
+        if let Some(actual) = profile_switch(error) {
+            let text = profile_conflict_message(reader, None, &format!("\"{actual}\""), None);
+            return (OutKind::Conflict, text);
+        }
+        if is_profile_unavailable_advice(error) {
+            return (OutKind::Environment, profile_unavailable_message(reader));
+        }
+    }
+    let kind = classify_page_failure(code, error);
+    (kind, reword(kind, error))
+}
+
+/// The page-level half of the classification: what a failure that is not about the helper's
+/// environment or the profile came to.
+fn classify_page_failure(code: Option<&str>, error: &str) -> OutKind {
     if error.contains("net::ERR_") || code == Some("connection_failed") {
         return OutKind::Network;
     }
     // chrome-use's internal action timeout. Chrome-side deadlines equal the declared budget and
-    // the mahbot-side kill rides KILL_SLACK above them, so chrome-use's phrased timeouts normally
-    // surface first. Matched by its specific phrasings rather than a bare "timed out" substring,
-    // so an unrecognized connect-timeout still classifies as Error.
+    // the mahbot-side kill rides KILL_SLACK above them, so chrome-use's phrased timeout is
+    // normally the one reported. Matched by its specific phrasings rather than a bare "timed out"
+    // substring, so an unrecognized connect-timeout still classifies as Error.
     let lower = error.to_ascii_lowercase();
     if code == Some("timeout")
         || lower.contains("timed out after")
@@ -575,15 +721,16 @@ pub(crate) fn net_error_phrase(code: &str) -> &'static str {
 }
 
 /// Start of the canned remediation hint chrome-use appends to some timeout failures; everything
-/// from it to the end of the message is stripped by [`sanitize_timeout_message`].
+/// from it to the end of the message is stripped by [`classify_call_failure`].
 const STALE_RELAY_HINT_MARKER: &str = "Hint: the session's browser connection is unresponsive";
 
-/// chrome-use appends a canned hint to some timeout failures ("the session's browser connection
-/// is unresponsive … Reconnect with `connect`"), which is wrong in mahbot's surface — there is no
-/// `connect` verb and the connection is usually healthy — so both frontends strip it from
-/// Timeout-classified messages. Environment-classified diagnostics are never rewritten. The
-/// wording is chrome-use's: if a release rephrases it the strip degrades to a no-op.
-pub(crate) fn sanitize_timeout_message(kind: OutKind, message: &str) -> String {
+/// The message side of the classification: a Timeout-classified message loses chrome-use's canned
+/// stale-relay hint ("the session's browser connection is unresponsive … Reconnect with `connect`"),
+/// which is wrong on mahbot's surface — there is no `connect` verb and the connection is usually
+/// healthy. Every other message is left verbatim; the profile rewrites happened where the kind was
+/// decided. The hint wording is chrome-use's: if a release rephrases it the strip degrades to a
+/// no-op.
+fn reword(kind: OutKind, message: &str) -> String {
     if kind != OutKind::Timeout {
         return message.to_string();
     }
@@ -955,26 +1102,24 @@ mod tests {
     }
     #[test]
     fn classify_call_failure_mapping() {
+        let blind = |code: Option<&str>, error: &str| classify_call_failure(code, error, None).0;
+        let pinned = |code: Option<&str>, error: &str| {
+            classify_call_failure(code, error, Some(Reader::Cli)).0
+        };
         // Environment signatures win (rc 2 must not be masked by page text).
         assert_eq!(
-            classify_call_failure(None, "daemon may be busy or unresponsive"),
+            blind(None, "daemon may be busy or unresponsive"),
             OutKind::Environment
         );
         assert_eq!(
-            classify_call_failure(Some("browser_not_launched"), "whatever"),
+            blind(Some("browser_not_launched"), "whatever"),
             OutKind::Environment
         );
-        assert_eq!(
-            classify_call_failure(None, "relay isn't connected"),
-            OutKind::Environment
-        );
+        assert_eq!(blind(None, "relay isn't connected"), OutKind::Environment);
         // Site-level network failures.
+        assert_eq!(blind(None, "net::ERR_NAME_NOT_RESOLVED"), OutKind::Network);
         assert_eq!(
-            classify_call_failure(None, "net::ERR_NAME_NOT_RESOLVED"),
-            OutKind::Network
-        );
-        assert_eq!(
-            classify_call_failure(Some("connection_failed"), "connection refused"),
+            blind(Some("connection_failed"), "connection refused"),
             OutKind::Network
         );
         // chrome-use's internal action timeout (AGENT_BROWSER_DEFAULT_TIMEOUT)
@@ -982,29 +1127,52 @@ mod tests {
         // budget (the mahbot kill rides KILL_SLACK above), but the
         // classifier still catches it for every verb.
         assert_eq!(
-            classify_call_failure(None, "Wait timed out after 15000ms"),
+            blind(None, "Wait timed out after 15000ms"),
             OutKind::Timeout
         );
-        assert_eq!(
-            classify_call_failure(None, "waitFor timed out: .submit"),
-            OutKind::Timeout
-        );
+        assert_eq!(blind(None, "waitFor timed out: .submit"), OutKind::Timeout);
         // Not-found selectors.
         assert_eq!(
-            classify_call_failure(Some("element_not_found"), "whatever"),
+            blind(Some("element_not_found"), "whatever"),
             OutKind::NotFound
         );
-        assert_eq!(
-            classify_call_failure(None, "Element not found"),
-            OutKind::NotFound
-        );
+        assert_eq!(blind(None, "Element not found"), OutKind::NotFound);
         // Everything else is a generic step failure.
-        assert_eq!(
-            classify_call_failure(None, "some random issue"),
-            OutKind::Error
+        assert_eq!(blind(None, "some random issue"), OutKind::Error);
+        assert_eq!(blind(Some("other_code"), "some issue"), OutKind::Error);
+        // The helper's real 1.5.292 profile-switch refusal: both sides name their Chrome profile,
+        // and the ids differ — a conflict, never a generic failure.
+        let switch = "Session 'x' is already bound to profile/endpoint ws://127.0.0.1:59962/abc \
+                      (Chrome profile Default); ws://127.0.0.1:55745/def is Chrome profile Profile \
+                      8. Cannot switch to 'Profile 8' on an existing session. Start a new session \
+                      with --session <name>.";
+        assert_eq!(pinned(None, switch), OutKind::Conflict);
+        // A relay ENDPOINT rebind names the SAME profile on both sides: the relay-recovery path's
+        // business, not a profile conflict.
+        assert_ne!(
+            pinned(
+                None,
+                "Session 'x' is already bound to profile/endpoint ws://127.0.0.1:5000/abc (Chrome \
+                 profile Default); ws://127.0.0.1:5001/def is Chrome profile Default. Cannot switch \
+                 to 'ws://127.0.0.1:5001/def' on an existing session."
+            ),
+            OutKind::Conflict
         );
+        // A profile that is not reachable is an environment condition when a profile is in force.
         assert_eq!(
-            classify_call_failure(Some("other_code"), "some issue"),
+            pinned(
+                None,
+                "the profile isn't connected; run `chrome-use connect --browser Work`"
+            ),
+            OutKind::Environment
+        );
+        // A profile-blind call keeps the classification it had before profiles existed: the
+        // helper's advice is not reclassified.
+        assert_eq!(
+            blind(
+                None,
+                "the profile isn't connected; run `chrome-use connect --browser Work`"
+            ),
             OutKind::Error
         );
     }
@@ -1130,12 +1298,12 @@ mod tests {
         assert_eq!(parse_error_page_probe(&resp(json!(true))), None);
     }
 
-    /// A timeout message loses the canned stale-relay hint, and a message that
-    /// is not a timeout is left alone.
+    /// The classification decides the text too: a timeout message loses the canned stale-relay hint,
+    /// a profile diagnostic becomes the product-terms text, and any other message is left alone.
     #[test]
-    fn sanitize_timeout_message_strips_only_the_stale_relay_hint() {
+    fn classify_call_failure_rewrites_profiles_and_strips_the_stale_relay_hint() {
         {
-            let case = "sanitize timeout message strips stale relay hint";
+            let case = "timeout message strips stale relay hint";
             // Timeout-classified message with the canned hint → hint stripped
             // (including the separator period before the hint sentence), honest
             // prefix ("Wait timed out after 15000ms") kept. A Timeout message
@@ -1153,15 +1321,15 @@ mod tests {
                 ),
             ] {
                 assert_eq!(
-                    sanitize_timeout_message(OutKind::Timeout, input),
-                    expected,
+                    classify_call_failure(None, input, None),
+                    (OutKind::Timeout, expected.to_string()),
                     "case {case}: {input:?}"
                 );
             }
         }
 
         {
-            let case = "sanitize timeout message leaves non timeout alone";
+            let case = "a message without a timeout phrasing is left alone";
             // The hint with NO timeout phrasing → not Timeout, so untouched; an
             // Environment-classified relay message and an Error-classified message
             // carrying the hint are left verbatim too.
@@ -1169,17 +1337,51 @@ mod tests {
                         relay/service-worker mid-session). Reconnect with `connect`, or close the session \
                         and reopen it.";
             let untouched = [
-                (OutKind::Error, hint.to_string()),
-                (OutKind::Environment, "relay isn't connected".to_string()),
-                (OutKind::Error, format!("some other failure\n{hint}")),
+                (None, hint.to_string(), OutKind::Error),
+                (
+                    None,
+                    "relay isn't connected".to_string(),
+                    OutKind::Environment,
+                ),
+                (None, format!("some other failure\n{hint}"), OutKind::Error),
             ];
-            for (kind, message) in untouched {
+            for (code, message, kind) in untouched {
                 assert_eq!(
-                    sanitize_timeout_message(kind, &message),
-                    message,
+                    classify_call_failure(code, &message, None),
+                    (kind, message.clone()),
                     "case {case}: {kind:?}"
                 );
             }
+        }
+
+        {
+            // A helper profile-switch refusal becomes the product-terms conflict naming the
+            // profile the tab is actually in, worded for its reader; a profile-unavailable advice
+            // becomes the environment text. A profile-blind call is left verbatim.
+            let switch = "Session 'x' is already bound to profile/endpoint ws://a (Chrome profile \
+                          Default); ws://b is Chrome profile Profile 8. Cannot switch.";
+            let (kind, conflict) = classify_call_failure(None, switch, Some(Reader::Cli));
+            assert_eq!(kind, OutKind::Conflict);
+            assert!(conflict.contains("\"Default\""), "{conflict}");
+            assert!(conflict.contains("new session"), "{conflict}");
+            assert!(!conflict.contains("--session"), "{conflict}");
+            assert!(!conflict.contains('@'), "{conflict}");
+            let (kind, tool) = classify_call_failure(None, switch, Some(Reader::Tool));
+            assert_eq!(kind, OutKind::Conflict);
+            assert!(tool.contains("new tab"), "{tool}");
+            assert!(!tool.contains("session"), "{tool}");
+
+            let advice = "run `chrome-use connect --browser Work`";
+            let (kind, unavailable) = classify_call_failure(None, advice, Some(Reader::Cli));
+            assert_eq!(kind, OutKind::Environment);
+            assert!(
+                unavailable.contains("this session is pinned"),
+                "{unavailable}"
+            );
+            assert!(
+                classify_call_failure(None, advice, None) == (OutKind::Error, advice.to_string()),
+                "a profile-blind call keeps the helper text and its classification"
+            );
         }
     }
 

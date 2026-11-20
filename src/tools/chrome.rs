@@ -1,14 +1,13 @@
 //! Chrome automation tool.
 
 use crate::chrome::contract::{
-    ChromeResponse, ERROR_PAGE_PROBE_JS, EXPECT_TIMEOUT_NOTE, chrome_leftover_pipe_note,
+    ChromeResponse, ERROR_PAGE_PROBE_JS, EXPECT_TIMEOUT_NOTE, Reader, chrome_leftover_pipe_note,
     chrome_session_stop_command, chrome_use_warning, classify_call_failure, eval_count,
     expect_outcome, extract_output, extract_snapshot_text, is_daemon_unavailable_code,
     is_daemon_unavailable_error, is_self_launched_browser_error, is_session_unresponsive_error,
     is_unreachable_tab_error, net_error_phrase, never_dispatched_error, parse_first,
-    sanitize_timeout_message, self_launched_browser_error, self_launched_browser_note,
-    truncated_output_error, unreachable_tab_message, unreached_browser_error,
-    with_condition_timeout_note,
+    self_launched_browser_error, self_launched_browser_note, truncated_output_error,
+    unreachable_tab_message, unreached_browser_error, with_condition_timeout_note,
 };
 use crate::chrome::escape_js_single_quoted;
 use crate::chrome::files::{
@@ -18,7 +17,7 @@ use crate::chrome::forms::{
     ExpectCond, ExtractGate, count_eval_js, expect_args, extract_gate, parse_count_op,
     parse_predicate, parse_state, validate_extract_getters, wait_args, wait_target,
 };
-use crate::chrome::spawn::{CliOutput, CliRun, CliSpawn, spawn_cli};
+use crate::chrome::spawn::{CliOutput, CliRun, CliSpawn, ProfileWindow, spawn_cli};
 use crate::chrome::{ChromeCallClocks, CliRecovery, clocks};
 use crate::util::{UnwrapPoison, is_http_url};
 use crate::{Tool, Workspace};
@@ -204,9 +203,11 @@ const CLI_UNAVAILABLE: &str = "chrome-use CLI is not available";
 const CLI_SPAWN_FAILED: &str = "Failed to execute chrome-use CLI";
 const CLI_BOUND_EXCEEDED: &str = "chrome-use did not answer within";
 
-/// The one wording for an unusable helper, shared by the availability gate and the dispatch.
-const HELPER_UNUSABLE: &str = "the product's own copy of the helper is absent or unusable, \
-     so nothing can reach the browser.";
+/// The one wording for an unusable helper, shared by the availability gate, the dispatch and the
+/// profile-resolution bail. The page rasteriser shares the gate, so the agent's own sentence is
+/// added only where the tool answers a caller ([`ChromeTool::helper_missing_for_agent`]).
+const HELPER_MISSING: &str = "chrome-use CLI is not available: the product's own copy of the \
+                              helper is absent or unusable, so nothing can reach the browser.";
 
 /// The workspace a dispatch records when the surface has none of its own: link enrichment
 /// summarizes a channel message, not a workspace (see [`crate::logs::StrayEvent::workspace`]).
@@ -313,6 +314,15 @@ pub struct ChromeTool {
     chrome_sessions: std::sync::Arc<ChromeRunSessions>,
 }
 
+/// Which readiness gate a call runs: a profile-blind one may refuse a working named profile (and
+/// its relay recovery restarts every session's daemon), so a call pinned to a profile the pre-step
+/// already validated and brought up skips it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Gate {
+    ProfileBlind,
+    ProfileReady,
+}
+
 impl ChromeTool {
     /// A chrome tool for one agent run, sharing its session tracker; the run releases its own
     /// names.
@@ -376,7 +386,7 @@ impl ChromeTool {
     pub async fn fetch_page_text(&self, url: &str, tab: &str) -> anyhow::Result<String> {
         crate::util::http::validate_url(url)?;
 
-        Self::require_browser().await?;
+        Self::require_browser(Gate::ProfileBlind).await?;
 
         let _guard = self.acquire_tab_lock(tab).await;
         // Elapsed time of the whole enrichment dispatch, carried onto the leftover record below.
@@ -474,11 +484,11 @@ impl ChromeTool {
     /// verdict would leave it down for 10 s. The texts are audience-neutral (the rasteriser shares
     /// this gate), so the tool's own actions add the agent's sentence through
     /// [`Self::require_browser`].
-    pub(super) async fn ensure_available() -> anyhow::Result<()> {
+    pub(super) async fn ensure_available(gate: Gate) -> anyhow::Result<()> {
         match super::chrome_daemon::cli_probe().await {
             super::chrome_daemon::CliStatus::Available => {}
             super::chrome_daemon::CliStatus::Missing => {
-                anyhow::bail!("{CLI_UNAVAILABLE}: {HELPER_UNUSABLE}");
+                anyhow::bail!(HELPER_MISSING);
             }
             super::chrome_daemon::CliStatus::Transient(failure) => {
                 use super::chrome_daemon::CliProbeFailure;
@@ -498,17 +508,34 @@ impl ChromeTool {
                 anyhow::bail!(cause);
             }
         }
-        if let Err(refusal) = super::chrome_daemon::ensure_ready_for_actions().await {
+        if gate == Gate::ProfileBlind
+            && let Err(refusal) = super::chrome_daemon::ensure_ready_for_actions().await
+        {
             anyhow::bail!("{}", super::chrome_daemon::refusal_message(&refusal));
         }
         Ok(())
     }
 
     /// [`Self::ensure_available`] plus the agent's own sentence, added in one place.
-    async fn require_browser() -> anyhow::Result<()> {
-        Self::ensure_available()
+    async fn require_browser(gate: Gate) -> anyhow::Result<()> {
+        Self::ensure_available(gate)
             .await
             .map_err(|error| anyhow::anyhow!("{error}{}", super::chrome_daemon::REPORT_AS_IT_CAME))
+    }
+
+    /// [`HELPER_MISSING`] with the sentence the agent's own answers carry, for the bail that runs
+    /// before the readiness probe (the profile is resolved first, so the probe cannot answer for it).
+    fn helper_missing_for_agent() -> anyhow::Error {
+        anyhow::anyhow!(
+            "{HELPER_MISSING}{}",
+            super::chrome_daemon::REPORT_AS_IT_CAME
+        )
+    }
+
+    /// A profile refusal as the tool reports it: the kind it was classified as, then the
+    /// product-terms text — the same framing a failed dispatch uses.
+    fn profile_refusal_error(refused: &crate::chrome::profile::Refusal) -> anyhow::Error {
+        anyhow::anyhow!("{}: {}", refused.kind().as_str(), refused.message())
     }
 
     /// Condition-wait deadlines forwarded as `--timeout`. chrome-use honours them in full, so its
@@ -576,7 +603,7 @@ impl ChromeTool {
         ) else {
             return;
         };
-        self.evict_over_cap_tab(&eviction, tab);
+        self.evict_over_cap_tab(&eviction);
     }
 
     /// The record's own name for `tab`: the namespace is a transport detail, not part of the
@@ -610,21 +637,19 @@ impl ChromeTool {
 
     /// Close the tab the cap picked, off the agent's path: the over-cap call answers without
     /// waiting for the close, and the tab keeps counting as open until the browser confirms it is
-    /// gone. The close's reads run in `current`'s session, so they mint no page, and the pick is
-    /// re-checked right before the close (`take_eviction`). Accepted residual: a call already in
-    /// flight is not seen and answers with the unreachable-tab failure; the record still ends up
-    /// right.
-    fn evict_over_cap_tab(&self, eviction: &super::chrome_tab_ledger::Eviction, current: &str) {
+    /// gone. The close's reads run in the victim's own session (which carries its profile pin), so
+    /// they mint no page, and the pick is re-checked right before the close (`take_eviction`).
+    /// Accepted residual: a call already in flight is not seen and answers with the unreachable-tab
+    /// failure; the record still ends up right.
+    fn evict_over_cap_tab(&self, eviction: &super::chrome_tab_ledger::Eviction) {
         let namespace = self.session_prefix.clone();
         let session = self.resolve_session(&eviction.name);
-        let read_session = self.resolve_session(current);
         let eviction = eviction.clone();
         tokio::spawn(async move {
             if !super::chrome_tab_ledger::take_eviction(&namespace, &eviction) {
                 return;
             }
-            let gone =
-                super::chrome_release::evict_agent_tab(&namespace, &session, &read_session).await;
+            let gone = super::chrome_release::evict_agent_tab(&namespace, &session).await;
             super::chrome_tab_ledger::settle_eviction(&namespace, &eviction, gone);
         });
     }
@@ -658,16 +683,19 @@ impl ChromeTool {
         tab: &str,
         workspace: &str,
     ) -> anyhow::Result<ActionOutput<ChromeResponse>> {
-        let cli = super::chrome_daemon::cli_path()
-            .ok_or_else(|| anyhow::anyhow!("{CLI_UNAVAILABLE}: {HELPER_UNUSABLE}"))?;
+        let cli = super::chrome_daemon::cli_path().ok_or_else(Self::helper_missing_for_agent)?;
         let session = self.resolve_session(tab);
         self.chrome_sessions.track(&session);
 
-        let mut logged_args: Vec<&str> = args.to_vec();
-        logged_args.extend(["--json", "--session", &session]);
-        debug!("chrome-use args: {:?}", logged_args);
-
-        Self::dispatch_call(&cli, &session, args, Self::call_clocks(args), workspace).await
+        Self::dispatch_call(
+            &cli,
+            &session,
+            args,
+            Self::call_clocks(args),
+            ProfileWindow::Caller,
+            workspace,
+        )
+        .await
     }
 
     /// One chrome-use call in `session`, read the one way every call here is read: the child's EXIT
@@ -680,11 +708,18 @@ impl ChromeTool {
         session: &str,
         args: &[&str],
         clocks: crate::chrome::ChromeCallClocks,
+        window: ProfileWindow,
         workspace: &str,
     ) -> anyhow::Result<ActionOutput<ChromeResponse>> {
         // The elapsed time of this dispatch, carried on the durable rows it may write.
         let started = Instant::now();
-        let output = Self::spawn_call(cli, args, session, clocks).await?;
+        // The profile this call carries, read once: it is the spawn's `--browser` and the
+        // classification's "a profile is in force". A pinned call's helper diagnostic is rewritten;
+        // a profile-blind one is left alone.
+        let browser = crate::chrome::profile::browser_arg(args, Some(session));
+        let profile = browser.is_some().then_some(Reader::Tool);
+        let output =
+            Self::spawn_call(cli, args, session, browser.as_deref(), clocks, window).await?;
         let elapsed = started.elapsed();
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -731,6 +766,7 @@ impl ChromeTool {
                     retryable,
                     args.first().copied().unwrap_or(""),
                     session,
+                    profile,
                 )
                 .await
             }
@@ -755,12 +791,22 @@ impl ChromeTool {
         cli: &Path,
         args: &[&str],
         session: &str,
+        browser: Option<&str>,
         clocks: crate::chrome::ChromeCallClocks,
+        window: ProfileWindow,
     ) -> anyhow::Result<CliOutput> {
+        let mut logged_args: Vec<&str> = args.to_vec();
+        logged_args.extend(["--json", "--session", session]);
+        if let Some(dir) = browser {
+            logged_args.extend(["--browser", dir]);
+        }
+        debug!("chrome-use args: {:?}", logged_args);
         match spawn_cli(CliSpawn {
             path: cli,
             args,
             session: Some(session),
+            browser,
+            profile_window: window,
             json: true,
             capture_stderr: true,
             timeout: clocks.kill,
@@ -825,16 +871,17 @@ impl ChromeTool {
         retryable: Option<bool>,
         verb: &str,
         session: &str,
+        profile: Option<Reader>,
     ) -> anyhow::Error {
         let error_msg = if error.is_empty() {
             format!("chrome-use exited with code {exit}")
         } else {
             enhance_chrome_error(error)
         };
-        // Classify once: strip chrome-use's stale-relay hint from Timeout messages (this surface
-        // has no `connect` verb), then append the action's remediation note from the same kind.
-        let kind = classify_call_failure(code, &error_msg);
-        let error_msg = sanitize_timeout_message(kind, &error_msg);
+        // Classify once: the same decision words the message — a profile refusal is rewritten in
+        // product terms and chrome-use's stale-relay hint is stripped from Timeout messages (this
+        // surface has no `connect` verb).
+        let (kind, error_msg) = classify_call_failure(code, &error_msg, profile);
         let mut error_msg = with_retry_hint(error_msg, retryable);
         with_condition_timeout_note(verb, kind, &mut error_msg);
         // The daemon-down guidance REPLACES the classification when it fires, so
@@ -1174,6 +1221,10 @@ impl Tool for ChromeTool {
                 "tab": {
                     "type": "string",
                     "description": TAB_ARG
+                },
+                "profile": {
+                    "type": "string",
+                    "description": PROFILE_ARG
                 }
             },
             "required": ["action"]
@@ -1181,7 +1232,7 @@ impl Tool for ChromeTool {
     }
 
     async fn execute(&self, ws: &Workspace, args: Value) -> anyhow::Result<String> {
-        let (tab, action, normalized_notes) = Self::normalize_call(&args)?;
+        let (tab, action, requested_profile, normalized_notes) = Self::normalize_call(&args)?;
         for note in &normalized_notes {
             super::log_normalization_note("chrome", note);
         }
@@ -1195,18 +1246,100 @@ impl Tool for ChromeTool {
             anyhow::bail!("{}", Self::cap_closed_tab_message(&tab));
         }
 
-        Self::require_browser().await?;
-
-        Self::validate_find(&action)?;
+        // The profile is resolved, refused and brought up before any readiness check: a bad name
+        // opens nothing, and a named profile is never refused by the profile-blind gate. The pin is
+        // read once and handed to `prepare`, so the call reads the store a single time.
+        let session = self.resolve_session(&tab);
+        let pinned_before = crate::chrome::profile::pinned(&session);
+        // `prepare` returns a profile exactly when one is in force: the name this call gave, or the
+        // session's own pin. A damaged pin record is not a profile either, so a blind call stays
+        // profile-blind — and is never refused for an internal file's integrity.
+        let named = requested_profile.is_some()
+            || matches!(pinned_before, crate::chrome::profile::PinState::Pinned(_));
+        if named {
+            // Before the bring-up: an invalid `find` must not start a browser.
+            Self::validate_find(&action)?;
+        }
+        let cli = super::chrome_daemon::cli_path().ok_or_else(Self::helper_missing_for_agent)?;
+        let pinned = match crate::chrome::profile::prepare(
+            &cli,
+            &session,
+            self.logical_tab(&tab),
+            requested_profile.as_deref(),
+            pinned_before,
+            Reader::Tool,
+        )
+        .await
+        {
+            Ok(profile) => profile,
+            Err(refused) => return Err(Self::profile_refusal_error(&refused)),
+        };
+        // Only a pinned session needs tracking here: `prepare` may have recorded a profile for a
+        // call that never dispatches (a failed readiness check, a bring-up that spent its bound),
+        // and the run's own release is what must forget that pin. A profile-blind call that never
+        // dispatches registers nothing, exactly as before profiles existed. `prepare` returns a
+        // profile exactly when one is in force, so `named` is that condition — bound once, so the
+        // early argument check and the gate cannot drift apart.
+        if named {
+            self.chrome_sessions.track(&session);
+            Self::require_browser(Gate::ProfileReady).await?;
+        } else {
+            Self::require_browser(Gate::ProfileBlind).await?;
+            // A profile-blind call is gated before its arguments, exactly as before profiles
+            // existed.
+            Self::validate_find(&action)?;
+        }
 
         let _guard = self.acquire_tab_lock(&tab).await;
 
         let workspace = ws.as_path().to_string_lossy().into_owned();
 
-        let outcome = self.run_step(&tab, action, &workspace).await;
+        let mut outcome = self.run_step(&tab, action, &workspace).await;
+        // The profile that ACTUALLY served the call, from the helper's own report — never echoed
+        // from the request. A helper reporting another profile than the pinned one is the conflict
+        // refusal, not a quiet success; it is returned after the group settles, so the tab this
+        // step opened still leaves chrome-use's group. A step that never reached the browser
+        // cannot have changed the session's binding, so its report is not read.
+        let mut conflict = None;
+        let step_reached = outcome
+            .as_ref()
+            .err()
+            .is_none_or(|error| !Self::never_reached_the_owner_browser(&error.to_string()));
+        if let Some(pinned) = pinned.as_ref()
+            && step_reached
+        {
+            match crate::chrome::profile::served(
+                &cli,
+                &session,
+                self.logical_tab(&tab),
+                pinned,
+                Reader::Tool,
+            )
+            .await
+            {
+                Ok(Some(actual)) => {
+                    // The serving profile rides the answer, success and failure alike, so a failed
+                    // step still says which browser it ran in.
+                    let note = format!("[browser profile: {} ({})]", actual.display, actual.dir);
+                    match &mut outcome {
+                        Ok(text) => {
+                            use std::fmt::Write as _;
+                            let _ = write!(text, "\n{note}");
+                        }
+                        Err(error) => *error = anyhow::anyhow!("{error}\n{note}"),
+                    }
+                }
+                Ok(None) => {}
+                Err(refused) => conflict = Some(Self::profile_refusal_error(&refused)),
+            }
+        }
         // The cosmetic tail rides the step inside the same lock; the step's result is already
         // decided.
-        self.settle_step_group(&tab, outcome.as_ref().err()).await;
+        self.settle_step_group(&tab, conflict.as_ref().or(outcome.as_ref().err()))
+            .await;
+        if let Some(conflict) = conflict {
+            return Err(conflict);
+        }
         outcome
     }
 
@@ -1569,19 +1702,42 @@ impl ChromeTool {
         output
     }
 
-    fn normalize_call(args: &Value) -> anyhow::Result<(String, ChromeAction, Vec<String>)> {
+    fn normalize_call(
+        args: &Value,
+    ) -> anyhow::Result<(String, ChromeAction, Option<String>, Vec<String>)> {
         let mut normalized_notes: Vec<String> = Vec::new();
         let (tab, tab_note) = Self::normalize_tab(args);
         if let Some(note) = tab_note {
             normalized_notes.push(note);
         }
-
         let action_value = args
             .get("action")
             .cloned()
             .ok_or_else(|| anyhow::anyhow!(corrective_action_error(args)))?;
+        let profile = match args.get("profile") {
+            None | Some(Value::Null) => None,
+            // An empty name is a request like any other: the profile module refuses it as a bad
+            // argument and lists the available profiles, which is how names are discovered.
+            Some(Value::String(name)) => Some(name.trim().to_string()),
+            Some(other) => anyhow::bail!(
+                "Invalid chrome 'profile' argument: expected a profile name string, got {other}"
+            ),
+        };
         let (action_value, normalized_note) =
             normalize_action(action_value, args).map_err(|e| anyhow::anyhow!(e))?;
+        // The schema puts `profile` beside `action`; one nested anywhere inside the action object
+        // would be dropped by the action's own deserializer, so the call would silently run in the
+        // helper's own profile.
+        if action_value
+            .as_object()
+            .is_some_and(|map| map.values().any(|inner| inner.get("profile").is_some()))
+        {
+            anyhow::bail!(
+                "Invalid chrome 'profile' placement: `profile` is a top-level argument, beside \
+                 `action` and `tab`, not a field of the action. Pass it as \
+                 {{\"action\": {{...}}, \"profile\": \"<name>\"}}."
+            );
+        }
         // The note names the reshaping, never the reshaped action: a `fill` carries text the
         // owner typed, and a note is only ever logged.
         normalized_notes.extend(normalized_note);
@@ -1600,7 +1756,7 @@ impl ChromeTool {
             )
         })?;
 
-        Ok((tab, action, normalized_notes))
+        Ok((tab, action, profile, normalized_notes))
     }
 
     fn validate_find(action: &ChromeAction) -> anyhow::Result<()> {
@@ -2086,6 +2242,13 @@ const EXPECTED_ACTION_SHAPE: &str = "one of: {\"open\":{\"url\":\"https://...\"}
 const TAB_ARG: &str = "`tab` is optional — it names the page in this run's private session, and an \
                        empty or missing value means the default page";
 
+/// The schema's one line for the `profile` argument: the tool description's profile paragraph
+/// (`src/prompt/tool/chrome.md`) carries the accepted names, the binding rules and the three
+/// refusals, so the schema points at it instead of repeating it into the same request.
+const PROFILE_ARG: &str = "`profile` is optional — the Chrome profile this tab must work in. See \
+    the profile paragraph in this tool's description for the accepted names, the binding rules and \
+    the three refusals.";
+
 fn corrective_action_error(received: &Value) -> String {
     format!(
         "Invalid chrome action arguments. Expected action to be {EXPECTED_ACTION_SHAPE}. {TAB_ARG}. \
@@ -2179,7 +2342,7 @@ fn build_action_from_siblings(name: &str, args: &Value) -> Result<(Value, Option
     };
     let mut siblings = serde_json::Map::new();
     for (k, v) in obj {
-        if k == "action" || k == "tab" {
+        if k == "action" || k == "tab" || k == "profile" {
             continue;
         }
         siblings.insert(k.clone(), v.clone());
@@ -2764,6 +2927,48 @@ mod tests {
                 case.name
             );
         }
+    }
+
+    #[test]
+    fn normalize_reads_the_profile_top_level() {
+        let (_, _, profile, _) = ChromeTool::normalize_call(&json!({
+            "action": "open",
+            "url": "https://example.com",
+            "profile": "Profile 8"
+        }))
+        .expect("top-level profile");
+        assert_eq!(profile.as_deref(), Some("Profile 8"));
+
+        let (_, _, profile, _) =
+            ChromeTool::normalize_call(&json!({"action": "open", "url": "https://example.com"}))
+                .expect("no profile");
+        assert_eq!(profile, None);
+
+        // An empty name is a request like any other: the profile module refuses it and lists the
+        // available profiles, which is how names are discovered.
+        let (_, _, profile, _) = ChromeTool::normalize_call(&json!({
+            "action": "open",
+            "url": "https://example.com",
+            "profile": ""
+        }))
+        .expect("an empty profile is carried to the resolver");
+        assert_eq!(profile.as_deref(), Some(""));
+
+        let error = ChromeTool::normalize_call(&json!({
+            "action": "open",
+            "url": "https://example.com",
+            "profile": 8
+        }))
+        .expect_err("a non-string profile is refused");
+        assert!(error.to_string().contains("profile"), "{error}");
+
+        // Nested inside the action object it would be dropped by the action's deserializer, so the
+        // call would silently run in the helper's own profile.
+        let error = ChromeTool::normalize_call(&json!({
+            "action": {"open": {"url": "https://example.com", "profile": "Profile 8"}}
+        }))
+        .expect_err("a nested profile is refused");
+        assert!(error.to_string().contains("top-level argument"), "{error}");
     }
 
     #[test]
@@ -3632,6 +3837,14 @@ mod tests {
                 "the step may have opened its tab before this failure: {message}"
             );
         }
+    }
+
+    /// The helper-missing text is one of the "never reached the browser" classes: it is minted in
+    /// three places, and the classifier keys on [`CLI_UNAVAILABLE`], so the two must agree.
+    #[test]
+    fn the_helper_missing_text_is_a_never_reached_failure() {
+        assert!(HELPER_MISSING.starts_with(CLI_UNAVAILABLE));
+        assert!(ChromeTool::never_reached_the_owner_browser(HELPER_MISSING));
     }
 
     /// A cap-closed tab is refused from the tool's own record, before the browser is asked

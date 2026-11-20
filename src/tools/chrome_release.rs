@@ -730,28 +730,21 @@ async fn release_due() {
         Vec::new()
     };
     let mut protected = ProtectedNamespaces::snapshot(&durable);
-    // The session this pass runs its browser reads in, decided once for the sweep and the close
-    // alike.
+    // The session this pass runs the reclaim sweep's browser reads in ([`read_session`]); the close
+    // reads each profile's groups through one of their own names.
     let session = read_session(pass.as_ref());
     let ask = reclaim_names(cli.as_deref(), &session, &protected, deadline, sweep_due).await;
-    let issues = attempt_pass(
-        cli.as_deref(),
-        pass,
-        &session,
-        &ask,
-        &mut protected,
-        deadline,
-    )
-    .await;
+    let issues = attempt_pass(cli.as_deref(), pass, &ask, &mut protected, deadline).await;
     report_issues(issues).await;
 }
 
-/// The session one pass runs its browser reads in: a name the work itself already has, so a pass
-/// with one opens no page of its own. The records the pass took come first — those are the tabs
-/// being closed — then the first name any queued or parked record carries, which is the run's own
-/// session. A page our read opens in that group is removed by the record's own close, unless the
+/// The session the reclaim sweep's profile-blind read runs in: a name the work itself already has,
+/// so a pass with one opens no page of its own. The records the pass took come first — those are the
+/// tabs being closed — then the first name any queued or parked record carries, which is the run's
+/// own session. A page our read opens in that group is removed by the record's own close, unless the
 /// namespace is protected then. [`OWN_SESSION`] is what is left for a pass with no name to borrow:
-/// our own scratch group.
+/// our own scratch group. (The close itself reads each profile's groups in one of their own names —
+/// [`crate::tools::chrome_tabs::close_sessions`].)
 fn read_session(pass: Option<&ReleasePass>) -> String {
     if let Some(name) = pass
         .and_then(|pass| pass.records.first())
@@ -778,7 +771,6 @@ fn read_session(pass: Option<&ReleasePass>) -> String {
 async fn close_unprotected(
     cli: Option<&Path>,
     names: &[String],
-    session: &str,
     protected: &mut ProtectedNamespaces,
     deadline: Instant,
 ) -> HashMap<String, TabOutcome> {
@@ -794,7 +786,7 @@ async fn close_unprotected(
     // What the close asks right before each act: the live map and the held records as they are
     // then. The durable half is what the pass snapshotted once and cannot change inside one pass.
     let owned_again = ProtectedNamespaces::protects_live_or_held;
-    chrome_tabs::close_sessions(cli, &unprotected, session, deadline, &owned_again)
+    chrome_tabs::close_sessions(cli, &unprotected, deadline, &owned_again)
         .await
         .into_iter()
         .collect()
@@ -805,7 +797,7 @@ async fn close_unprotected(
 /// exactly, so no other run's tabs and none of the owner's can be touched; the caller's namespace
 /// is exempt from the live-run guard, or every eviction would be a no-op. Off the agent's path,
 /// bounded by [`ATTEMPT_TIMEOUT`].
-pub(crate) async fn evict_agent_tab(namespace: &str, session: &str, read_session: &str) -> bool {
+pub(crate) async fn evict_agent_tab(namespace: &str, session: &str) -> bool {
     let Some(cli) = release_cli() else {
         return false;
     };
@@ -816,14 +808,9 @@ pub(crate) async fn evict_agent_tab(namespace: &str, session: &str, read_session
         !names_a_namespace(namespace, name) && ProtectedNamespaces::protects_live_or_held(name)
     };
     let name = session.to_string();
-    let outcomes = chrome_tabs::close_sessions(
-        &cli,
-        std::slice::from_ref(&name),
-        read_session,
-        deadline,
-        &owned_again,
-    )
-    .await;
+    let outcomes =
+        chrome_tabs::close_sessions(&cli, std::slice::from_ref(&name), deadline, &owned_again)
+            .await;
     let gone = outcomes
         .first()
         .is_some_and(|(_, outcome)| matches!(outcome, chrome_tabs::TabOutcome::Gone));
@@ -850,6 +837,31 @@ pub(crate) async fn evict_agent_tab(namespace: &str, session: &str, read_session
         }
     }
     gone
+}
+
+/// Hand the sessions the browser confirmed gone to the let-go step: those tabs are closed, so the
+/// session ended, and its chrome-use record, its daemon and its profile pin end with it. A name a run
+/// owns again by the time the browser answered is left to that run's own release — a run
+/// re-dispatched while the close ran registers now, and its tabs must not be let go under it.
+async fn let_go_gone(
+    cli: Option<&Path>,
+    names: &[String],
+    outcomes: &HashMap<String, TabOutcome>,
+    deadline: Instant,
+) {
+    let Some(cli) = cli else {
+        return;
+    };
+    let live_now = ProtectedNamespaces::live_and_held();
+    let settled: Vec<String> = names
+        .iter()
+        .filter(|name| {
+            !live_now.contains(name)
+                && matches!(outcomes.get(name.as_str()), Some(TabOutcome::Gone))
+        })
+        .cloned()
+        .collect();
+    forget_settled(cli, &settled, deadline).await;
 }
 
 /// Let go of the sessions earlier passes closed but had no budget to forget, plus `just_settled`,
@@ -885,6 +897,9 @@ async fn forget_settled(cli: &Path, just_settled: &[String], deadline: Instant) 
     // let-go step must never race one.
     let owned_again = ProtectedNamespaces::protects_live_or_held;
     let left = chrome_tabs::forget_settled_sessions(cli, &names, deadline, &owned_again).await;
+    // A name this pass let go is a session that ended, so its profile pin ends with it — one store
+    // pass for the whole set. The helper's own answer says which names those were.
+    crate::chrome::profile::forget_all(left.settled.iter().map(String::as_str));
     let mut kept: Vec<(String, u32)> = Vec::new();
     for (name, attempts) in todo {
         if left.owned.contains(&name) {
@@ -1198,7 +1213,6 @@ fn conclude_released_record(namespace: &str) {
 async fn attempt_pass(
     cli: Option<&Path>,
     mut pass: Option<ReleasePass>,
-    session: &str,
     ask: &ReclaimAsk,
     protected: &mut ProtectedNamespaces,
     deadline: Instant,
@@ -1220,29 +1234,16 @@ async fn attempt_pass(
         return Vec::new();
     }
 
-    let outcomes = close_unprotected(cli, &names, session, protected, deadline).await;
+    let outcomes = close_unprotected(cli, &names, protected, deadline).await;
 
     // Every browser read is behind us, so our own session is let go HERE, where it is affordable.
     if let Some(cli) = cli {
         let_go_own_session(cli, deadline).await;
     }
 
-    // Let go of the settled sessions' chrome-use records and daemons — the close leaves both behind
-    // — but never a name a run owns again by the time the browser answered. This is the pass's
-    // THIRD read of the live map: a run re-dispatched while the close ran registers now, and its
-    // tabs must not be let go under it.
-    if let Some(cli) = cli {
-        let live_now = ProtectedNamespaces::live_and_held();
-        let settled: Vec<String> = names
-            .iter()
-            .filter(|name| {
-                !live_now.contains(name)
-                    && matches!(outcomes.get(name.as_str()), Some(TabOutcome::Gone))
-            })
-            .cloned()
-            .collect();
-        forget_settled(cli, &settled, deadline).await;
-    }
+    // Let go of the settled sessions' chrome-use records and daemons — the close leaves both
+    // behind — but never a name a run owns again by the time the browser answered.
+    let_go_gone(cli, &names, &outcomes, deadline).await;
 
     let mut issues: Vec<Issue> = Vec::new();
     let (reclaimed, reclaimed_issues) = reclaim_issues(&ask.names, ask.answered, &outcomes);
@@ -1343,16 +1344,14 @@ async fn flush_pending_run_releases(budget: Duration) {
     let names = record_names(&pass);
     let durable = durable_resume_namespaces().await;
     let mut protected = ProtectedNamespaces::snapshot(&durable);
-    let session = read_session(Some(&pass));
-    let outcomes =
-        close_unprotected(cli.as_deref(), &names, &session, &mut protected, deadline).await;
+    let outcomes = close_unprotected(cli.as_deref(), &names, &mut protected, deadline).await;
     if let Some(cli) = cli.as_deref() {
         // This product's own session, if the pass used it, goes before the process does.
         let_go_own_session(cli, deadline).await;
-        // The let-go queue is reached here too: only a graceful stop closes the group an
-        // unconfirmed let-go may have left, and the budget is below one whole stop, so the stop is
-        // best-effort.
-        forget_settled(cli, &[], deadline).await;
+        // A session whose tabs the browser confirmed gone ended here, so its let-go and its profile
+        // pin end with it — a shutdown must not leave a pin for the idle prune. The budget is below
+        // one whole stop, so the stop is best-effort.
+        let_go_gone(Some(cli), &names, &outcomes, deadline).await;
     }
     let mut released = 0usize;
     let mut still_open = 0usize;
@@ -1411,45 +1410,65 @@ async fn reclaim_names(
     // Built directly rather than through the live/held pair: it keeps a second driver off record
     // names.
     let claimed = claimed_names();
-    match chrome_tabs::agent_group_names(cli, session, deadline).await {
-        Ok(names) => {
-            reclaim_answered();
-            ReclaimAsk {
-                names: names
-                    .into_iter()
-                    .filter(|name| {
-                        !protected.contains(name)
-                            && !claimed.contains(name)
-                            && !stuck(crate::tools::chrome::session_namespace(name))
-                    })
-                    .collect(),
-                answered: true,
+    // One pass per pinned profile: a group lives in its session's profile, and an `extension call`
+    // reaches only the profile its own session is bound to.
+    let mut names = Vec::new();
+    let mut answered = false;
+    let mut failure = None;
+    for door in crate::chrome::profile::sweep_sessions(session, |name| {
+        name.starts_with(crate::tools::chrome::AGENT_TAB_PREFIX)
+    }) {
+        match chrome_tabs::agent_group_names(cli, &door, deadline).await {
+            Ok(found) => {
+                answered = true;
+                names.extend(found);
             }
+            Err(reason) => failure = Some(reason),
         }
-        Err(reason) => {
-            reclaim_unfinished();
-            debug!(
-                reason = %reason.text(),
-                "agent-run chrome reclaim could not read the live tab groups"
-            );
-            // No ownership door: the sweep cannot enumerate groups, and the Issues view is owed
-            // that.
-            if chrome_tabs::ownership_door_missing(cli, session, deadline).await {
-                report_once(
-                    NO_DOOR_MESSAGE,
-                    NO_OWNERSHIP_DOOR_REASON,
-                    serde_json::json!({
-                        "detail": "there is no ownership door on this browser side (no \
-                                   extension installed, one installed but disabled, or one \
-                                   older than the version that has it), so the sweep cannot \
-                                   enumerate the browser's groups and a name a record holds is \
-                                   left to chrome-use's own `session stop`",
-                    }),
-                )
-                .await;
-            }
-            ReclaimAsk::unanswered()
+    }
+    if let Some(reason) = &failure {
+        // A partial failure while another profile answered is still worth a line: the sweep then
+        // reaches only some profiles' tabs.
+        debug!(
+            reason = %reason.text(),
+            answered,
+            "agent-run chrome reclaim could not read every profile's live tab groups"
+        );
+    }
+    if answered {
+        reclaim_answered();
+        let mut seen = std::collections::HashSet::new();
+        ReclaimAsk {
+            names: names
+                .into_iter()
+                .filter(|name| seen.insert(name.clone()))
+                .filter(|name| {
+                    !protected.contains(name)
+                        && !claimed.contains(name)
+                        && !stuck(crate::tools::chrome::session_namespace(name))
+                })
+                .collect(),
+            answered: true,
         }
+    } else {
+        reclaim_unfinished();
+        // No ownership door: the sweep cannot enumerate groups, and the Issues view is owed
+        // that.
+        if chrome_tabs::ownership_door_missing(cli, session, deadline).await {
+            report_once(
+                NO_DOOR_MESSAGE,
+                NO_OWNERSHIP_DOOR_REASON,
+                serde_json::json!({
+                    "detail": "there is no ownership door on this browser side (no \
+                               extension installed, one installed but disabled, or one \
+                               older than the version that has it), so the sweep cannot \
+                               enumerate the browser's groups and a name a record holds is \
+                               left to chrome-use's own `session stop`",
+                }),
+            )
+            .await;
+        }
+        ReclaimAsk::unanswered()
     }
 }
 
@@ -2318,7 +2337,6 @@ exit 0
             let _ = chrome_tabs::close_sessions(
                 &cli,
                 &["warmup".to_string()],
-                OWN_SESSION,
                 Instant::now() + attempt_timeout,
                 &|_: &str| false,
             )
@@ -4685,7 +4703,6 @@ exit 0
             let issues = attempt_pass(
                 cli.as_deref(),
                 Some(pass),
-                OWN_SESSION,
                 &ReclaimAsk::unanswered(),
                 &mut protected,
                 Instant::now() + Duration::from_secs(10),
@@ -4980,7 +4997,7 @@ exit 0
         let other_session = format!("{}bystander", other.namespace());
         guard.write_state(&[ours_session.clone(), other_session.clone()], true);
 
-        let gone = evict_agent_tab(ours.namespace(), &ours_session, &other_session).await;
+        let gone = evict_agent_tab(ours.namespace(), &ours_session).await;
 
         assert!(gone, "the browser confirmed the victim's group gone");
         assert!(
@@ -5011,7 +5028,7 @@ exit 0
         let ours_session = format!("{}victim", ours.namespace());
         guard.write_state(std::slice::from_ref(&ours_session), true);
 
-        let gone = evict_agent_tab(ours.namespace(), &ours_session, &ours_session).await;
+        let gone = evict_agent_tab(ours.namespace(), &ours_session).await;
 
         assert!(
             !gone,
@@ -5036,7 +5053,7 @@ exit 0
         let ours_session = format!("{}victim", ours.namespace());
         guard.write_state(std::slice::from_ref(&ours_session), true);
 
-        let gone = evict_agent_tab(ours.namespace(), &ours_session, &ours_session).await;
+        let gone = evict_agent_tab(ours.namespace(), &ours_session).await;
 
         assert!(gone, "the group itself was closed: {:?}", guard.log_lines());
         let stops = guard

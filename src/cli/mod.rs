@@ -4964,7 +4964,7 @@ mod tests {
                 | OutKind::Redesign
                 | OutKind::NotFound
                 | OutKind::Error => Exit::Failed,
-                OutKind::Environment => Exit::Environment,
+                OutKind::Environment | OutKind::Conflict => Exit::Environment,
                 OutKind::Usage => Exit::Usage,
             }
         }
@@ -4979,6 +4979,7 @@ mod tests {
             OutKind::Error,
             OutKind::Environment,
             OutKind::Usage,
+            OutKind::Conflict,
         ] {
             assert_eq!(
                 kind.exit_code(),

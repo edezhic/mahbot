@@ -7,7 +7,10 @@
 //! the ONE shared source of LLM-facing action descriptions, rendered by both frontends, and the
 //! chrome-failure remediation notes ([`contract`]) are the other agent-facing text owned here. The
 //! chrome-use spawn ([`spawn`]), the tolerant `--json` envelope parser, the session-name/URL rules
-//! and the CLI's own session record ([`cli_sessions`]) live here too.
+//! and the CLI's own session record ([`cli_sessions`]) live here too. [`profile`] is the
+//! session-scoped Chrome profile pin: it resolves a caller-named profile the way the helper does,
+//! keeps every later call of that session on it, and turns the three profile conditions into
+//! distinct refusals.
 //!
 //! ## The two clocks
 //!
@@ -54,6 +57,8 @@ pub(crate) mod cli_sessions;
 pub(crate) mod contract;
 pub(crate) mod files;
 pub(crate) mod forms;
+pub(crate) mod lock_json;
+pub(crate) mod profile;
 pub(crate) mod spawn;
 
 /// Name prefix of every session the `mahbot chrome` CLI creates (named and ephemeral). The
