@@ -71,19 +71,19 @@ impl Tool for PhotocraftTool {
                 "action": {
                     "type": "string",
                     "enum": ALL,
-                    "description": "`commands` for the engine's registry, `inspect` for one document's size, colour mode, depth, layers and the format its file name gives, `run` to apply a chain to one document, `batch` to apply one chain to a folder."
+                    "description": "`commands`, `inspect`, `run` or `batch`."
                 },
                 "input": {
                     "type": "string",
-                    "description": "For `run` and `inspect`: the document to open — with `canvas` it is left out. For `batch`: the folder to process."
+                    "description": "The document (`run`/`inspect`) or folder (`batch`)."
                 },
                 "canvas": {
                     "type": "object",
-                    "description": "For `run` instead of `input`: the new document's own parameters, like {\"width\": 800, \"height\": 600}, so the chain starts from a canvas created from nothing; a fresh output for one is PNG."
+                    "description": "For `run` instead of `input`: the new canvas's parameters."
                 },
                 "output": {
                     "type": "string",
-                    "description": "For `run`: the file to write; an existing one is refused. For `batch`: the folder to write into, which must be new or empty."
+                    "description": "The file to write (`run`, never an existing one) or folder (`batch`, new or empty)."
                 },
                 "chain": {
                     "type": "array",
@@ -99,25 +99,25 @@ impl Tool for PhotocraftTool {
                         },
                         "required": ["command"]
                     },
-                    "description": "One step per engine command, `{\"command\": \"<id>\", \"params\": {...}}`, applied in order to the one open document for `run`, or to every file for `batch`; `params` is optional."
+                    "description": "Steps applied in order: `{\"command\": \"<id>\", \"params\": {...}}`."
                 },
                 "filter": {
                     "type": "string",
-                    "description": "Text to narrow the command registry by, for `commands`; a narrowed answer also carries each match's parameter documentation."
+                    "description": "Narrows the `commands` registry and adds each match's parameter docs."
                 },
                 "format": {
                     "type": "string",
-                    "description": "The output extension to write, for `batch`, like `jpg` or `png`; with no `chain` it is what a folder-wide conversion writes."
+                    "description": "Output extension for `batch`, e.g. `jpg`; with no `chain`, a conversion."
                 },
                 "quality": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 100,
-                    "description": "The lossy encoder quality, 1 to 100, for `batch`."
+                    "description": "Lossy quality, 1-100, for `batch`."
                 },
                 "tiff_layers": {
                     "type": "boolean",
-                    "description": "Keep layers in TIFF output, for `batch`; a `format` of tif or tiff keeps them anyway."
+                    "description": "Keep layers in `batch` TIFF output."
                 }
             }),
             &["action"],

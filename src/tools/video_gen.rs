@@ -837,60 +837,54 @@ impl Tool for VideoGenTool {
                 "prompt": {
                     "type": "string",
                     "description": format!(
-                        "The text description of the clip to produce, or of the edit to apply \
-                         (max {MAX_PROMPT_CHARS} chars)"
+                        "The clip or edit to produce (max {MAX_PROMPT_CHARS} chars)"
                     )
                 },
                 "video_url": {
                     "type": "string",
-                    "description": "The clip to edit: a public HTTPS URL, or a local path inside the caller's workspace (an attachment is shown as [Saved video: /path] in the chat, a previous call's output as [VIDEO:path]). Present, the call edits that clip; omitted, a new clip is generated. Mutually exclusive with first_frame/last_frame"
+                    "description": "The clip to edit: a public HTTPS URL or a local workspace path."
                 },
                 "images": {
                     "type": "array",
                     "items": { "type": "string" },
                     "maxItems": MAX_REFERENCE_IMAGES,
                     "description": format!(
-                        "A new clip's start picture (ONE, a local path inside the caller's own \
-                         workspace — an attachment, a previous output, or a file the caller filed \
-                         itself — never a URL), or an edit's guiding pictures (up to \
-                         {MAX_REFERENCE_IMAGES}, those local paths or public HTTPS URLs) for \
-                         style/subject/identity. An edit's guiding pictures are JPG/JPEG/PNG/WEBP/\
-                         HEIC/HEIF, at most 30 MB each. Mutually exclusive with \
-                         first_frame/last_frame"
+                        "A new clip's one start picture, or an edit's up to \
+                         {MAX_REFERENCE_IMAGES} guiding pictures."
                     )
                 },
                 "duration": {
                     "type": "integer",
-                    "description": "Output duration in seconds (model-dependent; valid values come from the active model's capability block)"
+                    "description": "Output seconds for a new clip."
                 },
                 "resolution": {
                     "type": "string",
-                    "description": "Desired resolution for a new clip (model-dependent; valid values come from the active model's capability block)"
+                    "description": "Resolution for a new clip."
                 },
                 "aspect_ratio": {
                     "type": "string",
-                    "description": "Aspect ratio for a new clip (model-dependent; valid values come from the active model's capability block)"
+                    "description": "Aspect ratio for a new clip."
                 },
                 "size": {
                     "type": "string",
                     "pattern": "\\d+x\\d+",
-                    "description": "Exact size of a new clip in WxH format (e.g. 1280x720; model-dependent)"
+                    "description": "Exact size for a new clip, e.g. `1280x720`."
                 },
                 "generate_audio": {
                     "type": "boolean",
-                    "description": "Whether a new clip carries an audio track (model-dependent)"
+                    "description": "Whether a new clip carries audio."
                 },
                 "seed": {
                     "type": "integer",
-                    "description": "Seed for a repeatable generation of a new clip"
+                    "description": "Seed for a repeatable new clip."
                 },
                 "first_frame": {
                     "type": "string",
-                    "description": "Path or public HTTPS URL of an image to use as the exact first frame (image-to-video) — JPG/JPEG/PNG/WEBP/HEIC/HEIF, at most 30 MB. A local path must be a file inside the caller's own workspace. Mutually exclusive with video_url and images"
+                    "description": "An exact first frame: a local path or public HTTPS URL."
                 },
                 "last_frame": {
                     "type": "string",
-                    "description": "Path or public HTTPS URL of an image to use as the exact last frame (image-to-video) — JPG/JPEG/PNG/WEBP/HEIC/HEIF, at most 30 MB. A local path must be a file inside the caller's own workspace. Mutually exclusive with video_url and images"
+                    "description": "An exact last frame: a local path or public HTTPS URL."
                 }
             }),
             &["prompt"],

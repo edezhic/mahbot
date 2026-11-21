@@ -112,13 +112,14 @@ impl Tool for CreateTicketTool {
     }
 
     /// The shared instructions plus the Manager-only fragment, so a holder
-    /// without those arguments never learns they exist.
+    /// without those arguments never learns they exist. The on-demand pointer is
+    /// appended last whatever the variant assembled above it.
     fn description(&self) -> String {
         let mut parts = vec![crate::prompt::load_prompt("tool/create_ticket.md")];
         if self.is_manager() {
             parts.push(crate::prompt::load_prompt("tool/create_ticket_manager.md"));
         }
-        parts.join("\n\n")
+        crate::tools::tool_reference::standing(self.name(), &parts.join("\n\n"))
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -127,21 +128,21 @@ impl Tool for CreateTicketTool {
             "title".into(),
             json!({
                 "type": "string",
-                "description": "Short title/summary of the task"
+                "description": "Short ticket title"
             }),
         );
         props.insert(
             "description".into(),
             json!({
                 "type": "string",
-                "description": "Detailed description of the task"
+                "description": "Full ticket description"
             }),
         );
         props.insert(
             "prerequisites".into(),
             json!({
                 "type": "array",
-                "description": "Optional list of ticket IDs that must be completed (done, archived, or cancelled) before this ticket can be claimed",
+                "description": "Optional ticket IDs that must finish first",
                 "items": {
                     "type": "string"
                 }
@@ -151,7 +152,7 @@ impl Tool for CreateTicketTool {
             "supersede".into(),
             json!({
                 "type": "string",
-                "description": "Optional ticket ID to supersede — atomically cancels the old ticket, creates this one as its replacement, and rewires any dependents to point to the new ID. A finished (done) ticket cannot be superseded."
+                "description": "Optional ticket ID to replace; a `done` ticket cannot be superseded"
             }),
         );
 
@@ -163,7 +164,7 @@ impl Tool for CreateTicketTool {
                 "priority".into(),
                 json!({
                     "type": "integer",
-                    "description": "Priority level: 0 = highest urgency, 1 (default), 2, 3, ... Higher numbers = lower priority"
+                    "description": "0 highest, 1 default, higher is lower"
                 }),
             );
             props.insert(
@@ -171,7 +172,7 @@ impl Tool for CreateTicketTool {
                 json!({
                     "type": "string",
                     "enum": ["feat", "fix", "maint"],
-                    "description": "Classification label: `feat` adds a capability, `fix` repairs a problem, `maint` is everything else"
+                    "description": "`feat` capability, `fix` repair, `maint` other"
                 }),
             );
             required.push("label");
@@ -285,7 +286,7 @@ impl Tool for UpdateTicketTool {
                 },
                 "phase": {
                     "type": "string",
-                    "description": "New phase for the ticket. Valid manual transitions: backlog (return to queue), planning (paused state awaiting further decision whether to proceed with the ticket or cancel it), queued (send to engineer), cancelled (abandon), failed (mark unsuccessful), done (mark complete; irreversible). Do NOT manually set other pipeline-managed phases (analysis, in_development, verification, in_sanitation) — the board poller handles these automatically and manual transitions will interfere with running agents. A finished (done) ticket's phase is immutable: it cannot be moved to any other phase."
+                    "description": "New phase: `backlog`, `planning`, `queued`, `cancelled`, `failed` or `done` (irreversible)."
                 }
             }),
             &["ticket_id", "phase"],
@@ -333,7 +334,7 @@ impl Tool for ListTicketsTool {
             &json!({
                 "phase": {
                     "type": "string",
-                    "description": "Optional phase filter (e.g. 'queued', 'in_development', 'done', 'cancelled'). When omitted, 'done' and 'cancelled' tickets are excluded — use an explicit phase filter to include them. Use 'search_archived_tickets' to find archived tickets."
+                    "description": "Optional phase filter; omitted, `done` and `cancelled` are excluded. `archived` is not a phase."
                 }
             }),
             &[],
@@ -596,7 +597,6 @@ mod tests {
                 .get("label")
                 .is_none()
         );
-        assert!(!maintainer.description().contains("label"));
         let answer = maintainer
             .execute(&ws, args("Tidy up"))
             .await

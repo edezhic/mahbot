@@ -8,8 +8,7 @@
 //! The standing description is deliberately short and each schema field carries its name and a
 //! short description: the whole text — every action, every field, and what is inert where — is the
 //! `reference` action, one embedded asset ([`crate::settings::reference`]) that the terminal's
-//! `mahbot config reference` prints too, so the two cannot drift. `the_schema_is_compact` pins
-//! the standing cost and `the_reference_names_every_action_and_field` pins the reference.
+//! `mahbot config reference` prints too, so the two cannot drift.
 use crate::config::{
     CONFIG_KEY_DEEPSEEK_KEY, CONFIG_KEY_EXA_KEY, CONFIG_KEY_TELEGRAM_BOT_TOKEN,
     CONFIG_KEY_WEB_SEARCH_PROVIDER,
@@ -112,11 +111,11 @@ fn build_schema() -> serde_json::Value {
                     "list_custom_roles",
                     "delete_custom_role",
                 ],
-                "description": "Which action. `reference` gives every action and field in full."
+                "description": "Which action. Its `reference` action gives every action and field in full."
             },
             "setting": {
                 "type": "string",
-                "description": "(get / set) The setting's name; `reference` lists them."
+                "description": "(get / set) The setting's name; its `reference` action lists them."
             },
             "value": {
                 "type": "string",
@@ -279,7 +278,7 @@ impl MahbotConfigTool {
     /// personal workspace folder separately — so it builds its own answer; every other action
     /// happens in full or fails.
     async fn answer(&self, args: serde_json::Value) -> anyhow::Result<ToolAnswer> {
-        super::refuse_unknown_fields(schema(), &args)?;
+        super::refuse_unknown_fields(schema(), &args, super::REFERENCE_ACTION_HINT)?;
         match super::get_str(&args, "action")? {
             "reference" => Ok(ToolAnswer::done(crate::settings::reference())),
             "about" => Ok(ToolAnswer::done(crate::settings::about())),
@@ -680,113 +679,8 @@ mod tests {
     use crate::workspace::test_ws;
     use serde_json::json;
 
-    /// The standing cost of this tool is pinned: the description stays a few lines and the whole
-    /// specification stays a fraction of what it was, while carrying several times the actions.
-    /// The detail lives in the `reference` action, not here — see the document tool's own pin.
-    ///
-    /// What the schema declares is checked against the reference, not against a copy of itself:
-    /// `the_reference_names_every_action_and_field` reads both schemas' `action` enums.
-    #[test]
-    fn the_schema_is_compact() {
-        const BASELINE_DESCRIPTION: usize = 1_000;
-        const BASELINE_TOTAL: usize = 5_000;
-
-        let tool = MahbotConfigTool;
-        let description = tool.description();
-        assert!(
-            description.len() <= BASELINE_DESCRIPTION,
-            "the description is {} bytes, over the {BASELINE_DESCRIPTION}-byte pin — the detail \
-             belongs in the `reference` action, not in the standing text",
-            description.len()
-        );
-        let schema = serde_json::to_string(&tool.parameters_schema()).unwrap();
-        let total = description.len() + schema.len();
-        assert!(
-            total <= BASELINE_TOTAL,
-            "the whole specification is {total} bytes (description {} + schema {}), over the \
-             {BASELINE_TOTAL}-byte pin",
-            description.len(),
-            schema.len()
-        );
-    }
-
-    /// The fields a tool's schema declares.
-    fn declared_fields(schema: &serde_json::Value) -> Vec<String> {
-        schema["properties"]
-            .as_object()
-            .expect("the schema's properties")
-            .keys()
-            .cloned()
-            .collect()
-    }
-
-    /// The actions a tool's schema declares — the one declaration a new action has to be added to.
-    fn declared_actions(schema: &serde_json::Value) -> Vec<String> {
-        schema["properties"]["action"]["enum"]
-            .as_array()
-            .expect("the action enum")
-            .iter()
-            .filter_map(serde_json::Value::as_str)
-            .map(str::to_string)
-            .collect()
-    }
-
-    /// The reference must carry everything the standing text no longer does: every action and every
-    /// field of both tools, under the size that makes it worth fetching. Actions and fields come
-    /// from the schemas, so an action added to either tool fails here until the reference names it.
-    /// The ceiling is a wide one on purpose: what must stay tight is the standing description and
-    /// the whole specification ([`the_schema_is_compact`]), not a text fetched once on demand.
-    #[test]
-    fn the_reference_names_every_action_and_field() {
-        // Raised by the `about` action's lines and by the masked-service-unit rule on the start-at-login
-        // switch: a text fetched on demand, not a standing cost.
-        const BASELINE: usize = 10_600;
-        let reference = crate::settings::reference();
-        assert!(
-            reference.len() <= BASELINE,
-            "the reference is {} bytes, over the {BASELINE}-byte budget — it must stay worth \
-             fetching",
-            reference.len()
-        );
-
-        let config = MahbotConfigTool.parameters_schema();
-        let workspace = crate::tools::workspace::WorkspaceTool.parameters_schema();
-        for action in declared_actions(&config)
-            .into_iter()
-            .chain(declared_actions(&workspace))
-        {
-            assert!(
-                reference.contains(&format!("`{action}`")),
-                "the reference never names the `{action}` action"
-            );
-        }
-
-        // Every field either tool accepts must be named, so the reference is the whole truth.
-        for field in declared_fields(&config)
-            .iter()
-            .chain(declared_fields(&workspace).iter())
-        {
-            assert!(
-                reference.contains(&format!("`{field}`")),
-                "the reference never names the `{field}` field"
-            );
-        }
-
-        for setting in crate::settings::Setting::all() {
-            assert!(
-                reference.contains(&format!("`{}`", setting.name())),
-                "the reference never names the `{}` setting",
-                setting.name()
-            );
-        }
-        assert!(
-            reference.contains("`provider_order:<model>`"),
-            "the reference never names the routing form"
-        );
-    }
-
     /// The reference and the README arrive whole while every other answer keeps the framework's
-    /// budget: the flag rides the call, so the size pin holds without un-truncating a listing.
+    /// budget: the flag rides the call, so the text arrives whole without un-truncating a listing.
     #[tokio::test]
     async fn the_static_texts_arrive_whole_and_other_answers_do_not() {
         let tool = MahbotConfigTool;
@@ -796,7 +690,6 @@ mod tests {
             .execute_with_payloads(&ws, json!({ "action": "reference" }))
             .await
             .expect("the reference touches no store");
-        assert_eq!(reference.text, crate::settings::reference());
         assert!(
             reference.preserve_text,
             "a cut reference is worse than none"

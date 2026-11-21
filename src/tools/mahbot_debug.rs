@@ -21,12 +21,12 @@ impl Tool for MahbotDebugTool {
             &serde_json::json!({
                 "query": {
                     "type": "string",
-                    "description": "A single read-only SQL statement (with multi-statement input only the first statement runs — the rest is silently ignored). Any mutating statement or non-read-only PRAGMA is rejected before execution — see the tool description for the full blocklist. Introspect table/column names first (sqlite_master / PRAGMA table_info) instead of guessing."
+                    "description": "A single read-only SQL statement."
                 },
                 "db": {
                     "type": "string",
                     "description": format!(
-                        "Target database. One of: {}. Defaults to 'core'.",
+                        "One of: {}. Defaults to core.",
                         crate::db::debug_db_names().join(", ")
                     )
                 }

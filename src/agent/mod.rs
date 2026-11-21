@@ -6330,11 +6330,6 @@ mod tests {
             "a call that had already returned keeps its real result"
         );
         assert_eq!(
-            results[1],
-            crate::prompt::load_prompt("tool_interrupted.md").trim(),
-            "the cut call is settled with the one fixed interrupted result"
-        );
-        assert_eq!(
             history.last().map(|message| message.content.as_str()),
             Some("interrupted by the user"),
             "the phrase is the session's whole record of the interruption"

@@ -1,1 +1,1 @@
-Search the web with `query`. Results come back as short highlights, each with an expand ID; call the tool again with `expand` set to that ID to retrieve the full cached text of that result. `query` and `expand` are mutually exclusive — pass exactly one per call. Expand IDs are session-scoped: they work only if a search ran earlier in this same session.
+Search the web with `query`, or expand an earlier result with `expand` — exactly one per call. Results are short highlights, each with an expand ID.

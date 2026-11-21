@@ -45,6 +45,8 @@ pub(crate) mod shell;
 pub(crate) mod show_tab;
 pub(crate) mod sleep;
 pub(crate) mod ticket;
+// The on-demand detail behind every tool's short standing description.
+pub(crate) mod tool_reference;
 pub(crate) mod video_gen;
 pub(crate) mod web_search;
 pub(crate) mod workspace;
@@ -216,6 +218,7 @@ pub(crate) use sleep::SleepTool;
 pub(crate) use ticket::{
     AddCommentTool, CreateTicketTool, GetTicketTool, ListTicketsTool, UpdateTicketTool,
 };
+pub(crate) use tool_reference::ReferenceTool;
 pub(crate) use video_gen::VideoGenTool;
 pub(crate) use web_search::WebSearchTool;
 pub(crate) use workspace::WorkspaceTool;
@@ -310,12 +313,17 @@ pub(crate) fn tool_params_schema(
     schema
 }
 
-/// Refuse an argument the tool's own schema does not declare, naming the reference action.
+/// The hint [`refuse_unknown_fields`] gives for a tool that keeps its own `reference` action.
+pub(crate) const REFERENCE_ACTION_HINT: &str =
+    "the `reference` action of this tool lists every action and field it accepts";
+
+/// Refuse an argument the tool's own schema does not declare, naming the guessed field.
 ///
 /// A guessed field name is a mistake worth naming rather than ignoring: the call would otherwise
 /// silently do less than it asked for. `null` is exempt, because a provider may pad omitted
 /// arguments with nulls. The schema is the only list of what a tool accepts, so this cannot
-/// drift from it.
+/// drift from it. `hint` says where the accepted fields are listed — not every tool has a
+/// `reference` action to point at.
 ///
 /// # Errors
 ///
@@ -323,6 +331,7 @@ pub(crate) fn tool_params_schema(
 pub(crate) fn refuse_unknown_fields(
     schema: &serde_json::Value,
     args: &serde_json::Value,
+    hint: &str,
 ) -> anyhow::Result<()> {
     let Some(object) = args.as_object() else {
         return Ok(());
@@ -334,10 +343,7 @@ pub(crate) fn refuse_unknown_fields(
         if value.is_null() || declared.is_some_and(|declared| declared.contains_key(key)) {
             continue;
         }
-        anyhow::bail!(
-            "unknown field '{key}' — the `reference` action of this tool lists every action and \
-             field it accepts"
-        );
+        anyhow::bail!("unknown field '{key}' — {hint}");
     }
     Ok(())
 }
@@ -1870,13 +1876,25 @@ mod tests {
             &serde_json::json!({ "action": {}, "path": {} }),
             &["action"],
         );
-        refuse_unknown_fields(&flat, &serde_json::json!({ "action": "read", "path": "a" }))
-            .expect("both fields are declared");
-        refuse_unknown_fields(&flat, &serde_json::json!({ "path": null, "folder": null }))
-            .expect("a provider may pad an omitted argument with null");
+        refuse_unknown_fields(
+            &flat,
+            &serde_json::json!({ "action": "read", "path": "a" }),
+            REFERENCE_ACTION_HINT,
+        )
+        .expect("both fields are declared");
+        refuse_unknown_fields(
+            &flat,
+            &serde_json::json!({ "path": null, "folder": null }),
+            REFERENCE_ACTION_HINT,
+        )
+        .expect("a provider may pad an omitted argument with null");
 
-        let err = refuse_unknown_fields(&flat, &serde_json::json!({ "folder": "a" }))
-            .expect_err("a guessed field is refused");
+        let err = refuse_unknown_fields(
+            &flat,
+            &serde_json::json!({ "folder": "a" }),
+            REFERENCE_ACTION_HINT,
+        )
+        .expect_err("a guessed field is refused");
         assert!(
             err.to_string().contains("`reference` action"),
             "the refusal says where the list is: {err}"
@@ -1885,11 +1903,20 @@ mod tests {
         // A schema with no `properties` declares nothing, so every field is a guess.
         let none = serde_json::json!({ "type": "object" });
         assert!(
-            refuse_unknown_fields(&none, &serde_json::json!({ "action": "read" })).is_err(),
+            refuse_unknown_fields(
+                &none,
+                &serde_json::json!({ "action": "read" }),
+                REFERENCE_ACTION_HINT
+            )
+            .is_err(),
             "a schema with no field to compare against refuses them all"
         );
-        refuse_unknown_fields(&none, &serde_json::json!({ "action": null }))
-            .expect("null padding is exempt whatever the schema declares");
+        refuse_unknown_fields(
+            &none,
+            &serde_json::json!({ "action": null }),
+            REFERENCE_ACTION_HINT,
+        )
+        .expect("null padding is exempt whatever the schema declares");
     }
 
     #[test]

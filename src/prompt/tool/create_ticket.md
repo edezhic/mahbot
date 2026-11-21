@@ -1,11 +1,5 @@
-Create a new ticket on the work board. New tickets start in the `backlog` where analysts pick them up for validation of the scope.
+File work on the board as a new ticket; it starts in `backlog` for analysts to validate its scope. Give a `title`, a `description`, and optionally `prerequisites` (tickets that must finish first) or `supersede` (the ticket this one replaces). A `done` ticket cannot be superseded — file the follow-up as a new ticket.
 
-Parameters:
-- `title`: short ticket title
-- `description`: full ticket description
-- `prerequisites`: optional ticket IDs that must finish before this ticket can be claimed
-- `supersede`: optional ticket ID to replace/refine (never a finished `done` ticket — it cannot be superseded)
+IDs take a bare number or `<workspace>-<number>`; another workspace's is refused.
 
-Ticket IDs may be given as a bare number (e.g. `123`) or the fully prefixed form (e.g. `workspace-123`); both refer to tickets in the current workspace only. IDs from other workspaces are rejected.
-
-When `supersede` is provided, the old ticket is cancelled, this ticket is created as its replacement, and dependent prerequisites are rewired to the new ticket. A `done` ticket cannot be superseded — its phase is immutable, so the follow-up work must be filed as a new standalone ticket.
+Returns the new ticket's ID.

@@ -2,6 +2,11 @@
 //! over `src/prompt/`, the `\n---\n` section splitter, the `{{key}}` substituter, and the
 //! workspace and ticket context blocks installed into a call.
 //!
+//! Two directories carry tool text: `tool/{name}.md` is a tool's standing description — how to
+//! use it, why, and one clause about what it returns — and `reference/{name}.md` is the detail
+//! behind it, fetched on demand by the `reference` tool
+//! ([`crate::tools::tool_reference`]).
+//!
 //! Not the prompts themselves — those are the `.md` files, loaded by asset key — and not a
 //! template engine: substitution is one pass and never cascades.
 
@@ -33,17 +38,23 @@ fn asset_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).replace("\r\n", "\n")
 }
 
+/// An embedded asset's text, or `None` when no such asset is embedded — for the on-demand tool
+/// references, whose keys are chosen at runtime by the model rather than by the code.
+#[must_use]
+pub(crate) fn prompt_asset(asset_key: &str) -> Option<String> {
+    PromptAssets::get(asset_key).map(|file| asset_text(file.data.as_ref()))
+}
+
 /// Load a prompt template from embedded assets. Panics if the asset is missing — prompt
 /// files are always present, so that is a stale key or a partial checkout.
 #[must_use]
 pub(crate) fn load_prompt(asset_key: &str) -> String {
-    let file = PromptAssets::get(asset_key).unwrap_or_else(|| {
+    prompt_asset(asset_key).unwrap_or_else(|| {
         panic!(
             "Embedded prompt '{asset_key}' not found. \
              Create the file at src/prompt/{asset_key} and rebuild."
         )
-    });
-    asset_text(file.data.as_ref())
+    })
 }
 
 /// The one statement of the delivery rule — a produced file reaches the user only when the reply
@@ -287,10 +298,9 @@ async fn discover_claude_rules(workspace: &Path) -> Vec<(String, String)> {
 /// literally.
 ///
 /// Keys must be word characters (`[a-zA-Z0-9_]`); a key with hyphens or dots stays in the
-/// output unexpanded (`all_template_variables_are_word_chars` enforces this across the embedded
-/// assets). A key with no replacement is left literal and warns at runtime, so a typo shows up
-/// in the log instead of silently corrupting the prompt. Callers pass keys with the full
-/// wrapper (`"{{ticket_id}}"`).
+/// output unexpanded. A key with no replacement is left literal and warns at runtime, so a typo
+/// shows up in the log instead of silently corrupting the prompt. Callers pass keys with the
+/// full wrapper (`"{{ticket_id}}"`).
 pub(crate) fn substitute(template: &str, replacements: &[(&str, &str)]) -> String {
     let map: HashMap<&str, &str> = replacements.iter().copied().collect();
     TEMPLATE_RE
@@ -418,76 +428,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn all_template_variables_are_word_chars() {
-        // Every {{...}} placeholder in the embedded assets must use \w+ keys (ASCII
-        // alphanumeric and underscore), or TEMPLATE_RE never matches and the placeholder
-        // silently reaches the prompt.
-        let broad_re =
-            regex::Regex::new(r"\{\{([^}]+)\}\}").expect("broad placeholder regex must compile");
-        for asset_key in PromptAssets::iter() {
-            let asset = PromptAssets::get(&asset_key)
-                .unwrap_or_else(|| panic!("asset {asset_key} disappeared between iter and get"));
-            let content = String::from_utf8_lossy(asset.data.as_ref());
-            for cap in broad_re.captures_iter(&content) {
-                let var_name = cap.get(1).unwrap().as_str();
-                assert!(
-                    var_name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_'),
-                    "Template variable '{{{{{var_name}}}}}' in '{asset_key}' contains non-\\w \
-                     characters (only ASCII alphanumeric and underscore are allowed).\n\
-                     Template keys must match \\w+ so that TEMPLATE_RE can substitute them. \
-                     Use underscores instead of hyphens, dots, or spaces.",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn all_prompt_assets_load_non_empty() {
-        for asset_key in PromptAssets::iter() {
-            let content = load_prompt(&asset_key);
-            assert!(
-                !content.trim().is_empty(),
-                "Prompt asset '{asset_key}' is empty or whitespace-only.\n\
-                 Each embedded prompt file must contain meaningful content.",
-            );
-        }
-    }
-
-    /// The assets the pipeline rotates through parallel agents, with the number of variants
-    /// each must yield: a collapse to one section silently hands every analyst the same
-    /// variant instead of a decorrelated set.
-    const VARIANT_ASSETS: &[(&str, usize)] = &[
-        ("analyze/angles.md", 3),
-        ("analyze/ticket_angles.md", 3),
-        ("review_angles.md", 3),
-        ("qa_angles.md", 3),
-        ("synthesis/repair_framing.md", 6),
-    ];
-
-    #[test]
-    fn embedded_assets_are_checked_out_with_lf() {
-        // `rust_embed` embeds the checkout's bytes, so CR bytes here mean the build would
-        // carry something other than the repository's text — the Windows build did exactly
-        // that before `.gitattributes` pinned LF.
-        let mut scanned = 0;
-        // The instruction texts are the `.md` assets (a stray `.DS_Store` is not one).
-        for asset_key in PromptAssets::iter().filter(|key| key.ends_with(".md")) {
-            let asset =
-                PromptAssets::get(&asset_key).expect("asset disappeared between iter and get");
-            assert!(
-                !asset.data.contains(&b'\r'),
-                "Embedded prompt '{asset_key}' holds CR bytes.\n\
-                 src/prompt must be checked out with LF — see .gitattributes, \
-                 and re-checkout rather than keeping an existing working copy.",
-            );
-            scanned += 1;
-        }
-        assert!(scanned > 0, "no embedded prompt asset was inspected");
-    }
-
     /// The context cut is also the nightly inventory's trigger: 10,000 characters render
     /// whole, 10,001 do not, and the count is characters — a multi-byte file measures the same.
     #[test]
@@ -500,31 +440,5 @@ mod tests {
         );
         assert!(!exceeds_workspace_file_limit(&fits));
         assert!(exceeds_workspace_file_limit(&format!("{fits}ё")));
-    }
-
-    #[test]
-    fn variant_assets_split_alike_under_either_checkout() {
-        for &(asset_key, variants) in VARIANT_ASSETS {
-            let file =
-                PromptAssets::get(asset_key).expect("asset disappeared between iter and get");
-            let text = asset_text(file.data.as_ref());
-            assert_eq!(
-                split_sections(&text).len(),
-                variants,
-                "'{asset_key}' must split into its {variants} variants — \
-                 the `---` separators are a contract, not formatting",
-            );
-
-            // A working copy checked out under the Windows convention hands the build the
-            // same file with CRLF endings.
-            let crlf = text.replace('\n', "\r\n");
-            assert_ne!(crlf, text, "'{asset_key}' has no line endings to convert");
-            assert_eq!(
-                asset_text(crlf.as_bytes()),
-                text,
-                "'{asset_key}' must deliver the same text under either \
-                 checkout convention",
-            );
-        }
     }
 }

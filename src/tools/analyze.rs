@@ -179,14 +179,15 @@ impl Tool for AnalyzeTool {
         if self.cancels() {
             parts.push(load_prompt("tool/analyze_cancel.md"));
         }
-        parts.join("\n\n")
+        // One pointer, last, whatever the holder's depths, mode and grants assembled above.
+        crate::tools::tool_reference::standing(self.name(), &parts.join("\n\n"))
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         let mut properties = json!({
             "message": {
                 "type": "string",
-                "description": "The question for the analysts"
+                "description": "Question for the analysts"
             }
         });
         let mut dispatch = vec!["message"];
@@ -195,20 +196,16 @@ impl Tool for AnalyzeTool {
             properties[AnalyzeDepth::ARG] = json!({
                 "type": "string",
                 "enum": choices,
-                "description": "How deep to go; the matching note says what each value does."
+                "description": "`quick` one round, `deep` multi-round"
             });
             dispatch.push(AnalyzeDepth::ARG);
         }
         if self.accepts_place {
-            // Declared per choice — `deep` never takes the folder — so only a
-            // holder with the `depth` argument is told about it.
-            let mut description = "Optional folder this round works in.".to_string();
-            if self.kinds.contains(&AnalyzeDepth::Deep) {
-                description.push_str(" `deep` ignores it.");
-            }
+            // Only a holder whose `quick` round can be placed declares it; the
+            // `deep` interaction lives in the reference.
             properties["place"] = json!({
                 "type": "string",
-                "description": description
+                "description": "Folder to run in; omit for your own"
             });
         }
         if !self.cancels() {
@@ -220,11 +217,11 @@ impl Tool for AnalyzeTool {
         properties[ACTION_ARG] = json!({
             "type": "string",
             "enum": [ACTION_CANCEL],
-            "description": "Set to `cancel` to stop one of the rounds you dispatched, named by `job_id`, instead of dispatching a new one."
+            "description": "`cancel` stops a round"
         });
         properties[JOB_ID_ARG] = json!({
             "type": "string",
-            "description": "The round to cancel — the id from its dispatch acknowledgement."
+            "description": "Round id from its acknowledgement"
         });
         let mut schema = super::tool_params_schema(&properties, &[]);
         schema["oneOf"] = json!([
@@ -3981,35 +3978,27 @@ mod tests {
         );
     }
 
-    /// Offered exactly where a quick async round can be dispatched: `action`/`job_id` and
-    /// the cancel note appear on the admin Assistant, the async Manager and a quick-granted
-    /// holder, and nowhere else.
+    /// Offered exactly where a quick async round can be dispatched: `action`/`job_id` appear on
+    /// the admin Assistant, the async Manager and a quick-granted holder, and nowhere else.
     #[test]
     fn the_cancel_action_is_offered_only_where_a_quick_round_can_be_dispatched() {
-        let note = load_prompt("tool/analyze_cancel.md");
         for tool in [
             AnalyzeTool::admin(Role::Assistant),
             AnalyzeTool::new(DispatchMode::Async, Role::Manager),
             AnalyzeTool::granted(&[AnalyzeDepth::Quick]),
         ] {
-            let description = tool.description();
             let schema = tool.parameters_schema();
             assert!(
                 schema["properties"]
                     .get(crate::tools::analyze::ACTION_ARG)
                     .is_some(),
-                "a holder that can dispatch a quick round must offer the cancel action: \
-                 {description}"
+                "a holder that can dispatch a quick round must offer the cancel action: {schema}"
             );
             assert!(
                 schema["properties"]
                     .get(crate::tools::analyze::JOB_ID_ARG)
                     .is_some(),
-                "a cancelling holder must declare the round to cancel: {description}"
-            );
-            assert!(
-                description.contains(&note),
-                "the cancel note must be declared where the action is: {description}"
+                "a cancelling holder must declare the round to cancel: {schema}"
             );
             // A cancel carries no dispatch argument, so the requirement is per-branch:
             // `message` (+ `depth`) to dispatch, `action` + `job_id` to cancel — never a
@@ -4041,23 +4030,18 @@ mod tests {
             AnalyzeTool::new(DispatchMode::Sync, Role::Maintainer),
             AnalyzeTool::granted(&[AnalyzeDepth::Deep]),
         ] {
-            let description = tool.description();
             let schema = tool.parameters_schema();
             assert!(
                 schema["properties"]
                     .get(crate::tools::analyze::ACTION_ARG)
                     .is_none(),
-                "a holder that cannot cancel must not declare the action: {description}"
+                "a holder that cannot cancel must not declare the action: {schema}"
             );
             assert!(
                 schema["properties"]
                     .get(crate::tools::analyze::JOB_ID_ARG)
                     .is_none(),
-                "a holder that cannot cancel must not declare a job id: {description}"
-            );
-            assert!(
-                !description.contains(&note),
-                "the cancel note must not be declared where the action is not: {description}"
+                "a holder that cannot cancel must not declare a job id: {schema}"
             );
             assert!(
                 schema.get("oneOf").is_none() && schema["required"].is_array(),
@@ -4066,9 +4050,9 @@ mod tests {
         }
     }
 
-    /// The depth choice's sweep: a holder is never told about a depth it does not have, the
-    /// `depth` argument exists only where a choice is declared, and `place` only where it
-    /// means something. Swept over every holder, so a third depth joins by existing.
+    /// The depth choice's sweep: the `depth` argument exists only where a choice is declared,
+    /// and `place` only where it means something. Swept over every holder, so a third depth
+    /// joins by existing.
     #[test]
     fn no_holder_reads_a_depth_it_does_not_have() {
         for mask in 1u32..(1 << AnalyzeDepth::ALL.len()) {
@@ -4081,14 +4065,6 @@ mod tests {
             let tool = AnalyzeTool::granted(&kinds);
             let declared = kinds.len() > 1;
             let schema = tool.parameters_schema();
-            let text = format!("{}\n{schema}", tool.description());
-            for depth in AnalyzeDepth::ALL {
-                let labelled = format!("`{}`", depth.as_str());
-                assert!(
-                    !text.contains(&labelled) || kinds.contains(&depth),
-                    "{kinds:?} is told about {labelled}, which it does not have: {text}"
-                );
-            }
             assert_eq!(
                 schema["properties"].get(AnalyzeDepth::ARG).is_some(),
                 declared,

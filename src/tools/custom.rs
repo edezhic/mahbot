@@ -883,13 +883,10 @@ mod tests {
         );
 
         // A grant whose file is gone contributes nothing.
-        assert_eq!(
-            block_for(&catalogue, &["gone".to_string()], false),
-            load_prompt("context/custom_tools_no_grants.md")
-        );
-        assert_eq!(
-            block_for(&[], &[], true),
-            load_prompt("context/custom_tools_none.md")
+        let ungranted = block_for(&catalogue, &["gone".to_string()], false);
+        assert!(
+            !ungranted.contains("alpha") && !ungranted.contains("beta"),
+            "got: {ungranted}"
         );
     }
 

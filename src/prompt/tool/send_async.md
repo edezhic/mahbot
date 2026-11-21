@@ -1,1 +1,1 @@
-The call returns before the work finishes; what comes back arrives later, injected into this conversation — a one-way address sends nothing back. A message to a continuous role is handled one at a time, in the order sent, so a second never overtakes the first; a one-off send starts a fresh agent right away and runs in parallel.
+Returns before the work finishes; the answer arrives later, in this conversation. A continuous role takes its messages in order, one at a time.

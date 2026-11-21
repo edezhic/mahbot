@@ -222,7 +222,7 @@ static ACTION_ENTRIES: LazyLock<Vec<Value>> = LazyLock::new(|| {
     vec![
         super::action_entry_schema(
             "observe",
-            "Read a surface's tree with element refs; narrow it, or ask what changed.",
+            "Read a surface tree.",
             &[],
             &json!({
                 "target": {"type": "string"},
@@ -249,10 +249,10 @@ static ACTION_ENTRIES: LazyLock<Vec<Value>> = LazyLock::new(|| {
                 "region": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}}
             }),
         ),
-        super::action_entry_schema("apps", "List applications with their ids.", &[], &json!({})),
+        super::action_entry_schema("apps", "List applications.", &[], &json!({})),
         super::action_entry_schema(
             "windows",
-            "List windows with their ids, optionally per app.",
+            "List windows (all or one app).",
             &[],
             &json!({
                 "app": {"type": "string"}
@@ -260,8 +260,7 @@ static ACTION_ENTRIES: LazyLock<Vec<Value>> = LazyLock::new(|| {
         ),
         super::action_entry_schema(
             "click",
-            "Click a ref, or a point by x and y; button, double and modifiers apply to a \
-             point only.",
+            "Click a ref or point.",
             &[],
             &json!({
                 "target": {"type": "string"},
@@ -275,7 +274,7 @@ static ACTION_ENTRIES: LazyLock<Vec<Value>> = LazyLock::new(|| {
         ),
         super::action_entry_schema(
             "type",
-            "Set an element's value, or type into focus.",
+            "Set value or type into focus.",
             &["text"],
             &json!({
                 "text": {"type": "string"},
@@ -285,7 +284,7 @@ static ACTION_ENTRIES: LazyLock<Vec<Value>> = LazyLock::new(|| {
         ),
         super::action_entry_schema(
             "press",
-            "Press a key chord, e.g. \"ctrl+c\".",
+            "Press a key chord.",
             &["keys"],
             &json!({
                 "keys": {"type": "string"}
@@ -305,7 +304,7 @@ static ACTION_ENTRIES: LazyLock<Vec<Value>> = LazyLock::new(|| {
         ),
         super::action_entry_schema(
             "drag",
-            "Drag between two normalized points.",
+            "Drag between points.",
             &["from", "to"],
             &json!({
                 "from": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "number"}},
@@ -313,10 +312,10 @@ static ACTION_ENTRIES: LazyLock<Vec<Value>> = LazyLock::new(|| {
                 "target": {"type": "string"}
             }),
         ),
-        super::action_entry_schema("cursor", "Report the pointer position.", &[], &json!({})),
+        super::action_entry_schema("cursor", "Report pointer position.", &[], &json!({})),
         super::action_entry_schema(
             "wait",
-            "Pause before the next action.",
+            "Pause (seconds).",
             &["seconds"],
             &json!({
                 "seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": MAX_WAIT_SECS}
@@ -733,17 +732,21 @@ impl Tool for ComputerTool {
         "computer"
     }
 
-    /// The shared contract plus this platform's own half — one installation is one platform.
+    /// The shared contract plus this platform's own half — one installation is one platform. The
+    /// on-demand pointer is appended last whatever was assembled above it.
     fn description(&self) -> String {
         let mut sections = vec![crate::prompt::load_prompt("tool/computer.md")];
         if let Some(asset) = PLATFORM_DESCRIPTION {
             sections.push(crate::prompt::load_prompt(asset));
         }
-        sections
-            .iter()
-            .map(|s| s.trim_end())
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        crate::tools::tool_reference::standing(
+            self.name(),
+            &sections
+                .iter()
+                .map(|s| s.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
     }
 
     fn is_advertised(&self) -> bool {
@@ -755,10 +758,7 @@ impl Tool for ComputerTool {
             "type": "object",
             "properties": {
                 "action": {
-                    "description": format!(
-                        "One action per call; each string argument is capped at {} characters.",
-                        core::MAX_ARG_CHARS
-                    ),
+                    "description": "One action per call.",
                     "oneOf": Value::Array(ACTION_ENTRIES.clone()),
                 }
             },

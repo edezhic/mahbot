@@ -32,12 +32,14 @@
 //!   the chart's other texts, saying how much more it holds rather than cutting
 //!   it off silently. At most [`MAX_CHARTS`] of a package's parts are read, and
 //!   the ones left out stay in the report.
-//! - **The notation the model reads is documented in `src/prompt/tool/read.md`**:
-//!   the block's header, its field labels, the marks standing in for values and
-//!   the annotations a value carries are stated once in [`crate::reader_output`],
-//!   which that description and this module both take them from, and the counts
-//!   standing in for what the bounds above leave out are what the description
-//!   calls an excess counted.
+//! - **The notation the model reads is stated in [`crate::reader_output`]** — the
+//!   block's header, its field labels, the marks standing in for values and the
+//!   annotations a value carries — and printed from there, so this module and the
+//!   other readers cannot name one mark two ways. The model-facing wording is a
+//!   hand-kept copy in `src/prompt/reference/read.md` (the on-demand detail behind
+//!   the `read` tool's short description): a mark renamed in [`crate::reader_output`]
+//!   has to be renamed there too. The counts standing in for what the bounds above
+//!   leave out are what that reference calls an excess counted.
 
 use super::{
     Relationship, ZipEntry, append_entity, attr, entry_names, is_chart_part, numfmt, part_text,

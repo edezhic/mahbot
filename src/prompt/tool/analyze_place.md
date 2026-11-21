@@ -1,1 +1,1 @@
-`place` points this round at another folder: the exact name of a managed workspace (case-sensitive) or an absolute path to a directory; the analysts read and search that folder with its own context. An absolute path that is a managed workspace is treated as that workspace; the filesystem root is refused. Omit it to run in your own workspace.
+`place` runs the round in another folder — a managed workspace name or an absolute path (not the root); omit for your own workspace.

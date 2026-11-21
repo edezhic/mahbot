@@ -37,11 +37,11 @@ Image sequences and HLS are not offered: both produce a folder, and this product
 
 ## The result
 
-The result starts with a `[VIDEO:path]` marker — put it in your reply to send the video — followed by what was produced: duration, pixel size, container and file size, and the frame rate when you gave `fps` as a whole number. When the product or the renderer had something to say after the file was written — a stop, a run that ended badly, a failed step after the write, a probe that could not check it — a further sentence says so; the video is still the result.
+The result starts with a `[VIDEO:path]` marker — put it in your reply to send the video — followed by what was produced: duration, pixel size, container and file size, and the frame rate when you gave `fps` as a whole number. After that comes the clip's timeline: its frames grouped four to a picture, each frame with its mark and each picture naming the frames it holds, the speech with marks and text, and a sound label where there is no speech. When the product or the renderer had something to say after the file was written — a stop, a run that ended badly, a failed step after the write, a probe that could not check it — a further sentence says so; the video is still the result.
 
 ## The machine side
 
-The renderer runs on the product's managed bun runtime, with the product's own headless Chrome for Testing and the product's own FFmpeg. None of it comes from the user's installed software: a machine with no Chrome and no FFmpeg still renders, and a Chrome the user happens to have is never used.
+The renderer runs on the product's managed bun runtime, with the product's own headless Chrome for Testing and the product's own FFmpeg. None of it comes from the user's installed software: a machine with no Chrome and no FFmpeg still renders, and a Chrome the user happens to have is never used. Nothing is uploaded and no render is billed: the work is local.
 
 The first call on a machine installs the renderer package from the npm registry, and the first render then downloads the browser into the product's storage — hundreds of megabytes, minutes rather than seconds. That is a first-use cost only: later calls reuse both, and a browser build this machine has already proved is used as it is, so the newest published build is fetched only when a download is needed. The product keeps the renderer at its newest release by itself.
 

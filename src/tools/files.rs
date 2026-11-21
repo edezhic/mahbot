@@ -62,11 +62,11 @@ impl Tool for FilesTool {
                 },
                 "to": {
                     "type": "string",
-                    "description": "`move` only: the destination folder inside your workspace, created when it is missing; a relative path resolves against your workspace root, `~` and `.` are that root, an empty value is its top level, and `archive` is today's dated folder under archive/. `..` is refused."
+                    "description": "`move` only: the destination folder, created when missing; `~` and `.` are your workspace root, an empty value its top level, and `archive` today's dated shelf. `..` is refused."
                 },
                 "name": {
                     "type": "string",
-                    "description": "The new name: required by `rename`, optional for `move` (which otherwise keeps the current name)."
+                    "description": "The new name: required by `rename`, optional for `move`."
                 }
             }),
             &["operation", "path"],

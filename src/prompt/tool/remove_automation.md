@@ -1,1 +1,1 @@
-Stop and remove one of your scheduled automations by its id, so it will no longer wake you up. Pass the exact id returned by `list_automations`. Only active (not yet fired/removed) automations can be removed; a removed automation will never fire.
+Stop an automation by `id`; the answer names what it removed.

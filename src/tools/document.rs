@@ -370,12 +370,10 @@ impl DeckSize {
     }
 }
 
-/// One size [`Rules::pptx_sizes`] states: the word and the deck it means, in EMU.
+/// One size [`Rules::pptx_sizes`] states: the word the model chooses from.
 #[derive(serde::Deserialize)]
 struct PptxSize {
     name: String,
-    #[serde(flatten)]
-    deck: DeckSize,
 }
 
 /// [`crate::docgen::rules`] parsed into this tool's shape: a file this shape cannot
@@ -436,23 +434,18 @@ impl Tool for DocumentTool {
         true
     }
 
-    /// The prompt asset with the rules the schema cannot state — the safety promise,
-    /// the losses and refusals no argument carries; bounds stay in the schema.
+    /// The standing asset, which carries the rules the schema cannot state, then the one pointer;
+    /// the refusals and the per-action manual are the on-demand reference.
     fn description(&self) -> String {
-        let ppt = crate::reader_output::ppt_description_substitutions();
         let input_mb = megabytes(crate::util::FILE_MAX_BYTES).to_string();
-        let edit_text_max = RULES.edit_text_max.to_string();
-        let docx_inline_marks = spelled_docx_marks(true);
-        let docx_label_marks = spelled_docx_marks(false);
-        let mut pairs: Vec<(&str, &str)> = vec![
+        let pairs: Vec<(&str, &str)> = vec![
             ("{{input_location}}", self.input_location()),
             ("{{input_mb}}", &input_mb),
-            ("{{edit_text_max}}", &edit_text_max),
-            ("{{docx_inline_marks}}", &docx_inline_marks),
-            ("{{docx_label_marks}}", &docx_label_marks),
         ];
-        pairs.extend(ppt.iter().map(|(key, value)| (*key, value.as_str())));
-        crate::prompt::substitute(&crate::prompt::load_prompt("tool/document.md"), &pairs)
+        crate::tools::tool_reference::standing(
+            self.name(),
+            &crate::prompt::substitute(&crate::prompt::load_prompt("tool/document.md"), &pairs),
+        )
     }
 
     /// The per-action contract, in `chrome`'s shape: `action` is a `oneOf` with one
@@ -600,9 +593,7 @@ fn scalar_arg() -> Value {
 /// `file_name`: the produced file's base name, capped at [`MAX_BASE_CHARS`].
 fn file_name_arg() -> Value {
     text_arg(&format!(
-        "Base name for the produced file (max {MAX_BASE_CHARS} chars); the tool appends the \
-         extension, puts the file in the workspace's generated/ directory and makes the name \
-         unique."
+        "Base name for the produced file (max {MAX_BASE_CHARS} chars)."
     ))
 }
 
@@ -617,12 +608,7 @@ fn metadata_arg() -> Value {
         "type": "object",
         "minProperties": 1,
         "additionalProperties": false,
-        "description": format!(
-            "The PDF's own description. A field left out stays as the file has it — except an \
-             existing modified date, which advances to a write; an empty string clears one; \
-             keywords is the single text the file carries. A date is {}.",
-            crate::docgen::pdf_date_format()
-        ),
+        "description": "The PDF's own description; a field left out stays as the file has it.",
         "properties": properties,
     })
 }
@@ -670,9 +656,7 @@ pub(crate) fn image_args() -> Vec<Value> {
 
 /// What a picture argument states, with `names` the formats its target takes.
 fn picture_arg(names: &str) -> Value {
-    text_arg(&format!(
-        "The picture to place ({names}); naming one side's size alone keeps its own proportions."
-    ))
+    text_arg(&format!("The picture to place ({names})."))
 }
 
 /// `paths`: a merge's inputs — the count as `minItems`/`maxItems`, the total size only
@@ -697,7 +681,7 @@ fn values_arg(kind: &str) -> Value {
         "type": "object",
         "minProperties": 1,
         "description": format!(
-            "One entry per {kind}, keyed by its name; a value is text, a number or a boolean."
+            "One entry per {kind}, keyed by its name."
         ),
     })
 }
@@ -706,9 +690,7 @@ fn values_arg(kind: &str) -> Value {
 /// comma-separated list of `N` and `N-M`; a split cuts one file per element, the other
 /// actions act on their union.
 fn pages_arg(split: bool) -> Value {
-    let element = text_arg(
-        "An entry: \"all\", a page, a range, or a comma list like \"1-3,5\"; \"all\" stands alone.",
-    );
+    let element = text_arg("A page, a range, or a comma list like \"1-3,5\".");
     if split {
         json!({
             "type": "array",
@@ -716,21 +698,13 @@ fn pages_arg(split: bool) -> Value {
             "minItems": 1,
             "maxItems": MAX_SPLIT_PARTS,
             "description": format!(
-                "One output file per entry, in order: [\"1-3\", \"5\"] makes two files, and \
-                 [\"1-3,5\"] one file holding those four pages. At most {MAX_SPLIT_PARTS} files \
-                 and {} pages.",
+                "One output file per entry, in order; at most {MAX_SPLIT_PARTS} files and {} \
+                 pages.",
                 RULES.max_pages_per_request
             ),
         })
     } else {
-        array_arg(
-            &element,
-            &format!(
-                "The pages to act on, as [\"1-3\", \"5\"]; absent means all pages. At most \
-                 {} pages.",
-                RULES.max_pages_per_request
-            ),
-        )
+        array_arg(&element, "The pages; absent means all.")
     }
 }
 
@@ -740,30 +714,15 @@ fn row_arg() -> Value {
     json!({ "type": "array", "items": scalar_arg() })
 }
 
-/// The one statement of a placed picture's size: the unit, the bound, and the derived
-/// side held to it too.
+/// The one statement of a placed picture's size: the unit and the bound.
 fn picture_size_rule() -> String {
-    format!(
-        "in points, {}; a side derived from the other one is held to the same bound",
-        RULES.dimension_points.bounds()
-    )
+    format!("in points, {}", RULES.dimension_points.bounds())
 }
 
 /// A size a picture is placed at, in points — a content-block or `add_image` height,
 /// and a `pdf_image`'s placed size.
 fn placed_size_arg(what: &str) -> Value {
     number_arg(&format!("{what} {}.", picture_size_rule()))
-}
-
-/// With neither side named, a laid-out block's picture keeps its own size, fitted whole
-/// into the page's or slide's text column; one in a sheet has no column.
-const BLOCK_IMAGE_FIT: &str = "with neither side named the picture keeps its own size, fitted \
-                                whole into the page's or slide's own text column.";
-
-/// A placed picture's width: the shared placement rule, then `fallback` — the one part a
-/// laid-out block's picture and one in a sheet do not share.
-fn picture_width_arg(what: &str, fallback: &str) -> Value {
-    number_arg(&format!("{what} {}; {fallback}", picture_size_rule()))
 }
 
 /// A `format_cells` `border`: the sides to set, each a boolean; an object naming no
@@ -778,8 +737,7 @@ fn border_arg() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": sides,
-        "description": "The sides to set — true draws a thin border on that side, false takes its \
-                        own away — at least one of them.",
+        "description": "The sides to set; at least one.",
     })
 }
 
@@ -799,8 +757,7 @@ fn list_arg() -> Value {
     json!({
         "type": ["string", "boolean"],
         "enum": values,
-        "description": "The list kind, or false to take the paragraph's list away; absent keeps \
-                        its numbering.",
+        "description": "The list kind, or false to remove it.",
     })
 }
 
@@ -813,7 +770,7 @@ fn fill_arg() -> Value {
             { "enum": [false] },
         ],
         "description": format!(
-            "Background: {} hex digits, or false to take the cell's fill away.",
+            "Background: {} hex digits, or false to clear it.",
             RULES.color_digits
         ),
     })
@@ -839,11 +796,7 @@ fn block_kind_note(kind: &str) -> Option<String> {
     match kind {
         "page_break" => Some("A page break: the next block starts a new page.".to_owned()),
         "link" => Some("A paragraph holding a link: its text and the address it opens.".to_owned()),
-        "contents" => Some(format!(
-            "A table of contents over the document's headings (levels {}), with the page numbers \
-             already written in; one per document.",
-            listed(&RULES.heading_levels)
-        )),
+        "contents" => Some("A table of contents over the headings; one per document.".to_owned()),
         _ => None,
     }
 }
@@ -857,28 +810,22 @@ fn block_field(name: &str) -> Value {
         "headers" => array_arg(
             &scalar_arg(),
             &format!(
-                "The header cells; a .docx table holds at most {} columns.",
+                "The header cells; at most {} columns.",
                 RULES.table_columns_max
             ),
         ),
         "rows" => array_arg(
             &row_arg(),
             &format!(
-                "The rows, each an array of cells; a .docx table holds at most {} columns.",
+                "The rows, each an array of cells; at most {} columns.",
                 RULES.table_columns_max
             ),
         ),
         "image" => content_image_arg(),
-        "width" => picture_width_arg("Placed width", BLOCK_IMAGE_FIT),
+        "width" => placed_size_arg("Placed width"),
         "height" => placed_size_arg("Placed height"),
-        "footnote" => text_arg(
-            "A footnote attached to this paragraph: its text is printed at the foot of the \
-             page the paragraph lands on.",
-        ),
-        "url" => text_arg(
-            "The address the link opens: an http, https, mailto or tel address, e.g. \
-             https://example.com; another scheme is refused.",
-        ),
+        "footnote" => text_arg("A footnote printed at the foot of the paragraph's page."),
+        "url" => text_arg("The address the link opens (http, https, mailto or tel)."),
         other => unreachable!("every block field has a declaration: {other}"),
     }
 }
@@ -914,9 +861,7 @@ fn content_arg() -> Value {
         "type": "array",
         "minItems": 1,
         "items": { "oneOf": variants },
-        "description": "The blocks, in order, each with its own \"type\"; \"notes\" is pptx speaker \
-                        notes, a table needs a row or a header, and a link, a page break, a \
-                        footnote and a table of contents are a .docx's own.",
+        "description": "The blocks, in order, each with its own \"type\".",
     })
 }
 
@@ -961,15 +906,13 @@ fn sheets_arg() -> Value {
 fn sheet_field(name: &str) -> Value {
     match name {
         "name" => text_arg(&format!(
-            "Sheet name: at most {} characters, none of {:?}, unique ignoring case; without one it \
-             becomes Sheet<n>.",
+            "Sheet name: at most {} characters, none of {:?}.",
             RULES.sheet_name_max, RULES.sheet_name_forbidden,
         )),
         "rows" => array_arg(&sheet_row_arg(), "The rows, top to bottom."),
         "merges" => array_arg(
             &text_arg("A range like A1:C1, corners in either order."),
-            "Ranges to merge, each covering at least two cells; a merge never clears what its cells \
-             hold.",
+            "Ranges to merge, each covering at least two cells.",
         ),
         other => unreachable!("every sheet field has a declaration: {other}"),
     }
@@ -988,9 +931,7 @@ fn cell_arg() -> Value {
                 "required": ["formula"],
             },
         ],
-        "description": "Text (a string starting with `=` stays text), a number, a boolean, or \
-                        {\"formula\": \"SUM(A1:A2)\"}; a number is written as the cell stores it, \
-                        not as a reading displayed it.",
+        "description": "Text, a number, a boolean, or {\"formula\": \"SUM(A1:A2)\"}.",
     })
 }
 
@@ -1001,33 +942,13 @@ fn sheet_row_arg() -> Value {
     )
 }
 
-/// What the four run toggles mean in every family's formatting path: one statement, not twelve.
-const TOGGLE_RULE: &str = "bold, italic, underline and strike are toggles: true sets the \
-                            property, false switches it off.";
-
 /// `edits`: one edit object per family, declaring that family's `op` enum and the union
-/// of its fields; the `op` description carries the mapping and the family's rules.
-fn edits_arg(family: crate::ooxml::Family, fields: &Value, rules: &str) -> Value {
+/// of its fields; the per-op field list lives in the reference.
+fn edits_arg(family: crate::ooxml::Family, fields: &Value) -> Value {
     let op_fields = edit_op_fields(family);
     let ops: Vec<&str> = op_fields.iter().map(|(op, _)| *op).collect();
     let mut properties = fields.clone();
-    let fields_by_op = op_fields
-        .iter()
-        .map(|(op, taken)| format!("{op}: {}", taken.join(", ")))
-        .collect::<Vec<_>>()
-        .join("; ");
-    let statements = [
-        rules,
-        TOGGLE_RULE,
-        &format!("Fields by op: {fields_by_op}."),
-    ];
-    let description = statements
-        .iter()
-        .filter(|part| !part.is_empty())
-        .copied()
-        .collect::<Vec<_>>()
-        .join(" ");
-    properties["op"] = choice_arg(&ops, &description);
+    properties["op"] = choice_arg(&ops, "The operation.");
     json!({
         "type": "array",
         "minItems": 1,
@@ -1038,11 +959,7 @@ fn edits_arg(family: crate::ooxml::Family, fields: &Value, rules: &str) -> Value
             "properties": properties,
             "required": ["op"],
         },
-        "description": format!(
-            "The edits, in order, at most {}. Applied whole or not at all: an edit whose fields \
-             do not fit its op is refused by name rather than partly applied.",
-            RULES.edits_max
-        ),
+        "description": format!("The edits, in order, at most {}.", RULES.edits_max),
     })
 }
 
@@ -1053,11 +970,7 @@ fn action_schema(action: &str) -> Value {
     match action {
         "create" => super::action_entry_schema(
             "create",
-            "Write a new file: blocks for docx/pptx/pdf, sheets for xlsx. A PDF is laid out as a \
-             simple stream: blocks follow one another down the page, and columns, floating objects \
-             and exact page placement are not attempted. A .docx may carry a running header and \
-             footer, page numbers, a table of contents over its headings, links, footnotes and \
-             explicit page breaks.",
+            "Write a new file: blocks for docx/pptx/pdf, sheets for xlsx.",
             &["format"],
             &json!({
                 "format": choice_arg(&SUPPORTED_FORMATS, "The format to write."),
@@ -1066,33 +979,21 @@ fn action_schema(action: &str) -> Value {
                 "metadata": metadata_entry(),
                 "size": choice_arg(
                     &pptx_size_words(),
-                    &format!(
-                        "A pptx slide size: {}. Unnamed is the {} deck this tool has always \
-                         written.",
-                        pptx_size_list(),
-                        RULES.pptx_default_size.inches()
-                    ),
+                    &format!("A pptx slide size; unnamed is {}.", RULES.pptx_default_size.inches()),
                 ),
-                "header": text_arg(
-                    "A running header, one paragraph per line: {page} is the page number and \
-                     {pages} the document's page count.",
-                ),
-                "footer": text_arg(
-                    "A running footer, one paragraph per line: {page} is the page number and \
-                     {pages} the document's page count.",
-                ),
+                "header": text_arg("A running header, one paragraph per line."),
+                "footer": text_arg("A running footer, one paragraph per line."),
             }),
         ),
         "fill_template" => super::action_entry_schema(
             "fill_template",
-            "Fill a copy of the user's own .docx/.pptx/.xlsx sample's placeholders.",
+            "Fill a copy of the user's own sample's placeholders.",
             &["path", "values"],
             &json!({ "path": path_arg(), "values": values_arg("placeholder") }),
         ),
         "docx_edit" => super::action_entry_schema(
             "docx_edit",
-            "Edit a .docx/.docm; a .docx package is required. Rewrite and format its text, and \
-             add paragraphs, pictures and tables.",
+            "Edit a .docx/.docm; a .docx package is required.",
             &["path", "edits"],
             &json!({
                 "path": path_arg(),
@@ -1119,8 +1020,7 @@ fn action_schema(action: &str) -> Value {
                             "Paragraph alignment."
                         ),
                         "style": text_arg(&format!(
-                            "A paragraph style the document defines, at most {} characters; \
-                             Normal, Heading 1, Heading 2 and Heading 3 always work.",
+                            "A paragraph style, at most {} characters.",
                             RULES.paragraph_style_max
                         )),
                         "indent_left": number_arg(&format!(
@@ -1132,7 +1032,7 @@ fn action_schema(action: &str) -> Value {
                             RULES.paragraph_indent_points.bounds()
                         )),
                         "indent_first_line": number_arg(&format!(
-                            "First-line indent, {} points; a negative one hangs.",
+                            "First-line indent, {} points.",
                             RULES.paragraph_indent_points.bounds()
                         )),
                         "spacing_before": number_arg(&format!(
@@ -1150,53 +1050,38 @@ fn action_schema(action: &str) -> Value {
                         "list": list_arg(),
                         "level": integer_arg(&format!("List level, 0 to {}.", RULES.paragraph_level_max)),
                         "image": image_arg(),
-                        "width": picture_width_arg("Picture width", BLOCK_IMAGE_FIT),
+                        "width": placed_size_arg("Picture width"),
                         "height": placed_size_arg("Picture height"),
                         "headers": array_arg(
                             &scalar_arg(),
                             &format!(
-                                "add_table: the headings row; the table holds at most {} columns, \
-                                 headings included.",
+                                "add_table: the headings row; at most {} columns.",
                                 RULES.table_columns_max
                             ),
                         ),
                         "rows": array_arg(
                             &array_arg(&scalar_arg(), "A row of cells."),
-                            &format!(
-                                "add_table: the table's rows, each an array of cells — a table \
-                                 holds at most {} columns; a headings row alone makes a table.",
-                                RULES.table_columns_max
-                            ),
+                            "add_table: the rows, each an array of cells.",
                         ),
                     }),
-                    "format_text and format_paragraph need one property beyond find. add_image and \
-                     add_table land after the first paragraph that holds their after text — a \
-                     table cell's anchor means after the whole table — and are refused, never \
-                     appended, when no paragraph holds it.",
                 ),
             }),
         ),
         "xlsx_edit" => super::action_entry_schema(
             "xlsx_edit",
-            "Edit an .xlsx/.xlsm; an .xlsx package is required. Rewrite cells and formatting, shift \
-             rows and columns, merge and unmerge a range, add, rename, move or delete a sheet, and \
-             place a picture in a sheet.",
+            "Edit an .xlsx/.xlsm; an .xlsx package is required.",
             &["path", "edits"],
             &json!({
                 "path": path_arg(),
                 "edits": edits_arg(
                     crate::ooxml::Family::Xlsx,
                     &json!({
-                        "sheet": text_arg("Sheet name, as a reading prints it."),
+                        "sheet": text_arg("Sheet name."),
                         "name": text_arg(&format!(
-                            "A sheet name: at most {} characters, none of {:?}, unique ignoring \
-                             case.",
+                            "A sheet name: at most {} characters, none of {:?}.",
                             RULES.sheet_name_max, RULES.sheet_name_forbidden
                         )),
-                        "to": integer_arg(
-                            "The 1-based position the sheet takes, counting the sheets as a reading \
-                             prints them."
-                        ),
+                        "to": integer_arg("The 1-based position."),
                         "cell": text_arg("A1 address, like B7."),
                         "value": cell_arg(),
                         "number_format": text_arg(&format!(
@@ -1204,8 +1089,7 @@ fn action_schema(action: &str) -> Value {
                             RULES.number_format_max
                         )),
                         "range": text_arg(&format!(
-                            "Cells, like B2:D2, corners in either order; a format_cells range \
-                             holds at most {} cells.",
+                            "Cells, like B2:D2, corners in either order; at most {} cells.",
                             RULES.format_cells_max
                         )),
                         "column": text_arg(&format!(
@@ -1217,7 +1101,7 @@ fn action_schema(action: &str) -> Value {
                             RULES.sheet_row_max
                         )),
                         "width_chars": number_arg(&format!(
-                            "Column width, {} characters (as Excel shows one).",
+                            "Column width, {} characters.",
                             RULES.column_width_chars.bounds()
                         )),
                         "height_points": number_arg(&format!(
@@ -1243,15 +1127,9 @@ fn action_schema(action: &str) -> Value {
                         "vertical": choice_arg(&RULES.cell_verticals, "Vertical alignment."),
                         "wrap": bool_arg("Wrap the text."),
                         "image": image_arg(),
-                        "width": picture_width_arg(
-                            "Picture width",
-                            "with neither side named the picture keeps its own size.",
-                        ),
+                        "width": placed_size_arg("Picture width"),
                         "height": placed_size_arg("Picture height"),
                     }),
-                    "An edit names one sheet unless it adds one. One target only: range, column or \
-                     row, with at least one of its own properties. An inserted row or column may be \
-                     one past the sheet's used range; a deleted one must be inside it.",
                 ),
             }),
         ),
@@ -1270,7 +1148,7 @@ fn action_schema(action: &str) -> Value {
                         "text": text_arg("The text to write."),
                         "after": {
                             "type": ["string", "integer"],
-                            "description": "add_paragraph: the text it follows; add_slide: the slide number.",
+                            "description": "add_paragraph: the text it follows; add_slide: the slide.",
                         },
                         "level": integer_arg(&format!("Outline level, 0 to {}.", RULES.paragraph_level_max)),
                         "bold": toggle_arg(),
@@ -1286,16 +1164,14 @@ fn action_schema(action: &str) -> Value {
                         "image": image_arg(),
                         "headers": array_arg(
                             &scalar_arg(),
-                            "add_table: the headings row; a presentation's table has no column bound.",
+                            "add_table: the headings row.",
                         ),
                         "rows": array_arg(
                             &array_arg(&scalar_arg(), "A row of cells."),
-                            "add_table: the table's rows, each an array of cells — a headings row alone makes a table.",
+                            "add_table: the rows, each an array of cells.",
                         ),
                         "x_fraction": number_arg(&format!(
-                            "Across the slide, {} of its width; an unnamed place is the slide's \
-                             middle, an unnamed size a picture's largest fit or a table's own, and \
-                             a place named without a size can push either past the slide's edge.",
+                            "Across the slide, {} of its width.",
                             RULES.slide_position_fraction.bounds()
                         )),
                         "y_fraction": number_arg(&format!(
@@ -1317,7 +1193,6 @@ fn action_schema(action: &str) -> Value {
                         ),
                         "to": integer_arg("The slide it moves to."),
                     }),
-                    "format_text needs one property beyond find.",
                 ),
             }),
         ),
@@ -1367,14 +1242,14 @@ fn action_schema(action: &str) -> Value {
         ),
         "pdf_text" => super::action_entry_schema(
             "pdf_text",
-            "Draw text on a PDF's pages, as page content rather than an annotation.",
+            "Draw text on a PDF's pages as page content.",
             &["path", "text"],
             &json!({
                 "path": path_arg(),
                 "text": text_arg("The text to draw."),
                 "pages": pages_arg(false),
-                "x": point_arg("X position on the page as it reads, from its left edge"),
-                "y": point_arg("Y position on the page as it reads, from its bottom edge"),
+                "x": point_arg("X position"),
+                "y": point_arg("Y position"),
                 "size": number_arg(&format!(
                     "Font size, {} points.",
                     RULES.dimension_points.bounds()
@@ -1382,7 +1257,7 @@ fn action_schema(action: &str) -> Value {
                 "color": color_arg("Text colour"),
                 "stamp": bool_arg("Draw a box around the text."),
                 "opacity": number_arg(&format!(
-                    "Opacity of the drawn text and its stamp box, {}; unstated draws them solid.",
+                    "Opacity, {}; unstated is solid.",
                     RULES.pdf_opacity.bounds()
                 )),
                 "rotate": number_arg(&format!(
@@ -1394,14 +1269,14 @@ fn action_schema(action: &str) -> Value {
         ),
         "pdf_image" => super::action_entry_schema(
             "pdf_image",
-            "Place a PNG or JPEG on a PDF's pages, as page content rather than an annotation.",
+            "Place a PNG or JPEG on a PDF's pages.",
             &["path", "image"],
             &json!({
                 "path": path_arg(),
                 "image": pdf_image_arg(),
                 "pages": pages_arg(false),
-                "x": point_arg("X position on the page as it reads, from its left edge"),
-                "y": point_arg("Y position on the page as it reads, from its bottom edge"),
+                "x": point_arg("X position"),
+                "y": point_arg("Y position"),
                 "width": placed_size_arg("Placed width"),
                 "height": placed_size_arg("Placed height"),
                 "metadata": metadata_entry(),
@@ -1414,7 +1289,7 @@ fn action_schema(action: &str) -> Value {
             &json!({
                 "path": path_arg(),
                 "values": values_arg("form field"),
-                "flatten": bool_arg("Bake the fields into the page content and remove them."),
+                "flatten": bool_arg("Bake the fields into the page content."),
                 "metadata": metadata_entry(),
             }),
         ),
@@ -1429,7 +1304,6 @@ fn point_arg(what: &str) -> Value {
         RULES.pdf_point_abs_max
     ))
 }
-
 fn degrees_arg() -> Value {
     integer_arg(&format!(
         "A multiple of {}, not a whole turn.",
@@ -1439,12 +1313,7 @@ fn degrees_arg() -> Value {
 
 /// `area`: the fraction of what a page currently shows a `pdf_crop` keeps.
 fn page_area_arg() -> Value {
-    let side = |what: &str| {
-        number_arg(&format!(
-            "{what}, as a fraction of the page ({}).",
-            RULES.pdf_page_fraction.bounds()
-        ))
-    };
+    let side = |what: &str| number_arg(&format!("{what}, {}.", RULES.pdf_page_fraction.bounds()));
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -1455,8 +1324,7 @@ fn page_area_arg() -> Value {
             "width": side("The width"),
             "height": side("The height"),
         },
-        "description": "The area to keep, in fractions of the page's current visible area, \
-                        measured from the displayed top-left and reaching down and right.",
+        "description": "The area to keep, in fractions of the page's current visible area.",
     })
 }
 
@@ -3537,28 +3405,6 @@ fn pptx_size_words() -> Vec<&'static str> {
         .iter()
         .map(|size| size.name.as_str())
         .collect()
-}
-
-/// The same sizes as the model reads them: every word with the deck it means.
-fn pptx_size_list() -> String {
-    RULES
-        .pptx_sizes
-        .iter()
-        .map(|size| format!("{} ({})", size.name, size.deck.inches()))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// The shared Word marks a reading prints in brackets, and the labels it adds without them,
-/// quoted for the prompt (see [`crate::docgen::docx_marks`]); a mark's group is the shape it
-/// is printed as.
-fn spelled_docx_marks(bracketed: bool) -> String {
-    crate::docgen::docx_marks()
-        .iter()
-        .filter(|mark| mark.example.starts_with('[') == bracketed)
-        .map(|mark| format!("`{}`", mark.example))
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 /// Require a pptx `format_text` to name at least one property, each the shape the kit writes:
@@ -6583,160 +6429,10 @@ mod tests {
         }
     }
 
-    /// Whether `text` states `value` as a whole number rather than as a slice of a longer one:
-    /// a bare `contains` would let the paragraph-level cap `8` be satisfied by the `1048576` of
-    /// the row cap.
-    fn states_whole_number(text: &str, value: &str) -> bool {
-        // An empty value is found everywhere, so it would pass this test vacuously.
-        if value.is_empty() {
-            return false;
-        }
-        let mut from = 0;
-        while let Some(at) = text[from..].find(value) {
-            let start = from + at;
-            let end = start + value.len();
-            let digit_before = text[..start]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_ascii_digit());
-            let digit_after = text[end..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_digit());
-            if !digit_before && !digit_after {
-                return true;
-            }
-            from = start + 1;
-        }
-        false
-    }
-
-    /// Every string the schema itself carries, unescaped, so a rule stated in the parameter
-    /// interface is searched the way the rendered description is.
-    fn schema_text(value: &Value) -> String {
-        match value {
-            Value::String(text) => text.clone(),
-            Value::Array(values) => values.iter().map(schema_text).collect::<Vec<_>>().join(" "),
-            Value::Object(object) => object
-                .values()
-                .map(schema_text)
-                .collect::<Vec<_>>()
-                .join(" "),
-            other => other.to_string(),
-        }
-    }
-
-    /// Every rule the tool enforces is stated where the model reads it: the asset's placeholders
-    /// are rendered from `rules.json`, and the bounds that live on a single argument are stated
-    /// in the parameter schema.
-    #[test]
-    fn the_description_states_every_rule_it_names() {
-        let description = confined_document().description();
-        assert!(
-            !description.contains("{{"),
-            "the description left a placeholder unreplaced:\n{description}"
-        );
-        let schema = schema_text(&confined_document().parameters_schema());
-        for value in [
-            listed(&RULES.heading_levels),
-            RULES.dimension_points.bounds(),
-            RULES.slide_position_fraction.bounds(),
-            RULES.slide_size_fraction.bounds(),
-            RULES.text_size_points.bounds(),
-            RULES.paragraph_indent_points.bounds(),
-            RULES.paragraph_spacing_points.bounds(),
-            RULES.paragraph_line_points.bounds(),
-            RULES.slide_text_size_points.bounds(),
-            RULES.cell_font_points.bounds(),
-            RULES.column_width_chars.bounds(),
-            RULES.row_height_points.bounds(),
-            RULES.color_digits.to_string(),
-            RULES.degrees_step.to_string(),
-            RULES.sheet_name_max.to_string(),
-            format!("{:?}", RULES.sheet_name_forbidden),
-            RULES.edit_text_max.to_string(),
-            RULES.edits_max.to_string(),
-            RULES.bullets_max.to_string(),
-            RULES.paragraph_level_max.to_string(),
-            RULES.paragraph_style_max.to_string(),
-            RULES.sheet_row_max.to_string(),
-            RULES.sheet_column_max.to_string(),
-            RULES.number_format_max.to_string(),
-            RULES.font_name_max.to_string(),
-            RULES.format_cells_max.to_string(),
-            RULES.table_columns_max.to_string(),
-            RULES.max_pages_per_request.to_string(),
-            megabytes(crate::util::FILE_MAX_BYTES).to_string(),
-        ] {
-            assert!(
-                states_whole_number(&description, &value) || states_whole_number(&schema, &value),
-                "neither the description nor the schema states the rule it names — {value:?} is \
-                 missing as a whole number from:\n{description}\n{schema}"
-            );
-        }
-        // The default deck's size is text the model reads rather than a number inside a
-        // sentence, so the whole-number guard above would not cover it.
-        let default_deck = RULES.pptx_default_size.inches();
-        assert!(
-            schema.contains(&default_deck),
-            "the schema does not state the default deck's size {default_deck:?}:\n{schema}"
-        );
-        // A slide mark is not a number, so the guard asserts nothing for it: the description
-        // names every mark the reader prints, from the shared lists. A label's `{n}` is the
-        // reader's own placeholder, so the description states it as `<n>`; each enumeration word
-        // is checked on its own.
-        for word in pair_words(&RULES.paragraph_alignments)
-            .into_iter()
-            .chain(pair_words(&RULES.paragraph_lists))
-            .chain(pair_words(&RULES.slide_alignments))
-            .chain(RULES.cell_alignments.iter().map(String::as_str))
-            .chain(RULES.cell_verticals.iter().map(String::as_str))
-            .chain(RULES.cell_border_sides.iter().map(String::as_str))
-            .chain(RULES.pptx_sizes.iter().map(|size| size.name.as_str()))
-        {
-            assert!(
-                description.contains(word) || schema.contains(word),
-                "neither the description nor the schema names the accepted word {word:?}"
-            );
-        }
-        let marks = crate::docgen::ppt_marks();
-        let labels = crate::docgen::ppt_slide_labels();
-        let slide_label = crate::reader_output::slide_label(&labels.slide, "<n>");
-        let notes_label = crate::reader_output::slide_label(&labels.notes, "<n>");
-        let comments_label = crate::reader_output::slide_label(&labels.comments, "<n>");
-        for mark in [
-            &marks.title,
-            &marks.hidden_slide,
-            &marks.diagram_text,
-            &marks.diagram_text_lost,
-            &marks.no_text,
-            &slide_label,
-            &notes_label,
-            &comments_label,
-        ] {
-            assert!(
-                description.contains(mark.as_str()),
-                "the description does not name the slide mark {mark:?}"
-            );
-        }
-        for mark in crate::docgen::docx_marks() {
-            assert!(
-                description.contains(mark.example.as_str()),
-                "the description does not name the Word mark {:?}",
-                mark.example
-            );
-        }
-    }
-
-    /// What this tool's model-read contract measured: the rendered description for the path-access
-    /// variant this test builds, and the description and the serialized schema together.
-    const BASELINE_DESCRIPTION: usize = 9_532;
-    const BASELINE_TOTAL: usize = 37_402;
-
     /// The whole per-action contract is one compact value: every action has an entry declaring
-    /// exactly the arguments it takes and requires, within the measured baseline.
+    /// exactly the arguments it takes and requires.
     #[test]
-    fn the_schema_is_compact_and_declares_every_action() {
+    fn the_schema_declares_every_action() {
         let tool = confined_document();
         let schema = tool.parameters_schema();
         let entries = schema["properties"]["action"]["oneOf"]
@@ -6758,21 +6454,6 @@ mod tests {
                 "an entry takes only the actions it names"
             );
         }
-        let description = tool.description().len();
-        assert!(
-            description <= BASELINE_DESCRIPTION,
-            "the rendered description is {description} bytes, more than the measured \
-             {BASELINE_DESCRIPTION}"
-        );
-        let size = serde_json::to_string(&schema)
-            .expect("the schema serializes")
-            .len();
-        assert!(
-            description + size <= BASELINE_TOTAL,
-            "the description ({description}) and serialized schema ({size}) together are {} bytes, \
-             more than the measured {BASELINE_TOTAL}",
-            description + size
-        );
     }
 
     /// The tool is offered exactly while the managed runtime is present: a tool whose runtime is

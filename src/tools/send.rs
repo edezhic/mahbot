@@ -24,8 +24,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::json;
 
-/// One of `send`'s optional arguments — the shared `message` is not one. The lead opens
-/// that argument's description.
+/// One of `send`'s optional arguments — the shared `message` is not one.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum Argument {
     /// The folder the addressee works in (which project a `manager` call messages).
@@ -47,19 +46,10 @@ impl Argument {
             Self::Name => "name",
         }
     }
-
-    /// The lead of this argument's description.
-    const fn lead(self) -> &'static str {
-        match self {
-            Self::Place => "The folder this call names",
-            Self::Branch => "The branch to continue or create",
-            Self::Name => "The name the chosen address takes",
-        }
-    }
 }
 
-/// What one addressee takes besides the shared `message`: which argument, what it holds
-/// (phrased to read after the lead), and whether the addressee cannot do without it.
+/// What one addressee takes besides the shared `message`: which argument, the note describing
+/// what it holds for that addressee, and whether the addressee cannot do without it.
 ///
 /// This table is the single owner of the per-addressee requirements: the choice
 /// declaration, every argument description and the one-addressee holder's required
@@ -160,11 +150,11 @@ impl Addressee {
     const fn does(self) -> &'static str {
         match self {
             Self::Assistant => "hands the message to your own assistant",
-            Self::Worker => "runs one scoped change and reports back",
-            Self::WorkerBranch => "continues a named worker branch",
-            Self::Manager => "messages a project's Manager",
-            Self::Role => "starts a custom role",
-            Self::Guest => "hands the message to a guest's own assistant, one-way",
+            Self::Worker => "one scoped run",
+            Self::WorkerBranch => "a continuable branch",
+            Self::Manager => "a workspace's Manager",
+            Self::Role => "a custom role",
+            Self::Guest => "a guest's assistant",
         }
     }
 
@@ -172,7 +162,7 @@ impl Addressee {
     fn requirements(self) -> &'static [Requirement] {
         /// The worker's folder rule, shared by both worker kinds so their `place` text is one
         /// entry.
-        const OUTSIDE_MANAGED_WORKSPACES: &str = "any directory outside the managed workspaces";
+        const OUTSIDE_MANAGED_WORKSPACES: &str = "a folder outside managed workspaces";
         match self {
             // The message is all it takes.
             Self::Assistant => &[],
@@ -189,36 +179,35 @@ impl Addressee {
                 },
                 Requirement {
                     arg: Argument::Branch,
-                    note: "the name of the branch to continue, created on its first use (ASCII \
-                           letters, digits, `_` and `-`, at most 32 chars)",
+                    note: "the branch to continue",
                     required: true,
                 },
             ],
             Self::Manager => &[Requirement {
                 arg: Argument::Place,
-                note: "the managed workspace to message, by its managed name or its own folder",
+                note: "the managed workspace",
                 required: true,
             }],
             Self::Role => &[
                 Requirement {
                     arg: Argument::Place,
-                    note: "a managed workspace, a folder path, or `personal:<user>`",
+                    note: "a workspace, path or `personal:<user>`",
                     required: false,
                 },
                 Requirement {
                     arg: Argument::Branch,
-                    note: "a named branch of the role to continue, whose history is restored",
+                    note: "a branch of the role",
                     required: false,
                 },
                 Requirement {
                     arg: Argument::Name,
-                    note: "the name of an existing custom role",
+                    note: "a custom role's name",
                     required: true,
                 },
             ],
             Self::Guest => &[Requirement {
                 arg: Argument::Name,
-                note: "the guest's account name, exactly as it is written",
+                note: "an account name",
                 required: true,
             }],
         }
@@ -471,8 +460,9 @@ impl SendTool {
         }
     }
 
-    /// The description of one optional argument: its lead, what it holds for every addressee
-    /// that takes it, and whether it can be left out.
+    /// The description of one optional argument: what it holds for every addressee that takes
+    /// it. Whether it can be left out is the choice declaration's own `(… required)` marker, and
+    /// what each addressee means by it is the reference's.
     fn describe(&self, arg: Argument) -> Option<String> {
         if !self.declares(arg) {
             return None;
@@ -491,36 +481,21 @@ impl SendTool {
         // Addressees that share a note read as one entry under their joint label.
         let mut grouped: Vec<(Vec<&'static str>, &'static Requirement)> = Vec::new();
         for (addressee, requirement) in &takers {
-            let same = grouped.iter_mut().find(|(_, held)| {
-                held.note == requirement.note && held.required == requirement.required
-            });
+            let same = grouped
+                .iter_mut()
+                .find(|(_, held)| held.note == requirement.note);
             match same {
                 Some((labels, _)) => labels.push(addressee.as_str()),
                 None => grouped.push((vec![addressee.as_str()], requirement)),
             }
         }
-        let notes: Vec<String> = grouped
-            .iter()
-            .map(|(labels, requirement)| labelled(labels, requirement.note))
-            .collect();
-        let needed_by: Vec<String> = takers
-            .iter()
-            .filter(|(_, requirement)| requirement.required)
-            .map(|(addressee, _)| format!("`{}`", addressee.as_str()))
-            .collect();
-        // Whether the argument can be left out follows from the holder's choices: only those that
-        // cannot do without it are named.
-        let tail = match needed_by.len() {
-            0 => " Omit for the default.".to_string(),
-            needed if needed < takers.len() => {
-                format!(
-                    " Omit for the default; required for {}.",
-                    needed_by.join(" and ")
-                )
-            }
-            _ => format!(" Required for {}.", needed_by.join(" and ")),
-        };
-        Some(format!("{} — {}.{tail}", arg.lead(), notes.join("; ")))
+        Some(
+            grouped
+                .iter()
+                .map(|(labels, requirement)| labelled(labels, requirement.note))
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
     }
 }
 
@@ -531,7 +506,7 @@ impl Tool for SendTool {
     }
 
     /// Compose the description from shared fragments: the base text, the choice note, one
-    /// note per held addressee, and the async/sync note.
+    /// note per held addressee, the async/sync note, and the on-demand pointer last.
     fn description(&self) -> String {
         let mut parts = vec![
             load_prompt("tool/send.md"),
@@ -556,14 +531,15 @@ impl Tool for SendTool {
         if self.dispatch_mode.is_async() {
             parts.push(load_prompt("tool/send_async.md"));
         }
-        parts.join("\n\n")
+        // One pointer, last, whatever the holder's addressees and mode assembled above.
+        crate::tools::tool_reference::standing(self.name(), &parts.join("\n\n"))
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         let mut properties = json!({
             "message": {
                 "type": "string",
-                "description": "The work to hand over; make it self-contained — the addressee cannot see your conversation."
+                "description": "The work to hand over — self-contained: the addressee cannot see this conversation."
             }
         });
         let mut required = vec!["message"];

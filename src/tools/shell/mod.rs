@@ -3326,23 +3326,34 @@ impl Tool for ShellTool {
         if let Some(command_lines) = render_command_line_notes(SHELL_PLATFORM, self.mode) {
             sections.push(command_lines);
         }
-        sections
-            .iter()
-            .map(|s| s.trim_end())
-            .collect::<Vec<_>>()
-            .join("\n\n")
+        // The standing text ends with one pointer to the on-demand reference, whatever mode
+        // and platform assembled the sections above.
+        crate::tools::tool_reference::standing(
+            self.name(),
+            &sections
+                .iter()
+                .map(|s| s.trim_end())
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
+        // One literal for both modes, so the two schemas cannot drift; only Full declares
+        // `background`, so only Full's text names it.
+        let background_note = if self.mode == ShellMode::Full {
+            "; ignored in background mode"
+        } else {
+            ""
+        };
         let timeout_secs = json!({
             "type": "integer",
-            "description": "Optional custom timeout in seconds (default: 600, max: 3600). Use this for long-running commands that need more than the default 10-minute timeout.",
+            "description": format!("Timeout in seconds (default 600, max 3600){background_note}."),
             "minimum": 1,
             "maximum": 3600
         });
         match self.mode {
-            // ReadOnly: byte-identical to the pre-background literal. Background is Full-only; the
-            // shared `timeout_secs` binding keeps the two schemas from drifting.
+            // ReadOnly: byte-identical to the pre-background literal.
             ShellMode::ReadOnly => super::tool_params_schema(
                 &json!({
                     "command": {
@@ -3361,12 +3372,12 @@ impl Tool for ShellTool {
                 &json!({
                     "command": {
                         "type": "string",
-                        "description": "The shell command to execute. Required for normal and background runs; not needed (and ignored) when `stop` is set."
+                        "description": "The shell command to execute; ignored when `stop` is set."
                     },
                     "timeout_secs": timeout_secs,
                     "background": {
                         "type": "boolean",
-                        "description": "When true, run the command in the background: it keeps running after this tool call returns and its raw output is written to a file in the temp area whose path is returned. Read that file with the read tool; when the command exits, the line `[exit status: N]` is appended to its end (including exit 0). `timeout_secs` is ignored in background mode. Default: false.",
+                        "description": "Run in the background; returns the path of its raw output file. Default: false.",
                         "default": false
                     },
                     "stop": {
@@ -3374,11 +3385,7 @@ impl Tool for ShellTool {
                         // The platform's own stop text (`stop_semantics`) — the same text the
                         // description's stop bullet carries.
                         "description": format!(
-                            "Output-file path of a background session (as returned by a \
-                             background launch) to stop. {} Pass only `stop` with the exact \
-                             path — a `command` is not needed and is ignored if present, and \
-                             `background` must NOT be combined with `stop` (the tool rejects \
-                             the combination). Stopping an already-finished session is a no-op.",
+                            "Output-file path of a background session to stop; pass it alone. {}",
                             stop_semantics()
                         )
                     },

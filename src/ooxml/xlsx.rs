@@ -18,8 +18,8 @@
 //! - **Structure is marked, never silently dropped**, by range rather than by cell. The merge
 //!   and link lists are swept down the sheet's rows ([`RowSweep`]), and the tests are bounded
 //!   by [`MAX_RANGE_PROBES`], past which the rest of the marks are reported, not worked through.
-//! - **The notation the model reads is documented in `src/prompt/tool/read.md`** — a mark this
-//!   module adds belongs there too.
+//! - **The notation the model reads is documented in `src/prompt/reference/read.md`** — a mark
+//!   this module adds belongs there too.
 
 use super::chart;
 use super::{

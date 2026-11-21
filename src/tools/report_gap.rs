@@ -53,9 +53,12 @@ impl Tool for ReportGapTool {
         let min = MIN_REPORT_CHARS.to_string();
         let max = MAX_REPORT_CHARS.to_string();
         let cap = DAILY_REPORT_CAP.to_string();
-        substitute(
-            &load_prompt("tool/report_gap.md"),
-            &[("{{min}}", &min), ("{{max}}", &max), ("{{cap}}", &cap)],
+        crate::tools::tool_reference::standing(
+            self.name(),
+            &substitute(
+                &load_prompt("tool/report_gap.md"),
+                &[("{{min}}", &min), ("{{max}}", &max), ("{{cap}}", &cap)],
+            ),
         )
     }
 
@@ -282,8 +285,7 @@ mod tests {
         reclaim(&job).await;
     }
 
-    /// Every refusal names the limit it hit, and the length limits are the ones the description
-    /// states.
+    /// Every refusal names the limit it hit.
     #[tokio::test]
     async fn refusals_name_their_reason() {
         let answer = run("report_gap_limits", json!({})).await;
@@ -302,19 +304,6 @@ mod tests {
             answer.contains(&format!("the limit is {MAX_REPORT_CHARS}")),
             "{answer}"
         );
-
-        // The description states the limits the tool enforces, from their own constants.
-        let description = ReportGapTool.description();
-        for limit in [
-            MIN_REPORT_CHARS.to_string(),
-            MAX_REPORT_CHARS.to_string(),
-            DAILY_REPORT_CAP.to_string(),
-        ] {
-            assert!(
-                description.contains(&limit),
-                "{limit} is stated: {description}"
-            );
-        }
     }
 
     /// A day's reports are capped, and a repeat of one already filed is refused WITHOUT spending

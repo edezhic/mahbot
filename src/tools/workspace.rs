@@ -70,71 +70,71 @@ fn build_schema() -> serde_json::Value {
                     "ticket",
                     "comment"
                 ],
-                "description": "Which action to perform; each field's own description says which action it belongs to."
+                "description": "The operation; its `reference` action lists every one."
             },
             "workspace": {
                 "type": "string",
-                "description": "The managed workspace to act on, spelled exactly as `list` spells it; the `reference` says which actions take it."
+                "description": "The managed workspace, spelled as `list` spells it."
             },
             "name": {
                 "type": "string",
-                "description": "(add) The new workspace's short unique name, used in ticket ids and the GUI."
+                "description": "(add) Short unique name."
             },
             "path": {
                 "type": "string",
-                "description": "(add) The project directory: absolute, relative, or `~` — resolved where the call runs."
+                "description": "(add) The project directory."
             },
             "phase": {
                 "type": "string",
-                "description": "(board) Narrow the listing to one ticket phase (e.g. 'queued', 'in_development', 'done', 'cancelled'). Omit it to list every non-archived ticket."
+                "description": "(board) One ticket phase."
             },
             "ticket_id": {
                 "type": "string",
-                "description": "(ticket / comment) The ticket's full id — `<workspace>-<number>`, which already carries its workspace. A bare number is refused."
+                "description": "(ticket/comment) Full id `<workspace>-<number>`."
             },
             "full": {
                 "type": "boolean",
-                "description": "(ticket) Return the ticket whole and unclipped. Default false."
+                "description": "(ticket) Whole and unclipped. Default false."
             },
             "content": {
                 "type": "string",
-                "description": "(comment) The clarification note to leave on the ticket."
+                "description": "(comment) The note to leave."
             },
             "rules": {
                 "type": "string",
-                "description": "(set_rules) The project rules; empty clears them."
+                "description": "(set_rules) Project rules; empty clears."
             },
             "maintenance": {
                 "type": "boolean",
-                "description": "(maintenance) On to run the background maintainer, off to stop it."
+                "description": "(maintenance) Background maintainer on or off."
             },
             "format": {
                 "type": "string",
-                "description": "(set_diagnostics) The format command; omit to keep it, empty to clear it."
+                "description": "(set_diagnostics) Format command."
             },
             "format_check": {
                 "type": "string",
-                "description": "(set_diagnostics) The format-check command; omit to keep it, empty to clear it."
+                "description": "(set_diagnostics) Format-check command."
             },
             "lint": {
                 "type": "string",
-                "description": "(set_diagnostics) The lint command; omit to keep it, empty to clear it."
+                "description": "(set_diagnostics) Lint command."
             },
             "lint_fix": {
                 "type": "string",
-                "description": "(set_diagnostics) The lint-fix command; omit to keep it, empty to clear it."
+                "description": "(set_diagnostics) Lint-fix command."
             },
             "type_check": {
                 "type": "string",
-                "description": "(set_diagnostics) The type-check command; omit to keep it, empty to clear it."
+                "description": "(set_diagnostics) Type-check command."
             },
             "build": {
                 "type": "string",
-                "description": "(set_diagnostics) The build command; omit to keep it, empty to clear it."
+                "description": "(set_diagnostics) Build command."
             },
             "unit_test": {
                 "type": "string",
-                "description": "(set_diagnostics) The unit-test command; omit to keep it, empty to clear it."
+                "description": "(set_diagnostics) Unit-test command."
             }
         }),
         &["action"],
@@ -178,7 +178,7 @@ impl WorkspaceTool {
         // Before anything is read: a field the schema does not declare is a usage error naming
         // the reference, never silently ignored — a misspelled `workspace` would otherwise act
         // on the whole fleet.
-        super::refuse_unknown_fields(schema(), &args)?;
+        super::refuse_unknown_fields(schema(), &args, super::REFERENCE_ACTION_HINT)?;
         match super::get_str(&args, "action")? {
             "reference" => Ok(ToolAnswer::done(crate::settings::reference())),
             "list" => Ok(ToolAnswer::done(

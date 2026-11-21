@@ -1,0 +1,1 @@
+Read a tool's full detail on demand: its output formats, per-action nuance and edge cases. A tool that keeps its own `reference` action says so in its description. Call with no `tool` for the list of names.

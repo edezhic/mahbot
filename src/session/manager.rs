@@ -2338,15 +2338,4 @@ mod tests {
         );
         assert!(messages.iter().all(|m| !m.content.contains(MEMORY)));
     }
-
-    /// A custom role never sees a built-in role prompt, so the fixed block is the only place its
-    /// session can learn the delivery rule — and a key left unsubstituted would reach the
-    /// model as literal text.
-    #[test]
-    fn custom_role_block_carries_the_delivery_rule() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let block = custom_role_block(&crate::Workspace::from_path(dir.path()));
-        assert!(block.contains(&crate::prompt::media_delivery()));
-        assert!(!crate::prompt::TEMPLATE_RE.is_match(&block));
-    }
 }

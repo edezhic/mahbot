@@ -119,15 +119,6 @@ pub(crate) struct PdfFieldKinds {
     pub(crate) choice: String,
 }
 
-impl PdfFieldKinds {
-    pub(crate) fn spelled(&self) -> String {
-        format!(
-            "`{}`, `{}`, `{}` and `{}`",
-            self.text, self.checkbox, self.radio, self.choice
-        )
-    }
-}
-
 pub(crate) fn pdf_field_kinds() -> &'static PdfFieldKinds {
     static KINDS: OnceLock<PdfFieldKinds> = OnceLock::new();
     KINDS.get_or_init(|| {
@@ -137,9 +128,9 @@ pub(crate) fn pdf_field_kinds() -> &'static PdfFieldKinds {
 }
 
 /// The words a PDF form reading prints: the section heading, the empty-value marker, the one
-/// for a field a fill cannot reach, and the name of a field the file gives none. The reading and
-/// the prompt describing it both take them from [`RULES_JSON`], so the vocabulary the model is
-/// told to expect cannot drift from the one the reader emits.
+/// for a field a fill cannot reach, and the name of a field the file gives none. The reading
+/// takes them from [`RULES_JSON`]; `src/prompt/reference/read.md` states them by hand, so a
+/// change here has to be mirrored there.
 #[derive(serde::Deserialize)]
 pub(crate) struct PdfFormWords {
     pub(crate) fields: String,
@@ -195,7 +186,9 @@ pub(crate) fn pdf_metadata_fields_spelled() -> String {
 }
 
 /// The marks a Word reading prints that are labels rather than text: the pattern each is matched
-/// by and the spelling it prints as. The editing side names the same marks in its refusals.
+/// by and the spelling it prints as. The editing side names the same marks in its refusals; this
+/// Rust view is read by the tests that keep the two sides spelling one mark one way.
+#[cfg(test)]
 #[derive(serde::Deserialize)]
 pub(crate) struct DocxMark {
     /// The pattern the mark is matched by — by the kit in JavaScript and by this crate's own
@@ -206,6 +199,7 @@ pub(crate) struct DocxMark {
 
 /// [`DocxMark`]s out of [`rules`], as [`ppt_marks`] reads its own. Each pattern is compiled here:
 /// a pattern only one side accepts is a build fault, named at the first read.
+#[cfg(test)]
 pub(crate) fn docx_marks() -> &'static [DocxMark] {
     static MARKS: OnceLock<Vec<DocxMark>> = OnceLock::new();
     MARKS.get_or_init(|| {

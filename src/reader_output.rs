@@ -11,10 +11,10 @@
 //! delivery layers report a loss the same way.
 //!
 //! The PowerPoint marks (`(title)`, `(hidden slide)`, …) and the marks the kit's refusals
-//! match live in `assets/docgen/rules.json`; [`ppt_description_substitutions`] binds them
-//! and the three slide labels to the `{{ppt_…}}` keys the model-facing texts spell. The
-//! vocabulary a chart's content prints as is stated here, because all three OOXML readers
-//! print it through one module and the model-facing description names it.
+//! match live in `assets/docgen/rules.json`. The vocabulary a chart's content prints as is
+//! stated here, because all three OOXML readers print it through one module; the model-facing
+//! reference (`src/prompt/reference/read.md`) restates it by hand, so a mark renamed here has
+//! to be renamed there too.
 
 use strum::{EnumCount, EnumIter, IntoEnumIterator};
 
@@ -143,34 +143,10 @@ pub(crate) fn slide_comments_header(number: usize) -> String {
 }
 
 /// `template` with its `{n}` replaced by `number` — the one place a slide's own label is
-/// built from the shared template, for a reading and for a model-facing description alike
-/// (`<n>` there, a real number through [`slide_header`]).
+/// built from the shared template, for every reading header alike (a real number through
+/// [`slide_header`]).
 pub(crate) fn slide_label(template: &str, number: &str) -> String {
     template.replace("{n}", number)
-}
-
-/// The `{{ppt_…}}` pairs a model-facing text spells for a reading's marks: the kit's five
-/// marks and the three slide labels, with `<n>` where a description leaves the number to
-/// the reader. The chart keys stay bound in the `read` description alone.
-pub(crate) fn ppt_description_substitutions() -> Vec<(&'static str, String)> {
-    let marks = crate::docgen::ppt_marks();
-    let labels = crate::docgen::ppt_slide_labels();
-    vec![
-        ("{{ppt_title_mark}}", marks.title.clone()),
-        ("{{ppt_hidden_slide_mark}}", marks.hidden_slide.clone()),
-        ("{{ppt_diagram_text_mark}}", marks.diagram_text.clone()),
-        (
-            "{{ppt_diagram_text_lost_mark}}",
-            marks.diagram_text_lost.clone(),
-        ),
-        ("{{ppt_no_text_mark}}", marks.no_text.clone()),
-        ("{{ppt_slide_label}}", slide_label(&labels.slide, "<n>")),
-        ("{{ppt_notes_label}}", slide_label(&labels.notes, "<n>")),
-        (
-            "{{ppt_comments_label}}",
-            slide_label(&labels.comments, "<n>"),
-        ),
-    ]
 }
 
 /// The mark a text box is printed as, by both Word readers: a `[text box]` block.
@@ -181,10 +157,10 @@ pub(crate) const TEXT_BOX: &str = "[text box]";
 pub(crate) const DOC_LINK: &str = "(link: ";
 
 // The vocabulary a chart's content prints as, wherever a reading prints it: the three OOXML readers
-// print it through [`crate::ooxml::chart`], and the model-facing description names it from here, so
-// the two cannot spell one mark two ways. A chart's field labels (`Title:`, `Text:`, `Label:`, a
-// bare `Chart:`) are deliberately not patterns in the kit's refusals — ordinary words a document's
-// own text can hold.
+// print it through [`crate::ooxml::chart`]. The model-facing reference
+// (`src/prompt/reference/read.md`) restates it by hand, so a mark renamed here has to be renamed
+// there too. A chart's field labels (`Title:`, `Text:`, `Label:`, a bare `Chart:`) are deliberately
+// not patterns in the kit's refusals — ordinary words a document's own text can hold.
 
 pub(crate) const CHART_TITLE: &str = "Title:";
 
@@ -308,7 +284,7 @@ impl UnshownKind {
 /// A reader counts only what its own pass met and really left out: a kind at zero prints
 /// nothing. What no reader looks at — a PDF text page's vector drawings, a package's themes
 /// and document properties — is deliberately absent and belongs in the model-facing
-/// description instead: a kind here is a promise the reading keeps. A PDF's own description
+/// reference instead: a kind here is a promise the reading keeps. A PDF's own description
 /// is the exception (it *is* read, see [`crate::pdf_marks`]).
 #[derive(Default)]
 pub(crate) struct Unshown {
@@ -352,19 +328,4 @@ impl Unshown {
             .map(|(kind, count)| format!("{count} {} not shown", kind.what()))
             .collect()
     }
-}
-
-/// Two of the report's lines, as the model-facing description of a reading spells
-/// them: built by the same code that prints a report, so a kind renamed here
-/// cannot leave the description quoting a line no reading prints.
-pub(crate) fn unshown_report_examples() -> String {
-    let mut unshown = Unshown::default();
-    unshown.add(UnshownKind::Chart, 1);
-    unshown.add(UnshownKind::Video, 2);
-    unshown
-        .lines()
-        .iter()
-        .map(|line| format!("`{line}`"))
-        .collect::<Vec<_>>()
-        .join(", ")
 }

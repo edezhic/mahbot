@@ -1,11 +1,5 @@
-Transition an existing ticket to a new phase. Requires the ticket `ticket_id`, which you can obtain from the output of create_ticket or list_tickets. The `ticket_id` may be a bare number (e.g. `123`) or the fully prefixed form (e.g. `workspace-123`). The valid phases for manual transitions are:
+Transition a ticket to a new phase, named by `ticket_id` (a bare number or `<workspace>-<number>`). Valid manual phases: `backlog` (back to the queue), `planning` (paused), `queued` (send to the engineer), `cancelled` (abandon; work already done leaves the workspace dirty), `failed` (unsuccessful; blocks its dependents), `done` (complete, irreversible).
 
-- **backlog** — return the ticket to the start (analysts will re-evaluate it)
-- **planning** — paused state awaiting further decision whether to proceed with the ticket or cancel it
-- **queued** — send the ticket to the engineer's queue for implementation
-- **cancelled** — abandon the ticket without completing it (beware that if the ticket already had some work done in it then the workspace will be left in a dirty state even after cancellation).
-- **done** — mark the ticket as complete and successful (irreversible: a finished ticket's phase can never change again)
+Never set the pipeline-managed phases (`analysis`, `in_development`, `verification`, `in_sanitation`) — the board poller does. A `done` ticket's phase is frozen: it cannot change or be superseded; file a new ticket to revisit the work.
 
-In general you should not set any other phases unless explicitly requested by the user.
-
-A ticket in `done` is finished for good. Its phase is immutable: any attempt to move it to another phase is refused and it cannot be superseded. Only the phase is frozen — a finished ticket can still be read, commented on and archived. If finished work needs to be revisited, create a new standalone ticket instead of trying to re-open the finished one.
+Returns a one-line confirmation.

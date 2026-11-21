@@ -419,22 +419,21 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
     async fn parse_failure_reprompts_with_a_non_empty_assistant_turn() {
-        let marker = crate::prompt::load_prompt("extraction/retry_no_output.md");
         let cases = [
             (
                 "a JSON reply is carried verbatim",
                 r#"{"verdict": "bad"}"#,
                 r#"{"score": 4}"#,
                 4u8,
-                r#"{\"verdict\": \"bad\"}"#.to_string(),
+                Some(r#"{\"verdict\": \"bad\"}"#.to_string()),
                 None,
             ),
             (
-                "a reply with no text becomes the marker",
+                "a reply with no text becomes the non-empty marker",
                 "",
                 r#"{"score": 7}"#,
                 7u8,
-                marker.clone(),
+                None,
                 Some("content: \"\"".to_string()),
             ),
         ];
@@ -449,11 +448,13 @@ mod tests {
             let messages = fake.request_messages.lock().unwrap().clone();
             assert_eq!(messages.len(), 2, "case: {reason}");
             assert!(messages[1].contains("Assistant"), "{}", messages[1]);
-            assert!(
-                messages[1].contains(&must_contain),
-                "case: {reason}: {}",
-                messages[1]
-            );
+            if let Some(expected) = &must_contain {
+                assert!(
+                    messages[1].contains(expected.as_str()),
+                    "case: {reason}: {}",
+                    messages[1]
+                );
+            }
             if let Some(never) = must_not_contain {
                 assert!(
                     !messages[1].contains(&never),

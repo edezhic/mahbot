@@ -47,28 +47,28 @@ impl Tool for ImageGenTool {
             &json!({
                 "prompt": {
                     "type": "string",
-                    "description": "Text description of the picture to generate"
+                    "description": "The picture to generate."
                 },
                 "generations": {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": MAX_GENERATIONS,
-                    "description": "The pictures to generate — one entry each",
+                    "description": "One entry per picture.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "images": {
                                 "type": "array",
                                 "items": { "type": "string" },
-                                "description": "Paths to this generation's reference images for image-to-image generation (a local path must be a file inside the caller's own workspace — an attachment, a previous output, or a file the caller filed itself — and a relative one resolves against the workspace root); none makes it text-to-image"
+                                "description": "Reference images for this generation; none makes it text-to-image."
                             },
                             "aspect_ratio": {
                                 "type": "string",
-                                "description": "This generation's aspect ratio (e.g. 16:9, 1:1, 4:3); unset keeps the default, or the first reference's own ratio"
+                                "description": "This generation's aspect ratio, e.g. `16:9`."
                             },
                             "size": {
                                 "type": "string",
-                                "description": "This generation's size — a tier (e.g. 1K, 2K) or explicit pixels (e.g. 1024x1024); a model that cannot express the value is not sent the request. Unset keeps the model's own default"
+                                "description": "This generation's size, e.g. `1K` or `1024x1024`."
                             }
                         }
                     }

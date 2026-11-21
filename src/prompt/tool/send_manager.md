@@ -1,1 +1,1 @@
-Deliver an internal message to the Manager of one managed workspace (a personal workspace has no Manager). Fully internal — users never see it. The Manager's answer arrives as a `<manager-message>` naming its workspace.
+An internal message to a managed workspace's Manager. Answers as a `<manager-message>`.

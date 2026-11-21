@@ -417,40 +417,40 @@ impl Tool for SearchTool {
                 "mode": {
                     "type": "string",
                     "enum": ["files", "grep"],
-                    "description": "'files' = fuzzy file/path name search (ranked, replaces glob). 'grep' = file content search (replaces rg). Note: 'mode' and 'grep_mode' are DIFFERENT parameters — 'mode' selects files vs grep; 'grep_mode' selects the matching strategy within grep."
+                    "description": "'files' = fuzzy file/path name search; 'grep' = content search. Default: 'grep'."
                 },
                 "query": {
                     "type": "string",
-                    "description": "The search query. Use inline constraint syntax like '*.rs' (extension) or 'src/' (path segment) for filtering — or use the standalone 'ext'/'path' parameters. For 'files': fuzzy text like 'lib.rs' or 'types/query'. For 'grep': pattern to find in file contents (supports regex, plain_text, or fuzzy via grep_mode)."
+                    "description": "The search query; may carry inline `*.rs`/`src/` constraints. For 'files': fuzzy text. For 'grep': the pattern."
                 },
                 "grep_mode": {
                     "type": "string",
                     "enum": ["fuzzy", "plain_text", "regex"],
-                    "description": "Grep matching mode (only used when mode='grep', NOT the same as the top-level 'mode' parameter). 'fuzzy' (default) — approximate/similar matching, the recommended starting mode for most searches. 'plain_text' — literal substring search, use for exact identifiers, variable names, or error strings. 'regex' — regex pattern matching, use for complex patterns (patterns with special chars like ., *, +, ?, [], (), {}, ^, $, |, ). Note: lookahead/lookbehind assertions ((?=...), (?!...), (?<=...), (?<!...)) are not supported and will return an error. Ignored when mode='files'."
+                    "description": "Grep only: 'fuzzy' (default), 'plain_text' or 'regex'; ignored in 'files' mode."
                 },
                 "case_sensitive": {
                     "type": "boolean",
-                    "description": "Grep mode only, default: true. If true, matches case-sensitively. If false, uses smart-case (case-insensitive when pattern is all-lowercase, case-sensitive otherwise). Ignored in 'files' mode."
+                    "description": "Grep only, default true; false is smart-case. Ignored in 'files' mode."
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Max results to return (default: 50, max: 500). Use with offset for pagination."
+                    "description": "Max results (default 50, max 500)."
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Pagination offset (default: 0, 0-based). In 'files' mode: skips this many items (item-based). In 'grep' mode: skips this many *files*, not matches (file-based) — use 'next_file_offset' from the previous response for correct pagination."
+                    "description": "Pagination offset (default 0). In 'grep' mode it skips files, not matches."
                 },
                 "context_lines": {
                     "type": "integer",
-                    "description": "Context lines before/after each match (grep mode only, default: 0). Ignored in 'files' mode."
+                    "description": "Context lines before and after each match (grep only, default 0)."
                 },
                 "path": {
                     "type": "string",
-                    "description": "Optional path segment filter. Appends a trailing-slash constraint (e.g. 'src' becomes 'src/') to restrict results to a directory or path prefix. Use this parameter or inline 'src/' syntax in the query — they are additive."
+                    "description": "Path segment filter; appends a trailing slash. Combines with inline `src/`."
                 },
                 "ext": {
                     "type": "string",
-                    "description": "Optional file extension filter. Appends a glob constraint (e.g. 'rs' becomes '*.rs') to restrict results by extension. Use this parameter or inline '*.rs' syntax in the query — they are additive."
+                    "description": "File extension filter; appends a glob. Combines with inline `*.rs`."
                 }
             }),
             &["query"],

@@ -109,17 +109,28 @@ Wake-word enrolment needs a microphone and stays in the window.
 
 Bracketed fields are the ones the action reads.
 
-- `reference` — this text, whole.
-- `list` (`workspace`) — the managed workspaces, the active one marked, or only the one named.
+- `reference` — this text, whole: every action, every field, and what is inert where.
+- `list` (`workspace`) — the managed workspaces, read live: name, status, whether the pipeline is
+  paused, whether background maintenance is on, and the project folder; the active one is marked, or
+  the listing says none is. Without `workspace`, every managed workspace; with it, only the one
+  named. Use it for any question about current state — the `<managed-workspaces>` block is a
+  session-start snapshot and carries neither state.
 - `show` (`workspace`) — one workspace: path, status, paused, maintenance, active, rules, commands.
-- `add` (`name`, `path`) — add a project directory and make it active; it starts pending and paused.
-  The name is up to 40 ASCII letters and underscores, starting with a letter; `path` must be an
-  existing directory (`~` allowed).
+- `add` (`name`, `path`) — add a project directory and make it active; it starts pending and paused,
+  and awaits its first discovery pass, which begins by itself once the model provider is configured.
+  Managed workspaces are for software projects only — documents, notes and research files go in the
+  personal workspace. The name is up to 40 ASCII letters and underscores, starting with a letter;
+  `path` must be an existing directory (absolute, relative or `~`, resolved where the call runs).
 - `delete` (`workspace`) — remove a workspace, its jobs and its research runs; the folder and the
   tickets stay on disk.
-- `pause` / `resume` (`workspace`) — freeze or unfreeze a pipeline; only a `ready` workspace has
-  one, and a named one that is not ready is refused. With no `workspace`, all of them: the ready
-  ones are acted on, the rest skipped.
+- `pause` / `resume` (`workspace`) — freeze or unfreeze a pipeline: no stage advances, and agents
+  stop at their next round boundary; a resume lets work in flight continue from where it stopped,
+  and neither direction loses anything. Only a `ready` workspace has one, and a named one that is
+  not ready is refused; for a workspace that is not `ready`, the `, paused` that `list` prints is
+  its discovery's own analysis pause, not a freeze you applied. With no `workspace`, all of them:
+  the ready ones are acted on, the rest skipped. That is a fleet-wide write — use it only when the
+  owner asked for all of them, and then pass nothing else. The answer reports workspace by
+  workspace: paused, resumed, already in that state, or skipped because it was not ready.
 - `maintenance` (`workspace`, `maintenance`) — turn the background maintainer on or off.
 - `rediscover` (`workspace`) — re-analyse a project: its per-role contexts are cleared and discovery
   starts again; the pipeline is paused until it finishes, and the answer says so.
@@ -132,15 +143,31 @@ Bracketed fields are the ones the action reads.
   text is truncated). They reach a session's prompt when it is built or next compacted, not a
   running one.
 - `use` (`workspace`) — make a workspace the active project.
-- `board` (`workspace`, `phase`) — the tickets of the addressed workspaces, one line each: filer,
-  phase, id, title; without `workspace`, every managed workspace's, and archived tickets are never
-  listed. `phase` is one exact snake_case phase word (`in_development`, `done`, …); `archived` is
-  refused, and a long listing says it is partial.
-- `ticket` (`ticket_id`, `full`) / `comment` (`ticket_id`, `content`) — read one ticket, or leave a
-  note on it. `ticket_id` is the full `<workspace>-<number>` id, never a bare number. A ticket is
-  shortened by default — description cut at 500 characters, the three newest comments in full and
-  older ones at 200 — and `full: true` is it whole. A note reaches a working agent at its next round.
+- `board` (`workspace`, `phase`) — the tickets of the addressed workspaces, one line each: who
+  filed it, its phase, its id and its title. Without `workspace`, every managed workspace's tickets
+  come back together, each id carrying its project. Every non-archived ticket is listed, finished
+  ones included; `phase` is one exact snake_case phase word (`in_development`, `done`, …) and
+  narrows a long listing; `archived` is refused, and archived tickets are never listed — archiving
+  is a one-way visibility switch. A listing that is too long is cut short and says it is partial.
+- `ticket` (`ticket_id`, `full`) — one ticket by its full id, with the fields the project's manager
+  sees: title, description, phase, filer, project, created and updated times, priority, the
+  supersedes / superseded-by / prerequisites / archived markers, and the whole comment thread. A
+  ticket is shortened by default — description cut at 500 characters, the three newest comments in
+  full and older ones at 200 — and `full: true` is it whole and unclipped; the heaviest tickets
+  carry hundreds of kilobytes of comments. An archived ticket is still readable here by its id.
+- `comment` (`ticket_id`, `content`) — leave a clarification note on a ticket by its full id, as
+  `assistant`: an ordinary comment in that ticket's thread. One left while an agent works on the
+  ticket reaches it at the start of its next round without interrupting it; otherwise it waits in
+  the thread until the ticket is next worked on. It never advances, blocks, cancels or unblocks a
+  ticket, never changes a phase or a prerequisite, and cannot be edited or removed afterwards — so
+  leave one only when the owner asks.
 
 `workspace` names the managed workspace an action covers, spelled exactly as `list` does. Omit it
 for `list` and `board` (every one) and for `pause` / `resume` (a fleet-wide freeze); `reference`,
-`add`, `ticket` and `comment` do not read it.
+`add`, `ticket` and `comment` do not read it. `ticket_id` is the full `<workspace>-<number>` id,
+never a bare number.
+
+`list`, `show`, `board` and `ticket` change nothing and work for any managed workspace, ready or
+not, frozen or not. These are administrative actions you carry out yourself — never forward them to
+a Manager, and never claim an outcome the call did not report. Close with the outcome in the reply
+that ends your turn, naming the workspace — and, for a change you carried out, its resulting state.

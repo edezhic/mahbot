@@ -1277,12 +1277,24 @@ pub(crate) struct ToolSpec {
 #[async_trait]
 pub(crate) trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
-    /// Human-readable description of this tool.
+    /// Human-readable description of this tool: how to use it, why, and one clause about the shape
+    /// of what it returns. Nothing else belongs here — output vocabulary, per-action nuance and
+    /// edge cases go into `src/prompt/reference/{name}.md`, which the `reference` tool returns on
+    /// demand, and the description ends with the one-line pointer to it:
     ///
-    /// The default implementation loads the description from
-    /// `src/prompt/tool/{name}.md` in the embedded prompt assets.
+    /// ```text
+    /// Full detail: `reference` `{"tool": "<name>"}`.
+    /// ```
+    ///
+    /// The default loads `src/prompt/tool/{name}.md` from the embedded prompt assets and appends
+    /// that pointer; a tool composing its own description does the same through
+    /// `tools::tool_reference::standing`, except one that carries its own `reference` action and
+    /// points at that instead.
     fn description(&self) -> String {
-        crate::prompt::load_prompt(&format!("tool/{}.md", self.name()))
+        crate::tools::tool_reference::standing(
+            self.name(),
+            &crate::prompt::load_prompt(&format!("tool/{}.md", self.name())),
+        )
     }
     fn parameters_schema(&self) -> serde_json::Value;
     async fn execute(

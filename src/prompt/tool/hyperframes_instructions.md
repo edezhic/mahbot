@@ -64,7 +64,7 @@ The root's `data-duration` is the finished length. To move or scale a video, ani
 
 `data-track-index` is a Studio lane only: the render never reads it, and paint order is CSS `z-index`. Tracks do not prevent overlap.
 
-Fonts: a family installed on the machine resolves by name, and so do the families the renderer bundles (`reference` → `authoring` lists them, and says which are only fetched from Google at render time). Any other family needs an `@font-face` pointing at a file in the composition's own `assets/fonts/`: a name alone is fetched from Google when the render reaches it, which needs a working connection. Asset paths are relative to the composition file (`assets/logo.png`), never absolute.
+Fonts: a family installed on the machine resolves by name, and so do the families the renderer bundles (`action: "reference"` → `topic: "authoring"` lists them, and says which are only fetched from Google at render time). Any other family needs an `@font-face` pointing at a file in the composition's own `assets/fonts/`: a name alone is fetched from Google when the render reaches it, which needs a working connection. Asset paths are relative to the composition file (`assets/logo.png`), never absolute.
 
 Rendered pages do reach the network — a CDN script, a web font, a remote image is fetched while the page loads. That is normal and allowed; only runtime *fetches driven by your JavaScript* are banned, because they make frames irreproducible.
 
@@ -80,6 +80,10 @@ Rendered pages do reach the network — a CDN script, a web font, a remote image
 A render produces exactly one file. A frame count follows from duration and fps (6 s at 30 fps is 180 frames); a minute of 1080p is a normal size, and the work grows with resolution, fps and quality.
 
 There is no timeout on a render, and a long one is not a stalled one. Do not re-issue a render because it is slow — wait for it. The one thing that can end one early is the product stopping a run that overruns the machine's memory, which is reported as a machine-side failure rather than as a broken composition.
+
+## Before you deliver
+
+When the work uses existing footage, establish what that footage is and choose the way of selecting pieces that fits it — source footage is not automatically a clean take. Before delivering a render, check it as far as the material allows and fix what you find; where a check could not be made, say so — never claim a check you did not make. Deliver one finished file as the result, not a series of drafts.
 
 ## When a render fails
 
@@ -98,4 +102,4 @@ Nothing half-written is left behind: a failed render removes the file it was wri
 - A render leaves a `.hyperframes/` state folder beside the composition. It is the renderer's own bookkeeping, and the product puts a `.gitignore` inside it so a repository never commits it — leave it in place, and do not delete it while a render is running.
 - Only single-file formats are produced. Image sequences and HLS playlists are not offered: their output is a directory, which this product does not deliver.
 
-Deeper detail: `reference` with `topic: "authoring"` (composition format, attributes, scenes, media, variables), `"rendering"` (pipeline, formats, quality, frames, output rules) or `"troubleshooting"` (lint codes and failure classes).
+Deeper detail: `action: "reference"` with `topic: "authoring"` (composition format, attributes, scenes, media, variables), `"rendering"` (pipeline, formats, quality, frames, output rules) or `"troubleshooting"` (lint codes and failure classes).

@@ -1,1 +1,1 @@
-`action` `cancel` with `job_id` stops that quick round instead of starting one and carries no dispatch argument. Its analysts stop and its result is never delivered, so cancel as soon as the answer is no longer needed. An id that is not one of your own dispatched quick analyses is refused and left untouched.
+`action` `cancel` with `job_id` stops that quick round; its result is never delivered. Only your own can be cancelled.

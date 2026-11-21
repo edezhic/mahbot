@@ -2239,15 +2239,12 @@ const EXPECTED_ACTION_SHAPE: &str = "one of: {\"open\":{\"url\":\"https://...\"}
     {\"extract\":{\"schema\":{...},\"limit\":int}}";
 
 /// The one statement of what `tab` is: optional; an empty or missing value means the default page.
-const TAB_ARG: &str = "`tab` is optional — it names the page in this run's private session, and an \
-                       empty or missing value means the default page";
+const TAB_ARG: &str = "`tab` names the page in this run's session; omit it for the default page";
 
-/// The schema's one line for the `profile` argument: the tool description's profile paragraph
-/// (`src/prompt/tool/chrome.md`) carries the accepted names, the binding rules and the three
-/// refusals, so the schema points at it instead of repeating it into the same request.
-const PROFILE_ARG: &str = "`profile` is optional — the Chrome profile this tab must work in. See \
-    the profile paragraph in this tool's description for the accepted names, the binding rules and \
-    the three refusals.";
+/// The schema's one line for the `profile` argument: the reference
+/// (`src/prompt/reference/chrome.md`) carries the accepted names, the binding rules and the three
+/// refusals.
+const PROFILE_ARG: &str = "`profile` pins this tab to one Chrome profile";
 
 fn corrective_action_error(received: &Value) -> String {
     format!(

@@ -1,1 +1,1 @@
-The call is dispatched asynchronously and returns immediately without findings. Results arrive later as an injected follow-up message wrapped in an `<analyze-tool-result>` envelope whose body starts with a `Job: <id>` line matching the dispatch acknowledgement.
+Returns immediately; findings arrive later as an injected `<analyze-tool-result>` message tagged with the acknowledgement's `Job: <id>`.

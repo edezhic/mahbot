@@ -1,1 +1,1 @@
-Two decorrelated analysts report structured claim-level findings, merged with agreement brackets and contradictions; disputed ones get a fresh-analyst verification pass appended as a `## Verification` section.
+`quick` is one round: two decorrelated analysts report structured claims.

@@ -1,1 +1,1 @@
-Optional check to run at fire time: a custom tool available to you together with the arguments it receives, as `{"tool": "<name>", "args": {…}}`. What wakes you and what removes the automation is stated in the `add_automation` description.
+Optional check to run at fire time: one custom tool available to you, named by `tool`, with its arguments in `args`.

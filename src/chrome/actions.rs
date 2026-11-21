@@ -192,13 +192,13 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "open",
-            purpose: "navigate to a URL (returns the snapshot)",
+            purpose: "open a URL, returning the snapshot",
             tool: Some(ToolParams {
                 required: &["url"],
                 properties: json!({
                     "url": {
                         "type": "string",
-                        "description": "http(s) URL to open"
+                        "description": "http(s) URL"
                     }
                 }),
             }),
@@ -269,12 +269,10 @@ fn build_actions() -> Vec<ActionDesc> {
                         "description": "CSS selector"
                     },
                     "url": {
-                        "type": "string",
-                        "description": "URL pattern"
+                        "type": "string"
                     },
                     "text": {
-                        "type": "string",
-                        "description": "Text to appear"
+                        "type": "string"
                     }
                 }),
             }),
@@ -302,31 +300,29 @@ fn build_actions() -> Vec<ActionDesc> {
                 properties: json!({
                     "condition": {
                         "type": "string",
-                        "description": "visible|hidden|present|count|text|value|attr|url"
+                        "description": "visible, hidden, present, count, text, value, attr, url"
                     },
                     "selector": {
                         "type": "string",
-                        "description": "CSS selector (except url)"
+                        "description": "CSS selector"
                     },
                     "count": {
-                        "type": "integer",
-                        "description": "element count"
+                        "type": "integer"
                     },
                     "op": {
                         "type": "string",
-                        "description": "== != > < >= <= (default ==)"
+                        "description": "==, !=, >, <, >=, <="
                     },
                     "predicate": {
                         "type": "string",
-                        "description": "equals | contains | matches (default equals)"
+                        "description": "equals, contains, matches"
                     },
                     "name": {
-                        "type": "string",
-                        "description": "attribute name"
+                        "type": "string"
                     },
                     "expected": {
                         "type": "string",
-                        "description": "expected value; pattern for url"
+                        "description": "expected value"
                     }
                 }),
             }),
@@ -372,11 +368,11 @@ fn build_actions() -> Vec<ActionDesc> {
                 properties: json!({
                     "schema": {
                         "type": "object",
-                        "description": "{\"rows\": \"<css>\", \"fields\": {\"<name>\": \"<css>\" | {\"sel\": \"<css>\", \"get\": \"text|html|value|@attr\", \"all\": true}}}; \"all\" returns an array of every match; attributes need the \"@\""
+                        "description": "`rows` selector plus a `fields` map"
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "trim rows; total keeps the count"
+                        "description": "trim rows"
                     }
                 }),
             }),
@@ -407,7 +403,7 @@ fn build_actions() -> Vec<ActionDesc> {
                 properties: json!({
                     "selector": {
                         "type": "string",
-                        "description": "Ref (@e1) or CSS selector"
+                        "description": "ref or CSS selector"
                     }
                 }),
             }),
@@ -431,17 +427,17 @@ fn build_actions() -> Vec<ActionDesc> {
         },
         ActionDesc {
             name: "fill",
-            purpose: "fill a field (read back)",
+            purpose: "fill a field, read back",
             tool: Some(ToolParams {
                 required: &["selector", "text"],
                 properties: json!({
                     "selector": {
                         "type": "string",
-                        "description": "CSS selector or ref (@e1)"
+                        "description": "ref or CSS selector"
                     },
                     "text": {
                         "type": "string",
-                        "description": "text to write, replacing content"
+                        "description": "text, replacing content"
                     }
                 }),
             }),
@@ -472,15 +468,15 @@ fn build_actions() -> Vec<ActionDesc> {
                 properties: json!({
                     "selector": {
                         "type": "string",
-                        "description": "CSS selector or ref (@e1) of the field"
+                        "description": "ref or CSS selector"
                     },
                     "text": {
                         "type": "string",
-                        "description": "text to append (a newline presses Enter)"
+                        "description": "text to append"
                     },
                     "key_events": {
                         "type": "boolean",
-                        "description": "send real key events (autocomplete fields)"
+                        "description": "real key events"
                     }
                 }),
             }),
@@ -510,11 +506,10 @@ fn build_actions() -> Vec<ActionDesc> {
                 properties: json!({
                     "key": {
                         "type": "string",
-                        "description": "key to press (e.g. Enter, Escape)"
+                        "description": "key, e.g. Enter"
                     },
                     "selector": {
-                        "type": "string",
-                        "description": "focus it first (non-focusable: the key lands where focus is)"
+                        "type": "string"
                     }
                 }),
             }),
@@ -547,13 +542,11 @@ fn build_actions() -> Vec<ActionDesc> {
                 required: &["selector", "files"],
                 properties: json!({
                     "selector": {
-                        "type": "string",
-                        "description": "file input or its label"
+                        "type": "string"
                     },
                     "files": {
                         "type": "array",
-                        "items": { "type": "string" },
-                        "description": "absolute or workspace-relative paths"
+                        "items": { "type": "string" }
                     }
                 }),
             }),
@@ -599,16 +592,14 @@ fn build_actions() -> Vec<ActionDesc> {
                 required: &[],
                 properties: json!({
                     "interactive_only": {
-                        "type": "boolean",
-                        "description": "Only interactive elements"
+                        "type": "boolean"
                     },
                     "compact": {
                         "type": "boolean",
-                        "description": "drop empty structure (default true)"
+                        "description": "drop empty structure"
                     },
                     "depth": {
-                        "type": "integer",
-                        "description": "Limit tree depth"
+                        "type": "integer"
                     }
                 }),
             }),
@@ -622,7 +613,7 @@ fn build_actions() -> Vec<ActionDesc> {
                 properties: json!({
                     "selector": {
                         "type": "string",
-                        "description": "CSS selector or ref (@e1)"
+                        "description": "ref or CSS selector"
                     }
                 }),
             }),
@@ -636,7 +627,7 @@ fn build_actions() -> Vec<ActionDesc> {
                 properties: json!({
                     "selector": {
                         "type": "string",
-                        "description": "CSS selector or ref (@e1)"
+                        "description": "ref or CSS selector"
                     }
                 }),
             }),
@@ -659,31 +650,28 @@ fn build_actions() -> Vec<ActionDesc> {
                 properties: json!({
                     "by": {
                         "type": "string",
-                        "description": "text | role | label (accessible label) | placeholder | alt | title | testid | first | last | nth"
+                        "description": "text, role, label, or a CSS form (first, last, nth)"
                     },
                     "value": {
                         "type": "string",
-                        "description": "what to locate (CSS for first/last/nth)"
+                        "description": "what to locate"
                     },
                     "action": {
                         "type": "string",
-                        "description": "click | fill | hover | check | text (reads the element)"
+                        "description": "click, fill, hover, check, text"
                     },
                     "text": {
                         "type": "string",
-                        "description": "Text for action fill"
+                        "description": "text for fill"
                     },
                     "name": {
-                        "type": "string",
-                        "description": "name filter for role"
+                        "type": "string"
                     },
                     "exact": {
-                        "type": "boolean",
-                        "description": "Whole-string match"
+                        "type": "boolean"
                     },
                     "index": {
-                        "type": "integer",
-                        "description": "Zero-based, for nth"
+                        "type": "integer"
                     }
                 }),
             }),

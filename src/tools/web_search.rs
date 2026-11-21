@@ -944,7 +944,8 @@ impl Tool for WebSearchTool {
             description.push(' ');
             description.push_str(crate::prompt::load_prompt("tool/web_search_pictures.md").trim());
         }
-        description
+        // The on-demand pointer is last whatever the variant assembled above it.
+        crate::tools::tool_reference::standing(self.name(), &description)
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -953,11 +954,11 @@ impl Tool for WebSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The web search query. Mutually exclusive with `expand` — pass exactly one per call."
+                    "description": "The search query; one of `query` and `expand` per call."
                 },
                 "expand": {
                     "type": "integer",
-                    "description": "Expand ID of a result from a previous search in this same session; retrieves its full cached text instead of running a new search."
+                    "description": "An expand ID; returns its cached text."
                 }
             },
             "oneOf": [
@@ -968,7 +969,7 @@ impl Tool for WebSearchTool {
         if self.pictures.is_some() {
             schema["properties"]["pictures"] = json!({
                 "type": "boolean",
-                "description": "Also list pictures of the results' subjects, each with its address and hosting page."
+                "description": "Also list pictures of the results' subjects."
             });
         }
         schema
@@ -1331,12 +1332,11 @@ mod tests {
     }
 
     #[test]
-    fn test_picture_capability_shapes_description_and_schema() {
+    fn test_picture_capability_shapes_schema() {
         let with = WebSearchTool::new(
             WebSearchBackend::Exa { key: String::new() },
             Some(String::new()),
         );
-        assert!(with.description().contains("`pictures`"));
         assert!(
             with.parameters_schema()["properties"]
                 .get("pictures")
@@ -1346,7 +1346,6 @@ mod tests {
         // No picture backend: the model must not be told about a capability
         // nothing here can produce.
         let without = WebSearchTool::new(WebSearchBackend::DeepSeek { key: String::new() }, None);
-        assert!(!without.description().contains("pictures"));
         assert!(
             without.parameters_schema()["properties"]
                 .get("pictures")

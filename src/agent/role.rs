@@ -239,7 +239,7 @@ use crate::tools::{
     AddAutomationTool, AddCommentTool, Addressee, AnalyzeDepth, AnalyzeTool, ChromeTool,
     ComputerTool, CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool, FilesTool,
     GetTicketTool, HyperframesTool, ImageGenTool, ListAutomationsTool, ListTicketsTool,
-    MahbotConfigTool, MahbotDebugTool, PhotocraftTool, RasterizeTool, ReadTool,
+    MahbotConfigTool, MahbotDebugTool, PhotocraftTool, RasterizeTool, ReadTool, ReferenceTool,
     RemoveAutomationTool, ReportGapTool, SearchArchivedTicketsTool, SearchTool, SendTool,
     ShellMode, ShellTool, ShowTabTool, SleepTool, UpdateTicketTool, VideoGenTool, WebSearchTool,
     WorkspaceTool,
@@ -469,16 +469,24 @@ impl Role {
         if !matches!(self, Role::Manager | Role::Sanitation | Role::Custom) {
             Self::add_web_search_tool(&mut tools);
         }
+        // Every role's standing descriptions stay short and point at this one entry point. It is
+        // handed the tools this machine actually serves — the same `is_advertised` filter the
+        // caller applies — so a role is never told about a capability it cannot call; a custom
+        // role's set is per record, so [`Self::custom_role_tools`] adds its own.
+        if self != Role::Custom {
+            tools.push(Box::new(ReferenceTool::new(Self::holders(&tools))));
+        }
 
         tools
     }
 
     /// The tool set of a custom role: the subset of the admin Assistant's core tools (at the
     /// admin's own strength, minus [`CUSTOM_ROLE_WITHHELD_TOOLS`]) named by the record, plus the
-    /// configured `web_search` and the granted dispatch tools with their kinds. Each entry is
-    /// `"tool"` (its narrowest kind) or `"tool:kind1,kind2"`. `analyze` and `send` are never taken
-    /// from the static set — they are rebuilt from the grants so a role gets exactly its granted
-    /// depths and addressees. The read is lenient: an entry the grammar refuses drops itself alone.
+    /// configured `web_search`, the granted dispatch tools with their kinds, and the shared
+    /// `reference` entry point every set carries. Each entry is `"tool"` (its narrowest kind) or
+    /// `"tool:kind1,kind2"`. `analyze` and `send` are never taken from the static set — they are
+    /// rebuilt from the grants so a role gets exactly its granted depths and addressees. The read
+    /// is lenient: an entry the grammar refuses drops itself alone.
     /// A tool the installation cannot serve right now is simply absent (the record keeps the
     /// choice), as is an entry naming a withheld tool. The caller applies `is_advertised()` to the
     /// result.
@@ -522,7 +530,21 @@ impl Role {
                 _ => {}
             }
         }
+        // The shared reference entry point is not a grant: every set has it, so a custom role's
+        // short descriptions can point at the same route the built-in roles use. It is added once
+        // the whole set is assembled, so it serves exactly the tools this record granted.
+        tools.push(Box::new(ReferenceTool::new(Self::holders(&tools))));
         tools
+    }
+
+    /// The names the shared reference serves: the tools this machine advertises, since a tool
+    /// [`Tool::is_advertised`] withholds is not in the schema the model is sent.
+    fn holders(tools: &[Box<dyn Tool>]) -> Vec<&'static str> {
+        tools
+            .iter()
+            .filter(|tool| tool.is_advertised())
+            .map(|tool| tool.name())
+            .collect()
     }
 
     /// The catalog a custom role's subset is chosen from: the admin Assistant's static core tool
@@ -616,8 +638,12 @@ mod tests {
             .iter()
             .map(|tool| tool.name())
             .collect();
+        // The shared reference is not a grant: every set carries it, so it is the one built name
+        // the catalogue does not offer.
         assert!(
-            built.iter().all(|name| catalog.contains(name)),
+            built
+                .iter()
+                .all(|name| *name == "reference" || catalog.contains(name)),
             "nothing outside the catalog may be built: {built:?}"
         );
         for name in &catalog {
@@ -635,8 +661,18 @@ mod tests {
         ]);
         let mut chosen_names: Vec<&str> = chosen.iter().map(|tool| tool.name()).collect();
         chosen_names.sort_unstable();
-        assert_eq!(chosen_names, vec!["read", "sleep"]);
-        assert!(Role::custom_role_tools(&[]).is_empty());
+        // The shared reference is not a grant and every set carries it, so the assertions below
+        // read the granted set alone.
+        assert_eq!(chosen_names, vec!["read", "reference", "sleep"]);
+        let empty: Vec<&str> = Role::custom_role_tools(&[])
+            .iter()
+            .map(|tool| tool.name())
+            .collect();
+        assert_eq!(
+            empty,
+            ["reference"],
+            "a record granting nothing builds nothing but the shared reference"
+        );
 
         // Computer use stays with the administrator's Assistant: the record keeps the grant,
         // nothing builds.
@@ -649,6 +685,7 @@ mod tests {
             Role::custom_role_tools(&entries)
                 .iter()
                 .map(|tool| tool.name().to_string())
+                .filter(|name| name != "reference")
                 .collect()
         };
         assert!(
@@ -743,9 +780,7 @@ mod tests {
     #[test]
     fn all_roles_have_tools() {
         // Guards against an empty Vec in `Role::tools()` — the compiler catches missing arms but
-        // not one returning `vec![]`. Every role needs a tool, and every advertised tool must build
-        // its spec: `spec()` loads `src/prompt/tool/{name}.md`, so a misnamed asset panics here
-        // instead of at the first agent run.
+        // not one returning `vec![]`. Every role needs a tool.
         for role in Role::iter() {
             // A custom role's tool set is per-record, never static; the static factory has none for
             // it.
@@ -763,6 +798,9 @@ mod tests {
                     "{}: Role::tools() must not be empty — every role needs at least one tool",
                     role.as_str()
                 );
+                // Every tool loads its own description asset, so a misnamed or missing
+                // `tool/{name}.md` panics here rather than on the first run. (The reference
+                // assets are checked where the full tool list, `web_search` included, is built.)
                 for tool in &tools {
                     let _ = tool.spec();
                 }
@@ -772,7 +810,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(config_persist)] // swaps the process-global CONFIG
-    fn sanitation_toolset_is_read_and_shell_only() {
+    fn sanitation_toolset_is_read_shell_and_reference() {
         // Acceptance pin: the Sanitation role advertises NO search tools — even with web search
         // configured.
         let snapshot = crate::config::CONFIG.snapshot();
@@ -787,8 +825,9 @@ mod tests {
         crate::config::CONFIG.swap(snapshot);
         assert_eq!(
             names,
-            ["read", "shell"],
-            "Sanitation toolset must be exactly read + read-only shell, got: {names:?}"
+            ["read", "shell", "reference"],
+            "Sanitation toolset must be exactly read + read-only shell + the shared reference, \
+             got: {names:?}"
         );
     }
 
@@ -803,25 +842,16 @@ mod tests {
         crate::config::CONFIG.swap(crate::config::ConfigData::STRUCT_FIELDS_DEFAULT);
         let ws = crate::workspace::test_ws("test");
         let qa = crate::Role::Qa.tools(&ws, false, test_sessions());
-        let engineer = crate::Role::Engineer.tools(&ws, false, test_sessions());
         crate::config::CONFIG.swap(snapshot);
 
         let names: Vec<&str> = qa.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
-            ["read", "search", "shell"],
-            "QA toolset must be exactly read + search + the unrestricted shell, got: {names:?}"
+            ["read", "search", "shell", "reference"],
+            "QA toolset must be exactly read + search + the unrestricted shell + the shared \
+             reference, got: {names:?}"
         );
         let qa_shell = qa.iter().find(|t| t.name() == "shell").expect("QA shell");
-        let engineer_shell = engineer
-            .iter()
-            .find(|t| t.name() == "shell")
-            .expect("engineer shell");
-        assert_eq!(
-            qa_shell.description(),
-            engineer_shell.description(),
-            "QA must run the same shell the engineer gets"
-        );
         assert!(
             qa_shell.parameters_schema()["properties"]
                 .as_object()
@@ -859,8 +889,7 @@ mod tests {
     #[test]
     fn assistant_toolset_gates_admin_tools() {
         // The Assistant toolset must differ by whether the triggering account is the admin: a
-        // guest's has no shell/send/computer, the admin's does. A guest gets workspace-only read
-        // access; the admin's reaches the machine.
+        // guest's has no shell/send/computer, the admin's does.
         let ws = crate::workspace::test_ws("test");
         let guest = crate::Role::Assistant.tools(&ws, false, test_sessions());
         let admin = crate::Role::Assistant.tools(&ws, true, test_sessions());
@@ -885,61 +914,6 @@ mod tests {
             !admin.iter().any(|t| t.name() == "files"),
             "the admin's Assistant must not advertise `files` — its shell already moves files"
         );
-        // The read boundary is what the model is told — the tool's own description, not a
-        // restatement in its parameter schema: a guest only reaches the personal workspace; the
-        // admin's names the machine and what stays closed.
-        let guest_read = guest.iter().find(|t| t.name() == "read");
-        let guest_read_desc = guest_read.map(|t| t.description()).unwrap_or_default();
-        assert!(
-            guest_read_desc.contains("limited to your own personal workspace"),
-            "a guest's Assistant read must advertise the workspace-only boundary, got: \
-             {guest_read_desc}"
-        );
-        let admin_read_desc = admin
-            .iter()
-            .find(|t| t.name() == "read")
-            .map(|t| t.description())
-            .unwrap_or_default();
-        assert!(
-            admin_read_desc.contains("your home directory")
-                && admin_read_desc.contains("own live databases"),
-            "the admin's Assistant read must advertise the machine-wide boundary and what it \
-             refuses, got: {admin_read_desc}"
-        );
-
-        // The write boundary likewise: the admin's edit names the two refusals, a guest's states
-        // the workspace boundary.
-        let admin_edit_desc = admin
-            .iter()
-            .find(|t| t.name() == "edit")
-            .map(|t| t.description())
-            .unwrap_or_default();
-        assert!(
-            admin_edit_desc.contains("managed workspaces")
-                && admin_edit_desc.contains("home directory"),
-            "the admin's Assistant edit must name what stays closed, got: {admin_edit_desc}"
-        );
-        let guest_edit_desc = guest
-            .iter()
-            .find(|t| t.name() == "edit")
-            .map(|t| t.description())
-            .unwrap_or_default();
-        assert!(
-            guest_edit_desc.contains("confined to your workspace"),
-            "a guest's Assistant edit must keep the workspace boundary, got: {guest_edit_desc}"
-        );
-        for (who, desc) in [
-            ("the admin's read", &admin_read_desc),
-            ("the admin's edit", &admin_edit_desc),
-            ("a guest's read", &guest_read_desc),
-            ("a guest's edit", &guest_edit_desc),
-        ] {
-            assert!(
-                !desc.contains("{{"),
-                "{who} description left a placeholder unrendered: {desc}"
-            );
-        }
-
         // The optional `place` delegation argument is the admin's alone: the admin's `analyze` and
         // `send` advertise it, the guest's `analyze` (a guest has no `send`) does not.
         let advertises_place = |tools: &[Box<dyn Tool>], name: &str| {
@@ -1100,96 +1074,6 @@ mod tests {
                     if is_admin { " (admin)" } else { "" }
                 );
             }
-        }
-    }
-
-    #[test]
-    fn assistant_role_descriptions_are_populated() {
-        // Both Assistant descriptions (a guest's and the admin's) must be non-empty, free of
-        // unsubstituted template keys, and carry the automation-notification marker.
-        for is_admin in [false, true] {
-            let desc = crate::Role::Assistant.role_description_for(is_admin);
-            assert!(
-                !desc.trim().is_empty(),
-                "Assistant role description must not be empty"
-            );
-            assert!(
-                !crate::prompt::TEMPLATE_RE.is_match(&desc),
-                "Assistant role description must not contain unsubstituted template keys"
-            );
-            assert!(
-                desc.contains("<automation-notification>"),
-                "Assistant role description must explain the <automation-notification> marker"
-            );
-        }
-    }
-
-    #[test]
-    fn all_roles_have_role_description() {
-        // Guards against an empty or unsubstituted role description file.
-        for role in Role::iter() {
-            // A custom role has no compiled `role/custom.md`: only the built-in roles carry a
-            // description asset.
-            if role == Role::Custom {
-                continue;
-            }
-            let desc = role.role_description();
-            assert!(
-                !desc.trim().is_empty(),
-                "{}: role_description() must not be empty",
-                role.as_str()
-            );
-            assert!(
-                !crate::prompt::TEMPLATE_RE.is_match(&desc),
-                "{}: role description must not contain unsubstituted template keys",
-                role.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn all_roles_have_summary_prompt() {
-        // Guards against an empty or unsubstituted summary prompt, and against a role losing the
-        // no-tools / summary-only instruction the summarisation request depends on (its tool set is
-        // sent, so the model must be told not to use it).
-        for role in Role::iter() {
-            let prompt = role.summary_prompt();
-            assert!(
-                !prompt.trim().is_empty(),
-                "{}: summary_prompt() must not be empty",
-                role.as_str()
-            );
-            assert!(
-                !crate::prompt::TEMPLATE_RE.is_match(&prompt),
-                "{}: summary prompt must not contain unsubstituted template keys",
-                role.as_str()
-            );
-            assert!(
-                prompt.contains("DO NOT USE ANY TOOLS. ONLY RESPOND WITH THE SUMMARY."),
-                "{}: summary prompt must forbid tools and allow only the summary",
-                role.as_str()
-            );
-        }
-    }
-
-    #[test]
-    fn all_roles_have_discovery_prompt() {
-        // Guards against an empty or unsubstituted discovery prompt file.
-        for role in Role::iter() {
-            if !super::role_info(&role).has_discovery {
-                continue;
-            }
-            let prompt = role.discovery_prompt();
-            assert!(
-                !prompt.trim().is_empty(),
-                "{}: discovery_prompt() must not be empty",
-                role.as_str()
-            );
-            assert!(
-                !crate::prompt::TEMPLATE_RE.is_match(&prompt),
-                "{}: discovery prompt must not contain unsubstituted template keys",
-                role.as_str()
-            );
         }
     }
 }

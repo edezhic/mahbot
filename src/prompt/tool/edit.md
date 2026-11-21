@@ -1,3 +1,3 @@
-Edit or create a file. There is no separate write or create tool in this environment — this tool does both.
+Create or edit a file; no separate write tool exists. It reports what it wrote.
 
 {{path_policy}}

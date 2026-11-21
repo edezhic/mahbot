@@ -65,9 +65,12 @@ impl Tool for EditTool {
             PathAccess::Unrestricted => "tool/edit_paths_admin.md",
             PathAccess::Workspace | PathAccess::Allowlisted => "tool/edit_paths_workspace.md",
         });
-        crate::prompt::substitute(
-            &crate::prompt::load_prompt("tool/edit.md"),
-            &[("{{path_policy}}", &path_policy)],
+        crate::tools::tool_reference::standing(
+            self.name(),
+            &crate::prompt::substitute(
+                &crate::prompt::load_prompt("tool/edit.md"),
+                &[("{{path_policy}}", &path_policy)],
+            ),
         )
     }
 
@@ -76,19 +79,19 @@ impl Tool for EditTool {
             &json!({
                 "path": {
                     "type": "string",
-                    "description": "Path to the file (required on every call)."
+                    "description": "Path to the file."
                 },
                 "old_string": {
                     "type": "string",
-                    "description": "If omitted or empty: creates a new file with `new_string` (refuses if file exists). If provided and non-empty: this text is replaced by `new_string`. Its line endings never have to match the file's (LF and CRLF are interchangeable, for every file type), and it is semi-insensitive to whitespace in code files; it must appear exactly once unless multiple is true."
+                    "description": "Omit or leave empty to create; otherwise the text to replace."
                 },
                 "new_string": {
                     "type": "string",
-                    "description": "When old_string is omitted or empty: the content to write to the new file. When old_string is provided and non-empty: the replacement text (may be empty to delete the matched text); its line endings are rewritten to the ending the file uses around it. Must differ from old_string — identical old and new strings are rejected as a no-op."
+                    "description": "Content when creating, or the replacement text (empty deletes)."
                 },
                 "multiple": {
                     "type": "boolean",
-                    "description": "Only used when old_string is provided. Allow replacing multiple occurrences of old_string (default: false). When true, replaces all occurrences instead of requiring exactly one.",
+                    "description": "Replace every occurrence of `old_string` (default: false).",
                     "default": false
                 }
             }),

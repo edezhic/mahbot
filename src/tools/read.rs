@@ -225,22 +225,22 @@ fn read_parameters_schema(path_desc: &str) -> serde_json::Value {
             "mode": {
                 "type": "string",
                 "enum": ["content", "symbols", "zoom"],
-                "description": "Read mode. 'content' (default): line-numbered file read — large outputs are truncated to a ~5 KB budget — or, for a raster image (PNG, JPEG, WebP), attaches it to the conversation as a native image instead; a PDF or Office document (Word, Excel, PowerPoint) is converted to text instead of its raw bytes (the tool description says what a converted document yields); a video or a recording is read as a timeline of frames, speech and sound labels instead of lossy text. 'symbols': list all top-level AST symbols with line ranges. 'zoom': extract a single symbol's source by name. 'symbols'/'zoom' work for supported code formats only.",
+                "description": "'content' (default), 'symbols' or 'zoom'.",
                 "default": "content"
             },
             "symbol": {
                 "type": "string",
-                "description": "Symbol name for zoom mode. Required when mode is 'zoom'.",
+                "description": "Symbol name for `zoom` mode.",
                 "minLength": 1
             },
             "offset": {
                 "type": "integer",
-                "description": "Starting line number for a text read (1-based, default: 1), or the start second for a video or a recording. Omit it and `limit` for the whole clip at overview density (frames across all of it, transcript capped at ten minutes); give either to read a window of seconds. Not used for a converted document.",
+                "description": "Start line (1-based) for text, or start second for video/recording.",
                 "minimum": 0
             },
             "limit": {
                 "type": "integer",
-                "description": "Maximum number of lines to return for a text read (default: all), or how many seconds of a video or a recording (to the end of the file when omitted). Not used for a converted document.",
+                "description": "Max lines for text, or seconds for video/recording.",
                 "minimum": 1
             }
         }),
@@ -255,17 +255,6 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> String {
-        let ppt = crate::reader_output::ppt_description_substitutions();
-        // The chart block prints the kind it read where this spells `<kind>`, a
-        // series its own name where this spells `<name>` — or its number — and a
-        // bubble's size where this spells `<size>`.
-        let chart_header = crate::reader_output::chart_header(Some("<kind>"));
-        let chart_none = crate::reader_output::chart_header(None);
-        let chart_series = crate::reader_output::chart_series(Some("<name>"), 0);
-        let chart_series_numbered = crate::reader_output::chart_series(None, 0);
-        let chart_size = crate::reader_output::chart_size("<size>");
-        let pdf_field_kinds = crate::docgen::pdf_field_kinds().spelled();
-        let form_words = crate::docgen::pdf_form_words();
         // The path boundary, in the wording of this read's own access level —
         // the skeleton is shared, so the three statements cannot drift from each other's structure.
         let path_policy = crate::prompt::load_prompt(match self.access {
@@ -273,45 +262,13 @@ impl Tool for ReadTool {
             PathAccess::Allowlisted => "tool/read_paths_allowlisted.md",
             PathAccess::Unrestricted => "tool/read_paths_admin.md",
         });
-        let unshown_report = crate::reader_output::unshown_report_examples();
-        let mut pairs: Vec<(&str, &str)> = vec![
-            ("{{path_policy}}", &path_policy),
-            (
-                "{{doc_headers_footers}}",
-                crate::reader_output::DOC_HEADERS_FOOTERS,
+        crate::tools::tool_reference::standing(
+            self.name(),
+            &crate::prompt::substitute(
+                &crate::prompt::load_prompt("tool/read.md"),
+                &[("{{path_policy}}", &path_policy)],
             ),
-            ("{{doc_footnotes}}", crate::reader_output::DOC_FOOTNOTES),
-            ("{{doc_endnotes}}", crate::reader_output::DOC_ENDNOTES),
-            ("{{doc_comments}}", crate::reader_output::DOC_COMMENTS),
-            ("{{text_box_mark}}", crate::reader_output::TEXT_BOX),
-            ("{{chart_sheet_mark}}", crate::reader_output::CHART_SHEET),
-            ("{{chart_header}}", &chart_header),
-            ("{{chart_none}}", &chart_none),
-            ("{{chart_series_numbered}}", &chart_series_numbered),
-            ("{{chart_title}}", crate::reader_output::CHART_TITLE),
-            ("{{chart_text}}", crate::reader_output::CHART_TEXT),
-            ("{{chart_label}}", crate::reader_output::CHART_LABEL),
-            ("{{chart_series}}", &chart_series),
-            ("{{chart_size}}", &chart_size),
-            ("{{pdf_field_kinds}}", &pdf_field_kinds),
-            ("{{pdf_form_fields}}", &form_words.fields),
-            ("{{pdf_no_value}}", &form_words.no_value),
-            ("{{pdf_not_fillable}}", &form_words.not_fillable),
-            ("{{mark_stored}}", crate::reader_output::MARK_STORED.trim()),
-            ("{{chart_no_values}}", crate::reader_output::CHART_NO_VALUES),
-            (
-                "{{chart_attached}}",
-                crate::reader_output::CHART_VALUES_ATTACHED,
-            ),
-            (
-                "{{chart_unreadable}}",
-                crate::reader_output::CHART_UNREADABLE,
-            ),
-            ("{{chart_extended}}", crate::reader_output::CHART_EXTENDED),
-            ("{{unshown_report}}", &unshown_report),
-        ];
-        pairs.extend(ppt.iter().map(|(key, value)| (*key, value.as_str())));
-        crate::prompt::substitute(&crate::prompt::load_prompt("tool/read.md"), &pairs)
+        )
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
