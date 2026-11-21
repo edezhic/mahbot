@@ -187,6 +187,18 @@ pub(crate) fn autolaunch_available() -> bool {
 /// write's refusal both state.
 const AUTOLAUNCH_INERT: &str = "this build does not register at login — only a published copy does";
 
+/// The hint under the start-at-login switch, from the read the page already made: a masked host says
+/// why nothing registers and what undoes the mask; every other host what the switch does.
+pub(crate) fn autolaunch_hint(mask: Option<crate::autostart::Mask>) -> String {
+    match mask {
+        Some(mask) => format!(
+            "Masked service — {}",
+            crate::autostart::masked_at_login(mask)
+        ),
+        None => "Starts MahBot when you log in".to_string(),
+    }
+}
+
 /// The routing form's model, when `name` is that form. The bare word yields `Some("")`, so the
 /// caller's own "needs a model" message answers it rather than "unknown setting".
 fn order_model(name: &str) -> Option<&str> {
@@ -562,20 +574,24 @@ fn describe_search(config: &ConfigData) -> String {
 async fn describe_autolaunch(config: &ConfigData, detail: Detail) -> String {
     let decision = crate::config::flag_on(config.autolaunch.as_deref());
     match detail {
+        // The mask that overrides the registration comes from the same read, so the switch cannot
+        // describe two hosts.
         Detail::Full { probe: true } => {
-            autolaunch_line(decision, registered_at_login().await.into())
+            autolaunch_line(decision, read_login_registration().await.into())
         }
         _ => autolaunch_line(decision, Registration::NotRead),
     }
 }
 
 /// The login registration as far as it is known: not read at all — the summary, or a write that
-/// already has the OS's answer — read but unanswered, or the OS's own answer.
+/// already has the OS's answer — read but unanswered, the OS's own answer, or a masked service unit,
+/// which registers nothing at login whatever the OS says about a stale enablement.
 #[derive(Clone, Copy)]
 enum Registration {
     NotRead,
     Unknown,
     Known(bool),
+    Masked(crate::autostart::Mask),
 }
 
 impl From<Option<bool>> for Registration {
@@ -587,17 +603,31 @@ impl From<Option<bool>> for Registration {
     }
 }
 
+impl From<crate::autostart::LoginRead> for Registration {
+    fn from(read: crate::autostart::LoginRead) -> Self {
+        match read.mask {
+            Some(mask) => Self::Masked(mask),
+            None => read.registered.into(),
+        }
+    }
+}
+
 /// The start-at-login line, shared by the read-back and the write so the two cannot describe the
 /// same switch differently: the decision, the login registration when it was read, and the inert
 /// suffix a build that cannot register carries.
 fn autolaunch_line(decision: bool, registration: Registration) -> String {
+    use std::borrow::Cow;
     use std::fmt::Write as _;
     let mut line = on_off(decision).to_string();
-    let answer = match registration {
+    let answer: Option<Cow<'static, str>> = match registration {
         Registration::NotRead => None,
-        Registration::Unknown => Some("unknown"),
-        Registration::Known(true) => Some("in place"),
-        Registration::Known(false) => Some("not in place"),
+        Registration::Unknown => Some(Cow::Borrowed("unknown")),
+        Registration::Known(true) => Some(Cow::Borrowed("in place")),
+        Registration::Known(false) => Some(Cow::Borrowed("not in place")),
+        Registration::Masked(mask) => Some(Cow::Owned(format!(
+            "masked — {}",
+            crate::autostart::masked_at_login(mask)
+        ))),
     };
     if let Some(registration) = answer {
         let _ = write!(line, " (login registration: {registration})");
@@ -1075,12 +1105,15 @@ async fn write_switch_row(key: &str, enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// The OS's own answer on the login registration. `None` = unknown, never "off".
-pub(crate) async fn registered_at_login() -> Option<bool> {
-    tokio::task::spawn_blocking(crate::autostart::registered)
+/// The OS's own answer on the login registration, read together with the mask that overrides it so
+/// the two come from one look at the host.
+pub(crate) async fn read_login_registration() -> crate::autostart::LoginRead {
+    tokio::task::spawn_blocking(crate::autostart::read_login)
         .await
-        .ok()
-        .flatten()
+        .unwrap_or(crate::autostart::LoginRead {
+            registered: None,
+            mask: None,
+        })
 }
 
 /// Save the start-at-login decision. Saved before the registration is applied, so a refused
@@ -1647,6 +1680,22 @@ mod tests {
                 "the write and the read-back say the same: {line}"
             );
         }
+
+        // A masked unit is a state of its own — nothing registers at login while the mask stays —
+        // and the line names the command that undoes it. The switch's hint states the same sentence.
+        let mask = crate::autostart::Mask::DevNull;
+        let masked = autolaunch_line(true, Registration::Masked(mask));
+        assert!(
+            masked.contains("(login registration: masked —")
+                && masked.contains(&format!("`{}`", mask.undo())),
+            "a masked host is told why and what to run: {masked}"
+        );
+        assert_eq!(
+            autolaunch_hint(Some(mask)),
+            "Masked service — nothing registers at login while the mask stays; run `sudo \
+             systemctl unmask mahbot.service` to undo it"
+        );
+        assert_eq!(autolaunch_hint(None), "Starts MahBot when you log in");
 
         // In a source tree neither can register, and the refusal repeats the read-back's reason.
         // `off` carries the suffix too: `off (inert — …)` is the line a source build prints.

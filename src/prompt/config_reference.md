@@ -99,8 +99,9 @@ to every account; the other four require it.
   registry-cache install included); elsewhere the window hides the control and `set` refuses for the
   same reason.
 - `autolaunch` — start at login. Only a published copy registers itself (not a registry-cache
-  install), and a system-managed host refuses the registration, naming the command to run. `get`
-  reports the decision and whether the registration is in place; `list` the decision alone.
+  install); a system-managed host refuses the registration, naming the command to run, and a masked
+  unit refuses both ways, naming the unmask. `get` reports the decision and whether the registration
+  is in place — `masked` when the unit is; `list` the decision alone.
 
 Wake-word enrolment needs a microphone and stays in the window.
 

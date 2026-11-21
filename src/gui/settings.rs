@@ -343,11 +343,12 @@ pub enum SettingsMessage {
     TogglePasswordVisibility(PasswordTarget),
     /// The Autolaunch switch: apply the decision to the system's own registration.
     AutolaunchToggle(bool),
-    /// The system's answer to a read of its login registration, tagged with the click count
-    /// it was taken under (`None` when the read failed — unknown rather than off).
+    /// The system's answer to a read of its login registration, tagged with the click count it
+    /// was taken under: the OS's own answer and the mask that overrides it — both unknown rather
+    /// than off when the read failed.
     AutolaunchRead {
         epoch: u64,
-        state: Option<bool>,
+        read: crate::autostart::LoginRead,
     },
     /// An apply's result: the state the system reports afterwards (`None` = could not tell).
     AutolaunchApplied(Result<Option<bool>, String>),
@@ -503,6 +504,9 @@ pub struct SettingsState {
     /// Bumped by every Autolaunch click. A read carries the count it was taken under, so a late
     /// answer is discarded instead of painting the state the click replaced.
     autolaunch_epoch: u64,
+    /// The hint under the switch, from the same read that answered it: a masked host says why
+    /// nothing registers and what undoes the mask.
+    autolaunch_hint: String,
 
     /// Whether the api_id/api_hash dialog is open.
     telegram_credentials_open: bool,
@@ -585,6 +589,7 @@ impl SettingsState {
             autolaunch: None,
             autolaunch_applying: false,
             autolaunch_epoch: 0,
+            autolaunch_hint: crate::settings::autolaunch_hint(None),
             telegram_credentials_open: false,
             telegram_api_id_input: SingleLineEditorState::new(""),
             telegram_api_hash_input: SingleLineEditorState::new(""),
@@ -633,8 +638,8 @@ impl SettingsState {
     fn read_system_autolaunch(&mut self) -> Task<SettingsMessage> {
         self.autolaunch = None;
         let epoch = self.autolaunch_epoch;
-        Task::perform(crate::settings::registered_at_login(), move |state| {
-            SettingsMessage::AutolaunchRead { epoch, state }
+        Task::perform(crate::settings::read_login_registration(), move |read| {
+            SettingsMessage::AutolaunchRead { epoch, read }
         })
     }
 
@@ -1179,13 +1184,14 @@ impl SettingsState {
                     SettingsMessage::AutolaunchApplied,
                 )
             }
-            SettingsMessage::AutolaunchRead { epoch, state } => {
+            SettingsMessage::AutolaunchRead { epoch, read } => {
                 // Only the answer to the newest read counts: one taken before the
                 // owner's last click would paint the state that click already
                 // replaced. A read that could not run leaves the state unknown,
                 // which is not "off".
                 if epoch == self.autolaunch_epoch {
-                    self.autolaunch = state;
+                    self.autolaunch = read.registered;
+                    self.autolaunch_hint = crate::settings::autolaunch_hint(read.mask);
                 }
                 Task::none()
             }
@@ -1194,6 +1200,9 @@ impl SettingsState {
                 match result {
                     Ok(state) => {
                         self.autolaunch = state;
+                        // The apply succeeded, so no mask stands: the switch's refusal would have
+                        // been the answer otherwise.
+                        self.autolaunch_hint = crate::settings::autolaunch_hint(None);
                         Task::none()
                     }
                     Err(e) => {
@@ -3102,7 +3111,7 @@ impl SettingsState {
             rows.push(field_row(
                 "Autolaunch",
                 control,
-                Some("Starts MahBot when you log in"),
+                Some(self.autolaunch_hint.as_str()),
             ));
         }
         if crate::settings::autoupdate_available() {
@@ -3951,7 +3960,7 @@ const FIELD_ROW_INLINE_PAD: f32 = 188.0;
 fn field_row<'a>(
     label: &'static str,
     input: Element<'a, SettingsMessage>,
-    hint: Option<&'static str>,
+    hint: Option<&'a str>,
 ) -> Element<'a, SettingsMessage> {
     field_row_with_error(label, input, hint, None)
 }
@@ -4068,7 +4077,7 @@ fn enrollment_status_column(status: String) -> Element<'static, SettingsMessage>
 fn field_row_with_error<'a>(
     label: &'static str,
     input: Element<'a, SettingsMessage>,
-    hint: Option<&'static str>,
+    hint: Option<&'a str>,
     error: Option<&'a str>,
 ) -> Element<'a, SettingsMessage> {
     let mut row_widget = row![
@@ -4480,7 +4489,10 @@ mod tests {
 
         let _ = state.update(SettingsMessage::AutolaunchRead {
             epoch: 0,
-            state: Some(true),
+            read: crate::autostart::LoginRead {
+                registered: Some(true),
+                mask: None,
+            },
         });
         assert_eq!(state.autolaunch, Some(true));
 
@@ -4492,7 +4504,10 @@ mod tests {
         assert!(state.autolaunch_applying);
         let _ = state.update(SettingsMessage::AutolaunchRead {
             epoch: 0,
-            state: Some(true),
+            read: crate::autostart::LoginRead {
+                registered: Some(true),
+                mask: None,
+            },
         });
         assert_eq!(
             state.autolaunch,
@@ -4506,7 +4521,13 @@ mod tests {
 
         // A read that could not run is unknown, never "off".
         let epoch = state.autolaunch_epoch;
-        let _ = state.update(SettingsMessage::AutolaunchRead { epoch, state: None });
+        let _ = state.update(SettingsMessage::AutolaunchRead {
+            epoch,
+            read: crate::autostart::LoginRead {
+                registered: None,
+                mask: None,
+            },
+        });
         assert_eq!(state.autolaunch, None);
         assert!(state.error.is_none(), "a failed read is not an error");
 
@@ -4515,6 +4536,30 @@ mod tests {
         let _ = state.update(SettingsMessage::AutolaunchApplied(Err("denied".into())));
         assert_eq!(state.autolaunch, None);
         assert_eq!(state.error.as_deref(), Some("denied"));
+
+        // A mask comes from the same answer, and the hint under the switch says so — the view
+        // itself never probes the host.
+        let mask = crate::autostart::Mask::DevNull;
+        let _ = state.update(SettingsMessage::AutolaunchRead {
+            epoch: state.autolaunch_epoch,
+            read: crate::autostart::LoginRead {
+                registered: Some(false),
+                mask: Some(mask),
+            },
+        });
+        assert_eq!(state.autolaunch, Some(false));
+        assert_eq!(
+            state.autolaunch_hint,
+            crate::settings::autolaunch_hint(Some(mask))
+        );
+
+        // An apply that succeeds was answered by the service manager, so no mask stands: the hint
+        // goes back to what the switch does.
+        let _ = state.update(SettingsMessage::AutolaunchApplied(Ok(Some(true))));
+        assert_eq!(
+            state.autolaunch_hint,
+            crate::settings::autolaunch_hint(None)
+        );
     }
 
     // A dropped task never runs; no store is needed, so the state is the surface.

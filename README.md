@@ -41,7 +41,9 @@ On a Linux host with no display manager — a server with no graphical login —
 registers MahBot as a system service and starts it: it runs from boot with nobody logged in,
 restarts itself when it fails, and drains its agents before it stops. The unit is
 `/etc/systemd/system/mahbot.service`, and `systemctl status mahbot.service` shows it. A host with
-a display manager gets the login entry the product writes at its first start instead;
+a display manager gets the login entry the product writes at its first start instead. A masked
+`mahbot.service` gets no login entry at all: a mask is the owner's decision that the service must
+not run, and the product does not register itself beside it.
 `MAHBOT_INSTALL_REGISTRATION=service|login` asks for the other registration explicitly, and a
 re-run leaves an existing working registration alone. `MAHBOT_INSTALL_DRY_RUN=1` prints what the
 install would do without changing anything.

@@ -497,6 +497,23 @@ run_installer() {
     printf '%s\n' "$_out" | tr -d '\r' >"$INSTALL_OUT"
 }
 
+# The installed product's own start, as its owner: a headless container has no window to open, so the
+# start is bounded and its status reported rather than asserted — what it did to the login
+# registration is what the legs read afterwards. The bound covers store creation and the full
+# migration set before the product reconciles the registration, and `--kill-after` bounds a stop the
+# product's own drain keeps waiting on. Extra `docker exec` flags — an overridden config home, say —
+# come after the two arguments. A leg that starts the product twice waits for the lock in between
+# itself: a start the installer left detached holds it, which is not a failure here.
+start_product() {  # start_product <container> <log file> [docker exec flag...]
+    _c=$1
+    _log=$2
+    shift 2
+    _rc=0
+    docker exec -u owner -e HOME=/home/owner -w /home/owner "$@" "$_c" \
+        timeout --kill-after=30 120 /home/owner/.local/bin/mahbot >"$_log" 2>&1 || _rc=$?
+    say "That start exited $_rc (headless, so a window or a held lock is expected; the entry is what is asserted)."
+}
+
 # ── Legs ──────────────────────────────────────────────────────────────────
 
 leg_clean_server() {
@@ -630,6 +647,19 @@ leg_masked() {
     check_eq "the manager still reports it masked" masked \
         "$(docker exec "$MASKED" systemctl is-enabled mahbot.service 2>/dev/null || true)"
 
+    # The explicit login ask beside a mask is the one run that used to promise a login entry on this
+    # host: it must now say what the product will really do, and leave the mask alone.
+    run_installer "$MASKED" no -e MAHBOT_INSTALL_REGISTRATION=login
+    check_eq "the login ask on a masked host exits 0" 0 "$INSTALL_STATUS"
+    check_contains "it says the product writes no entry while the mask stays" "$INSTALL_OUT" \
+        "MahBot does not write it while the mask stays"
+    check_lacks "it makes no login-start promise beside the mask" "$INSTALL_OUT" \
+        "MahBot starts when you log in"
+    check_contains "it names how to undo the mask" "$INSTALL_OUT" \
+        "sudo systemctl unmask mahbot.service"
+    check_eq "the mask is still the owner's mask" /dev/null \
+        "$(docker exec "$MASKED" readlink /etc/systemd/system/mahbot.service)"
+
     # An explicit ask is never answered silently: a mask is the owner's decision, so the run that is
     # told to register the service must say it cannot, non-zero, and leave the mask alone.
     run_installer "$MASKED" no -e MAHBOT_INSTALL_REGISTRATION=service
@@ -639,6 +669,63 @@ leg_masked() {
         "sudo systemctl unmask mahbot.service"
     check_eq "the mask survived the refusal" /dev/null \
         "$(docker exec "$MASKED" readlink /etc/systemd/system/mahbot.service)"
+
+    # A mask the manager does not recognise as one — a link to nothing at the unit's place, which it
+    # reports as `not-found` — is the same statement to the product, so the install must say so and
+    # must not offer `systemctl unmask`, which leaves such a link where it is. The dry run must name
+    # the mask too, not a unit that would not load.
+    say "Replacing the mask with a link to nothing, which the manager calls not-found."
+    docker exec "$MASKED" sh -c '
+        mkdir -p /etc/systemd/system
+        rm -f /etc/systemd/system/mahbot.service
+        ln -s /nonexistent/mahbot.service /etc/systemd/system/mahbot.service
+        systemctl daemon-reload
+    ' >/dev/null 2>&1
+    check "the manager does not recognise the link as a mask" \
+        docker exec "$MASKED" sh -c '! systemctl is-enabled mahbot.service 2>/dev/null | grep -qx masked'
+    run_installer "$MASKED" no -e MAHBOT_INSTALL_REGISTRATION=login
+    check_eq "the login ask beside a link to nothing exits 0" 0 "$INSTALL_STATUS"
+    check_contains "it says the unit is masked" "$INSTALL_OUT" \
+        "The unit at /etc/systemd/system/mahbot.service is masked on this host"
+    check_lacks "it makes no login-start promise beside that mask" "$INSTALL_OUT" \
+        "MahBot starts when you log in"
+    check_contains "it removes the link as the remedy" "$INSTALL_OUT" \
+        "rm -f /etc/systemd/system/mahbot.service"
+    check "the link is still there" \
+        docker exec "$MASKED" test -L /etc/systemd/system/mahbot.service
+    run_installer "$MASKED" no -e MAHBOT_INSTALL_DRY_RUN=1
+    check_eq "the dry run beside a link to nothing exits 0" 0 "$INSTALL_STATUS"
+    check_contains "the dry run reports the mask" "$INSTALL_OUT" \
+        "nothing that starts: the unit at /etc/systemd/system/mahbot.service is masked"
+    check_lacks "the dry run does not call it a unit that would not load" "$INSTALL_OUT" \
+        "would not load"
+    check_lacks "the dry run promises no login entry" "$INSTALL_OUT" \
+        "(MahBot writes it at its first start)"
+    docker exec "$MASKED" rm -f /etc/systemd/system/mahbot.service
+    docker exec "$MASKED" systemctl mask mahbot.service >/dev/null 2>&1
+    check_eq "the owner's mask is back" /dev/null \
+        "$(docker exec "$MASKED" readlink /etc/systemd/system/mahbot.service)"
+
+    # The product's own side of the same rule. Its start at every launch reconciles the login
+    # registration with the host, and a mask is the owner saying this service must not run — so an
+    # entry an earlier release left goes, no entry is written, and the entry comes back once the mask
+    # goes. Only a published copy registers itself, which is what the installer put here; a source
+    # build could not show either half.
+    write_login_entries "$MASKED" /home/owner/.config
+    say "Starting the installed product on the masked host; the entry left there must go and none take its place."
+    start_product "$MASKED" "$WORK/masked-start.out"
+    check "the masked start released the instance lock" wait_until 60 lock_is_free "$MASKED"
+    check "no login entry was left beside the mask" \
+        docker exec "$MASKED" test ! -e /home/owner/.config/autostart/mahbot.desktop
+
+    say "Taking the mask away; the same start must register at login again."
+    docker exec "$MASKED" systemctl unmask mahbot.service >/dev/null 2>&1
+    start_product "$MASKED" "$WORK/masked-unmasked-start.out"
+    check "the unmasked start released the instance lock" wait_until 60 lock_is_free "$MASKED"
+    check "the login entry is back once the mask is gone" \
+        docker exec "$MASKED" test -f /home/owner/.config/autostart/mahbot.desktop
+    # The rest of this leg masks the name again; the entry is the owner's own file, so it goes.
+    docker exec "$MASKED" rm -f /home/owner/.config/autostart/mahbot.desktop
 
     # A runtime mask shadows a unit that is not in `/etc` — a unit file there takes precedence — so the
     # owner's route to this state is to remove the unit and mask the name for this boot only. The
@@ -893,6 +980,24 @@ leg_no_systemd() {
     check_lacks "it prints no unit for a host that cannot load one" "$INSTALL_OUT" "[Unit]"
     check_lacks "it offers no switch to the service" "$INSTALL_OUT" \
         "MAHBOT_INSTALL_REGISTRATION=service"
+
+    # A mask with no service manager to ask about it is still the owner's decision — the link itself
+    # says so — and the product writes no entry beside it, so the dry run must not promise one.
+    say "With the unit's name masked, the dry run reports the mask and promises no login entry."
+    # The plain image may have no unit directory at all; the gate must fail an assertion, not abort.
+    docker exec "$NOSYSTEMD" sh -c '
+        mkdir -p /etc/systemd/system
+        ln -s /dev/null /etc/systemd/system/mahbot.service
+    '
+    run_installer "$NOSYSTEMD" no -e MAHBOT_INSTALL_DRY_RUN=1
+    check_eq "the dry run with a masked unit exits 0" 0 "$INSTALL_STATUS"
+    check_contains "it names the mask that holds the registration" "$INSTALL_OUT" "is masked"
+    check_contains "it says the entry is not written while the mask stays" "$INSTALL_OUT" \
+        "not written while the unit is masked"
+    check_lacks "it promises no entry a mask keeps away" "$INSTALL_OUT" \
+        "(MahBot writes it at its first start)"
+    check "the dry run wrote nothing" \
+        docker exec "$NOSYSTEMD" test -L /etc/systemd/system/mahbot.service
 }
 
 leg_dying_service() {
@@ -999,12 +1104,8 @@ leg_graphical() {
     # start is repeated here to show the entry exists whether or not the first one stayed up; a
     # second copy refuses because the instance lock is held, which is expected and not asserted.
     say "Starting the product once as owner, so the entry it maintains is shown from a start of ours too."
-    _prc=0
-    docker exec -u owner -e HOME=/home/owner -w /home/owner \
-        -e XDG_CONFIG_HOME=/home/owner/.config-xdg \
-        "$GRAPHICAL" timeout 60 /home/owner/.local/bin/mahbot \
-        >"$WORK/graphical-start.out" 2>&1 || _prc=$?
-    say "That start exited $_prc (headless, so a window or a held lock is expected; the entry is what is asserted)."
+    start_product "$GRAPHICAL" "$WORK/graphical-start.out" \
+        -e XDG_CONFIG_HOME=/home/owner/.config-xdg
     check "the entry is at the XDG config home" \
         docker exec "$GRAPHICAL" test -f /home/owner/.config-xdg/autostart/mahbot.desktop
     check "the home entry was not written" \

@@ -409,14 +409,51 @@ unit_state_word() {
     printf '%s' "${1:-unknown}"
 }
 
-# The mask in front of a command that has to reach the unit, in the form that takes off that very
-# mask: a persistent mask is a link beside the unit, and a runtime one lives under `/run`, where only
-# `--runtime` removes it. Nothing at all for a unit that is not masked.
-unmask_prefix() {
+# The one command that takes off the mask a state names: a persistent mask is a link beside the unit,
+# a runtime one lives under `/run`, where only `--runtime` removes it, a host with no service manager
+# to ask is told to remove the link itself, and a link to nothing — which the manager calls
+# `not-found`, and `systemctl unmask` leaves where it is — is removed as the file it is. Nothing for a
+# unit that is not masked. One place, so a message naming the mask and the command in front of
+# another cannot disagree about its form.
+unmask_command() {
     case "${1:-}" in
-        masked) printf '%s' "${AS_ROOT}systemctl unmask $UNIT_NAME && " ;;
-        masked-runtime) printf '%s' "${AS_ROOT}systemctl unmask --runtime $UNIT_NAME && " ;;
+        masked)
+            if [ -n "$HAVE_SYSTEMD" ]; then
+                printf '%s' "${AS_ROOT}systemctl unmask $UNIT_NAME"
+            else
+                printf '%s' "${AS_ROOT}rm -f $UNIT_PATH"
+            fi
+            ;;
+        masked-runtime) printf '%s' "${AS_ROOT}systemctl unmask --runtime $UNIT_NAME" ;;
+        severed) printf '%s' "${AS_ROOT}rm -f $UNIT_PATH" ;;
     esac
+}
+
+# The same command in front of one that has to reach the unit, `&&`-joined: nothing at all for a unit
+# that is not masked.
+unmask_prefix() {
+    _unmask=$(unmask_command "${1:-}")
+    [ -z "$_unmask" ] || printf '%s' "$_unmask && "
+}
+
+# The mask this host carries, in the service manager's own word where it reports one and `severed`
+# where the unit's place is a link to nothing — a state the manager calls `not-found`, and one
+# `systemctl unmask` leaves where it is. Empty for a host with no mask.
+unit_mask_form() {
+    case "${UNIT_ENABLED_BEFORE:-}" in
+        masked | masked-runtime) printf '%s' "$UNIT_ENABLED_BEFORE" ;;
+        *)
+            if [ -L "$UNIT_PATH" ] && [ ! -e "$UNIT_PATH" ]; then
+                printf '%s' severed
+            fi
+            ;;
+    esac
+}
+
+# Whether the host's unit is masked — the owner's decision that nothing starts it. The product reads
+# the same states as a mask (`src/autostart.rs`), so the two cannot disagree.
+unit_masked() {
+    [ -n "$(unit_mask_form)" ]
 }
 
 # The one command that changes the answer for the two states where a command does — a mask removed and
@@ -648,8 +685,11 @@ choose_registration() {
 # The one line that names the other registration and the switch that asks for it: the environment
 # the install is run with, never the systemd default target, which decides nothing here. Either
 # direction is offered only where this host can carry it out, so no host is told to re-run into a
-# refusal.
+# refusal — a masked unit refuses both, and the run has already named what undoes it.
 registration_switch_line() {
+    if unit_masked; then
+        return 0
+    fi
     if [ "$REGISTRATION" = service ]; then
         # Login means no unit on this host, and taking one off needs root.
         if { [ -e "$UNIT_PATH" ] || [ -L "$UNIT_PATH" ]; } && [ -z "$PRIVILEGED" ]; then
@@ -812,13 +852,13 @@ if [ "$DRY_RUN" = 1 ]; then
     fi
     if [ -n "$UNIT_KEPT_AT" ]; then
         say "  registered:   the unit at $UNIT_KEPT_AT, '$(unit_state_word "$UNIT_ENABLED_BEFORE")'"
+    elif unit_masked; then
+        # A mask the manager does not report as one (a link to nothing) or a host with no manager to
+        # ask: the owner's decision either way, and this run leaves it in place — so it is named here
+        # rather than reported as a unit that would not load or as no registration at all.
+        say "  registered:   nothing that starts: the unit at $UNIT_PATH is masked"
     elif [ -n "$UNIT_REASON" ]; then
         say "  registered:   nothing that works: the unit at $UNIT_PATH would not load ($UNIT_REASON)"
-    elif [ "$UNIT_ENABLED_BEFORE" = masked ]; then
-        # Only reachable with no service manager to ask, where the mask was read from the link
-        # itself: still the owner's decision, and the run leaves it in place — so it is named here
-        # rather than reported as no registration at all.
-        say "  registered:   nothing that starts: the unit at $UNIT_PATH is '$(unit_state_word "$UNIT_ENABLED_BEFORE")'"
     elif ENTRY=$(login_entry_on_disk); then
         say "  registered:   the login entry at $ENTRY"
     else
@@ -838,7 +878,12 @@ if [ "$DRY_RUN" = 1 ]; then
             render_unit
         fi
     elif [ "$OS" = linux ]; then
-        say "  login entry:  $AUTOSTART_ENTRY (MahBot writes it at its first start)"
+        if unit_masked; then
+            # The product writes no entry beside a mask, so the dry run must not promise one.
+            say "  login entry:  $AUTOSTART_ENTRY (not written while the unit is masked)"
+        else
+            say "  login entry:  $AUTOSTART_ENTRY (MahBot writes it at its first start)"
+        fi
     else
         say "  login start:  MahBot's own login registration, which it writes at its first start"
     fi
@@ -1157,14 +1202,13 @@ fi
 
 # A graphical host starts the product at login, and the entry that does it is the product's own
 # (`src/autostart.rs`): this install writes none and reports where it goes. A mask starts nothing —
-# it is the owner's decision, so it is left where it is and named with the manager's own word and the
-# path that holds it, a runtime mask living under `/run` rather than beside the unit. A unit an
+# it is the owner's decision, so it is left where it is and named with the manager's own word where it
+# reports one and the path that holds it, a runtime mask living under `/run` rather than beside the
+# unit and a link to nothing being the same statement the manager calls `not-found`. A unit an
 # earlier install registered would start a second copy, so it goes — and a removal that fails is said
-# plainly rather than hidden.
-UNIT_SAID=$(unit_state_word "$UNIT_ENABLED_BEFORE")
-if [ "$UNIT_SAID" = masked ] || [ "$UNIT_SAID" = masked-runtime ]; then
-    say "The unit at ${UNIT_KEPT_AT:-$UNIT_PATH} is '$UNIT_SAID' on this host, so it starts nothing; this install left it in place."
-elif [ -e "$UNIT_PATH" ]; then
+# plainly rather than hidden. The mask is the one state left where it is, and the login consequence is
+# said once, below.
+if [ -e "$UNIT_PATH" ] && ! unit_masked; then
     if [ -n "$HAVE_SYSTEMD" ]; then
         if [ -n "$PRIVILEGED" ]; then
             as_root systemctl disable --now "$UNIT_NAME" >/dev/null 2>&1 || true
@@ -1198,8 +1242,17 @@ elif [ -e "$UNIT_PATH" ]; then
 fi
 
 if [ "$OS" = linux ]; then
-    say "MahBot starts when you log in ($REGISTRATION_WHY)."
-    say "The login entry is $AUTOSTART_ENTRY; MahBot writes it at its first start."
+    if unit_masked; then
+        # The product writes no entry beside a mask, so the promise this line makes on every other
+        # host would be false here: the owner is told what will happen instead, and the one command
+        # that gets the entry.
+        say "The unit at ${UNIT_KEPT_AT:-$UNIT_PATH} is masked on this host, so nothing starts MahBot at login until the mask goes."
+        say "The login entry is $AUTOSTART_ENTRY; MahBot does not write it while the mask stays."
+        say "Undo the mask ${AS_ROOT_SAYS}$(unmask_command "$(unit_mask_form)")"
+    else
+        say "MahBot starts when you log in ($REGISTRATION_WHY)."
+        say "The login entry is $AUTOSTART_ENTRY; MahBot writes it at its first start."
+    fi
 else
     say "MahBot starts when you log in."
 fi

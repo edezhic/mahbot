@@ -738,8 +738,9 @@ mod tests {
     /// the whole specification ([`the_schema_is_compact`]), not a text fetched once on demand.
     #[test]
     fn the_reference_names_every_action_and_field() {
-        // Raised by the `about` action's lines: a text fetched on demand, not a standing cost.
-        const BASELINE: usize = 10_500;
+        // Raised by the `about` action's lines and by the masked-service-unit rule on the start-at-login
+        // switch: a text fetched on demand, not a standing cost.
+        const BASELINE: usize = 10_600;
         let reference = crate::settings::reference();
         assert!(
             reference.len() <= BASELINE,

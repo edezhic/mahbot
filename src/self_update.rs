@@ -21,7 +21,9 @@
 //!
 //! Under a systemd unit there is no replacement process to start: the unit tracks this
 //! PID, so the update execs the new binary in place — same PID, same unit, same cgroup —
-//! and the service keeps running under it ([`exec_in_place`]).
+//! and the service keeps running under it ([`exec_in_place`]). A unit the owner masked
+//! counts as that registration too: nothing runs under it, so the in-place exec is then
+//! only how this process replaces its own image.
 //!
 //! A downloaded copy also updates *itself*: the periodic release check
 //! ([`run_update_availability_refresh`]) starts the very same update with no

@@ -4,7 +4,10 @@
 //! no graphical system gets the system unit ([`SYSTEM_UNIT`]), every other host starts the
 //! product at login. This module owns the login side of that choice and follows the
 //! installer's where it made one — with the unit in place it removes the login entry and never
-//! writes one, because the two would start two copies.
+//! writes one, because the two would start two copies. A unit the owner masked counts as in place,
+//! in either form — a link to `/dev/null`, or one that points at nothing, in the unit's own place or
+//! only for the running session: the owner said this service must not run, so the product neither
+//! registers at login nor starts there.
 //!
 //! Each platform keeps one fixed identity, so a start after an install, an update or a move
 //! re-points the same entry rather than adding a second one. The owner's decision is
@@ -21,16 +24,25 @@ use anyhow::Context as _;
 /// write and remove, and the one registration such a host gets.
 const SYSTEM_UNIT: &str = "/etc/systemd/system/mahbot.service";
 
+/// The name systemd knows the unit by — the word every command that reaches it carries.
+const UNIT_NAME: &str = "mahbot.service";
+
 /// The symlink systemd enables a unit with. The file alone starts nothing: a host whose unit was
 /// `systemctl disable`d keeps it and boots the product no more, so this — not the file — is what
 /// "registered" means.
 const SYSTEM_UNIT_ENABLED: &str = "/etc/systemd/system/multi-user.target.wants/mahbot.service";
 
-/// Whether the installer left its unit on this host at all. It answers which registration the
-/// host has (the installer's choice), not whether that registration is enabled
-/// ([`system_unit_enabled`]). Always `false` off Linux, where there is no such unit to respect.
+/// Where `systemctl mask --runtime` leaves its link: a mask that lives for the running session only,
+/// and gone at the next boot.
+const SYSTEM_UNIT_RUNTIME: &str = "/run/systemd/system/mahbot.service";
+
+/// Whether the installer left its unit on this host at all — a mask included, since the owner who
+/// wrote one said the unit is not to run. It answers which registration the host has (the
+/// installer's choice), not whether that registration is enabled ([`system_unit_enabled`]). Always
+/// `false` off Linux, where there is no such unit to respect.
 pub(crate) fn system_unit_installed() -> bool {
-    cfg!(target_os = "linux") && Path::new(SYSTEM_UNIT).is_file()
+    cfg!(target_os = "linux")
+        && unit_installed(Path::new(SYSTEM_UNIT), Path::new(SYSTEM_UNIT_RUNTIME))
 }
 
 /// Whether systemd is set to start the installer's unit at boot.
@@ -38,14 +50,124 @@ pub(crate) fn system_unit_enabled() -> bool {
     cfg!(target_os = "linux") && Path::new(SYSTEM_UNIT_ENABLED).exists()
 }
 
+/// The mask on this host's unit, when the owner put one there — the one state in which the product
+/// must not register itself at login at all, whatever its own decision says.
+pub(crate) fn system_unit_mask() -> Option<Mask> {
+    if cfg!(target_os = "linux") {
+        host_mask(Path::new(SYSTEM_UNIT), Path::new(SYSTEM_UNIT_RUNTIME))
+    } else {
+        None
+    }
+}
+
+/// What a masked unit means for start-at-login — the one sentence the switch's hint, the read-back
+/// and the write's refusal all state.
+const MASKED_AT_LOGIN: &str = "nothing registers at login while the mask stays";
+
+/// [`MASKED_AT_LOGIN`] with the command that undoes `mask`, for every place that can name one.
+pub(crate) fn masked_at_login(mask: Mask) -> String {
+    format!("{MASKED_AT_LOGIN}; run `{}` to undo it", mask.undo())
+}
+
+/// Whether the host has the installer's unit at all, over the paths it is read from — so a test can
+/// exercise it on files it made instead of on a host's own.
+fn unit_installed(unit: &Path, runtime: &Path) -> bool {
+    unit.is_file() || host_mask(unit, runtime).is_some()
+}
+
+/// The mask the host carries, and what it is made of — each form is undone by a different command.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Mask {
+    /// A link to `/dev/null` in the unit's own place, which the service manager knows as a mask.
+    DevNull,
+    /// The same, under `/run` for the running session only.
+    DevNullRuntime,
+    /// A link to nothing in the unit's own place: the manager calls it `not-found`, and
+    /// `systemctl unmask` leaves it where it is.
+    Dangling,
+    /// The same, under `/run` for the running session only.
+    DanglingRuntime,
+}
+
+impl Mask {
+    /// The command that removes this mask, as the host can run it.
+    pub(crate) fn undo(self) -> String {
+        match self {
+            Self::DevNull => format!("sudo systemctl unmask {UNIT_NAME}"),
+            Self::DevNullRuntime => format!("sudo systemctl unmask --runtime {UNIT_NAME}"),
+            Self::Dangling => format!("sudo rm {SYSTEM_UNIT}"),
+            Self::DanglingRuntime => format!("sudo rm {SYSTEM_UNIT_RUNTIME}"),
+        }
+    }
+}
+
+/// The mask the host carries, if any: the one in the unit's own place, or — where nothing else is
+/// there, since systemd reads that path first — one that lives only for the running session. A unit
+/// file, a directory, an alias link and a broken unit are not masks.
+fn host_mask(unit: &Path, runtime: &Path) -> Option<Mask> {
+    if let Some(mask) = mask_at(unit, false) {
+        return Some(mask);
+    }
+    if nothing_at(unit) {
+        return mask_at(runtime, true);
+    }
+    None
+}
+
+/// The mask `path` is — the unit's own place when `runtime` is false, the running session's when it
+/// is true — or `None` when it is not one.
+fn mask_at(path: &Path, runtime: bool) -> Option<Mask> {
+    // A link's target names its own directory when it is relative, as it does for systemd.
+    let target = std::fs::read_link(path).ok()?;
+    let target = match path.parent() {
+        Some(dir) => dir.join(target),
+        None => target,
+    };
+    if std::fs::canonicalize(&target).is_ok_and(|real| real == Path::new("/dev/null")) {
+        Some(if runtime {
+            Mask::DevNullRuntime
+        } else {
+            Mask::DevNull
+        })
+    } else if nothing_at(&target) {
+        Some(if runtime {
+            Mask::DanglingRuntime
+        } else {
+            Mask::Dangling
+        })
+    } else {
+        // A link to a unit that is there is an alias, and one that cannot be resolved for another
+        // reason — a loop, a directory this process may not read — is a broken unit, not a mask.
+        None
+    }
+}
+
+/// Whether nothing at all is at `path` — not a unit, not a link, not a directory.
+fn nothing_at(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
 /// Keep the system's registration true to the installer's choice and to the running binary.
 /// Called at every start; a no-op for a copy built from sources.
 ///
-/// With the installer's unit in place the login entry is only ever removed — enabled or not, the
-/// host's registration is the unit, and writing an entry beside it would start two copies.
+/// With the installer's unit in place — masked included — the login entry is only ever removed:
+/// enabled or not, the host's registration is the unit, and writing an entry beside it would start
+/// two copies. An entry that was already there when the mask went on may start one copy before this
+/// removes it, which is accepted; a masked host is told in the log why start-at-login stops working.
 pub fn reconcile() {
     if !crate::self_update::is_published_copy() {
         return;
+    }
+    if decision()
+        && let Some(mask) = system_unit_mask()
+    {
+        tracing::info!(
+            "MahBot's service unit is masked on this host: {}",
+            masked_at_login(mask)
+        );
     }
     let outcome = if system_unit_installed() || !decision() {
         platform::remove()
@@ -59,13 +181,29 @@ pub fn reconcile() {
     }
 }
 
-/// Whether the system reports a registration that will start the product at login — an entry
-/// the owner disabled reads as `false`, and a probe that could not run as `None`.
-pub(crate) fn registered() -> Option<bool> {
-    if system_unit_enabled() {
-        Some(true)
-    } else {
-        platform::registered()
+/// What a read of the login registration answered: the OS's own answer, and the mask that overrides
+/// it — `None` for each = unknown, never "off".
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LoginRead {
+    pub(crate) registered: Option<bool>,
+    pub(crate) mask: Option<Mask>,
+}
+
+/// Whether the system reports a registration that will start the product at login, read with the
+/// mask that overrides it so one look at the host answers both. An entry the owner disabled reads as
+/// `false`, a masked unit reads as `false` (nothing starts under a mask) whatever a stale enablement
+/// says, and a probe that could not run as `None`.
+pub(crate) fn read_login() -> LoginRead {
+    let mask = system_unit_mask();
+    LoginRead {
+        registered: if mask.is_some() {
+            Some(false)
+        } else if system_unit_enabled() {
+            Some(true)
+        } else {
+            platform::registered()
+        },
+        mask,
     }
 }
 
@@ -74,8 +212,15 @@ pub(crate) fn registered() -> Option<bool> {
 ///
 /// Where the installer left its unit, the start is the service manager's to set — the switch
 /// cannot enable a disabled unit (that needs root) and must not claim it did, so both answers
-/// name the command that does it.
+/// name the command that does it. A masked unit is refused first: no enable or disable takes
+/// effect on one, and nothing registers at login while the mask stays.
 pub(crate) fn set_enabled(enabled: bool) -> anyhow::Result<Option<bool>> {
+    if let Some(mask) = system_unit_mask() {
+        anyhow::bail!(
+            "MahBot's service unit is masked on this host, so {}",
+            masked_at_login(mask)
+        );
+    }
     if system_unit_installed() {
         anyhow::bail!(
             "MahBot is registered as a system service, and its start is the service manager's to \
@@ -720,6 +865,11 @@ disabled services = {
         };
         let name = assigned("UNIT_NAME=");
         let path = assigned("UNIT_PATH=").replace("$UNIT_NAME", &name);
+        // The unmask commands name the unit by this word, so it must be the installer's own too.
+        assert_eq!(
+            UNIT_NAME, name,
+            "the product must name the unit as the installer does"
+        );
         assert_eq!(
             SYSTEM_UNIT, path,
             "the product must look for the unit where the installer writes it"
@@ -732,6 +882,108 @@ disabled services = {
             format!("/etc/systemd/system/{target}.wants/{name}"),
             "the product must read the wants symlink of the target the unit is wanted by"
         );
+        // A mask for the running session only is read from `/run`, which is the path the installer
+        // reports to its owner — one location, or the product would look where no mask is.
+        assert!(
+            installer.contains("UNIT_KEPT_AT=\"/run/systemd/system/$UNIT_NAME\""),
+            "the installer must read a runtime mask from the one place systemd writes it"
+        );
+        assert_eq!(
+            SYSTEM_UNIT_RUNTIME,
+            format!("/run/systemd/system/{name}"),
+            "the product must look for a runtime mask where the installer reads one"
+        );
+    }
+
+    /// A mask is the owner's decision that the service must not run, and a plain file check reads it
+    /// as "no unit here" — so the product must count it as the host's registration. Only a mask
+    /// does: a broken unit, a directory at the unit's path and a unit file beside a runtime mask all
+    /// keep the treatment they had, and each mask form is undone by the command that reaches it.
+    #[cfg(unix)]
+    #[test]
+    fn a_masked_unit_counts_as_installed_and_nothing_else_does() {
+        use std::os::unix::fs::symlink;
+
+        let dir = crate::util::test::test_root().join("autostart-mask");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let unit = dir.join("mahbot.service");
+        let runtime = dir.join("run-mahbot.service");
+
+        // Nothing at either path: the unit was removed entirely, so the host has no service.
+        assert!(!unit_installed(&unit, &runtime));
+        assert!(host_mask(&unit, &runtime).is_none());
+
+        // A unit file is the installer's registration, and no mask.
+        std::fs::write(&unit, "[Unit]\n").unwrap();
+        assert!(unit_installed(&unit, &runtime));
+        assert!(host_mask(&unit, &runtime).is_none());
+
+        // The mask `systemctl mask` writes, where the unit was.
+        std::fs::remove_file(&unit).unwrap();
+        symlink("/dev/null", &unit).unwrap();
+        assert!(unit_installed(&unit, &runtime));
+        assert_eq!(
+            host_mask(&unit, &runtime).map(Mask::undo).as_deref(),
+            Some("sudo systemctl unmask mahbot.service")
+        );
+
+        // A link spelled relative to its own directory reaches the same `/dev/null`, and is the same
+        // statement.
+        std::fs::create_dir_all(dir.join("dev")).unwrap();
+        symlink("/dev/null", dir.join("dev").join("null")).unwrap();
+        std::fs::remove_file(&unit).unwrap();
+        symlink("dev/null", &unit).unwrap();
+        assert!(host_mask(&unit, &runtime).is_some());
+
+        // A link whose target is gone is the same statement, and systemd does not know it as a
+        // mask: the link is removed as the file it is, not unmasked.
+        std::fs::remove_file(&unit).unwrap();
+        symlink(dir.join("gone.service"), &unit).unwrap();
+        assert!(unit_installed(&unit, &runtime));
+        assert_eq!(
+            host_mask(&unit, &runtime).map(Mask::undo).as_deref(),
+            Some("sudo rm /etc/systemd/system/mahbot.service")
+        );
+
+        // A mask for the running session only, with no unit file behind it, is undone by the form
+        // that names it.
+        std::fs::remove_file(&unit).unwrap();
+        symlink("/dev/null", &runtime).unwrap();
+        assert!(unit_installed(&unit, &runtime));
+        assert_eq!(
+            host_mask(&unit, &runtime).map(Mask::undo).as_deref(),
+            Some("sudo systemctl unmask --runtime mahbot.service")
+        );
+
+        // A unit file beside a runtime mask is the unit systemd loads, so it is not a mask.
+        std::fs::write(&unit, "[Unit]\n").unwrap();
+        assert!(unit_installed(&unit, &runtime));
+        assert!(host_mask(&unit, &runtime).is_none());
+
+        // A link to a unit file that is there is an alias, not a mask.
+        std::fs::remove_file(&unit).unwrap();
+        std::fs::write(dir.join("real.service"), "[Unit]\n").unwrap();
+        symlink(dir.join("real.service"), &unit).unwrap();
+        assert!(unit_installed(&unit, &runtime));
+        assert!(host_mask(&unit, &runtime).is_none());
+
+        // A directory at the unit's path is neither a unit nor a mask, exactly as before — and it is
+        // not made one by a runtime mask beside it.
+        std::fs::remove_file(&unit).unwrap();
+        std::fs::create_dir(&unit).unwrap();
+        assert!(!unit_installed(&unit, &runtime));
+        assert!(host_mask(&unit, &runtime).is_none());
+
+        // Both masks at once: systemd reads the unit's own place first, so that is the one named.
+        std::fs::remove_dir(&unit).unwrap();
+        symlink("/dev/null", &unit).unwrap();
+        assert_eq!(
+            host_mask(&unit, &runtime).map(Mask::undo).as_deref(),
+            Some("sudo systemctl unmask mahbot.service")
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A unit systemd refuses leaves the host registered and unstarted, and the shipped defect —
