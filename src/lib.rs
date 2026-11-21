@@ -849,8 +849,8 @@ pub struct Launch {
     pub identifier: Option<String>,
     /// The authorial prompt text, taken at launch; empty for a worker branch.
     pub prompt: String,
-    /// The chosen subset of the admin Assistant's tool names, taken at launch; empty
-    /// for a worker branch.
+    /// The chosen subset of the admin Assistant's tools and custom-tool scripts
+    /// (`custom:<script>`), taken at launch; empty for a worker branch.
     pub tools: Vec<String>,
     /// The resolved session/branch address (`role_{name}`, `role_{name}:{id}`,
     /// `rolerun_{name}:{suffix}` or `worker_{branch}`).

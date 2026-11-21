@@ -30,6 +30,10 @@ pub(crate) enum CustomRolesMessage {
     ToggleTool(String),
     /// Mark or unmark one KIND of a catalog tool that has a kind vocabulary.
     ToggleToolKind { tool: String, kind: String },
+    /// Mark or unmark one script of the admin's shared folder.
+    ToggleScript(String),
+    /// The scripts present in the shared folder finished reading. `Err` keeps the last loaded set.
+    ScriptsLoaded(Result<Vec<String>, String>),
     /// Submit the open window: create the record, or save the edited one.
     SubmitEditor,
     /// Result of a submit. An error keeps the window open with it.
@@ -48,6 +52,8 @@ pub(crate) struct CustomRolesState {
     pub(crate) roles: Vec<CustomRole>,
     pub(crate) loaded: bool,
     pub(crate) error: Option<String>,
+    /// The custom-tool scripts present in the admin's shared folder, as of the last read.
+    pub(crate) scripts: Vec<String>,
     /// The open create/edit window; `None` when closed.
     pub(crate) editor: Option<RoleEditor>,
     /// The role name a delete confirmation is open for; `None` when closed.
@@ -64,6 +70,9 @@ pub(crate) struct RoleEditor {
     /// The tool catalogue the picker offers, captured when the window opened: it constructs the
     /// tool objects and reads CONFIG, so it must not be rebuilt on every render pass.
     pub(crate) catalog: Vec<&'static str>,
+    /// The custom-tool scripts the shared folder held at the last read — loaded with the page's
+    /// role list and refreshed while the window is open.
+    pub(crate) scripts: Vec<String>,
     pub(crate) in_flight: bool,
     pub(crate) error: Option<String>,
 }
@@ -76,6 +85,7 @@ impl RoleEditor {
         prompt: &str,
         behavior: CustomRoleBehavior,
         tools: Vec<String>,
+        scripts: Vec<String>,
     ) -> Self {
         // A role name is one line: newlines never enter the field.
         let name_buffer = EditorBuffer::with_text(name, None);
@@ -91,6 +101,7 @@ impl RoleEditor {
             behavior,
             tools,
             catalog,
+            scripts,
             in_flight: false,
             error: None,
         }
@@ -102,7 +113,7 @@ impl RoleEditor {
     pub(crate) fn held_kinds(&self, tool: &str) -> Vec<String> {
         crate::tools::grants::parse_lossy(&self.tools)
             .into_iter()
-            .find(|g| g.tool == tool)
+            .find(|g| g.tool() == Some(tool))
             .map(|grant| crate::tools::grants::held_kinds(&grant))
             .unwrap_or_default()
     }
@@ -112,6 +123,18 @@ impl RoleEditor {
     fn toggle_kind(&mut self, tool: &str, kind: &str) {
         self.tools = crate::tools::grants::toggle(&self.tools, tool, kind);
     }
+
+    /// Mark or unmark one script: each script is its own entry (`custom:<script>`), so several sit
+    /// in one list and none collapses into another.
+    fn toggle_script(&mut self, name: &str) {
+        let entry = crate::tools::grants::script_entry(name);
+        match self.tools.iter().position(|held| held == &entry) {
+            Some(at) => {
+                self.tools.remove(at);
+            }
+            None => self.tools.push(entry),
+        }
+    }
 }
 
 impl CustomRolesState {
@@ -120,6 +143,7 @@ impl CustomRolesState {
             roles: Vec::new(),
             loaded: false,
             error: None,
+            scripts: Vec::new(),
             editor: None,
             delete_target: None,
         }
@@ -127,9 +151,16 @@ impl CustomRolesState {
 
     #[allow(clippy::unused_self)]
     pub(crate) fn refresh(&self) -> Task<CustomRolesMessage> {
-        Task::perform(custom_role::list(), |res| {
-            CustomRolesMessage::Refreshed(res.map_err(|e| e.to_string()))
-        })
+        Task::batch([
+            Task::perform(custom_role::list(), |res| {
+                CustomRolesMessage::Refreshed(res.map_err(|e| e.to_string()))
+            }),
+            // The scripts a role may be handed are the ones present now, read with the records so
+            // the picker's choices and the list on screen come from the same moment.
+            Task::perform(crate::tools::custom::script_names(), |res| {
+                CustomRolesMessage::ScriptsLoaded(res.map_err(|e| e.to_string()))
+            }),
+        ])
     }
 
     /// Dismiss the open window and the delete confirmation (Escape).
@@ -160,6 +191,7 @@ impl CustomRolesState {
                     "",
                     CustomRoleBehavior::Continuous,
                     Vec::new(),
+                    self.scripts.clone(),
                 ));
                 Task::none()
             }
@@ -173,6 +205,7 @@ impl CustomRolesState {
                         &role.prompt,
                         role.behavior,
                         role.tools.clone(),
+                        self.scripts.clone(),
                     ));
                 }
                 Task::none()
@@ -203,12 +236,12 @@ impl CustomRolesState {
             CustomRolesMessage::ToggleTool(name) => {
                 if let Some(editor) = &mut self.editor {
                     // An entry is identified by its tool name: unticking an entry this
-                    // installation cannot serve must remove it rather than add a second one.
-                    match editor
-                        .tools
-                        .iter()
-                        .position(|entry| crate::tools::grants::tool_name(entry) == name.as_str())
-                    {
+                    // installation cannot serve must remove it rather than add a second one. A
+                    // script entry names a script, never a tool, so it is never touched here.
+                    match editor.tools.iter().position(|entry| {
+                        !crate::tools::grants::is_script_entry(entry)
+                            && crate::tools::grants::tool_name(entry) == name.as_str()
+                    }) {
                         Some(at) => {
                             editor.tools.remove(at);
                         }
@@ -221,6 +254,26 @@ impl CustomRolesState {
                 if let Some(editor) = &mut self.editor {
                     editor.toggle_kind(&tool, &kind);
                 }
+                Task::none()
+            }
+            CustomRolesMessage::ToggleScript(name) => {
+                if let Some(editor) = &mut self.editor {
+                    editor.toggle_script(&name);
+                }
+                Task::none()
+            }
+            CustomRolesMessage::ScriptsLoaded(Ok(scripts)) => {
+                self.scripts = scripts;
+                // A window already open follows the read: a script deleted while it was open is
+                // then shown as unavailable rather than vanishing from the record.
+                if let Some(editor) = &mut self.editor {
+                    editor.scripts.clone_from(&self.scripts);
+                }
+                Task::none()
+            }
+            CustomRolesMessage::ScriptsLoaded(Err(e)) => {
+                // The picker keeps the last loaded set; a save still validates against the disk.
+                tracing::warn!(error = %e, "Failed to read the shared folder's scripts");
                 Task::none()
             }
             CustomRolesMessage::SubmitEditor => {
@@ -307,7 +360,8 @@ impl CustomRolesState {
 mod tests {
     use super::*;
     use CustomRolesMessage::{
-        CloseEditor, OpenCreate, OpenEdit, SubmitEditor, SubmitResult, ToggleTool, ToggleToolKind,
+        CloseEditor, OpenCreate, OpenEdit, ScriptsLoaded, SubmitEditor, SubmitResult, ToggleScript,
+        ToggleTool, ToggleToolKind,
     };
 
     const ANALYST: &str = "analyst";
@@ -408,6 +462,41 @@ mod tests {
                 "case {name}"
             );
         }
+    }
+
+    /// Each script is its own entry in the same list: marking two keeps both, unmarking one leaves
+    /// the other, and a script named like a tool is a different entry from that tool. A script read
+    /// while the window is open updates the choices it offers.
+    #[test]
+    fn script_marks_are_individual_entries() {
+        let mut state = CustomRolesState::new();
+        let _ = state.update(CustomRolesMessage::Refreshed(Ok(vec![role(ANALYST)])));
+        let _ = state.update(OpenEdit(ANALYST.to_string()));
+
+        let _ = state.update(ToggleScript("weather".to_string()));
+        let _ = state.update(ToggleScript("read".to_string()));
+        let _ = state.update(ToggleTool("read".to_string()));
+        let tools = &state.editor.as_ref().expect("the window stays open").tools;
+        assert_eq!(
+            tools,
+            &["web_search", "custom:weather", "custom:read", "read"],
+            "a script and a tool of the same name are two entries"
+        );
+
+        let _ = state.update(ToggleScript("weather".to_string()));
+        let tools = &state.editor.as_ref().expect("the window stays open").tools;
+        assert_eq!(tools, &["web_search", "custom:read", "read"]);
+
+        let _ = state.update(ScriptsLoaded(Ok(vec!["weather".to_string()])));
+        assert_eq!(
+            state
+                .editor
+                .as_ref()
+                .expect("the window stays open")
+                .scripts,
+            ["weather"],
+            "an open window follows the read"
+        );
     }
 
     #[test]

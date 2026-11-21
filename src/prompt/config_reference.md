@@ -53,8 +53,11 @@ Bracketed fields are the ones the action reads.
   (`name`, `tools`, `behavior`, `prompt`) — the owner's own agents. `create_custom_role` needs
   `prompt`, `update_custom_role` one of `prompt`, `tools`, `behavior`; a name is up to 32 letters,
   digits, `_` and `-`, starting with a letter, and must not shadow an agent-id namespace (`role`,
-  `ticket`, `maintainer`, `discovery`, …); `tools` entries come from the custom-role catalogue, an
-  empty array clearing them.
+  `ticket`, `maintainer`, `discovery`, …). A `tools` entry is a catalogue tool name, optionally
+  `name:kind1,kind2` for one with kinds, or `custom:<script>` for one script in the owner's `shared`
+  folder — one entry per script, so several scripts sit in the same list. A role holds the `custom`
+  dispatcher exactly when its list names at least one script, and the plain `custom` entry means
+  nothing; an empty array clears the list.
 
 `user` names the account an action acts on: `bind_telegram` defaults to the owner and `list_grants`
 to every account; the other four require it.

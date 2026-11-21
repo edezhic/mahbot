@@ -16,7 +16,8 @@ The script runs with the managed runtime, from your workspace root, never throug
 ## Refusals
 
 - The tool does not exist, or its definition cannot be read (a malformed header is never repaired).
-- You are not granted it — availability is per account, and the `<custom-tools>` block lists exactly what you hold.
+- It is not yours to call — availability is per account or per role, and the `<custom-tools>` block
+  lists exactly what you hold.
 - A required argument is missing, or a value is of the wrong type.
 
 ## Failures

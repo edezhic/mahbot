@@ -339,7 +339,7 @@ impl Role {
         }
         // The grant-gated forwarding tool: the grant (or admin rights) decides what each call may
         // reach.
-        t.push(Box::new(CustomTool));
+        t.push(Box::new(CustomTool::for_account()));
         // A guest's read access is workspace-bounded; the admin's reaches any path the shell could
         // name.
         t.push(Box::new(ReadTool::new(file_access)));
@@ -375,11 +375,14 @@ impl Role {
 
     /// The admin Assistant's own set as a custom role sees it: the same list minus
     /// [`CUSTOM_ROLE_WITHHELD_TOOLS`], so neither the catalogue nor the built set can offer a
-    /// withheld tool.
+    /// withheld tool. The `custom` dispatcher is not a grant at all — a role holds it exactly when
+    /// its record names at least one script, and [`Self::custom_role_tools`] builds it from those
+    /// names — so the base set has none.
     fn custom_role_base_tools() -> Vec<Box<dyn Tool>> {
         Self::assistant_core_tools(true)
             .into_iter()
             .filter(|tool| !CUSTOM_ROLE_WITHHELD_TOOLS.contains(&tool.name()))
+            .filter(|tool| tool.name() != CustomTool::NAME)
             .collect()
     }
 
@@ -482,11 +485,16 @@ impl Role {
 
     /// The tool set of a custom role: the subset of the admin Assistant's core tools (at the
     /// admin's own strength, minus [`CUSTOM_ROLE_WITHHELD_TOOLS`]) named by the record, plus the
-    /// configured `web_search`, the granted dispatch tools with their kinds, and the shared
-    /// `reference` entry point every set carries. Each entry is `"tool"` (its narrowest kind) or
-    /// `"tool:kind1,kind2"`. `analyze` and `send` are never taken from the static set — they are
+    /// configured `web_search`, the granted dispatch tools with their kinds, the `custom`
+    /// dispatcher holding the scripts the record names, and the shared `reference` entry point
+    /// every set carries. Each entry is `"tool"` (its narrowest kind), `"tool:kind1,kind2"`, or
+    /// `"custom:<script>"`. `analyze` and `send` are never taken from the static set — they are
     /// rebuilt from the grants so a role gets exactly its granted depths and addressees. The read
     /// is lenient: an entry the grammar refuses drops itself alone.
+    ///
+    /// The dispatcher follows the record, not the folder: a role that names a script whose file has
+    /// since gone still holds `custom`, and the call is refused when it is made.
+    ///
     /// A tool the installation cannot serve right now is simply absent (the record keeps the
     /// choice), as is an entry naming a withheld tool. The caller applies `is_advertised()` to the
     /// result.
@@ -494,7 +502,10 @@ impl Role {
     pub(crate) fn custom_role_tools(entries: &[String]) -> Vec<Box<dyn Tool>> {
         // One unparsable stored entry drops itself alone, never the record's whole tool set.
         let grants = crate::tools::grants::parse_lossy(entries);
-        let granted: Vec<&str> = grants.iter().map(|grant| grant.tool.as_str()).collect();
+        let granted: Vec<&str> = grants
+            .iter()
+            .filter_map(crate::tools::grants::Grant::tool)
+            .collect();
         let mut tools: Vec<Box<dyn Tool>> = Self::custom_role_base_tools()
             .into_iter()
             // The dispatch tools are rebuilt from their grants below, never taken from the static
@@ -507,26 +518,31 @@ impl Role {
         if granted.contains(&"web_search") {
             Self::add_web_search_tool(&mut tools);
         }
+        // The dispatcher is not a grant either: it exists exactly when the record names a script.
+        let scripts: Vec<String> = grants
+            .iter()
+            .filter_map(|grant| grant.script().map(str::to_string))
+            .collect();
+        if !scripts.is_empty() {
+            tools.push(Box::new(CustomTool::held(scripts)));
+        }
         for grant in &grants {
-            match grant.tool.as_str() {
-                "analyze" => {
-                    tools.push(Box::new(AnalyzeTool::granted(
-                        &grant
-                            .kinds
-                            .iter()
-                            .filter_map(|kind| AnalyzeDepth::parse(kind))
-                            .collect::<Vec<_>>(),
-                    )));
-                }
-                "send" => {
-                    tools.push(Box::new(SendTool::granted(
-                        &grant
-                            .kinds
-                            .iter()
-                            .filter_map(|kind| Addressee::parse(kind))
-                            .collect::<Vec<_>>(),
-                    )));
-                }
+            let crate::tools::grants::Grant::Tool { tool, kinds } = grant else {
+                continue;
+            };
+            match tool.as_str() {
+                "analyze" => tools.push(Box::new(AnalyzeTool::granted(
+                    &kinds
+                        .iter()
+                        .filter_map(|kind| AnalyzeDepth::parse(kind))
+                        .collect::<Vec<_>>(),
+                ))),
+                "send" => tools.push(Box::new(SendTool::granted(
+                    &kinds
+                        .iter()
+                        .filter_map(|kind| Addressee::parse(kind))
+                        .collect::<Vec<_>>(),
+                ))),
                 _ => {}
             }
         }
@@ -548,9 +564,11 @@ impl Role {
     }
 
     /// The catalog a custom role's subset is chosen from: the admin Assistant's static core tool
-    /// names minus [`CUSTOM_ROLE_WITHHELD_TOOLS`], plus `"web_search"` — offered even before a
-    /// provider is configured, so a role keeps its choice across a provider change. This is what
-    /// the settings picker shows and [`crate::custom_role::validate_tools_against`] accepts.
+    /// names minus [`CUSTOM_ROLE_WITHHELD_TOOLS`] (and the `custom` dispatcher, which is not a
+    /// grant), plus `"web_search"` — offered even before a provider is configured, so a role keeps
+    /// its choice across a provider change. This is what the settings picker shows and
+    /// [`crate::custom_role::validate_tools_against`] accepts as a tool; a role's scripts are
+    /// separate entries validated against the shared folder.
     #[must_use]
     pub(crate) fn custom_role_tool_catalog() -> Vec<&'static str> {
         let mut names: Vec<&'static str> = Self::custom_role_base_tools()
@@ -627,11 +645,14 @@ mod tests {
             .iter()
             .map(|tool| tool.name())
             .filter(|name| !CUSTOM_ROLE_WITHHELD_TOOLS.contains(name))
+            // The dispatcher is not a grant: a role holds it exactly when it names a script.
+            .filter(|name| *name != CustomTool::NAME)
             .collect();
         expected.push("web_search");
         assert_eq!(
             catalog, expected,
-            "the catalogue is the admin set minus {CUSTOM_ROLE_WITHHELD_TOOLS:?}, plus web_search"
+            "the catalogue is the admin set minus {CUSTOM_ROLE_WITHHELD_TOOLS:?} and the \
+             dispatcher, plus web_search"
         );
         let all_names: Vec<String> = catalog.iter().map(ToString::to_string).collect();
         let built: Vec<&str> = Role::custom_role_tools(&all_names)
@@ -696,6 +717,26 @@ mod tests {
             granted(&["read", "computer"]),
             vec!["read"],
             "the withheld entry costs the record nothing else"
+        );
+
+        // A script is held individually: the dispatcher follows the record's entries, never the
+        // folder, and a bare `custom` entry means nothing for a role.
+        assert!(
+            !catalog.contains(&CustomTool::NAME),
+            "the dispatcher is not a grantable tool"
+        );
+        assert!(
+            !granted(&["custom"]).contains(&CustomTool::NAME.to_string()),
+            "a bare `custom` entry must build no dispatcher"
+        );
+        assert!(
+            granted(&["custom:weather"]).contains(&CustomTool::NAME.to_string()),
+            "one named script must build the dispatcher"
+        );
+        assert_eq!(
+            granted(&["custom:weather", "read"]),
+            vec!["read", "custom"],
+            "the dispatcher sits beside the other granted tools"
         );
     }
 

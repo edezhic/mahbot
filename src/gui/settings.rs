@@ -2468,14 +2468,17 @@ impl SettingsState {
     }
 
     /// The custom-role tool list: the window's catalogue plus any stored name this installation
-    /// cannot serve right now, marked unavailable. A tool with a kind vocabulary renders one
-    /// checkbox per kind (granted iff one is checked); an unserviceable name stays offered.
+    /// cannot serve right now, marked unavailable, then one row per custom-tool script. A tool with
+    /// a kind vocabulary renders one checkbox per kind (granted iff one is checked); an
+    /// unserviceable name stays offered so it can be removed, and a script that has gone keeps its
+    /// own name rather than collapsing into an unknown tool.
     fn custom_role_tool_picker(editor: &custom_roles::RoleEditor) -> Element<'_, SettingsMessage> {
         let mut tool_rows = Column::new().spacing(theme::SPACE_2);
 
         let unavailable = editor
             .tools
             .iter()
+            .filter(|entry| !crate::tools::grants::is_script_entry(entry))
             .map(|entry| crate::tools::grants::tool_name(entry))
             .filter(|tool| !editor.catalog.contains(tool))
             .map(str::to_string)
@@ -2542,6 +2545,12 @@ impl SettingsState {
                 }
             }
         }
+
+        // The shared folder's scripts, each its own choice.
+        for row in Self::custom_role_script_rows(editor) {
+            tool_rows = tool_rows.push(row);
+        }
+
         column![
             text("Tools")
                 .size(theme::TEXT_13)
@@ -2550,6 +2559,62 @@ impl SettingsState {
         ]
         .spacing(theme::SPACE_4)
         .into()
+    }
+
+    /// The script rows of the custom-role picker: the scripts present now, then any the record
+    /// still holds whose file has gone — each its own choice, and a gone one keeps its own name
+    /// rather than collapsing into an unknown tool.
+    fn custom_role_script_rows(
+        editor: &custom_roles::RoleEditor,
+    ) -> Vec<Element<'_, SettingsMessage>> {
+        let unavailable = editor
+            .tools
+            .iter()
+            .filter_map(|entry| crate::tools::grants::script_of(entry))
+            .filter(|name| !editor.scripts.iter().any(|script| script == name))
+            .map(str::to_string)
+            .collect::<Vec<String>>();
+        let mut rows = vec![
+            text("Custom tools (your shared folder's scripts)")
+                .size(theme::TEXT_12)
+                .color(theme::TEXT_SECONDARY)
+                .into(),
+        ];
+        if editor.scripts.is_empty() && unavailable.is_empty() {
+            rows.push(
+                text("No scripts in your shared folder.")
+                    .size(theme::TEXT_11)
+                    .color(theme::TEXT_MUTED)
+                    .into(),
+            );
+        }
+        let scripts = editor
+            .scripts
+            .iter()
+            .map(|name| (name.clone(), false))
+            .chain(unavailable.into_iter().map(|name| (name, true)));
+        for (name, is_unavailable) in scripts {
+            let entry = crate::tools::grants::script_entry(&name);
+            // The stored spelling, so a script named like a tool never shares its label.
+            let shown = if is_unavailable {
+                format!("{entry} (not available here)")
+            } else {
+                entry.clone()
+            };
+            rows.push(
+                checkbox(editor.tools.iter().any(|held| held == &entry))
+                    .label(shown)
+                    .text_size(theme::TEXT_12)
+                    .style(theme::checkbox_style)
+                    .on_toggle(move |_| {
+                        SettingsMessage::CustomRolesMsg(
+                            custom_roles::CustomRolesMessage::ToggleScript(name.clone()),
+                        )
+                    })
+                    .into(),
+            );
+        }
+        rows
     }
 
     /// The custom-role delete confirmation: what the record's removal takes with it.

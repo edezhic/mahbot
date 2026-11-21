@@ -69,7 +69,8 @@ pub(crate) struct CustomRole {
     pub name: String,
     /// The administrator's authorial text — the whole definition of the role.
     pub prompt: String,
-    /// The chosen subset of the admin Assistant's tool names.
+    /// The chosen tool subset: `"tool"`, `"tool:kind1,kind2"` or `"custom:<script>"` entries
+    /// ([`crate::tools::grants`]).
     pub tools: Vec<String>,
     pub behavior: CustomRoleBehavior,
 }
@@ -115,7 +116,8 @@ pub(crate) async fn create(
     behavior: CustomRoleBehavior,
 ) -> Result<()> {
     validate_name(name)?;
-    validate_tools_against(tools, &[])?;
+    let scripts = available_scripts(tools, &[]).await?;
+    validate_tools_against(tools, &[], &scripts)?;
     anyhow::ensure!(
         !prompt.trim().is_empty(),
         "a custom role needs a prompt — the administrator's text is the whole definition"
@@ -157,7 +159,8 @@ pub(crate) async fn update(
         "a custom role needs a prompt — the administrator's text is the whole definition"
     );
     let tools = tools.unwrap_or(&existing.tools);
-    validate_tools_against(tools, &existing.tools)?;
+    let scripts = available_scripts(tools, &existing.tools).await?;
+    validate_tools_against(tools, &existing.tools, &scripts)?;
     let behavior = behavior.unwrap_or(existing.behavior);
     store()
         .conn
@@ -299,80 +302,190 @@ fn validate_segment(value: &str, max_chars: usize, what: &str) -> Result<()> {
 }
 
 /// Validate a tool subset a caller wrote, against the catalog of what a custom role may be given
-/// ([`crate::Role::custom_role_tool_catalog`]). Each entry is `"tool"` (the tool with its
-/// narrowest kind) or `"tool:kind1,kind2"` ([`crate::tools::grants`]); an empty subset is
-/// allowed, an unknown tool, a tool a custom role cannot hold, an unknown kind and a tool named
-/// twice are not.
+/// ([`crate::Role::custom_role_tool_catalog`]) and the scripts usable right now (`scripts`). Each
+/// entry is `"tool"` (the tool with its narrowest kind), `"tool:kind1,kind2"` or
+/// `"custom:<script>"` ([`crate::tools::grants`]); an empty subset is allowed, an unknown tool, a
+/// tool a custom role cannot hold, an unknown kind, a name the grammar cannot express and a name
+/// given twice are not.
 ///
 /// Names the record ALREADY holds are exempt from the catalog check: a tool this installation
-/// cannot serve right now, or one no longer offered, stays on the record — the launch simply
-/// omits it — so editing another field must never drop it.
-pub(crate) fn validate_tools_against(tools: &[String], held: &[String]) -> Result<()> {
+/// cannot serve right now, one no longer offered, or a script whose file has since gone stays on
+/// the record — the launch simply omits it, and a call to it is refused — so editing another field
+/// must never drop it.
+pub(crate) fn validate_tools_against(
+    tools: &[String],
+    held: &[String],
+    scripts: &[String],
+) -> Result<()> {
     let catalog = crate::Role::custom_role_tool_catalog();
     // parse() validates the grammar: an unknown kind, a kind on a kindless tool, a kind named
-    // twice on one tool, and a tool named twice.
+    // twice on one tool, a script name that is not a plain file name, and a name given twice.
     let grants = crate::tools::grants::parse(tools)?;
-    let held: Vec<&str> = held
-        .iter()
-        .map(|entry| crate::tools::grants::tool_name(entry))
-        .collect();
+    let held = crate::tools::grants::parse_lossy(held);
     for grant in &grants {
-        anyhow::ensure!(
-            held.contains(&grant.tool.as_str()) || catalog.contains(&grant.tool.as_str()),
-            "tool '{}' is not available to a custom role",
-            grant.tool
-        );
+        if held.iter().any(|entry| entry.names_the_same(grant)) {
+            continue;
+        }
+        match grant {
+            crate::tools::grants::Grant::Tool { tool, .. } => anyhow::ensure!(
+                catalog.contains(&tool.as_str()),
+                "tool '{tool}' is not available to a custom role"
+            ),
+            crate::tools::grants::Grant::Script { name } => anyhow::ensure!(
+                scripts.iter().any(|script| script == name),
+                "custom tool '{name}' is not available to a custom role"
+            ),
+        }
     }
     Ok(())
+}
+
+/// The scripts usable right now, read only when the new list names one the record does not already
+/// hold: a held entry is never re-validated, and a prompt-only edit must not depend on the folder
+/// being readable.
+async fn available_scripts(tools: &[String], held: &[String]) -> Result<Vec<String>> {
+    let held = crate::tools::grants::parse_lossy(held);
+    let needs_folder = crate::tools::grants::parse_lossy(tools)
+        .iter()
+        .any(|grant| {
+            grant.script().is_some() && !held.iter().any(|entry| entry.names_the_same(grant))
+        });
+    if needs_folder {
+        crate::tools::custom::script_names().await
+    } else {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The stored grant grammar: a tool name, or `tool:kind1,kind2`. A bare name is the tool's
-    /// narrowest kind; an unknown kind, a kind on a tool that has no kinds, an unknown tool and a
-    /// tool named twice are all refused.
+    /// The stored grant grammar: a tool name, `tool:kind1,kind2`, or `custom:<script>`. A bare name
+    /// is the tool's narrowest kind; an unknown kind, a kind on a tool that has no kinds, an
+    /// unknown tool, a name the grammar cannot express and a name given twice are all refused.
     #[test]
-    fn validate_tools_against_reads_the_kind_grammar() {
+    fn validate_tools_against_reads_the_grant_grammar() {
         let entries =
             |items: &[&str]| -> Vec<String> { items.iter().map(|s| (*s).to_string()).collect() };
+        let check = |tools: &[&str], held: &[&str], scripts: &[&str]| {
+            validate_tools_against(&entries(tools), &entries(held), &entries(scripts))
+        };
+        assert!(check(&["analyze:quick,deep", "send:worker"], &[], &[]).is_ok());
+        assert!(check(&["analyze", "send", "read"], &[], &[]).is_ok());
         assert!(
-            validate_tools_against(&entries(&["analyze:quick,deep", "send:worker"]), &[]).is_ok()
-        );
-        assert!(validate_tools_against(&entries(&["analyze", "send", "read"]), &[]).is_ok());
-        assert!(
-            validate_tools_against(&entries(&["analyze:sideways"]), &[]).is_err(),
+            check(&["analyze:sideways"], &[], &[]).is_err(),
             "an unknown kind is refused"
         );
         assert!(
-            validate_tools_against(&entries(&["read:quick"]), &[]).is_err(),
+            check(&["read:quick"], &[], &[]).is_err(),
             "a kind on a tool that has no kinds is refused"
         );
         assert!(
-            validate_tools_against(&entries(&["not-a-tool"]), &[]).is_err(),
+            check(&["not-a-tool"], &[], &[]).is_err(),
             "an unknown tool is refused"
         );
         assert!(
-            validate_tools_against(&entries(&["read", "read"]), &[]).is_err(),
+            check(&["read", "read"], &[], &[]).is_err(),
             "a tool named twice is refused"
         );
         assert!(
-            validate_tools_against(&entries(&["analyze:quick", "analyze:deep"]), &[]).is_err(),
+            check(&["analyze:quick", "analyze:deep"], &[], &[]).is_err(),
             "the same tool split across two entries is refused too"
         );
         assert!(
-            validate_tools_against(&entries(&["gone"]), &entries(&["gone"])).is_ok(),
+            check(&["gone"], &["gone"], &[]).is_ok(),
             "a name the record already holds stays valid"
         );
         assert!(
-            validate_tools_against(&entries(&["computer"]), &[]).is_err(),
+            check(&["computer"], &[], &[]).is_err(),
             "computer use is not offered to a custom role"
         );
         assert!(
-            validate_tools_against(&entries(&["computer"]), &entries(&["computer"])).is_ok(),
+            check(&["computer"], &["computer"], &[]).is_ok(),
             "a stored computer grant is left alone when the record is edited"
         );
+        assert!(
+            check(&["custom"], &[], &[]).is_err(),
+            "the plain dispatcher entry is not offered to a custom role"
+        );
+        assert!(
+            check(&["custom"], &["custom"], &[]).is_ok(),
+            "a stored dispatcher entry stays on the record so another edit can save"
+        );
+
+        // A script is validated against the ones present right now, and one the record already
+        // holds survives its file going away.
+        assert!(check(&["custom:weather"], &[], &["weather"]).is_ok());
+        assert!(
+            check(&["custom:weather"], &[], &["other"]).is_err(),
+            "a script that is not present is refused like an unknown tool"
+        );
+        assert!(
+            check(&["custom:weather"], &["custom:weather"], &[]).is_ok(),
+            "a held script stays valid after its file is deleted"
+        );
+        assert!(
+            check(&["custom:"], &[], &[]).is_err(),
+            "a name the grammar cannot express is refused, present or not"
+        );
+        assert!(
+            check(&["custom:weather", "custom:weather"], &[], &["weather"]).is_err(),
+            "one script named twice is refused"
+        );
+        assert!(
+            check(&["custom:read", "read"], &[], &["read"]).is_ok(),
+            "a script and a tool of the same name are two different things"
+        );
+    }
+
+    /// A script is handed out through the record's own validators: a name present in the folder is
+    /// accepted, one that is not is refused like an unknown tool, and a held one survives its file
+    /// going away.
+    #[tokio::test]
+    async fn a_script_entry_is_validated_against_the_folder() {
+        crate::util::test::init_test_stores().await;
+        let dir =
+            crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME).join("shared");
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = crate::util::test::ProbeFile(dir.join("role_script_probe.ts"));
+        std::fs::write(&probe.0, "// @description Probe.\n").unwrap();
+
+        create(
+            "scripted",
+            "run the probe",
+            &["custom:role_script_probe".to_string()],
+            CustomRoleBehavior::OneOff,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            get("scripted").await.unwrap().unwrap().tools,
+            ["custom:role_script_probe"]
+        );
+
+        let err = update(
+            "scripted",
+            None,
+            Some(&["custom:missing_probe".to_string()]),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("custom tool 'missing_probe' is not available to a custom role"),
+            "an unknown script is refused like an unknown tool: {err}"
+        );
+
+        // The held entry stays when its file goes away, so an unrelated edit still saves.
+        std::fs::remove_file(&probe.0).unwrap();
+        update("scripted", Some("run it another way"), None, None)
+            .await
+            .unwrap();
+        let saved = get("scripted").await.unwrap().unwrap();
+        assert_eq!(saved.prompt, "run it another way");
+        assert_eq!(saved.tools, ["custom:role_script_probe"]);
     }
 
     #[test]

@@ -184,7 +184,7 @@ fn build_schema() -> serde_json::Value {
             "tools": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "(custom roles) The tools it may use, each optionally `name:kind`; an empty array clears them."
+                "description": "(custom roles) The tools it may use: a catalogue tool name, optionally `name:kind`, or `custom:<script>` for one script in your `shared` folder (one entry per script). An empty array clears them."
             },
             "behavior": {
                 "type": "string",
@@ -1145,18 +1145,27 @@ mod tests {
         assert!(owner.contains("cannot be deleted"), "{owner}");
     }
 
-    /// A bare entry is spelled with the narrowest kind it implies, and an explicit
-    /// `tool:k1,k2` entry reads back as stored.
+    /// A bare entry is spelled with the narrowest kind it implies, an explicit `tool:k1,k2` entry
+    /// reads back as stored, and a script entry as itself.
     #[tokio::test]
     async fn list_custom_roles_shows_the_kinds_a_role_holds() {
         crate::util::test::init_test_stores().await;
         let tool = MahbotConfigTool;
         let ws = test_ws("/tmp/test_ws");
+        let dir =
+            crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME).join("shared");
+        std::fs::create_dir_all(&dir).unwrap();
+        let probe = crate::util::test::ProbeFile(dir.join("kind_script_probe.ts"));
+        std::fs::write(&probe.0, "// @description Probe.\n").unwrap();
 
         crate::custom_role::create(
             "kind_grants_probe",
             "you hold kinds",
-            &["analyze".to_string(), "send:worker,manager".to_string()],
+            &[
+                "analyze".to_string(),
+                "send:worker,manager".to_string(),
+                "custom:kind_script_probe".to_string(),
+            ],
             CustomRoleBehavior::Continuous,
         )
         .await
@@ -1168,8 +1177,9 @@ mod tests {
             .unwrap();
         assert!(out.contains("kind_grants_probe"), "{out}");
         assert!(
-            out.contains("tools: analyze:quick, send:worker,manager"),
-            "the listing spells a bare entry's narrowest kind and keeps the stored kinds: {out}"
+            out.contains("tools: analyze:quick, send:worker,manager, custom:kind_script_probe"),
+            "the listing spells a bare entry's narrowest kind, keeps the stored kinds and names \
+             each script: {out}"
         );
     }
 

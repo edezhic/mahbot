@@ -19,10 +19,12 @@
 //! folder (inside the workspace, so even a confined guest's `read` may open it) and
 //! deleted when the run ends.
 //!
-//! Availability is per user: the admin may call anything, a guest only what is granted to
-//! them (`users.granted_tools`). The `<custom-tools>` context block follows the same split
-//! and is fixed when a session is built, so a grant change on an existing session is
-//! announced into it ([`notify_grant_change`]) carrying the tool's own entry.
+//! Availability is per caller: an Assistant's is its account — the admin may call anything, a guest
+//! only what is granted to them (`users.granted_tools`) — while a custom role holds exactly the
+//! scripts its own record names (`custom:<script>`), which is also what makes it hold this tool at
+//! all. The `<custom-tools>` context block follows the same split and is fixed when a session is
+//! built, so a grant change on an existing Assistant session is announced into it
+//! ([`notify_grant_change`]); a custom role's block is rebuilt with its prompt.
 
 use crate::Workspace;
 use crate::prompt::{load_prompt, substitute};
@@ -408,7 +410,7 @@ fn render_lines(tools: &[&CustomToolEntry]) -> String {
     out.trim_end().to_string()
 }
 
-/// The `<custom-tools>` context block for an Assistant session.
+/// The `<custom-tools>` block for an Assistant session.
 ///
 /// Unlike the other assistant blocks this one is emitted even when there is
 /// nothing to list — a guest with no grants (and the admin's Assistant with no
@@ -429,6 +431,41 @@ pub(crate) async fn context_block(user_name: &str, is_admin: bool) -> String {
     block_for(&catalogue, &granted, is_admin)
 }
 
+/// The `<custom-tools>` block for a custom role: the same catalogue block an Assistant gets,
+/// filtered to the scripts the role's record names, so it reads the entries it may actually call.
+///
+/// A role that names scripts whose files have no usable definition gets the unavailable form rather
+/// than no block at all: the dispatcher it holds points at this block, so the pointer must never be
+/// dead.
+pub(crate) async fn role_context_block(scripts: &[String]) -> String {
+    let catalogue = catalogue().await;
+    let tools: Vec<&CustomToolEntry> = catalogue
+        .iter()
+        .filter(|tool| scripts.iter().any(|script| script == &tool.name))
+        .collect();
+    if tools.is_empty() {
+        return load_prompt("context/custom_tools_unavailable.md");
+    }
+    render_block(&tools)
+}
+
+/// The names of the scripts usable right now — what a custom role's list may newly name, and what
+/// the settings picker offers. A folder that cannot be read is an error, never an empty catalogue.
+pub(crate) async fn script_names() -> Result<Vec<String>> {
+    list_tool_listings()
+        .await
+        .map_err(|e| anyhow::anyhow!("the shared folder could not be read: {e}"))
+        .map(|listings| {
+            listings
+                .into_iter()
+                .filter_map(|listing| match listing {
+                    ToolListing::Usable(entry) => Some(entry.name),
+                    ToolListing::Broken(_) => None,
+                })
+                .collect()
+        })
+}
+
 /// Render the block for a loaded catalogue: every tool for the admin, only the granted
 /// ones for a guest. A grant matching no usable file contributes nothing.
 fn block_for(catalogue: &[CustomToolEntry], granted: &[String], is_admin: bool) -> String {
@@ -443,9 +480,13 @@ fn block_for(catalogue: &[CustomToolEntry], granted: &[String], is_admin: bool) 
             "context/custom_tools_no_grants.md"
         });
     }
+    render_block(&tools)
+}
+
+fn render_block(tools: &[&CustomToolEntry]) -> String {
     substitute(
         &load_prompt("context/custom_tools.md"),
-        &[("{{tools}}", &render_lines(&tools))],
+        &[("{{tools}}", &render_lines(tools))],
     )
 }
 
@@ -527,12 +568,21 @@ impl ResolvedCall {
 pub(crate) enum CallRefusal {
     /// The name is not a callable tool name at all (a path, a dot-file, empty).
     Name { name: String },
-    /// The caller may not call this name: not the admin and not granted it.
-    Unavailable { name: String },
+    /// The caller may not call this name: see [`Caller`] for which rule refused it.
+    Unavailable { name: String, caller: Caller },
     /// No usable tool of that name: no such file, or a header the catalogue refuses.
     NotUsable { name: String },
     /// The arguments do not fit the tool's declared interface.
     Arguments(anyhow::Error),
+}
+
+/// The rule that settles what a caller may reach — and the sentence a refusal has to be true for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Caller {
+    /// An Assistant: the admin may call anything, a guest only its account's grants.
+    Account,
+    /// A custom role: only the scripts its own record names.
+    Role,
 }
 
 impl CallRefusal {
@@ -543,9 +593,19 @@ impl CallRefusal {
                 "forbidden: \"{name}\" is not a tool name — hint: a tool's name is the file \
                  name without its extension"
             ),
-            Self::Unavailable { name } => anyhow::anyhow!(
+            Self::Unavailable {
+                name,
+                caller: Caller::Account,
+            } => anyhow::anyhow!(
                 "forbidden: custom tool \"{name}\" is not granted to you — hint: only tools \
                  granted to your account can be called"
+            ),
+            Self::Unavailable {
+                name,
+                caller: Caller::Role,
+            } => anyhow::anyhow!(
+                "forbidden: custom tool \"{name}\" is not one this role holds — hint: a role \
+                 calls only the custom tools its own tool list names"
             ),
             Self::NotUsable { name } => anyhow::anyhow!(
                 "not-found: custom tool \"{name}\" is not usable — hint: a tool is a \
@@ -572,7 +632,7 @@ fn check_name(name: &str) -> Result<(), CallRefusal> {
     }
 }
 
-/// Resolve `name` for `caller` and validate `supplied` against the tool's declared
+/// Resolve `name` for `caller`'s account and validate `supplied` against the tool's declared
 /// interface, returning the script to run and the arguments it gets.
 ///
 /// Availability is settled before the catalogue is read, so no path that resolves a tool can
@@ -595,8 +655,19 @@ pub(crate) async fn resolve_tool_call(
     {
         return Err(CallRefusal::Unavailable {
             name: name.to_string(),
+            caller: Caller::Account,
         });
     }
+    resolve_available(name, supplied, strict).await
+}
+
+/// Resolve a name whose availability is already settled — a custom role's own list has been
+/// checked — and validate its arguments against the tool's declared interface.
+async fn resolve_available(
+    name: &str,
+    supplied: &Map<String, Value>,
+    strict: bool,
+) -> Result<ResolvedCall, CallRefusal> {
     let Some(tool) = catalogue().await.into_iter().find(|t| t.name == name) else {
         return Err(CallRefusal::NotUsable {
             name: name.to_string(),
@@ -714,14 +785,45 @@ fn ignored_arguments(tool: &CustomToolEntry, supplied: &Map<String, Value>) -> V
     ignored
 }
 
-/// The single native tool that forwards a call to one admin-authored script. Available to
-/// every Assistant; the grant decides what each call may reach.
-pub(crate) struct CustomTool;
+/// What a `custom` call may reach.
+enum ScriptScope {
+    /// An Assistant: the admin may call anything, a guest only its account's grants.
+    Account,
+    /// A custom role: exactly the scripts its record names.
+    Held(Vec<String>),
+}
+
+/// The single native tool that forwards a call to one admin-authored script. An Assistant holds it
+/// always (the account's grants decide each call); a custom role holds it exactly when its record
+/// names at least one script, and then only those.
+pub(crate) struct CustomTool {
+    scope: ScriptScope,
+}
+
+impl CustomTool {
+    /// The tool's name. A role's record never names it as a tool: it names scripts instead, and
+    /// the dispatcher follows them.
+    pub(crate) const NAME: &'static str = "custom";
+
+    /// The dispatcher of an Assistant session.
+    pub(crate) const fn for_account() -> Self {
+        Self {
+            scope: ScriptScope::Account,
+        }
+    }
+
+    /// The dispatcher of a custom role, holding exactly `scripts`.
+    pub(crate) fn held(scripts: Vec<String>) -> Self {
+        Self {
+            scope: ScriptScope::Held(scripts),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for CustomTool {
     fn name(&self) -> &'static str {
-        "custom"
+        Self::NAME
     }
 
     fn parameters_schema(&self) -> Value {
@@ -747,7 +849,7 @@ impl Tool for CustomTool {
         if caller.trim().is_empty() {
             anyhow::bail!(
                 "forbidden: this call has no acting user — hint: custom tools are only \
-                 callable from an Assistant session"
+                 callable from a session with an acting user"
             );
         }
 
@@ -758,9 +860,22 @@ impl Tool for CustomTool {
         let supplied = super::get_object(&args, "args")?;
         // A normal call is not strict: an argument the tool does not declare is ignored and
         // reported back with the run rather than refused.
-        let call = resolve_tool_call(&caller, name, &supplied, false)
-            .await
-            .map_err(CallRefusal::into_error)?;
+        let resolved = match &self.scope {
+            ScriptScope::Account => resolve_tool_call(&caller, name, &supplied, false).await,
+            // A role's own list is its whole grant: anything else is refused before the catalogue
+            // is read, exactly as an account's grant is.
+            ScriptScope::Held(scripts) => {
+                if scripts.iter().all(|script| script != name) {
+                    Err(CallRefusal::Unavailable {
+                        name: name.to_string(),
+                        caller: Caller::Role,
+                    })
+                } else {
+                    resolve_available(name, &supplied, false).await
+                }
+            }
+        };
+        let call = resolved.map_err(CallRefusal::into_error)?;
 
         let Some(bun) = crate::tools::bun::bun_binary_path() else {
             return Err(report_ignored_failure(
@@ -890,6 +1005,30 @@ mod tests {
         );
     }
 
+    /// A role's catalogue block lists only its own usable scripts, and a role whose scripts have no
+    /// usable definition gets the unavailable form rather than no block.
+    #[tokio::test]
+    async fn role_block_lists_only_its_own_scripts_and_says_so_when_none_is_usable() {
+        crate::util::test::init_management_test_stores().await;
+        let dir = shared_dir();
+        std::fs::create_dir_all(&dir).expect("create the shared folder");
+        let mine = ProbeFile(dir.join("role_block_probe.ts"));
+        std::fs::write(&mine.0, "// @description Mine.\n").expect("write the probe tool");
+        let other = ProbeFile(dir.join("role_block_other.ts"));
+        std::fs::write(&other.0, "// @description Other.\n").expect("write the other tool");
+
+        let block = role_context_block(&["role_block_probe".to_string()]).await;
+        assert!(block.contains("role_block_probe: Mine."), "got: {block}");
+        assert!(
+            !block.contains("role_block_other"),
+            "only the role's own scripts may be listed: {block}"
+        );
+
+        let none = role_context_block(&["gone_script".to_string()]).await;
+        assert!(none.starts_with("<custom-tools>"), "got: {none}");
+        assert!(none.contains("no usable definition"), "got: {none}");
+    }
+
     /// The access gate and the argument contract, end to end: an unresolvable identity is
     /// refused, grants are checked before the catalogue is read, only plain file names are
     /// accepted, and the unrecognised-argument note rides a refusal as well as a run.
@@ -897,7 +1036,7 @@ mod tests {
     async fn call_gate_and_argument_contract() {
         crate::util::test::init_management_test_stores().await;
         let ws = crate::workspace::test_ws("/tmp/custom_tool_gate");
-        let tool = CustomTool;
+        let tool = CustomTool::for_account();
         let call = |args: Value| tool.execute(&ws, args);
         let as_user = |user: &str, args: Value| {
             crate::agent::CURRENT_TOOL_USER_NAME.scope(user.to_string(), call(args))
@@ -993,6 +1132,54 @@ mod tests {
             matches!(unavailable, Err(CallRefusal::Unavailable { .. })),
             "an ungranted caller must be refused before the tool is looked up"
         );
+    }
+
+    /// A custom role's dispatcher holds exactly its own scripts: one it names resolves, one it does
+    /// not is refused before the catalogue is read, and the refusal is worded for a role — the
+    /// acting identity here is the admin's, which the account rule would have let through.
+    #[tokio::test]
+    async fn a_held_dispatcher_refuses_anything_its_list_does_not_name() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/custom_tool_held");
+        let dir = shared_dir();
+        std::fs::create_dir_all(&dir).expect("create the shared folder");
+        let probe = ProbeFile(dir.join("held_probe.ts"));
+        std::fs::write(
+            &probe.0,
+            "// @description Held probe.\n// @param city string optional the city\n",
+        )
+        .expect("write the probe tool");
+        let tool = CustomTool::held(vec!["held_probe".to_string()]);
+        let call = |args: Value| {
+            crate::agent::CURRENT_TOOL_USER_NAME.scope("admin".to_string(), tool.execute(&ws, args))
+        };
+
+        // Named: the call reaches the argument contract (a type mismatch is a `usage:` refusal),
+        // so it was neither refused as unheld nor reported as missing.
+        let err = call(json!({ "tool": "held_probe", "args": { "city": 5 } }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("usage: "), "got: {err}");
+
+        // Not named, though the admin could call it: the role's own list is the whole grant.
+        let err = call(json!({ "tool": "other_probe" }))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is not one this role holds"), "got: {err}");
+
+        // Named but no usable definition: the role holds the name, the folder does not serve it.
+        let held_gone = CustomTool::held(vec!["gone_script".to_string()]);
+        let err = crate::agent::CURRENT_TOOL_USER_NAME
+            .scope(
+                "admin".to_string(),
+                held_gone.execute(&ws, json!({ "tool": "gone_script" })),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("not-found:"), "got: {err}");
     }
 
     #[test]

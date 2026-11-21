@@ -831,10 +831,12 @@ impl Session {
     /// compaction, and wrapped by [`Self::build_turn_messages`] to add the per-turn user message. The
     /// Assistant block is re-emitted on compaction, so long sessions never lose the capability info.
     ///
-    /// Custom roles: a [`Role::Custom`] session receives exactly two system parts and nothing else —
-    /// the fixed [`custom_role_block`] first and the launch's authorial text second. Every
-    /// built-in-role block is deliberately absent, because the administrator's own words are the
-    /// whole definition.
+    /// Custom roles: a [`Role::Custom`] session opens with the fixed [`custom_role_block`] and the
+    /// launch's authorial text, and a role whose record names custom-tool scripts then reads the
+    /// same `<custom-tools>` catalogue block the admin's Assistant gets, filtered to its own
+    /// scripts. Every other built-in-role block is deliberately absent, because the administrator's
+    /// own words are the whole definition. The catalogue block is built with the prompt, so an
+    /// edited tool list shows from the next session — the accepted staleness of the whole block.
     async fn build_context_messages(
         ws: &Workspace,
         role: &Role,
@@ -843,19 +845,28 @@ impl Session {
         user_name: &str,
         launch: Option<&crate::Launch>,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
-        // A `Role::Custom` session ALWAYS opens with the two-part custom prompt. A launch without
-        // one (a mis-routed envelope, an old row, a bug) renders the fixed block with an empty
-        // authorial part instead of falling through to the built-in path, which would
+        // A `Role::Custom` session ALWAYS opens with the custom prompt. A launch without one (a
+        // mis-routed envelope, an old row, a bug) renders the fixed block with an empty authorial
+        // part instead of falling through to the built-in path, which would
         // `load_prompt("role/custom.md")` and panic (there is no such asset). The message router
         // already refuses a launch-less custom-role job.
         if role == &Role::Custom {
-            return (
-                vec![
-                    ChatMessage::system(custom_role_block(ws)),
-                    ChatMessage::system(launch.map_or("", |launch| launch.prompt.as_str())),
-                ],
-                ModelSnapshot::default(),
-            );
+            let mut msgs = vec![
+                ChatMessage::system(custom_role_block(ws)),
+                ChatMessage::system(launch.map_or("", |launch| launch.prompt.as_str())),
+            ];
+            // The dispatcher a role holds points at this block, so a role that names scripts always
+            // gets it — the usable ones it holds, or the unavailable form when none is usable. No
+            // scripts means no dispatcher and no block.
+            let scripts = launch.map_or_else(Vec::new, |launch| {
+                crate::tools::grants::scripts_of(&launch.tools)
+            });
+            if !scripts.is_empty() {
+                msgs.push(ChatMessage::system(
+                    crate::tools::custom::role_context_block(&scripts).await,
+                ));
+            }
+            return (msgs, ModelSnapshot::default());
         }
         let (stored_context, board_context) = tokio::join!(
             lookup_workspace_context(ws, role),
@@ -2097,8 +2108,9 @@ mod tests {
         assert!(fetch_personal_files("manager_picture_user").await.is_none());
     }
 
-    /// A custom role's system prompt is exactly two parts — the fixed folder/system block and the
-    /// administrator's authorial text verbatim — in that order, whatever folder the launch runs in.
+    /// A custom role that names no custom-tool scripts gets exactly two system parts — the fixed
+    /// folder/system block and the administrator's authorial text verbatim — in that order,
+    /// whatever folder the launch runs in.
     #[tokio::test]
     async fn custom_role_prompt_is_the_fixed_block_plus_the_authorial_text() {
         let ws = crate::workspace::test_ws_named("/data/proj", "/data/proj");
@@ -2125,6 +2137,57 @@ mod tests {
         assert_eq!(messages[0].content, custom_role_block(&ws));
         assert!(messages[0].content.contains("/data/proj"));
         assert_eq!(messages[1].content, launch.prompt);
+    }
+
+    /// A custom role that names custom-tool scripts reads the same catalogue block the admin's
+    /// Assistant gets — same text, same parameter rendering — filtered to its own scripts and
+    /// following the authorial text.
+    #[tokio::test]
+    async fn a_role_holding_scripts_reads_its_own_catalogue_block() {
+        crate::util::test::init_test_stores().await;
+        let dir =
+            crate::users::personal_workspace_path(crate::users::ADMIN_USER_NAME).join("shared");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mine = crate::util::test::ProbeFile(dir.join("role_prompt_probe.ts"));
+        std::fs::write(
+            &mine.0,
+            "// @description Role prompt probe.\n// @param city string required the city\n",
+        )
+        .unwrap();
+        let other = crate::util::test::ProbeFile(dir.join("role_prompt_other.ts"));
+        std::fs::write(&other.0, "// @description Other probe.\n").unwrap();
+
+        let ws = crate::workspace::test_ws_named("/data/proj", "personal:admin");
+        let launch = crate::Launch {
+            role: crate::Role::Custom,
+            name: "briefer".to_string(),
+            identifier: None,
+            prompt: "You write the morning brief.".to_string(),
+            tools: vec!["custom:role_prompt_probe".to_string()],
+            agent_id: "role_briefer".to_string(),
+            reply_to: None,
+        };
+        let (messages, _) = Session::build_context_messages(
+            &ws,
+            &crate::Role::Custom,
+            None,
+            false,
+            "admin",
+            Some(&launch),
+        )
+        .await;
+
+        assert_eq!(messages.len(), 3, "got: {messages:?}");
+        assert_eq!(messages[1].content, launch.prompt);
+        let block = &messages[2].content;
+        assert!(
+            block.contains("- role_prompt_probe: Role prompt probe. Parameters: city (string, required) — the city."),
+            "the entry must be the admin's own rendering: {block}"
+        );
+        assert!(
+            !block.contains("role_prompt_other"),
+            "only the role's own scripts may be listed: {block}"
+        );
     }
 
     /// A worker branch's folder is named on every use, so its cached opening context block follows

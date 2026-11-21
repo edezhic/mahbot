@@ -674,7 +674,8 @@ pub(crate) const FAMILIES: &[Family] = &[
                     Flag {
                         arg: "tools",
                         kind: FlagKind::List,
-                        purpose: "A tool name, optionally `name:kind1,kind2` for one with kinds; \
+                        purpose: "A tool name, optionally `name:kind1,kind2` for one with kinds, \
+                                  or `custom:<script>` for one of your `shared` folder's scripts; \
                                   repeat once per tool (omit for none)",
                     },
                     Flag {
@@ -702,7 +703,8 @@ pub(crate) const FAMILIES: &[Family] = &[
                     Flag {
                         arg: "tools",
                         kind: FlagKind::List,
-                        purpose: "The role's new tool subset; repeat once per tool (omit to leave \
+                        purpose: "The role's new tool subset — `name`, `name:kind1,kind2` or \
+                                  `custom:<script>` entries; repeat once per tool (omit to leave \
                                   it as it is)",
                     },
                     Flag {
