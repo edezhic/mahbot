@@ -628,6 +628,13 @@ mod platform {
 mod tests {
     use super::*;
 
+    /// The installer's own text, which the tripwires below read: what it writes for a unit, how it
+    /// decides the registration and where the login entry lives are all stated there.
+    fn install_script() -> String {
+        std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"))
+            .expect("install.sh is part of the tree")
+    }
+
     /// The two files that register the product with the system name the program and the login
     /// word, and nothing a parser would misread: the escape each format needs is applied to a
     /// path that needs every one of them.
@@ -702,10 +709,7 @@ disabled services = {
     /// instead of landing on an operator's host.
     #[test]
     fn the_system_unit_paths_are_the_installers_own() {
-        let installer = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("install.sh"),
-        )
-        .expect("install.sh is part of the tree");
+        let installer = install_script();
         let assigned = |prefix: &str| -> String {
             installer
                 .lines()
@@ -727,6 +731,140 @@ disabled services = {
             SYSTEM_UNIT_ENABLED,
             format!("/etc/systemd/system/{target}.wants/{name}"),
             "the product must read the wants symlink of the target the unit is wanted by"
+        );
+    }
+
+    /// A unit systemd refuses leaves the host registered and unstarted, and the shipped defect —
+    /// `WorkingDirectory="$HOME"`, which systemd does not unquote — did exactly that while
+    /// `systemctl enable` still succeeded. The stop timeout is the product's own drain cap, so a
+    /// drift there would either cut a drain short or hold a stop open long after the work is gone.
+    #[test]
+    fn the_unit_the_installer_writes_is_one_the_service_manager_will_load() {
+        let installer = install_script();
+        assert!(
+            installer.contains("WorkingDirectory=$HOME"),
+            "the unit's working directory must be an unquoted path systemd accepts"
+        );
+        assert!(
+            !installer.contains("WorkingDirectory=\""),
+            "a quoted working directory is not an absolute path to systemd, and it refuses the unit"
+        );
+        assert!(
+            installer.contains("TimeoutStopSec=$STOP_TIMEOUT_SECS"),
+            "the unit's stop timeout must come from the one variable"
+        );
+        assert!(
+            !installer.contains("TimeoutStopSec=900"),
+            "a literal stop timeout would drift from the product's drain cap"
+        );
+        // The value is the drain cap plus an allowance for the closing steps after it, so the manager
+        // never ends a stop before the drain has had the time the product allows it. The allowance is
+        // whatever the script names it, as long as there is one.
+        assert!(
+            installer.contains("STOP_TIMEOUT_SECS=$((DRAIN_CAP_SECS + ")
+                && !installer.contains("STOP_TIMEOUT_SECS=$((DRAIN_CAP_SECS + 0))"),
+            "the unit's stop timeout must be the product's own drain cap plus a closing allowance"
+        );
+        let drain_cap = installer
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("DRAIN_CAP_SECS="))
+            .expect("install.sh must set DRAIN_CAP_SECS")
+            .trim()
+            .parse::<u64>()
+            .expect("DRAIN_CAP_SECS is a number of seconds");
+        assert_eq!(
+            drain_cap,
+            crate::jobs::DRAIN_CAP_SECS,
+            "the unit's stop timeout must not drift from the product's drain cap"
+        );
+    }
+
+    /// The default target is not evidence of a graphical login — stock Ubuntu answers
+    /// `graphical.target` with no desktop at all — so the installer chooses from the display
+    /// manager's own files. A regression to `systemctl get-default`, or a login entry derived
+    /// differently from the product's, would put servers back on the wrong registration.
+    #[test]
+    fn the_registration_is_chosen_from_a_display_manager_not_the_default_target() {
+        let installer = install_script();
+        assert!(
+            installer.contains("display-manager.service"),
+            "the installer must read the display manager's own alias"
+        );
+        assert!(
+            installer.contains("MAHBOT_INSTALL_REGISTRATION"),
+            "the registration must be overridable explicitly"
+        );
+        assert!(
+            !installer.contains("get-default") && !installer.contains("set-default"),
+            "the systemd default target decides nothing about a graphical login"
+        );
+    }
+
+    /// A message that reports a unit's state prints the service manager's own word and offers a
+    /// command only where one changes the answer — a mask removed in the form that removes that very
+    /// mask, and a disabled unit enabled. The shipped installer called every state but `enabled` one
+    /// that starts nothing at boot, wrong for statically enabled and generator-enabled units.
+    ///
+    /// A command a message prints carries the same privilege framing as the rest of the installer, so
+    /// a host that needs `sudo` is never handed a command it cannot run.
+    #[test]
+    fn the_installer_reports_unit_states_it_can_act_on_and_frames_every_command() {
+        let installer = install_script();
+        assert!(
+            !installer.contains("nothing would start it at boot")
+                && !installer.contains("nothing starts it at boot")
+                && !installer.contains("starts nothing at boot"),
+            "a state other than 'enabled' is not evidence that nothing starts the unit"
+        );
+        // Both families of state — `is-enabled` and `ActiveState` — go through one word for "the
+        // manager said nothing", or the same output would paraphrase the same fact two ways.
+        assert!(
+            !installer.contains("'$UNIT_ENABLED_BEFORE'") && !installer.contains("no state for it"),
+            "a state is printed through unit_state_word, never paraphrased"
+        );
+        assert!(
+            installer.contains("systemctl unmask --runtime $UNIT_NAME"),
+            "a runtime mask is removed by the form that names it"
+        );
+        assert!(
+            installer.contains("did not start or enable it"),
+            "a state no command changes gets the neutral sentence, not a remedy"
+        );
+        assert!(
+            installer.contains("${AS_ROOT_SAYS}${AS_ROOT}tee $UNIT_PATH")
+                && !installer.contains("remove it as root:")
+                && !installer.contains("Save this as $UNIT_PATH as root"),
+            "a printed command carries the framing the rest of the installer uses"
+        );
+        assert!(
+            installer.contains("stop $UNIT_NAME, then run this installer again")
+                && installer.contains("kill $LEFTOVER, then run this installer again"),
+            "a printed command is separated from the sentence after it, not run together"
+        );
+    }
+
+    /// The product resolves the login entry through `directories::BaseDirs::config_dir` — an absolute
+    /// `$XDG_CONFIG_HOME`, else `$HOME/.config` — and the installer must land on the same file, or the
+    /// service leg removes an entry that is not the one in use. The rule itself is pinned here; the
+    /// two paths are exercised against a real install by `scripts/install-acceptance.sh`.
+    #[test]
+    fn the_installer_resolves_the_login_entry_the_way_the_product_does() {
+        let installer = install_script();
+        assert!(
+            installer.contains("AUTOSTART_DIR=\"$HOME/.config\"")
+                && installer.contains("case \"${XDG_CONFIG_HOME:-}\" in")
+                && installer.contains("AUTOSTART_DIR=$XDG_CONFIG_HOME"),
+            "the entry's directory must be an absolute XDG_CONFIG_HOME, else $HOME/.config"
+        );
+        // Every trailing separator goes, and the entry is joined onto what is left: a doubled
+        // separator is a different string from the one the product computes.
+        assert!(
+            installer.contains("while [ \"${AUTOSTART_DIR%/}\" != \"$AUTOSTART_DIR\" ]; do"),
+            "a trailing separator must be dropped, as the product's own path join drops it"
+        );
+        assert!(
+            installer.contains("AUTOSTART_ENTRY=\"$AUTOSTART_DIR/autostart/mahbot.desktop\""),
+            "the entry must be joined onto the stripped directory, with one separator"
         );
     }
 

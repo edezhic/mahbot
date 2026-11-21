@@ -3121,6 +3121,72 @@ mod tests {
         }
     }
 
+    /// The installer's acceptance harness is a release step, not an optional script: it is the only
+    /// place the shipped registration is exercised against a real systemd, so a workflow that stopped
+    /// naming it would drop the gate silently — and a harness that lost a leg or its executable bit
+    /// would stop being the gate the workflow names. The workflow's header is the repository's only
+    /// release procedure, so the name it must keep is read there.
+    #[test]
+    fn the_installer_acceptance_harness_is_a_named_release_step() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let harness = root.join("scripts/install-acceptance.sh");
+        // `scripts` is not part of the published package, so only a run from a packaged crate — what
+        // `Cargo.toml.orig` alone marks — may lack it.
+        let Ok(script) = std::fs::read_to_string(&harness) else {
+            assert!(
+                root.join("Cargo.toml.orig").exists(),
+                "scripts/install-acceptance.sh is part of the tree"
+            );
+            return;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&harness)
+                .expect("the harness is readable")
+                .permissions()
+                .mode();
+            assert!(
+                mode & 0o111 != 0,
+                "the harness must be executable to be the gate the release names"
+            );
+        }
+        // One list, so a leg cannot be run by the gate and unknown to `--only`, or the other way
+        // round: the harness names its legs once and the run walks that list.
+        let legs = script
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("LEGS='"))
+            .and_then(|line| line.strip_suffix('\''))
+            .expect("the harness names its legs once");
+        for leg in [
+            "clean-server",
+            "reboot",
+            "re-run",
+            "broken-unit",
+            "masked",
+            "switch",
+            "leftover",
+            "no-sudo",
+            "no-systemd",
+            "dying-service",
+            "root",
+            "bad-unit",
+            "graphical",
+            "dry-run",
+        ] {
+            assert!(
+                legs.split_whitespace().any(|named| named == leg),
+                "the harness must run the {leg} leg"
+            );
+        }
+        let workflow = std::fs::read_to_string(root.join(".github/workflows/release.yml"))
+            .expect("release.yml is part of the tree");
+        assert!(
+            workflow.contains("scripts/install-acceptance.sh"),
+            "release.yml must name the installer's acceptance gate as a manual release step"
+        );
+    }
+
     /// The changelog step as it ships — the awk program read out of the workflow — groups the
     /// subjects it keeps into `Features:` and `Fixes:`, drops the pipeline's leading marker from
     /// each bullet, and keeps every subject otherwise: only version bumps, blank titles and

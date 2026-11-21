@@ -71,7 +71,15 @@
 # how a Linux-only build failure is seen before a tag spends the version, since
 # nothing here compiles for Linux before the tag: it covers both targets, because
 # aarch64 fails where x86_64 does not, and needs no ALSA headers and no binding
-# toolchain — the audio shim commits its bindings.
+# toolchain — the audio shim commits its bindings. `scripts/install-acceptance.sh`
+# is the same kind of gate for the installer and the service registration: it runs this
+# tree's `install.sh` against the published release's binary in clean Ubuntu 24.04
+# containers — one of them with no service manager at all, the rest running a real systemd
+# — and asserts which registration was chosen, that the unit is enabled and active, that it
+# is active again after a restart with nobody logged in, that a re-run keeps it, and that a
+# deliberately broken unit is reported and repaired. It needs Docker and network access to
+# the release host, so it is run by hand before a tag that touches `install.sh` or the
+# service.
 
 name: Release
 

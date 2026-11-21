@@ -37,10 +37,14 @@ The rest of the onboarding will be explained and done through the assistant. Fur
 
 ## Running as a service (Linux servers)
 
-On a Linux host that boots to a console — a server with no graphical system — the same install
+On a Linux host with no display manager — a server with no graphical login — the same install
 registers MahBot as a system service and starts it: it runs from boot with nobody logged in,
 restarts itself when it fails, and drains its agents before it stops. The unit is
-`/etc/systemd/system/mahbot.service`, and `systemctl status mahbot.service` shows it.
+`/etc/systemd/system/mahbot.service`, and `systemctl status mahbot.service` shows it. A host with
+a display manager gets the login entry the product writes at its first start instead;
+`MAHBOT_INSTALL_REGISTRATION=service|login` asks for the other registration explicitly, and a
+re-run leaves an existing working registration alone. `MAHBOT_INSTALL_DRY_RUN=1` prints what the
+install would do without changing anything.
 
 Give it its credentials in one command, then work through Telegram:
 
@@ -69,8 +73,8 @@ prints every action and every setting name in full. `mahbot workspace` does the 
 managed projects: add or delete one, re-analyse it or re-detect its diagnostics commands, write
 those commands and the project rules by hand, choose the active project, and turn its background
 maintainer on or off. The assistant in the bot can do all of it too, and can explain anything
-left to set up. A host with a display gets the window from the same install instead, at login,
-with the same service behaviour underneath: the same updates, the same pause and resume.
+left to set up. A host with a display manager gets the window from the same install at login
+instead, with the same service behaviour underneath: the same updates, the same pause and resume.
 
 # Software development
 

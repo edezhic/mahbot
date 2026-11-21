@@ -22,8 +22,10 @@
 
 # The shell scripts are run with `sh` — the ffmpeg release legs run them on Windows
 # too — so a CRLF checkout would break them: their endings are pinned like the prompt
-# texts above.
+# texts above. `install.sh` is fetched and piped to `sh` on unix and checked out on
+# Windows, so it follows the same rule.
 /scripts/*.sh text eol=lf
+/install.sh text eol=lf
 
 # The README is embedded with `include_str!` and served verbatim by the `about` action
 # and `mahbot config about`, so a checkout that rewrites its endings would ship text the
