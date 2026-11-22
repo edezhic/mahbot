@@ -139,18 +139,9 @@ mod tests {
         let Some((generated, lib)) = shim() else {
             return;
         };
-        let sources = audio_crate_sources();
-        if sources.is_empty() {
-            // The crate's source sits wherever the machine keeps its registry, and a vendored
-            // checkout, a directory registry or an offline mirror keeps it somewhere this cannot
-            // guess — so a miss says nothing about the surface. `scripts/linux-cross-check.sh` is
-            // the proof that does not depend on the layout.
+        let Some(used) = spelled() else {
             return;
-        }
-        let mut used = BTreeSet::new();
-        for source in &sources {
-            used.extend(names_in(source));
-        }
+        };
         assert!(
             !used.is_empty(),
             "the `alsa` sources on this machine name no surface symbol: the walk read them wrong"
@@ -181,9 +172,10 @@ mod tests {
     }
 
     /// The committed surface is an artefact: a formatter run inside the vendored crate, or a hand
-    /// edit, would change it without the recipe and take its byte-for-byte property with it. The
-    /// digest is the one `regenerate.sh` writes, and `.gitattributes` keeps those bytes the same on
-    /// a checkout that would otherwise rewrite the file's line endings.
+    /// edit, would change it without the recipe and take its byte-for-byte property with it. The pin
+    /// is this constant — `regenerate.sh` writes the bytes, not the pin, so a legitimate bump moves
+    /// this value in the same change — and `.gitattributes` keeps those bytes the same on a checkout
+    /// that would otherwise rewrite the file's line endings.
     #[test]
     fn the_frozen_surface_is_the_one_the_recipe_writes() {
         let Some((generated, _)) = shim() else {
@@ -191,8 +183,98 @@ mod tests {
         };
         assert_eq!(
             crate::util::hex_string(&sha2::Sha256::digest(generated.as_bytes())),
-            "45d0525c39224698c96dfabaddf0a45ee253a6a05fc98a34cbf6b83789f37aa5",
-            "the frozen surface changed: rebuild it with vendor/alsa-sys-dlopen/regenerate.sh"
+            "8457f90893d987230642c68409c7d152d085a35f5d39e4020e9734d28a285e8a",
+            "the frozen surface changed: rebuild it with vendor/alsa-sys-dlopen/regenerate.sh, \
+             then move this pin with it"
+        );
+    }
+
+    /// The surface carries no function the layer cannot reach: a function is reachable only by being
+    /// named, so one the layer's sources never spell is a binding nothing can invoke — the other half
+    /// of the completeness check above, which only says the surface is a superset of what the layer
+    /// needs. "Named" is that check's walk, so a name the layer only re-exports counts as reachable,
+    /// exactly as it does for the transform. Functions are the only items checked here because they
+    /// are the only ones reached by name; a type or a constant is reached through the signature of
+    /// something kept, which the digest above and the recipe below cover instead.
+    #[test]
+    fn the_surface_carries_no_function_the_audio_crate_cannot_reach() {
+        let Some((generated, _)) = shim() else {
+            return;
+        };
+        let Some(spelled) = spelled() else {
+            return;
+        };
+        let declared: Vec<&str> = generated
+            .lines()
+            .filter_map(|line| line.strip_prefix("pub unsafe fn "))
+            .filter_map(|rest| rest.split('(').next())
+            .collect();
+        assert!(
+            !declared.is_empty(),
+            "the surface declares no function: the walk read it wrong"
+        );
+        let unreachable: Vec<&str> = declared
+            .iter()
+            .copied()
+            .filter(|name| !spelled.contains(*name))
+            .collect();
+        assert!(
+            unreachable.is_empty(),
+            "the surface binds {} function(s) `alsa` never spells: {unreachable:?}",
+            unreachable.len()
+        );
+    }
+
+    /// The recipe is the authority for the committed bytes, so it has to reproduce them: a transform
+    /// that drifted from the file it produced would have the next dependency bump regenerate
+    /// something else. Skipped where `rustc` or the two pinned inputs are not on this machine: both
+    /// inputs live outside the crate, and cargo never fetches the published `alsa-sys` at all — this
+    /// repository patches it out — so a fresh clone skips here and the digest above is what still
+    /// holds. `vendor/alsa-sys-dlopen/regenerate.sh` is the same proof by hand, anywhere the inputs
+    /// are; the two lines below mirror its invocation, so a third input is a third edit there and
+    /// here.
+    #[test]
+    fn the_recipe_reproduces_the_frozen_surface() {
+        let Some((generated, _)) = shim() else {
+            return;
+        };
+        let (Some(bindings), Some(layer)) = (published_bindings(), audio_crate_source_dir()) else {
+            return;
+        };
+        let work = crate::util::test::test_root().join("alsa-recipe");
+        let _ = std::fs::remove_dir_all(&work);
+        std::fs::create_dir_all(&work).expect("create the recipe's scratch directory");
+        let transform = work.join("transform");
+        let recipe = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("vendor/alsa-sys-dlopen/regenerate.rs");
+        let compiled = std::process::Command::new("rustc")
+            .args(["--edition", "2021", "-O", "-o"])
+            .arg(&transform)
+            .arg(&recipe)
+            .output();
+        let Ok(compiled) = compiled else {
+            return;
+        };
+        assert!(
+            compiled.status.success(),
+            "the recipe does not compile: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let produced = std::process::Command::new(&transform)
+            .arg(&bindings)
+            .arg(&layer)
+            .output()
+            .expect("run the recipe");
+        assert!(
+            produced.status.success(),
+            "the recipe failed: {}",
+            String::from_utf8_lossy(&produced.stderr)
+        );
+        assert_eq!(
+            crate::util::hex_string(&sha2::Sha256::digest(&produced.stdout)),
+            crate::util::hex_string(&sha2::Sha256::digest(generated.as_bytes())),
+            "the recipe no longer writes the committed surface: \
+             run vendor/alsa-sys-dlopen/regenerate.sh"
         );
     }
 
@@ -201,42 +283,69 @@ mod tests {
     /// `src` — the `direct` directory holds the crate's own copy of the ioctl structures, so the
     /// names in it are the crate's own, not the surface's.
     fn audio_crate_sources() -> Vec<String> {
-        let Some(version) = locked_version("alsa") else {
+        let Some(directory) = audio_crate_source_dir() else {
             return Vec::new();
         };
-        let root = match std::env::var_os("CARGO_HOME") {
+        let Ok(files) = std::fs::read_dir(directory) else {
+            return Vec::new();
+        };
+        files
+            .flatten()
+            .map(|file| file.path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+            .filter_map(|path| std::fs::read_to_string(path).ok())
+            .collect()
+    }
+
+    /// The `src` directory of the `alsa` crate this build compiles, as the cargo registry holds it —
+    /// the keep-set the recipe reads.
+    fn audio_crate_source_dir() -> Option<std::path::PathBuf> {
+        let directory = registry_crate("alsa")?.join("src");
+        directory.is_dir().then_some(directory)
+    }
+
+    /// The published `alsa-sys` bindings the recipe reads, where the registry still holds the crate
+    /// this repository patches out — cargo never builds it, so it may never have been fetched.
+    fn published_bindings() -> Option<std::path::PathBuf> {
+        let bindings = registry_crate("alsa-sys")?.join("src/generated.rs");
+        bindings.is_file().then_some(bindings)
+    }
+
+    /// One crate's directory in the cargo registry, matched on the version `Cargo.lock` resolves.
+    fn registry_crate(package: &str) -> Option<std::path::PathBuf> {
+        let name = format!("{package}-{}", locked_version(package)?);
+        let cargo_home = match std::env::var_os("CARGO_HOME") {
             Some(cargo_home) => std::path::PathBuf::from(cargo_home),
-            None => match std::env::var_os("HOME") {
-                Some(home) => std::path::PathBuf::from(home).join(".cargo"),
-                None => return Vec::new(),
-            },
+            None => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cargo"),
         };
-        let mut sources = Vec::new();
-        let Ok(registries) = std::fs::read_dir(root.join("registry/src")) else {
-            return sources;
-        };
+        let registries = std::fs::read_dir(cargo_home.join("registry/src")).ok()?;
         for registry in registries.flatten() {
             let Ok(crates) = std::fs::read_dir(registry.path()) else {
                 continue;
             };
             for entry in crates.flatten() {
-                if entry.file_name().to_string_lossy() != format!("alsa-{version}") {
-                    continue;
-                }
-                let Ok(files) = std::fs::read_dir(entry.path().join("src")) else {
-                    continue;
-                };
-                for file in files.flatten() {
-                    let path = file.path();
-                    if path.extension().is_some_and(|extension| extension == "rs")
-                        && let Ok(source) = std::fs::read_to_string(&path)
-                    {
-                        sources.push(source);
-                    }
+                if entry.file_name().to_string_lossy() == name {
+                    return Some(entry.path());
                 }
             }
         }
-        sources
+        None
+    }
+
+    /// Every name the audio crate's sources spell, or `None` where its source is not on this machine:
+    /// a vendored checkout, a directory registry or an offline mirror keeps it somewhere this cannot
+    /// guess, so a miss says nothing about the surface. `scripts/linux-cross-check.sh` is the proof
+    /// that does not depend on the layout.
+    fn spelled() -> Option<BTreeSet<String>> {
+        let sources = audio_crate_sources();
+        if sources.is_empty() {
+            return None;
+        }
+        let mut names = BTreeSet::new();
+        for source in &sources {
+            names.extend(names_in(source));
+        }
+        Some(names)
     }
 
     /// The version `Cargo.lock` resolves for one package, so the check reads the crate the build
@@ -317,6 +426,9 @@ mod tests {
     /// inside it, no char literal holding one, no nested block comment. A source that had one would
     /// be mis-read silently, which is why the assumption is written down here beside the code that
     /// makes it rather than left implicit.
+    ///
+    /// `vendor/alsa-sys-dlopen/regenerate.rs` carries the same scan — it is the recipe's keep-set —
+    /// and the two cannot share code, so a change here is a change there.
     fn without_comments(source: &str) -> String {
         let chars: Vec<char> = source.chars().collect();
         let mut code = String::with_capacity(source.len());

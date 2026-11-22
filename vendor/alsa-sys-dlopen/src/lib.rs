@@ -12,13 +12,13 @@
 //! soname itself (`mahbot::audio::library_available`) because the published package replaces this
 //! shim with the registry crate, which has no such function.
 //!
-//! `src/generated.rs` holds the bindings themselves, committed rather than generated: they are the
-//! published `alsa-sys` 0.4.0 bindings — the surface the last release that linked the library
-//! shipped — with each `extern "C"` declaration replaced by its `dlopen` wrapper. Freezing them is
-//! what makes this crate compile the same on every machine: a build that reads
-//! `<alsa/asoundlib.h>` compiles whatever vintage that header is, and the release image's is older
-//! than the `alsa` crate expects. `regenerate.rs` is the transform, run by hand through
-//! `regenerate.sh` when the audio crate moves; it is not part of the build.
+//! `src/generated.rs` holds the bindings themselves, committed rather than generated: the part of
+//! the published `alsa-sys` 0.4.0 surface that `alsa` 0.11 reaches, with each `extern "C"`
+//! declaration replaced by its `dlopen` wrapper. Freezing them is what makes this crate compile the
+//! same on every machine: a build that reads `<alsa/asoundlib.h>` compiles whatever vintage that
+//! header is, and the release image's is older than the `alsa` crate expects. `regenerate.rs` is
+//! the transform, run by hand through `regenerate.sh` when the audio crate moves; it is not part of
+//! the build.
 // The bindings are bindgen's own spelling, and they are generated code: the naming lints and the
 // clippy families that a generated surface cannot satisfy are allowed rather than rewritten.
 #![allow(
@@ -28,14 +28,13 @@
     clippy::pedantic
 )]
 
-use libc::{pid_t, pollfd, timespec, timeval, FILE};
+use libc::{pollfd, timespec};
 
 include!("generated.rs");
 
 // Header macros: the published bindings carry functions and types, not the `#define`s the `alsa`
 // crate names. The values are the header's own, kept here because a macro has no symbol to look up.
 pub const SND_PCM_NONBLOCK: core::ffi::c_int = 0x1;
-pub const SND_PCM_ASYNC: core::ffi::c_int = 0x2;
 
 pub const SND_SEQ_OPEN_OUTPUT: i32 = 1;
 pub const SND_SEQ_OPEN_INPUT: i32 = 2;

@@ -3,9 +3,10 @@ name = "alsa-sys"
 version = "0.4.0"
 edition = "2021"
 # The package `alsa` 0.11 asks for, replaced through `[patch.crates-io]` so the file has no
-# load-time dependency on libasound. It is not a fork of the bindings: `src/generated.rs` is the
-# published `alsa-sys` 0.4.0 surface with every function wrapped in a `dlopen` lookup, committed so
-# the build reads no C header. `regenerate.rs` is the transform, run by hand only.
+# load-time dependency on libasound. It is not a fork of the bindings: `src/generated.rs` is the part
+# of the published `alsa-sys` 0.4.0 surface that `alsa` 0.11 reaches, with every function wrapped in a
+# `dlopen` lookup, committed so the build reads no C header. `regenerate.rs` is the transform, run by
+# hand only.
 links = "alsa"
 build = "build.rs"
 

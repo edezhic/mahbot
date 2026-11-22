@@ -440,11 +440,12 @@ serial_test = "4"
 
 [patch.crates-io]
 # `alsa` 0.11 asks for `alsa-sys` 0.4, whose build script links `libasound` at load. The shim keeps
-# the package name and version — so no dependency or source change is needed — compiles the published
-# bindings committed in `vendor/alsa-sys-dlopen/src/generated.rs`, and resolves every symbol through
-# `dlopen`. The result: the file starts on a server without libasound and reports voice unavailable,
-# while a host that has it gets the same audio as before. The surface is committed rather than read
-# from the build machine's headers, so every machine compiles the same one.
+# the package name and version — so no dependency or source change is needed — compiles the part of
+# the published bindings that `alsa` reaches, committed in `vendor/alsa-sys-dlopen/src/generated.rs`,
+# and resolves every symbol through `dlopen`. The result: the file starts on a server without
+# libasound and reports voice unavailable, while a host that has it gets the same audio as before.
+# The surface is committed rather than read from the build machine's headers, so every machine
+# compiles the same one.
 alsa-sys = { path = "vendor/alsa-sys-dlopen" }
 
 [profile.dev]
