@@ -4502,6 +4502,44 @@ pub async fn user_command_entries(user_name: &str) -> Vec<(String, String)> {
     entries
 }
 
+/// The image or video model picker's Telegram `inline_keyboard` JSON array: one button per row,
+/// each model on its own, the account's active model marked with ✓.
+#[must_use]
+pub async fn build_models_keyboard(is_image: bool, user_name: &str) -> serde_json::Value {
+    let (mut models, active, action_prefix) = if is_image {
+        (
+            crate::config::CONFIG.image_gen_models(),
+            crate::users::resolve_image_gen_model(user_name).await,
+            "__act__set_image_model",
+        )
+    } else {
+        (
+            crate::config::CONFIG.video_models(),
+            crate::users::resolve_video_model(user_name).await,
+            "__act__set_video_model",
+        )
+    };
+    // Merged in when the rendered list omits it, so the ✓ unambiguously shows the active model.
+    if !models.iter().any(|m| m == &active) {
+        models.push(active.clone());
+    }
+    let rows: Vec<serde_json::Value> = models
+        .iter()
+        .map(|model| {
+            let label = if model == &active {
+                format!("\u{2713} {model}")
+            } else {
+                model.clone()
+            };
+            serde_json::json!([{
+                "text": label,
+                "callback_data": format!("{action_prefix}|{model}"),
+            }])
+        })
+        .collect();
+    serde_json::json!({ "inline_keyboard": rows })
+}
+
 #[cfg(test)]
 #[path = "telegram_tests.rs"]
 mod tests;

@@ -3344,6 +3344,63 @@ async fn user_command_entries_reflect_admin_state() {
     assert_eq!(cmds[0], "image_models");
 }
 
+/// Both model pickers carry model buttons only — one row per model, the account's active model
+/// marked with ✓ — so a row that is not a model is a regression: clearing a session is `/clear`'s
+/// job, not a selection menu's.
+#[tokio::test]
+async fn the_model_pickers_carry_model_buttons_only() {
+    crate::util::test::init_test_stores().await;
+    // An account no other check touches, whose own image model sits outside the configured
+    // catalogue: the image picker then renders the merged active model beside the configured ones.
+    let user = "picker_only_user";
+    crate::users::store()
+        .set_image_gen_model(user, "acme/picker-own")
+        .await
+        .expect("the account's own image model is set");
+
+    for (is_image, active, action_prefix) in [
+        (
+            true,
+            crate::users::resolve_image_gen_model(user).await,
+            "__act__set_image_model|",
+        ),
+        (
+            false,
+            crate::users::resolve_video_model(user).await,
+            "__act__set_video_model|",
+        ),
+    ] {
+        let keyboard = build_models_keyboard(is_image, user).await;
+        let rows = keyboard["inline_keyboard"]
+            .as_array()
+            .expect("the picker is an inline keyboard");
+
+        let mut marked: Vec<String> = Vec::new();
+        for row in rows {
+            let buttons = row.as_array().expect("a row of buttons");
+            assert_eq!(buttons.len(), 1, "each model sits on its own row");
+            let payload = buttons[0]["callback_data"]
+                .as_str()
+                .expect("a callback payload");
+            let model = payload
+                .strip_prefix(action_prefix)
+                .expect("the picker's own action");
+            let text = buttons[0]["text"].as_str().expect("a label");
+            let label = text.strip_prefix("\u{2713} ").unwrap_or(text);
+            assert_eq!(label, model, "a row is labelled with its model");
+            if label != text {
+                marked.push(model.to_string());
+            }
+        }
+
+        assert_eq!(
+            marked,
+            vec![active],
+            "exactly the active model carries the ✓"
+        );
+    }
+}
+
 // The intake's guarantee — an event the platform handed over is never lost and is taken up exactly
 // once — is checked against a fake Bot API: a listener on a local endpoint
 // (`TelegramChannel::for_test`), scripted `getUpdates` batches, and a store of this check's own.

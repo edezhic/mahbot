@@ -37,7 +37,6 @@ use mahbot::agent::message_router;
 use mahbot::channels::broadcast_and_persist_incoming_message;
 use mahbot::channels::telegram::{ControlInput, control_input, user_command_entries};
 use mahbot::cli::EntryPoint;
-use mahbot::config::CONFIG;
 use mahbot::gui::{Dashboard, JETBRAINS_MONO, Message as DashboardMessage};
 use mahbot::logs::LogStore;
 use mahbot::power::Report;
@@ -1274,8 +1273,8 @@ async fn handle_start_command(msg: &ChannelMessage) {
     send_telegram_reply(msg, lines.join("\n")).await;
 }
 
-/// Handle session clearing for `/clear` and the "Clear session" inline button — deletes the current
-/// session and confirms via the canonical delivery path.
+/// Handle the `/clear` command — deletes the current session and confirms via the canonical
+/// delivery path.
 async fn handle_clear_session(msg: &ChannelMessage) {
     // The session the user actually talks to: the same (role, workspace) resolution as routing —
     // DB-selected workspace, the single Assistant role, Assistant pinning.
@@ -1323,7 +1322,8 @@ async fn deliver_clear_reply(
 
 /// Show the image or video model selection keyboard.
 async fn handle_models_command(msg: &ChannelMessage, is_image: bool) {
-    let reply_markup = build_models_keyboard(is_image, &msg.user_name).await;
+    let reply_markup =
+        mahbot::channels::telegram::build_models_keyboard(is_image, &msg.user_name).await;
     let content = if is_image {
         "Select an image model:".to_string()
     } else {
@@ -1336,58 +1336,6 @@ async fn handle_models_command(msg: &ChannelMessage, is_image: bool) {
             .await
     {
         warn!(error = %e, "Failed to send the model picker");
-    }
-}
-
-/// The full Telegram `inline_keyboard` JSON array: one button per row, each model on its own,
-/// followed by a clear-session button.
-async fn build_models_keyboard(is_image: bool, user_name: &str) -> serde_json::Value {
-    let mut rows: Vec<serde_json::Value> = Vec::new();
-
-    let (mut models, active, action_prefix) = if is_image {
-        (
-            CONFIG.image_gen_models(),
-            mahbot::users::resolve_image_gen_model(user_name).await,
-            "__act__set_image_model",
-        )
-    } else {
-        (
-            CONFIG.video_models(),
-            mahbot::users::resolve_video_model(user_name).await,
-            "__act__set_video_model",
-        )
-    };
-    // Merged in when the rendered list omits it, so the ✓ unambiguously shows the active model.
-    if !models.iter().any(|m| m == &active) {
-        models.push(active.clone());
-    }
-    build_model_button_rows(&mut rows, &models, &active, action_prefix);
-
-    rows.push(serde_json::json!([{
-        "text": "Clear session",
-        "callback_data": "__act__clear_session|",
-    }]));
-
-    serde_json::json!({ "inline_keyboard": rows })
-}
-
-/// Push one row per model to `rows`, marking the active model with ✓.
-fn build_model_button_rows(
-    rows: &mut Vec<serde_json::Value>,
-    models: &[String],
-    active_model: &str,
-    action_prefix: &str,
-) {
-    for model in models {
-        let label = if model == active_model {
-            format!("\u{2713} {model}")
-        } else {
-            model.clone()
-        };
-        rows.push(serde_json::json!([{
-            "text": label,
-            "callback_data": format!("{action_prefix}|{model}"),
-        }]));
     }
 }
 
@@ -1463,10 +1411,6 @@ async fn handle_action_callback(msg: ChannelMessage, decoded: (String, String)) 
         "set_video_model" => {
             handle_set_model_action(&msg, &payload, "Video", false).await;
         }
-        "clear_session" => {
-            answer_telegram_callback(&msg, None).await;
-            handle_clear_session(&msg).await;
-        }
         _ => {
             // Dismisses the loading spinner and surfaces a toast for unknown actions, so a stale
             // inline keyboard (e.g. a removed role-picker button) never fails silently.
@@ -1520,7 +1464,8 @@ async fn refresh_pressed_models_keyboard(msg: &ChannelMessage, is_image: bool) {
     let (Some(chat_id), Some(message_id)) = (&msg.chat_id, msg.message_id) else {
         return;
     };
-    let keyboard = build_models_keyboard(is_image, &msg.user_name).await;
+    let keyboard =
+        mahbot::channels::telegram::build_models_keyboard(is_image, &msg.user_name).await;
     if let Some(channel) = mahbot::channel_registry().get("telegram")
         && let Some(tc) = channel
             .as_any()

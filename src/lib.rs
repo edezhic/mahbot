@@ -532,9 +532,9 @@ pub struct ChannelMessage {
 
 /// An outbound message to deliver on a channel.
 ///
-/// `reply_markup` is Telegram inline_keyboard JSON, built in `main.rs`
-/// (`build_models_keyboard`); other channels ignore it. The self-update path stores
-/// `reply_target` into `recipient` for admin notifications — see the channel's
+/// `reply_markup` is Telegram inline_keyboard JSON, built in
+/// [`crate::channels::telegram::build_models_keyboard`]; other channels ignore it. The self-update
+/// path stores `reply_target` into `recipient` for admin notifications — see the channel's
 /// `resolve_recipient()`.
 #[derive(Debug, Clone)]
 pub struct SendMessage {
