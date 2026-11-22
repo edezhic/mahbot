@@ -62,7 +62,7 @@ iced_term = "0.8.0"
 # published, checksummed artifact rather than a sibling checkout's working tree.
 # Exact on purpose: a range over a pre-release also admits later releases of the
 # same series. The family it depends on rides the same release, held by Cargo.lock.
-mahbot-inference = "=0.2.18-mahbot.3"
+mahbot-inference = "=0.2.18-mahbot.4"
 # Microphone capture (`crate::audio::voice`): the platform's own host API —
 # CoreAudio, WASAPI, ALSA. The ALSA backend's bindings come from the vendored
 # `alsa-sys` shim (`[patch.crates-io]` below), which commits them, so building on

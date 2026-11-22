@@ -4145,13 +4145,15 @@ dependencies = [
 
 [[package]]
 name = "mahbot-inference"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2e10a656d7fb4a829512eaafa5b76d0d18583f5297995914a04ca70ed9c4c66"
+checksum = "bf8fe62c733e909b5bd64c91bf39633600b45123c6b229949fd9a1ef25efc848"
 dependencies = [
  "anyhow",
  "earshot",
  "half",
+ "libc",
+ "mahbot-rlx-cpu",
  "mahbot-rlx-flow",
  "mahbot-rlx-gguf",
  "mahbot-rlx-ir",
@@ -4165,9 +4167,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-autodiff"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e21bf41f72d43d3580736f47c9e0ff878cab0ff02422e7fb5f5fbe6f6df8ea96"
+checksum = "276e31775955fe0bce7454683d4b814b2444bdec65155e6d4d7589d34226989c"
 dependencies = [
  "half",
  "mahbot-rlx-fusion",
@@ -4177,9 +4179,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-compile"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "197e7df4fe132cb59611d7e09b23182d6fedc30952a4be4f991b9cd5ba4cfe5a"
+checksum = "ec2b73ff1a2629a99140a40e5163833ae818573601c88d889c628877e3c958f3"
 dependencies = [
  "mahbot-rlx-autodiff",
  "mahbot-rlx-fusion",
@@ -4188,9 +4190,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-cpu"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30218d43051ecf7fd5240e88a36a9edda90fc018c639a671ad7edcce54c0257b"
+checksum = "fcdc426ecddfe915eae1b93521e63bdbe0091c5a30b5862d81c48637259f29a8"
 dependencies = [
  "half",
  "libc",
@@ -4210,9 +4212,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-dduf"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d17dc4e1be8d61fefaad510e8b0f0d035183a0cc932c3324c2bb05c3cf65c213"
+checksum = "1b2ebbb6e377aed227f2ab5d7ce25a96d808f430f2b9477b9f64165a81279711"
 dependencies = [
  "anyhow",
  "half",
@@ -4223,9 +4225,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-driver"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "639b984b7091324486b5790b1e6083a7a090add50784aea73654ca15c94e4e2d"
+checksum = "e77cb4baa6e295f5657544cf42ff5ad26dd1796593ac070e1a1d8bdae271c33d"
 dependencies = [
  "half",
  "mahbot-rlx-ir",
@@ -4233,15 +4235,15 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-fastmath"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53136fa1a3163c733476b10aa25fbe76c99aa8a369d9aea577a96992172386be"
+checksum = "35657c088b5521e78bf60fc6fd98b582c209c50e2f4940324570d86e22ae3b40"
 
 [[package]]
 name = "mahbot-rlx-flow"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdf084da1579531505d4779bab857d804d81526fed30fa09ab60dface16b2d39"
+checksum = "3d3fd14d6712ff401292ff5ec1d978985949a7c9b506c06d3ebf56a5ba344ca5"
 dependencies = [
  "anyhow",
  "half",
@@ -4252,9 +4254,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-fusion"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab3a54c312cf998a174278e74740c909778e1aa5a32f1c1a1e77ccc69e10e52d"
+checksum = "c7c54f6599d8d436b75995a3f693cf6a9da20886d9bf825b8e0371abfa6a07e2"
 dependencies = [
  "mahbot-rlx-ir",
  "mahbot-rlx-pocketfft",
@@ -4262,9 +4264,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-gguf"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7776b10f4cd064efc8eede9a661f981f72008a2b7fdd740873c847160e30a6b5"
+checksum = "ac94e898ead3cdfab98353d5408125077193d66ca0ac116359472be80b549193"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -4277,15 +4279,15 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-gpu-dispatch"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55266ebc5f93ca3c3183ce6682fae48204fcd21d9cf7bf22317347ba5222cde9"
+checksum = "8bff5e8afa0d647dd3ef357763087cebe6c147fa88427bac1abda0442c0e8d4c"
 
 [[package]]
 name = "mahbot-rlx-gpu-host"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa57b3537bc3370ecea33c7757f70f8eb5d58ebff2debe7964555fe0a62be126"
+checksum = "d8c8b867cd1e9e65420e154d5f842892f35098f925fd0e0f7c5a5702d1c51897"
 dependencies = [
  "bytemuck",
  "half",
@@ -4298,9 +4300,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-ir"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f772834a804fdaab989af42a100255486fc5fc46d5657d240ce044590e07939"
+checksum = "45a050d3af8558826ed55eb8748f3af6a576d09ea1fb2a4c0c26534736c13bad"
 dependencies = [
  "aes 0.9.4",
  "bincode",
@@ -4312,24 +4314,24 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-libm"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc45cb026905238786ada97bb8e0df1d900db754995f33c3c9df95c6e936ab3b"
+checksum = "9d39592374800212a86d2d60bad1f62611b221bc0dfd0b930b1fd9df5f187b90"
 
 [[package]]
 name = "mahbot-rlx-linux-ref"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bee2bf5edad023d2df0a76b2afa4309f0ae8a464817721601ee5ef1ef42c9df"
+checksum = "261d529238667db55c8de627a9e65f4d1752b823fcd546fd031e1075a34a33f5"
 dependencies = [
  "mahbot-rlx-libm",
 ]
 
 [[package]]
 name = "mahbot-rlx-macros"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e3f60c0540bc619e907a4cc54f63b89694965657ff77231c502190e3a02dd02"
+checksum = "6245cdd8ab2d1eea6e5836c9045e74321ee5e5ea896f1c90983fa4498c68e8a2"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4338,9 +4340,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-mlx-io"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4d70b511f4f745e8675089a162f73e7dd9a8f9ede8a5cf183e21e926a1ad284"
+checksum = "fd0305c8bf353d9c6961cf33ce85bcf4ca7b8f2a38daf1919fa2f85776dc60b7"
 dependencies = [
  "anyhow",
  "half",
@@ -4357,9 +4359,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-opt"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4da7f9194279e66fe515ff7ae393fcf5116334347bfb94cdca121c6c8c8fac9f"
+checksum = "99f40594e8f6cf02212c0c50b70ab46ed903b1e07ac30c719330014bc3f3be02"
 dependencies = [
  "mahbot-rlx-autodiff",
  "mahbot-rlx-compile",
@@ -4369,9 +4371,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-pkg"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2020f9276b316d2cdbb89f841250615ceb07fe472db69b87ae280ba24c096ef"
+checksum = "fb89f76400e76594f1f2617eabc5dbd8421596c6754a9552607393bdd3140f0d"
 dependencies = [
  "anyhow",
  "bincode",
@@ -4387,9 +4389,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-pocketfft"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5024574fe9b2f7c643c4782a582d6f270b8338ef58f8d338b6c52e0de1a5ea67"
+checksum = "380c8feb5a7f8d275176dfcff3738d00eceee1dd0f1822226fdc18be5ff91ec6"
 dependencies = [
  "mahbot-rlx-libm",
  "mahbot-rlx-linux-ref",
@@ -4397,9 +4399,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-runtime"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e5bfd6ba89d48277d7559f4cce15dcb3bdc1ad76951f93c5b80fdbbc7a67476"
+checksum = "d5a54e3103c2fd114b9d9a88673b65b9d4c8b58d94318b48fcf575e837f6aae7"
 dependencies = [
  "anyhow",
  "half",
@@ -4425,24 +4427,24 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlx-search"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18c8944b8a27d3e70eb3c438516530646440285e8f74a4eca37b5d1fc1a5fab9"
+checksum = "448a89070292ea672814e3fb466de836f88558a495c47a7f876f25ccd46a69ca"
 
 [[package]]
 name = "mahbot-rlx-unfuse"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f008e646128da28a162216048cdc94b09821b0c79c3cf7d7abcbf4a317eb76e"
+checksum = "d299e9098a2cecd641888777d0a1544c2bd8c04f81117ae37ff4accc6c42051e"
 dependencies = [
  "mahbot-rlx-ir",
 ]
 
 [[package]]
 name = "mahbot-rlx-wgpu"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebb7c751154ce2adf3eee405d919b5e3ba72207e2a021b17e17061592a4b972d"
+checksum = "f5b26536100a909679ed45d369f62ecc5a8dd3974847bb5da188bc7b38ebcc74"
 dependencies = [
  "bytemuck",
  "half",
@@ -4463,9 +4465,9 @@ dependencies = [
 
 [[package]]
 name = "mahbot-rlxsl"
-version = "0.2.18-mahbot.3"
+version = "0.2.18-mahbot.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0b153d19c2c4178c71afd18b50d055bb2ce60f2cd6adb567a2a89a4093d6a7a"
+checksum = "4165e141bd89e6a97df9ffecd532b08a8b804a8818087ec82df6ed333204593c"
 dependencies = [
  "mahbot-rlx-ir",
 ]
