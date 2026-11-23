@@ -1591,9 +1591,10 @@ impl ChatResponse {
 /// output tokens), not the context window.
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
-/// Operation metadata for per-request LLM stats logging (the `llm_requests` table and
-/// the `llm_failures` per-attempt trail in logs.db). Requests without metadata (test
-/// doubles, ad-hoc calls) are not logged.
+/// Operation metadata: per-request LLM stats logging (the `llm_requests` table and the
+/// `llm_failures` per-attempt trail in logs.db), and the conversation identity a provider may need
+/// on the wire. Requests without metadata (test doubles, ad-hoc calls) are neither logged nor given
+/// an identity.
 #[derive(Debug, Clone)]
 pub(crate) struct ChatRequestMeta {
     /// Purpose tag: "agent" (agent loop incl. direct chat / discovery / sub-agents /
@@ -1603,6 +1604,10 @@ pub(crate) struct ChatRequestMeta {
     /// [`crate::agent::Agent::recover_reasoning_only_stop`] — one row per continuation
     /// operation, with `retry_attempts` carrying the attempt count.
     pub purpose: &'static str,
+    /// The conversation's own stored identifier — the `session_metadata` key of a durable
+    /// conversation, so the same conversation resumes under the same value. Sent as the OpenCode
+    /// gateway's `x-opencode-session` header; an operation with no conversation behind it (a verdict,
+    /// a grouping) sends the identity it minted for itself.
     pub agent_id: String,
     pub role: String,
     pub workspace: String,
@@ -1643,6 +1648,10 @@ pub(crate) trait Provider: Send + Sync {
     /// - **No model control token leaves the process** — every text channel of the request is
     ///   neutralized at the outbound boundary ([`crate::util::control_token`]); a token that
     ///   reaches an endpoint is refused, and the refusal is sticky in the session history.
+    /// - **The conversation identifies itself** — a provider whose endpoint demands it (the OpenCode
+    ///   gateway's `x-opencode-session`) sends the request's own [`ChatRequestMeta::agent_id`], the
+    ///   conversation's stored identifier, and never invents one. Every request names the product
+    ///   and its version in its `User-Agent`.
     /// - **Idle-timeout semantics** — the 600 s idle timeout
     ///   ([`crate::retry::DEFAULT_IDLE_TIMEOUT`]) bounds the TTFB wait and each
     ///   body-read chunk wait, resetting while data flows; a stalled connection

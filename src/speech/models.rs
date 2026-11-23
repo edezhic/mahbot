@@ -374,10 +374,9 @@ fn remove_retired(dir: &Path) {
 pub(crate) fn download_client() -> Result<reqwest::Client> {
     crate::util::http::install_ring_provider();
     reqwest::Client::builder()
-        .user_agent(concat!(
-            "mahbot/",
-            env!("CARGO_PKG_VERSION"),
-            " (speech model downloader)"
+        .user_agent(format!(
+            "{} (speech model downloader)",
+            crate::util::http::USER_AGENT
         ))
         .build()
         .context("Failed to create HTTP client for model download")

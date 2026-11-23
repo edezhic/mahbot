@@ -68,7 +68,9 @@ to every account; the other four require it.
   cleared.
 - `provider_endpoint` — the chat endpoint; OpenRouter's own unless `setup` set a custom one, which
   `get` reports as the value in use. `setup` probes it and warns when it does not answer;
-  `clear_provider_endpoint` settles it back. A custom endpoint is capped at 640 bytes.
+  `clear_provider_endpoint` settles it back. A custom endpoint is capped at 640 bytes. Pointing it
+  at the OpenCode gateway (`opencode.ai`) is supported: requests to it carry the `x-opencode-session`
+  header it requires and the product's own `User-Agent`.
 - `provider_endpoint_key` — the custom endpoint's own key. Secret; written by `setup` with the
   endpoint (alone it names nothing, so `set` refuses it and names `setup`), and dropped when the
   endpoint settles back.

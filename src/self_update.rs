@@ -590,7 +590,10 @@ fn release_http_client() -> Result<&'static reqwest::Client> {
         .get_or_init(|| {
             crate::util::http::install_ring_provider();
             reqwest::Client::builder()
-                .user_agent(format!("mahbot/{VERSION} (self-update check)"))
+                .user_agent(format!(
+                    "{} (self-update check)",
+                    crate::util::http::USER_AGENT
+                ))
                 .timeout(CHECK_TIMEOUT)
                 .build()
                 .map_err(|e| format!("failed to build the release-check HTTP client: {e}"))

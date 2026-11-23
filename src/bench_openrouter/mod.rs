@@ -870,6 +870,7 @@ async fn full_run(opts: &BenchOptions, budget: &crate::db::read_limit::Budget) -
 
     crate::util::http::install_ring_provider();
     let client = match reqwest::Client::builder()
+        .user_agent(crate::util::http::USER_AGENT)
         .connect_timeout(Duration::from_secs(10))
         .build()
     {

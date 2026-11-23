@@ -62,33 +62,38 @@ impl OpenAiCompatibleProvider {
     }
 
     /// Build the shared HTTP client: no total request timeout — the 600 s
-    /// idle timeout is the only bound for chats. 10 s connect timeout, extra
-    /// headers as default headers.
+    /// idle timeout is the only bound for chats. 10 s connect timeout, the caller's fixed headers
+    /// and the product's own `User-Agent` as default headers.
     fn build_client(&self) -> Client {
         crate::util::http::install_ring_provider();
-        let mut builder = Client::builder().connect_timeout(Duration::from_secs(10));
-
-        if !self.extra_headers.is_empty() {
-            let mut headers = HeaderMap::new();
-            for (key, value) in &self.extra_headers {
-                match (
-                    reqwest::header::HeaderName::from_bytes(key.as_bytes()),
-                    HeaderValue::from_str(value),
-                ) {
-                    (Ok(name), Ok(val)) => {
-                        headers.insert(name, val);
-                    }
-                    _ => {
-                        tracing::warn!(header = key, "Skipping invalid extra header name or value");
-                    }
-                }
-            }
-            builder = builder.default_headers(headers);
-        }
-
-        builder
+        Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .default_headers(self.default_headers())
             .build()
             .expect("Failed to build HTTP client — check TLS/network configuration")
+    }
+
+    /// The headers every request from this client carries: the product's [`USER_AGENT`] and the
+    /// caller's fixed ones (the title and referrer OpenRouter reads). An unusable name or value in
+    /// the caller's set is skipped rather than failing the client.
+    ///
+    /// [`USER_AGENT`]: crate::util::http::USER_AGENT
+    fn default_headers(&self) -> HeaderMap {
+        let mut headers = crate::util::http::identity_headers();
+        for (key, value) in &self.extra_headers {
+            match (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                (Ok(name), Ok(val)) => {
+                    headers.insert(name, val);
+                }
+                _ => {
+                    tracing::warn!(header = key, "Skipping invalid extra header name or value");
+                }
+            }
+        }
+        headers
     }
 
     /// Shared pool for warmup + scoped calls, no total timeout; warmup
@@ -830,7 +835,28 @@ impl OpenAiCompatibleProvider {
 
         let url = ensure_chat_completions_url(&self.base_url);
         let builder = client.post(url).json(&payload);
+        let builder = self.attach_session_header(builder, request);
         self.attach_auth_header(builder)
+    }
+
+    /// Attach `x-opencode-session` when the request goes to the OpenCode gateway, carrying the
+    /// conversation's stored identifier — the same value on every request of that conversation: the
+    /// first, each retry, and the summarisation of it. A request with no metadata at all carries no
+    /// header rather than an invented one.
+    fn attach_session_header(
+        &self,
+        builder: RequestBuilder,
+        request: &ProviderChatRequest,
+    ) -> RequestBuilder {
+        if !is_opencode_endpoint(&self.base_url) {
+            return builder;
+        }
+        match request.meta.as_ref().map(|meta| meta.agent_id.as_str()) {
+            Some(conversation) if !conversation.is_empty() => {
+                builder.header(OPENCODE_SESSION_HEADER, session_header_value(conversation))
+            }
+            _ => builder,
+        }
     }
 
     /// Attach the `Authorization: Bearer` header if a credential is configured.
@@ -841,6 +867,41 @@ impl OpenAiCompatibleProvider {
         }
         builder
     }
+}
+
+// The OpenCode gateway's session header
+
+/// The header the OpenCode gateway refuses a request without (HTTP 400, `MissingSessionID`). Its
+/// value keys the gateway's caching and routing, so it must stay the same for one conversation and
+/// differ between conversations.
+const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+
+/// Whether an endpoint is the OpenCode gateway. Matched by host, never by path: the gateway's
+/// documentation names several path shapes (`/zen/v1`, `/zen/go/v1`, `/inference/go/openai/v1`) for
+/// one service, so a path match would leave the header off for a shape this build does not know.
+fn is_opencode_endpoint(endpoint: &str) -> bool {
+    url::Url::parse(endpoint)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| host == "opencode.ai" || host.ends_with(".opencode.ai"))
+}
+
+/// The conversation identity as an outbound header value: the stored bytes, unchanged.
+///
+/// A header value carries every byte above 0x1F except 0x7F, so a stored identifier — a non-ASCII
+/// account name included — travels as itself. A control byte is the one thing a header cannot
+/// carry, and it is percent-encoded rather than dropped: a reversible transport encoding, so the
+/// identity on the wire is still the stored one.
+fn session_header_value(conversation: &str) -> HeaderValue {
+    let mut value = Vec::with_capacity(conversation.len());
+    for byte in conversation.bytes() {
+        if byte.is_ascii_control() && byte != b'\t' {
+            value.extend_from_slice(format!("%{byte:02X}").as_bytes());
+        } else {
+            value.push(byte);
+        }
+    }
+    HeaderValue::from_bytes(&value).expect("every byte but a control byte is representable")
 }
 
 // Model-family reasoning translation for custom endpoints
@@ -1373,10 +1434,7 @@ mod tests {
         provider: &OpenAiCompatibleProvider,
         request: &ProviderChatRequest,
     ) -> String {
-        let req = provider
-            .build_http_request_with_client(provider.http_client(), request)
-            .build()
-            .expect("request builds");
+        let req = built_request(provider, request);
         String::from_utf8(
             req.body()
                 .expect("full body")
@@ -1385,6 +1443,165 @@ mod tests {
                 .to_vec(),
         )
         .expect("utf8 body")
+    }
+
+    /// The request the provider would actually send, headers included.
+    fn built_request(
+        provider: &OpenAiCompatibleProvider,
+        request: &ProviderChatRequest,
+    ) -> reqwest::Request {
+        provider
+            .build_http_request_with_client(provider.http_client(), request)
+            .build()
+            .expect("request builds")
+    }
+
+    /// A request belonging to the conversation `agent_id` names.
+    fn conversation_request(agent_id: &str) -> ProviderChatRequest {
+        let mut request = test_request(vec![ChatMessage::user("hello")], None);
+        request.meta = Some(crate::ChatRequestMeta {
+            purpose: "agent",
+            agent_id: agent_id.to_string(),
+            role: "assistant".to_string(),
+            workspace: "personal".to_string(),
+            ticket_id: None,
+        });
+        request
+    }
+
+    fn session_of(
+        provider: &OpenAiCompatibleProvider,
+        request: &ProviderChatRequest,
+    ) -> Option<HeaderValue> {
+        built_request(provider, request)
+            .headers()
+            .get(OPENCODE_SESSION_HEADER)
+            .cloned()
+    }
+
+    fn gateway() -> OpenAiCompatibleProvider {
+        OpenAiCompatibleProvider::new("OpenCode", "https://opencode.ai/zen/go/v1", None)
+    }
+
+    /// The gateway refuses a request with no `x-opencode-session` and keys its caching and routing
+    /// on the value, so every request of one conversation carries that conversation's stored
+    /// identifier and another conversation carries another value.
+    #[test]
+    fn the_opencode_session_header_is_the_conversations_stored_identity() {
+        let gateway = gateway();
+        let first = conversation_request("Виктория_personal:assistant");
+
+        let value = session_of(&gateway, &first).expect("the gateway needs the header");
+        assert_eq!(
+            value.as_bytes(),
+            "Виктория_personal:assistant".as_bytes(),
+            "the stored identifier travels as itself, a non-ASCII account name included"
+        );
+
+        // Another request of the same conversation — a later turn, a retry, the summarisation of it
+        // — carries the same stored identifier, whatever its own body says.
+        let mut later_turn = conversation_request("Виктория_personal:assistant");
+        later_turn.messages = vec![ChatMessage::user(
+            "a later turn, after a retry and a compaction",
+        )];
+        assert_eq!(session_of(&gateway, &later_turn), Some(value.clone()));
+        assert_eq!(
+            session_of(&gateway, &conversation_request("admin_personal:assistant")),
+            Some(HeaderValue::from_static("admin_personal:assistant")),
+            "another conversation is another value"
+        );
+    }
+
+    /// Only the gateway's host gets the header: its documentation names several path shapes for one
+    /// service, so the match is on the host, and no other endpoint is sent a session it never asked
+    /// for.
+    #[test]
+    fn only_the_opencode_host_receives_the_session_header() {
+        for endpoint in [
+            "https://opencode.ai",
+            "https://opencode.ai/zen/v1",
+            "https://opencode.ai/zen/go/v1",
+            "https://opencode.ai/inference/go/openai/v1",
+        ] {
+            assert!(is_opencode_endpoint(endpoint), "{endpoint} is the gateway");
+        }
+        for endpoint in [
+            "https://api.example.com/zen/go/v1",
+            "https://opencode.ai.example.com/v1",
+            "http://127.0.0.1:8080/v1",
+            "not a url",
+        ] {
+            assert!(!is_opencode_endpoint(endpoint), "{endpoint} is not");
+        }
+
+        let openrouter = OpenAiCompatibleProvider::new(
+            "OpenRouter",
+            crate::config::DEFAULT_PROVIDER_ENDPOINT,
+            None,
+        );
+        assert_eq!(
+            session_of(
+                &openrouter,
+                &conversation_request("admin_personal:assistant")
+            ),
+            None,
+            "a request to another provider carries no session header"
+        );
+    }
+
+    /// The three requests that are not conversations (the warmup's GET, the model catalogue, the
+    /// benchmark) have no identity of their own, and nothing is invented for them.
+    #[test]
+    fn a_request_without_a_conversation_invents_no_identity() {
+        let gateway = gateway();
+        let plain = test_request(vec![ChatMessage::user("hello")], None);
+        assert_eq!(session_of(&gateway, &plain), None, "no metadata, no header");
+        assert_eq!(
+            session_of(&gateway, &conversation_request("")),
+            None,
+            "an empty value is refused by the gateway, so it is not sent"
+        );
+    }
+
+    /// A stored identifier can hold a byte no header carries; it is percent-encoded rather than
+    /// dropped, so the value is still the stored identity and a reversible decoding gets it back.
+    #[test]
+    fn a_control_byte_in_a_stored_identity_is_percent_encoded() {
+        assert_eq!(session_header_value("a\nb").as_bytes(), b"a%0Ab");
+        assert_eq!(
+            session_header_value("admin_personal:assistant").as_bytes(),
+            b"admin_personal:assistant"
+        );
+    }
+
+    /// Every model request names the product and the version it is running, and the two fixed
+    /// headers OpenRouter reads ride along untouched.
+    #[test]
+    fn the_client_presents_the_product_and_its_fixed_headers() {
+        let fixed = std::collections::HashMap::from([
+            ("X-Title".to_string(), "MahBot".to_string()),
+            (
+                "HTTP-Referrer".to_string(),
+                "https://github.com/edezhic/mahbot".to_string(),
+            ),
+        ]);
+        let provider = OpenAiCompatibleProvider::new(
+            "OpenRouter",
+            crate::config::DEFAULT_PROVIDER_ENDPOINT,
+            None,
+        )
+        .with_extra_headers(fixed);
+
+        let headers = provider.default_headers();
+        assert_eq!(
+            headers[reqwest::header::USER_AGENT],
+            crate::util::http::USER_AGENT
+        );
+        assert_eq!(headers["X-Title"], "MahBot");
+        assert_eq!(
+            headers["HTTP-Referrer"],
+            "https://github.com/edezhic/mahbot"
+        );
     }
 
     /// A request whose every free-text channel carries a synthetic control token: user content,

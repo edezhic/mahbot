@@ -9,10 +9,21 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// The product's ordinary outbound client identity, shared by the two clients that must present
-/// one: the GitHub API (which answers `403` without a `User-Agent`) and the OpenRouter model-page
-/// fetch.
+/// The product's outbound identity: its name and version. Every client that talks to a model
+/// provider, a media endpoint or another API presents it — the GitHub API answers `403` without a
+/// `User-Agent`, and the OpenCode gateway's rules ask a client to name itself.
 pub(crate) const USER_AGENT: &str = concat!("mahbot/", env!("CARGO_PKG_VERSION"));
+
+/// The default headers a model or media client presents on every request: [`USER_AGENT`] above. They
+/// sit on the client rather than on each request, so no call site can forget them.
+pub(crate) fn identity_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_static(USER_AGENT),
+    );
+    headers
+}
 
 /// Install the ring crypto provider for rustls.
 ///
@@ -240,6 +251,7 @@ fn build_http_client_with(
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(10))
         .redirect(redirect)
+        .default_headers(identity_headers())
         .build()
         .expect("Failed to build HTTP client (rustls TLS initialization failure)")
 }
@@ -639,6 +651,17 @@ pub(crate) async fn download_verified(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A provider, a media endpoint and the GitHub API see the product's own name and the version it
+    /// is running, not a library's name.
+    #[test]
+    fn the_product_identifies_itself_by_name_and_version() {
+        assert_eq!(
+            USER_AGENT,
+            concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(identity_headers()[reqwest::header::USER_AGENT], USER_AGENT);
+    }
 
     /// The parse error's body preview is handed back into the caller's context, so a control token
     /// in a provider body is masked out of it — while the reported length stays the real one.

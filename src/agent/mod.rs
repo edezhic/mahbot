@@ -435,8 +435,9 @@ pub(crate) fn role_chat_params(role: crate::Role) -> RoleChatParams {
 /// Build the byte-relevant chat params (model, tools, reasoning_effort, max_tokens) for a role;
 /// params come from [`role_chat_params`]. The provider is the caller's: a conversation pins its own
 /// ([`Agent::build_chat_request`]), a one-off call with no conversation takes
-/// [`crate::providers::selection::pick`]. `meta` is telemetry-only (never in the request body) and
-/// attached by call sites.
+/// [`crate::providers::selection::pick`]. `meta` stays empty here and is attached by every call site
+/// that sends the request — it is both the stats row and the conversation identity a provider may
+/// need on the wire, and never part of the body.
 #[must_use]
 pub(crate) fn chat_request(
     role: crate::Role,
