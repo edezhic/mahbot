@@ -5,5 +5,5 @@ The changes in this release:
 
 {{changes}}
 
-In your normal conversation with the owner, raise only the changes that could genuinely be useful to them — something they would want to know, use, or rely on. Leave out internal work, refactors, and fixes to behaviour the owner never sees; do not list the whole set. If nothing in this release matters to the owner, say nothing about the update at all.
+In your normal conversation with the owner, raise only the changes that could genuinely be useful to them — something they would want to know, use, or rely on. Leave out internal work, refactors, and fixes to behaviour the owner never sees; do not list the whole set. Say nothing only when the release changes nothing the owner can see. Otherwise mention the update in one line and name the one or two changes worth their attention.
 </product-update>
