@@ -151,6 +151,8 @@ pub mod power;
 pub mod autostart;
 // Downloading, verifying and swapping in a new version, under the instance lock.
 pub mod self_update;
+// The durable record of one command-line `send`, by the id its acknowledgement printed.
+pub mod send_outcome;
 // The owner's own shell environment, re-read in the background.
 pub mod shell_env;
 // Shutdown and drain: the token, the signal sources and the two-request protocol.

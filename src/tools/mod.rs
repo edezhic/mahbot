@@ -41,6 +41,7 @@ pub(crate) mod say;
 pub(crate) mod search;
 pub(crate) mod search_archived_tickets;
 pub(crate) mod send;
+pub(crate) mod send_outcome;
 pub(crate) mod shell;
 // Raises the browser tab the admin's Assistant is working in, in front of the owner's windows.
 pub(crate) mod show_tab;
@@ -213,6 +214,7 @@ pub(crate) use say::SayTool;
 pub(crate) use search::SearchTool;
 pub(crate) use search_archived_tickets::SearchArchivedTicketsTool;
 pub(crate) use send::{Addressee, SendTool};
+pub(crate) use send_outcome::SendOutcomeTool;
 pub(crate) use shell::{ShellMode, ShellTool};
 pub(crate) use show_tab::ShowTabTool;
 pub(crate) use sleep::SleepTool;
@@ -530,6 +532,20 @@ pub(crate) enum SyncCoreOutcome {
     Cancelled,
 }
 
+/// A durable round's answer and the shape it came back in: a handover's record needs both, the
+/// conversation it is wrapped for needs only the text.
+pub(crate) struct Delivered {
+    pub answer: String,
+    pub shape: crate::send_outcome::Shape,
+}
+
+impl Delivered {
+    /// The answer alone — what the conversation receives, with the record keeping the shape.
+    fn into_answer(self) -> String {
+        self.answer
+    }
+}
+
 /// The sync analyze/worker durable cores, behind one interface so the sync dispatch, the
 /// resume-completion loop and the per-tool wrappers share one body.
 #[derive(Copy, Clone)]
@@ -537,6 +553,10 @@ pub(crate) enum SyncDurableCore {
     Analyze,
     Worker,
 }
+
+/// What a command-line handover's record is told when its round's row vanished before the round
+/// could resume: nothing will answer it.
+const GONE_BEFORE_RESUME: &str = "the handover's work was gone when it tried to resume";
 
 impl SyncDurableCore {
     #[must_use]
@@ -799,10 +819,13 @@ impl SyncDurableCore {
                     job = %job_id,
                     "{label} resume drain-cut — outcome checkpointed, job stays for next boot",
                 );
+                // The record stays `running` on purpose: the job stays `launched`, and the boot
+                // resume completes it.
                 Ok(crate::jobs::SyncResumeOutcome::DrainCut)
             }
             // A cancel landed during this resume: the round stopped and its rows are the cancel
-            // action's.
+            // action's, so there is nothing to deliver and no record to settle — a worker round
+            // never registers a cancel signal, and an analyze round opens no record.
             Ok(SyncCoreOutcome::Cancelled) => Ok(crate::jobs::SyncResumeOutcome::Gone),
             Err(e) => Err(e),
         }
@@ -921,7 +944,8 @@ impl SyncDurableCore {
         // fails forwards the whole answer unchanged.
         let result = self
             .deliverable(job_id, &delivery.name, extract, result)
-            .await;
+            .await
+            .map(Delivered::into_answer);
         Some(
             crate::jobs::complete_durable_job(
                 job_id,
@@ -937,24 +961,27 @@ impl SyncDurableCore {
         )
     }
 
-    /// The answer a durable round delivers: its JSON form when the caller asked for a schema, else
-    /// the round's own result. A failed transformation forwards the whole answer, so the round's
-    /// work is never lost and the round is never re-run. The transformation runs where the round
-    /// ran — on the model and provider recorded for its conversation, read only when a schema asks
-    /// for it.
+    /// The answer a durable round delivers, and the shape it came back in: its JSON form when the
+    /// caller asked for a schema, else the round's own result. A failed transformation forwards the
+    /// whole answer, so the round's work is never lost and the round is never re-run. The
+    /// transformation runs where the round ran — on the model and provider recorded for its
+    /// conversation, read only when a schema asks for it.
     async fn deliverable(
         self,
         job_id: &str,
         workspace: &str,
         extract: Option<&crate::extract::Extract>,
         result: anyhow::Result<String>,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<Delivered> {
         let answer = result?;
         let Some(extract) = extract else {
-            return Ok(answer);
+            return Ok(Delivered {
+                answer,
+                shape: crate::send_outcome::Shape::None,
+            });
         };
         let conversation = round_conversation(job_id).await;
-        Ok(crate::extract::answer_as_json(
+        let (transformed, produced) = crate::extract::answer_as_json_reporting(
             Some(extract),
             &crate::extract::StepContext {
                 role: self.role(),
@@ -964,7 +991,11 @@ impl SyncDurableCore {
             },
             &answer,
         )
-        .await)
+        .await;
+        Ok(Delivered {
+            answer: transformed,
+            shape: crate::send_outcome::Shape::of(true, produced),
+        })
     }
 
     /// Boot-resume a durable round: resolve the execution workspace (the recorded directory when
@@ -1016,23 +1047,40 @@ impl SyncDurableCore {
                 let custom = caller.custom_launch.as_deref().cloned();
                 (caller_role, caller, custom, result)
             }
-            // Drain-cut mid-resume or job row gone: abort quietly — the core logs the reason.
-            Ok(crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::Gone) => {
+            // Drain-cut mid-resume: abort quietly — the core logs the reason, and the record is
+            // left `running` on purpose, for the boot resume that completes it.
+            Ok(crate::jobs::SyncResumeOutcome::DrainCut) => return,
+            // The row is gone (an explicit abandon, or a cancel that removed it while this resume
+            // ran): nothing will answer this handover, so its record must not read as running.
+            Ok(crate::jobs::SyncResumeOutcome::Gone) => {
+                crate::send_outcome::fail(job_id, GONE_BEFORE_RESUME).await;
                 return;
             }
             // Resume infra failure, an unusable recorded directory, or a panicked round: deliver an
             // error envelope to the ORIGINAL caller, like any round-level failure (the row is still
             // there to re-load it from).
             Err(e) => {
-                let Some((caller, caller_role)) = crate::jobs::resume_job_preamble(
+                let (caller, caller_role) = match crate::jobs::resume_job_preamble_discrete(
                     &crate::session::store().conn,
                     job_id,
                     &format!("{label} resume"),
                     &format!("{label} resume"),
                 )
                 .await
-                else {
-                    return;
+                {
+                    crate::jobs::ResumePreamble::Proceed(caller, caller_role) => {
+                        (caller, caller_role)
+                    }
+                    // A row gone under this resume has no caller to report to — but the handover
+                    // still gets its record settled.
+                    crate::jobs::ResumePreamble::Gone => {
+                        crate::send_outcome::fail(job_id, GONE_BEFORE_RESUME).await;
+                        return;
+                    }
+                    // A drain keeps the record for the boot resume; an unreadable row is retried
+                    // by the next cycle, so neither is a verdict.
+                    crate::jobs::ResumePreamble::DrainCut
+                    | crate::jobs::ResumePreamble::Unreadable(_) => return,
                 };
                 let custom = caller.custom_launch.as_deref().cloned();
                 // A chain step whose record can no longer be read is abandoned here too: a gone
@@ -1054,6 +1102,8 @@ impl SyncDurableCore {
                     crate::tools::chain::fail(chain, &e.to_string()).await;
                     return;
                 }
+                // The caller is told the round failed, so its record must not read as running.
+                crate::send_outcome::fail(job_id, &e.to_string()).await;
                 let envelope = crate::jobs::complete_durable_job(
                     job_id,
                     self.build_async_message(job_id, &Err(e), exec_dir, delivery),
@@ -1110,9 +1160,18 @@ impl SyncDurableCore {
         }
         // The schema the caller asked for replaces the answer with JSON; a transformation that
         // fails forwards the whole answer unchanged.
-        let result = self
+        let delivered = self
             .deliverable(job_id, &delivery.name, caller.extract.as_ref(), result)
             .await;
+        // The round's answer is final here: a command-line handover's record takes it, and a round
+        // that failed takes its reason. No-op for an id with no record — an analysis round.
+        match &delivered {
+            Ok(delivered) => {
+                crate::send_outcome::finish(job_id, &delivered.answer, delivered.shape).await;
+            }
+            Err(e) => crate::send_outcome::fail(job_id, &e.to_string()).await,
+        }
+        let result = delivered.map(Delivered::into_answer);
         let envelope = crate::jobs::complete_durable_job(
             job_id,
             self.build_async_message(job_id, &result, exec_dir, delivery),

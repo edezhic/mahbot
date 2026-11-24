@@ -14,6 +14,7 @@ use crate::agent::message_router::{AgentJob, MessageKind};
 use crate::db::{self, Connection, Row, TxGuard, Value, params};
 use crate::pipeline::board::{TicketPhase, WORKING_PHASES};
 use anyhow::{Context, Result};
+use std::collections::BTreeSet;
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
@@ -1172,18 +1173,17 @@ pub(crate) fn parse_custom_launch(raw: Option<String>) -> Option<crate::Launch> 
     }
 }
 
-/// Whether any of `steps` still has its durable record — a worker round's `jobs` row, a queued
+/// The steps among `steps` that still have a live record — a worker round's `jobs` row, a queued
 /// launch envelope, or the conversation a role or worker-branch step runs in (it has no round of
-/// its own). `Some(false)` only when the read proved them gone, `None` when the read failed. The
-/// step ids are deterministic, so one call is both the hand-off's idempotency check (the next step
-/// alone) and a chain's liveness check (every step).
-pub(crate) async fn chain_has_records(
+/// its own) — and whether the conversations could be read too. `None` when the rows themselves
+/// could not be read.
+async fn live_chain_steps(
     chain_id: &str,
     steps: impl IntoIterator<Item = usize>,
-) -> Option<bool> {
-    let steps: Vec<usize> = steps.into_iter().collect();
+) -> Option<(BTreeSet<usize>, bool)> {
+    let steps: BTreeSet<usize> = steps.into_iter().collect();
     if steps.is_empty() {
-        return Some(false);
+        return Some((steps, true));
     }
     let ids: Vec<Value> = steps
         .iter()
@@ -1193,32 +1193,82 @@ pub(crate) async fn chain_has_records(
     // The same ids bind twice: a worker round's row and a queued envelope are both a step's record.
     let mut bound = ids.clone();
     bound.extend(ids);
-    let found = crate::session::store()
+    let rows = crate::session::store()
         .conn
-        .query_optional(
+        .query(
             &format!(
-                "SELECT 1 FROM jobs WHERE id IN ({placeholders}) \
-                 UNION ALL SELECT 1 FROM pending_jobs WHERE id IN ({placeholders}) LIMIT 1"
+                "SELECT id FROM jobs WHERE id IN ({placeholders}) \
+                 UNION SELECT id FROM pending_jobs WHERE id IN ({placeholders})"
             ),
             bound,
-            |_| Ok::<(), anyhow::Error>(()),
         )
         .await;
-    match found {
-        Ok(Some(())) => return Some(true),
-        Ok(None) => {}
+    let mut live = BTreeSet::new();
+    match rows {
+        Ok(rows) => {
+            for row in rows {
+                let step = row
+                    .get::<String>(0)
+                    .ok()
+                    .and_then(|id| crate::launch::record_parts(&id).map(|(_, step)| step));
+                if let Some(step) = step
+                    && steps.contains(&step)
+                {
+                    live.insert(step);
+                }
+            }
+        }
         Err(e) => {
             tracing::warn!(chain = %chain_id, error = %e, "Failed to read a chain's records");
             return None;
         }
     }
     match chain_sessions(chain_id).await {
-        Ok(sessions) => Some(sessions.iter().any(|(_, at)| steps.contains(at))),
+        Ok(sessions) => {
+            live.extend(
+                sessions
+                    .into_iter()
+                    .map(|(_, step)| step)
+                    .filter(|step| steps.contains(step)),
+            );
+            Some((live, true))
+        }
         Err(e) => {
             tracing::warn!(chain = %chain_id, error = %e, "Failed to read a chain's conversations");
-            None
+            Some((live, false))
         }
     }
+}
+
+/// Whether any of `steps` still has its durable record. `Some(false)` only when a complete read
+/// proved them gone, `None` when it could not say. The step ids are deterministic, so one call is
+/// both the hand-off's idempotency check (the next step alone) and a chain's liveness check (every
+/// step).
+pub(crate) async fn chain_has_records(
+    chain_id: &str,
+    steps: impl IntoIterator<Item = usize>,
+) -> Option<bool> {
+    let (live, conversations_read) = live_chain_steps(chain_id, steps).await?;
+    if !live.is_empty() {
+        // A durable row is proof on its own: a conversation read that failed cannot take it back,
+        // and the hand-off's check must never re-dispatch over a step that exists.
+        return Some(true);
+    }
+    conversations_read.then_some(false)
+}
+
+/// The furthest step of a chain that still has a live record — the step it is on. `None` when
+/// nothing live was found or a read could not say, so a caller leaves the field out rather than
+/// guessing.
+pub(crate) async fn chain_live_step(chain_id: &str) -> Option<usize> {
+    let (live, conversations_read) =
+        live_chain_steps(chain_id, 1..=crate::launch::MAX_STEPS).await?;
+    if !conversations_read {
+        // A step's conversation carries its number too, so an incomplete read could fall short of
+        // the furthest one.
+        return None;
+    }
+    live.into_iter().next_back()
 }
 
 /// The conversations a chain's steps are running in, with each one's step number.
@@ -1615,20 +1665,50 @@ pub(crate) async fn delete_pending_job(conn: &Connection, id: &str) -> Result<()
     Ok(())
 }
 
+/// What a handover dropped with its stopped launch is told.
+const DROPPED_BY_STOPPED_LAUNCH: &str = "the handover was dropped when its launch stopped";
+
 /// Delete every deferred envelope addressed to `target_agent_id`, returning how many
 /// rows were dropped. The deliberate-stop path is the ONE place that drops durable
 /// envelopes by address, and it waives the at-least-once guarantee (a stopped launch
-/// must not be replayed at boot); every other deletion stays by row id.
+/// must not be replayed at boot); every other deletion stays by row id. A dropped
+/// envelope is work nobody will answer, so its outcome record is settled once the rows
+/// are gone — a chain step's record is the chain's own, so dropping the step ends it.
 #[expect(clippy::cast_possible_truncation)] // u64 row count fits usize on all supported targets
 pub(crate) async fn delete_pending_jobs_for(target_agent_id: &str) -> Result<usize> {
     let conn = &crate::session::store().conn;
-    let deleted = conn
+    // One transaction: an envelope persisted into the gap between the read and the delete would
+    // vanish without its record being settled.
+    let tx = conn.begin_tx().await?;
+    let dropped: Vec<(String, String)> = tx
+        .query(
+            "SELECT id, envelope FROM pending_jobs WHERE target_agent_id = ?1",
+            params![target_agent_id],
+        )
+        .await
+        .context("list pending jobs for agent")?
+        .iter()
+        .filter_map(|row| Some((row.get::<String>(0).ok()?, row.get::<String>(1).ok()?)))
+        .collect();
+    let deleted = tx
         .execute(
             "DELETE FROM pending_jobs WHERE target_agent_id = ?1",
             params![target_agent_id],
         )
         .await
         .context("delete pending jobs for agent")?;
+    tx.commit().await?;
+    // After the delete: a crash in between leaves no row, and the boot sweep fails the record.
+    for (id, envelope) in &dropped {
+        // A chain step's record is the chain's own, so dropping the step ends the chain.
+        let chain = serde_json::from_str::<AgentJob>(envelope)
+            .ok()
+            .and_then(|job| job.chain().cloned());
+        match chain {
+            Some(chain) => crate::tools::chain::fail(&chain, DROPPED_BY_STOPPED_LAUNCH).await,
+            None => crate::send_outcome::fail_dropped(Some(id), DROPPED_BY_STOPPED_LAUNCH).await,
+        }
+    }
     info!(
         target_agent_id,
         count = deleted,
@@ -1755,18 +1835,34 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
     for row in &rows {
         let Ok(mut job) = serde_json::from_str::<AgentJob>(&row.envelope) else {
             warn!(pending_job = %row.id, "Pending job envelope unreadable — skipping");
+            // The row is never replayed, so nothing will answer it: a record under its id must
+            // not read as running.
+            crate::send_outcome::fail_dropped(
+                Some(&row.id),
+                "the handover's stored envelope could not be read",
+            )
+            .await;
             continue;
         };
         job.pending_job_id = Some(row.id.clone());
         if pending_already_appended(conn, row).await {
             // The message already reached the session — dedup prevents a
             // duplicate append. The row is reclaimed here (delivery complete;
-            // response recovery is the dead-session poller's domain).
+            // response recovery is the dead-session poller's domain). Nothing
+            // re-runs this envelope, so a command-line handover's record must
+            // not read as running: the answer it was promised was never
+            // delivered.
             repair_chain_step(row, &job).await;
             debug!(pending_job = %row.id, "Pending job already appended — skipping");
             if let Err(e) = delete_pending_job(conn, &row.id).await {
                 warn!(pending_job = %row.id, error = %e, "Failed to delete deduped pending job");
             }
+            crate::send_outcome::fail_dropped(
+                Some(&row.id),
+                "the product stopped after this handover's message was recorded but before its \
+                 answer was delivered",
+            )
+            .await;
             continue;
         }
         // Execution-time invariant: re-pin pinned roles (Assistant)
@@ -1784,6 +1880,11 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
             if let Err(e) = delete_pending_job(conn, &row.id).await {
                 warn!(pending_job = %row.id, error = %e, "Failed to delete refused pending job");
             }
+            crate::send_outcome::fail_dropped(
+                Some(&row.id),
+                "the handover names no user it could run as",
+            )
+            .await;
             continue;
         };
         job.workspace_name = workspace_name;
@@ -2270,6 +2371,203 @@ mod tests {
         crate::tools::chain::stop(&chain.id)
             .await
             .expect("drop the test's chain group");
+    }
+
+    /// A poisoned envelope the boot replay refuses is work that will never run: its record is
+    /// failed, rather than left reading as running until it expires.
+    #[serial_test::serial(recover_from_restart, send_outcome)]
+    #[tokio::test]
+    async fn the_boot_replay_fails_a_refused_handovers_record() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        // A pinned role with an empty user is the one refusal this path drops the row for.
+        let job = AgentJob {
+            content: "do it".to_string(),
+            workspace_name: "unpinned".to_string(),
+            user_name: String::new(),
+            channel: "cli".to_string(),
+            kind: MessageKind::UserMessage,
+            role: crate::Role::Assistant,
+            reply_target: None,
+            pending_job_id: None,
+            originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
+            urgent: false,
+            extract: None,
+        };
+        let id = "refused_handover";
+        let created_at = db::now();
+        conn.execute(
+            PENDING_JOB_INSERT_SQL,
+            pending_job_params(id, &job, &created_at).expect("encode the envelope"),
+        )
+        .await
+        .expect("seed the envelope");
+        crate::send_outcome::begin(id, None).await;
+
+        replay_pending_jobs(conn).await.expect("the replay runs");
+
+        let record = crate::send_outcome::lookup(id)
+            .await
+            .expect("read the record")
+            .expect("the handover opened one");
+        assert_eq!(record.state, crate::send_outcome::State::Failed);
+        assert_eq!(
+            record.reason.as_deref(),
+            Some("the handover names no user it could run as"),
+        );
+    }
+
+    /// The crash window between the message being appended and the answer leaving: the replay
+    /// reclaims the row without re-running it, so the record is failed rather than left running
+    /// while dead-session recovery re-drives the turn without its id.
+    #[serial_test::serial(recover_from_restart, send_outcome)]
+    #[tokio::test]
+    async fn the_boot_replay_fails_a_record_whose_message_already_landed() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let job = AgentJob {
+            content: "do it".to_string(),
+            workspace_name: "appended_ws".to_string(),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "cli".to_string(),
+            kind: MessageKind::UserMessage,
+            role: crate::Role::Assistant,
+            reply_target: None,
+            pending_job_id: None,
+            originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
+            urgent: false,
+            extract: None,
+        };
+        let agent_id = envelope_target(&job);
+        let id = "appended_handover";
+        let created_at = db::now();
+        conn.execute(
+            PENDING_JOB_INSERT_SQL,
+            pending_job_params(id, &job, &created_at).expect("encode the envelope"),
+        )
+        .await
+        .expect("seed the envelope");
+        crate::send_outcome::begin(id, None).await;
+        // The crash window: the message landed (a later timestamp, so the dedup sees it), the
+        // answer never left.
+        crate::util::test::seed_session_row(conn, &agent_id, "user", "do it").await;
+
+        replay_pending_jobs(conn).await.expect("the replay runs");
+
+        let record = crate::send_outcome::lookup(id)
+            .await
+            .expect("read the record")
+            .expect("the handover opened one");
+        assert_eq!(record.state, crate::send_outcome::State::Failed);
+        assert!(
+            record
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("before its answer was delivered")),
+            "the record names the crash: {:?}",
+            record.reason
+        );
+        assert!(
+            !pending_row_exists(conn, id).await,
+            "the deduped row is reclaimed"
+        );
+    }
+
+    /// A stopped launch's waiting envelopes are dropped without an answer, so every handover among
+    /// them is failed — the custom role deleted while its envelope waited is the same discard.
+    #[serial_test::serial(send_outcome)]
+    #[tokio::test]
+    async fn a_stopped_launch_fails_the_handovers_it_drops() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let target = "dropped_handover_agent";
+        let job = AgentJob {
+            content: "wait for me".to_string(),
+            workspace_name: "dropped_ws".to_string(),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "cli".to_string(),
+            kind: MessageKind::UserMessage,
+            role: crate::Role::Worker,
+            reply_target: None,
+            pending_job_id: None,
+            originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
+            urgent: false,
+            extract: None,
+        };
+        let id = "dropped_handover";
+        let envelope = serde_json::to_string(&job).expect("encode the envelope");
+        conn.execute(
+            PENDING_JOB_INSERT_SQL,
+            params![id, target, envelope, db::now()],
+        )
+        .await
+        .expect("seed the envelope");
+        crate::send_outcome::begin(id, None).await;
+
+        assert_eq!(
+            delete_pending_jobs_for(target)
+                .await
+                .expect("drop the envelopes"),
+            1
+        );
+
+        let record = crate::send_outcome::lookup(id)
+            .await
+            .expect("read the record")
+            .expect("the handover opened one");
+        assert_eq!(record.state, crate::send_outcome::State::Failed);
+        assert!(
+            record
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("dropped when its launch stopped")),
+            "the record names the discard: {:?}",
+            record.reason
+        );
+        assert!(!pending_row_exists(conn, id).await, "the row is gone");
+    }
+
+    /// An envelope the replay cannot read is never re-run, so a record under its id is failed
+    /// rather than left running.
+    #[serial_test::serial(recover_from_restart, send_outcome)]
+    #[tokio::test]
+    async fn the_boot_replay_fails_a_record_whose_envelope_is_unreadable() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let id = "unreadable_handover";
+        conn.execute(
+            PENDING_JOB_INSERT_SQL,
+            params![id, "unreadable_agent", "{ not an envelope", db::now()],
+        )
+        .await
+        .expect("seed the envelope");
+        crate::send_outcome::begin(id, None).await;
+
+        replay_pending_jobs(conn).await.expect("the replay runs");
+
+        let record = crate::send_outcome::lookup(id)
+            .await
+            .expect("read the record")
+            .expect("the handover opened one");
+        assert_eq!(record.state, crate::send_outcome::State::Failed);
+        assert!(
+            record
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("could not be read")),
+            "the record names the unreadable envelope: {:?}",
+            record.reason
+        );
+        assert!(
+            pending_row_exists(conn, id).await,
+            "the unreadable row itself is left in place"
+        );
     }
 
     /// A dispatch whose id is already cancelled commits no row: the cancel gate inside

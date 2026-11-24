@@ -17,16 +17,16 @@
 //! The compatibility rule is why the operation rides the old frame: an operation frame carries a
 //! magic `store` value — the generation its family declares ([`CALL_STORE`] /
 //! [`CALL_STORE_BASE`] / [`CALL_STORE_VIDEO`] / [`CALL_STORE_PHOTO`] / [`CALL_STORE_SETTINGS`] /
-//! [`CALL_STORE_SEND`], and the retired [`CALL_STORE_SEND_CHAIN`]),
-//! never a store name — so a product that does not know it parses the frame as a diagnostic query
-//! and refuses it as an unknown store: an honest "this product does not serve that here" rather
-//! than a protocol complaint. A new frame type could be parsed as something else and answered
-//! misleadingly; a superset of the old frame is the only shape that degrades honestly. The value
-//! belongs to the FAMILY, so a family whose surface has not changed keeps working one build
-//! behind; a family added since — or one whose surface gained arguments a product built before it
-//! would ignore — carries a value that product does not know, so the call is refused instead of
-//! misanswered. This build serves every generation ([`CALL_STORES`]); its frontend sends the one
-//! its family declares.
+//! [`CALL_STORE_SEND_OUTCOME`] / [`CALL_STORE_OUTCOME`], and the retired
+//! [`CALL_STORE_SEND_CHAIN`] / [`CALL_STORE_SEND`]) — never a store name, so a product that does
+//! not know it parses the frame as a diagnostic query and refuses it as an unknown store: an
+//! honest "this product does not serve that here" rather than a protocol complaint. A new frame
+//! type could be parsed as something else and answered misleadingly; a superset of the old frame
+//! is the only shape that degrades honestly. The value belongs to the FAMILY, so a family whose
+//! surface has not changed keeps working one build behind; a family added since — or one whose
+//! surface gained arguments a product built before it would ignore — carries a value that product
+//! does not know, so the call is refused instead of misanswered. This build serves every
+//! generation ([`CALL_STORES`]); its frontend sends the one its family declares.
 //! The call channel is same-user-only, like the diagnostic one, and FAIL-CLOSED: when the socket
 //! could not be restricted to the instance's own user, queries keep working and operations are
 //! refused.
@@ -217,16 +217,26 @@ pub(crate) const CALL_STORE_PHOTO: &str = "cli4";
 /// `set_diagnostics` field — so the frame is refused as an unknown store: nothing ran, the
 /// environment's class.
 pub(crate) const CALL_STORE_SETTINGS: &str = "cli5";
-/// The value `send` carries since it gained the schema argument `extract`: a product built before
-/// it would drop the schema and deliver prose, so the frame is refused as an unknown store:
-/// nothing ran, the environment's class. Every other family keeps its value; the listener still
-/// serves them all.
+/// The value `send` carried since it gained the schema argument `extract`. No family of this build
+/// carries it any more, but the listener keeps serving it, so a frontend one build behind still
+/// reaches the product instead of losing `send` to an unknown store.
 pub(crate) const CALL_STORE_SEND: &str = "cli7";
 
 /// The value `send` carried since it gained the chain argument `for`. No family of this build
 /// carries it any more, but the listener keeps serving it, so a frontend one build behind still
 /// reaches the product instead of losing `send` to an unknown store.
 pub(crate) const CALL_STORE_SEND_CHAIN: &str = "cli6";
+
+/// The value the `outcome` family carries, added after the channel had served every earlier
+/// generation: a product built before it serves no such tool, so the frame is refused as an
+/// unknown store — nothing ran, the environment's class.
+pub(crate) const CALL_STORE_OUTCOME: &str = "cli8";
+
+/// The value `send` carries since its acknowledgement names the record its id answers: a product
+/// built before it answers a handover without an id, leaving a script nothing to ask about, so the
+/// frame is refused as an unknown store — nothing ran, the environment's class. Every other family
+/// keeps its value; the listener still serves them all.
+pub(crate) const CALL_STORE_SEND_OUTCOME: &str = "cli9";
 
 /// Every protocol value this build serves — one per generation of the command line's surface,
 /// including the ones only a frontend one build behind still sends.
@@ -238,6 +248,8 @@ pub(crate) const CALL_STORES: &[&str] = &[
     CALL_STORE_SETTINGS,
     CALL_STORE_SEND,
     CALL_STORE_SEND_CHAIN,
+    CALL_STORE_OUTCOME,
+    CALL_STORE_SEND_OUTCOME,
 ];
 
 /// The store value a second launch's frame names: not a store, and nothing is queried — the frame

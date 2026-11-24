@@ -240,15 +240,16 @@ use crate::tools::{
     ComputerTool, CreateTicketTool, CustomTool, DispatchMode, DocumentTool, EditTool, FilesTool,
     GetTicketTool, HyperframesTool, ImageGenTool, ListAutomationsTool, ListTicketsTool,
     MahbotConfigTool, MahbotDebugTool, PhotocraftTool, RasterizeTool, ReadTool, ReferenceTool,
-    RemoveAutomationTool, ReportGapTool, SearchArchivedTicketsTool, SearchTool, SendTool,
-    ShellMode, ShellTool, ShowTabTool, SleepTool, UpdateTicketTool, VideoGenTool, WebSearchTool,
-    WorkspaceTool,
+    RemoveAutomationTool, ReportGapTool, SearchArchivedTicketsTool, SearchTool, SendOutcomeTool,
+    SendTool, ShellMode, ShellTool, ShowTabTool, SleepTool, UpdateTicketTool, VideoGenTool,
+    WebSearchTool, WorkspaceTool,
 };
 
 /// Tools in the admin Assistant's set that a custom role is never offered or built: the `computer`
-/// surface, the `say` voice and the `show_tab` raise are the administrator's Assistant's alone. A
-/// stored entry naming one stays on the record and builds nothing.
-const CUSTOM_ROLE_WITHHELD_TOOLS: &[&str] = &["computer", "say", "show_tab"];
+/// surface, the `say` voice, the `show_tab` raise and the `send_outcome` lookup are the
+/// administrator's Assistant's alone. A stored entry naming one stays on the record and builds
+/// nothing.
+const CUSTOM_ROLE_WITHHELD_TOOLS: &[&str] = &["computer", "say", "show_tab", "send_outcome"];
 
 impl Role {
     /// Core read/search tools — plus the shell in `shell` mode when one is requested — for the
@@ -369,6 +370,9 @@ impl Role {
             // The voice: one short phrase spoken aloud, for the admin's own Assistant only — a
             // custom role is never offered it.
             t.push(Box::new(SayTool));
+            // What became of a command-line `send`, by the id its acknowledgement printed: the
+            // owner's own handover, so it stays with the admin's Assistant like `say`.
+            t.push(Box::new(SendOutcomeTool));
         }
         t
     }
@@ -1021,6 +1025,7 @@ mod tests {
             ("sleep", assistant_or_manager),
             ("say", admin_assistant),
             ("show_tab", admin_assistant),
+            ("send_outcome", admin_assistant),
         ];
         for (name, may_hold) in rules {
             for role in Role::iter() {
@@ -1046,6 +1051,10 @@ mod tests {
         assert!(
             !Role::custom_role_tool_catalog().contains(&"show_tab"),
             "a custom role must not be offered the browser raise"
+        );
+        assert!(
+            !Role::custom_role_tool_catalog().contains(&"send_outcome"),
+            "a custom role must not be offered the command-line outcome lookup"
         );
         assert!(
             Role::custom_role_tool_catalog().contains(&"photocraft"),

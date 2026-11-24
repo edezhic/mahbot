@@ -134,7 +134,7 @@ pub struct Asker {
 impl AgentJob {
     /// The chain this job is a step of, when it is one — carried by the branch launch.
     #[must_use]
-    fn chain(&self) -> Option<&crate::launch::Chain> {
+    pub(crate) fn chain(&self) -> Option<&crate::launch::Chain> {
         self.custom_role
             .as_ref()
             .and_then(|launch| launch.chain.as_deref())
@@ -383,11 +383,11 @@ pub async fn route_user_message(
     route(&agent_id, job);
 }
 
-// Persist `job` to `pending_jobs` and stamp the row id onto it — the at-least-once boundary. A
-// chain step passes its deterministic id, so a hand-off replayed after it committed finds the same
-// row; every other envelope gets a fresh one. An `Err` is a failed write, not a dropped message.
-async fn persist_and_stamp(job: &mut AgentJob, id: Option<String>) -> anyhow::Result<()> {
-    let id = id.unwrap_or_else(crate::generate_id);
+// Persist `job` to `pending_jobs` under `id` and stamp that id onto it — the at-least-once
+// boundary. A chain step passes its deterministic id, so a hand-off replayed after it committed
+// finds the same row; every other envelope gets a fresh one. An `Err` is a failed write, not a
+// dropped message.
+async fn persist_and_stamp(job: &mut AgentJob, id: String) -> anyhow::Result<()> {
     persist_pending(job, id.clone()).await?;
     job.pending_job_id = Some(id);
     Ok(())
@@ -411,18 +411,22 @@ pub(crate) enum AnsweredFor {
 // left to boot replay; the drain must not be raced with a live route). Only a
 // [`Caller`](AnsweredFor::Caller) handover returns `Err`; any other failure is
 // logged and routed best-effort — the price of never dropping a failed write.
+//
+// Returns the id a status query names, when this handover opened a record — the command line's
+// own, never an agent's, a chain step's or the one-way `guest` address's.
 pub(crate) async fn hand_over(
     mut job: AgentJob,
     target: &str,
     producer: &str,
     answered_for: AnsweredFor,
-) -> anyhow::Result<()> {
-    // A chain step's record id is deterministic, so a hand-off replayed after it committed
-    // finds the same row instead of starting the step twice.
-    let id = job
-        .chain()
-        .map(|chain| crate::launch::record_id(&chain.id, chain.step));
-    let persisted = match persist_and_stamp(&mut job, id).await {
+) -> anyhow::Result<Option<String>> {
+    // A chain step's record id is deterministic, so the step's row is the one its own id names —
+    // `chain::hand_on` checks that row before dispatching, and a replay can never start the step
+    // twice.
+    let id = job.chain().map_or_else(crate::generate_id, |chain| {
+        crate::launch::record_id(&chain.id, chain.step)
+    });
+    let persisted = match persist_and_stamp(&mut job, id.clone()).await {
         Ok(()) => true,
         Err(e) => {
             if answered_for == AnsweredFor::Caller {
@@ -441,11 +445,25 @@ pub(crate) async fn hand_over(
             false
         }
     };
+    // The command line's own handover opens the record its id answers: after the durable row
+    // exists, so a handover that could not be made durable records nothing, and before the work
+    // leaves, so a completion that arrives first cannot be missed. A chain's record is the chain's
+    // own id, opened where the chain starts, and the one-way `guest` address answers nothing, so
+    // neither opens one.
+    let opened = persisted
+        && crate::agent::tool_command_line()
+        && job.chain().is_none()
+        && job.kind != MessageKind::GuestMessage;
+    if opened {
+        crate::send_outcome::begin(&id, None).await;
+    }
+    // Computed once: the id is the acknowledgement's, whichever way this handover ends.
+    let acknowledged = opened.then_some(id);
     if crate::shutdown::aborting() && persisted {
-        return Ok(());
+        return Ok(acknowledged);
     }
     route(target, job);
-    Ok(())
+    Ok(acknowledged)
 }
 
 /// [`hand_over`] under [`AnsweredFor::Nobody`]: a failed write is logged and the envelope
@@ -494,7 +512,7 @@ pub(crate) async fn route_agent_message_to_manager(
     asker: Option<Asker>,
     extract: Option<crate::extract::Extract>,
     answered_for: AnsweredFor,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let job = agent_message_job(content, workspace_name, &user_name, asker, extract);
     let target = crate::jobs::envelope_target(&job);
     hand_over(job, &target, "agent message", answered_for).await
@@ -529,7 +547,9 @@ pub(crate) async fn route_guest_message(
         extract: None,
     };
     let target = crate::jobs::envelope_target(&job);
-    hand_over(job, &target, "guest message", answered_for).await
+    hand_over(job, &target, "guest message", answered_for)
+        .await
+        .map(|_| ())
 }
 
 /// Hand one message from the COMMAND LINE to the owner's own assistant as an ordinary
@@ -539,7 +559,9 @@ pub(crate) async fn route_guest_message(
 /// durable handover comes FIRST and the history copy second, the opposite of the other
 /// producers: the conversation must not show a message the caller was told did not get
 /// through. `Err` (no owner, or a failed write) REFUSES the handover.
-pub(crate) async fn deliver_command_line_message(content: String) -> anyhow::Result<()> {
+pub(crate) async fn deliver_command_line_message(
+    content: String,
+) -> anyhow::Result<Option<String>> {
     // The owner the CALL carries, never a second copy of the constant: the command line
     // scopes the identity it acts with ([`crate::cli::instance`]). Checked rather than
     // defaulted — an empty identity would address a `personal:` workspace that does not exist.
@@ -560,7 +582,7 @@ pub(crate) async fn deliver_command_line_message(content: String) -> anyhow::Res
         None,
     );
     let target = crate::jobs::envelope_target(&job);
-    hand_over(job, &target, "command-line message", AnsweredFor::Caller).await?;
+    let id = hand_over(job, &target, "command-line message", AnsweredFor::Caller).await?;
 
     crate::channels::broadcast_and_persist_incoming_message(
         &crate::ChannelMessage {
@@ -576,7 +598,7 @@ pub(crate) async fn deliver_command_line_message(content: String) -> anyhow::Res
     )
     .await;
 
-    Ok(())
+    Ok(id)
 }
 
 // Persist an envelope to `pending_jobs`; the target agent id is derived from it by
@@ -603,7 +625,7 @@ pub(crate) async fn deliver_assistant_notice(
     content: String,
 ) -> anyhow::Result<()> {
     let mut job = assistant_notice_job(content, user_name);
-    let durable = persist_and_stamp(&mut job, None).await;
+    let durable = persist_and_stamp(&mut job, crate::generate_id()).await;
     route(agent_id, job);
     durable
 }
@@ -642,7 +664,9 @@ pub(crate) fn post_assistant_notice(agent_id: &str, user_name: &str, content: St
 pub(crate) async fn deliver_guest_report(content: String) -> anyhow::Result<()> {
     let job = admin_assistant_job(content, MessageKind::GuestReport, None);
     let target = crate::jobs::envelope_target(&job);
-    hand_over(job, &target, "guest report", AnsweredFor::Caller).await
+    hand_over(job, &target, "guest report", AnsweredFor::Caller)
+        .await
+        .map(|_| ())
 }
 
 /// Register an agent without a consumer loop and hand back the receiver (`llm_loop` drains
@@ -860,6 +884,11 @@ async fn consumer_loop(
                     workspace = %item.workspace_name,
                     "Message router: pinned role with empty user — refusing to run unpinned, skipping job"
                 );
+                crate::send_outcome::fail_dropped(
+                    item.pending_job_id.as_deref(),
+                    "the handover names no user it could run as",
+                )
+                .await;
                 confirm_pending_delivery(&item).await;
                 continue;
             };
@@ -901,6 +930,8 @@ async fn consumer_loop(
                         crate::tools::chain::fail(chain, refusal).await;
                         continue;
                     }
+                    crate::send_outcome::fail_dropped(item.pending_job_id.as_deref(), refusal)
+                        .await;
                     confirm_pending_delivery(&item).await;
                     continue;
                 }
@@ -937,10 +968,14 @@ async fn consumer_loop(
                     workspace = %job.workspace_name,
                     "Message router: workspace not found — skipping job",
                 );
-                for item in &queued {
+                for item in queued.iter().chain(std::iter::once(&job)) {
                     report_unrunnable_branch(item).await;
+                    crate::send_outcome::fail_dropped(
+                        item.pending_job_id.as_deref(),
+                        "the handover's workspace no longer exists",
+                    )
+                    .await;
                 }
-                report_unrunnable_branch(&job).await;
                 continue;
             }
             Err(e) => {
@@ -1113,6 +1148,16 @@ async fn consumer_loop(
         }
 
         let Some(response) = response else {
+            // The record is the same truth as the ticket history: a handover that produced no
+            // answer must not read as running. A handover still queued when a drain stops the
+            // consumer never reaches this arm — its record stays `running` and the boot replay
+            // completes it.
+            fail_turn_outcomes(
+                &job,
+                &queued,
+                &agent.failure_reason("the turn ended without an answer"),
+            )
+            .await;
             // A custom role's failure produces no answer: deliver the durable failure notice to
             // the admin's Assistant — never the emoji, never anything to the owner. A worker
             // branch's failure goes into the asking conversation, guarded the same way.
@@ -1167,6 +1212,15 @@ async fn consumer_loop(
         // (no empty bubble, no emoji). The at-least-once pending-jobs boundary is still
         // confirmed.
         if agent.sleep_ended || agent.turn_state.interrupted {
+            // A sleep ended the turn deliberately: nothing to report is `done_no_answer`, not a
+            // failure. An urgent message cut it instead, and the answer it was writing is
+            // abandoned — the handover failed rather than finished.
+            if agent.sleep_ended {
+                finish_turn_outcomes(&job, &queued, "", crate::send_outcome::Shape::None).await;
+            } else {
+                fail_turn_outcomes(&job, &queued, "the turn was cut short before it answered")
+                    .await;
+            }
             confirm_turn_delivery(&queued).await;
             confirm_pending_delivery(&job).await;
             continue;
@@ -1175,13 +1229,24 @@ async fn consumer_loop(
         // A schema the caller asked for replaces the answer with the JSON document that matches
         // it; a transformation that fails forwards the whole answer unchanged, so the step's work
         // is never lost.
-        let Some(response) =
+        let Some((response, shape)) =
             answer_to_deliver(&job, &agent, &agent_id, answer_parent, response).await
         else {
+            // A cancelled turn's record ends as the failure it is: no answer was produced.
+            fail_turn_outcomes(
+                &job,
+                &queued,
+                &agent.failure_reason("the turn ended without an answer"),
+            )
+            .await;
             confirm_turn_delivery(&queued).await;
             confirm_pending_delivery(&job).await;
             continue;
         };
+
+        // The answer is final and unwrapped here, so the record and the conversation carry the same
+        // text — the conversation gets it wrapped in an envelope for the non-`assistant` addresses.
+        finish_turn_outcomes(&job, &queued, &response, shape).await;
 
         // Manager: a durable `<manager-message>` into the admin's Assistant, or back into the
         // asking branch. Custom role: `<custom-role-message>`. Worker branch: `<worker-report>`
@@ -1257,26 +1322,26 @@ async fn clear_spent_schema(job: &AgentJob, agent_id: &str) {
     }
 }
 
-/// The answer a turn delivers: its JSON form when the job asked for a schema, else the answer
-/// itself. `None` when the agent was stopped — the answer is discarded then, exactly as a stopped
-/// turn's is, and a turn already stopped when the transformation would begin spends no call on it.
-/// The transformation runs where the turn ran (this conversation's recorded model and provider) and
-/// appears in Running Agents under the turn's own group. A graceful drain is not a stop: the round
-/// already completed, so its answer is delivered.
+/// The answer a turn delivers, and the shape it came back in: its JSON form when the job asked for
+/// a schema, else the answer itself. `None` when the agent was stopped — the answer is discarded
+/// then, exactly as a stopped turn's is, and a turn already stopped when the transformation would
+/// begin spends no call on it. The transformation runs where the turn ran (this conversation's
+/// recorded model and provider) and appears in Running Agents under the turn's own group. A
+/// graceful drain is not a stop: the round already completed, so its answer is delivered.
 async fn answer_to_deliver(
     job: &AgentJob,
     agent: &crate::Agent,
     agent_id: &str,
     parent: Option<ParentKey>,
     answer: String,
-) -> Option<String> {
+) -> Option<(String, crate::send_outcome::Shape)> {
     let Some(extract) = job.answer_extract() else {
-        return Some(answer);
+        return Some((answer, crate::send_outcome::Shape::None));
     };
     if agent.is_cancelled() {
         return None;
     }
-    let transformed = crate::extract::answer_as_json(
+    let (transformed, produced) = crate::extract::answer_as_json_reporting(
         Some(extract),
         &crate::extract::StepContext {
             role: job.role,
@@ -1287,7 +1352,7 @@ async fn answer_to_deliver(
         &answer,
     )
     .await;
-    (!agent.is_cancelled()).then_some(transformed)
+    (!agent.is_cancelled()).then_some((transformed, crate::send_outcome::Shape::of(true, produced)))
 }
 
 /// The launch of a worker-branch job: `Some` only when the job carries a launch whose role
@@ -1333,6 +1398,54 @@ async fn confirm_pending_delivery(job: &AgentJob) {
 async fn confirm_turn_delivery(queued: &[AgentJob]) {
     for item in queued {
         confirm_pending_delivery(item).await;
+    }
+}
+
+/// The command-line handovers a turn answered, with the shape each one's answer took: its own job
+/// and those of the messages it carried. One turn delivers one answer, so several records may hold
+/// the same text; the turn shaped it for its own job, while a carried handover's schema was never
+/// applied, so its answer was forwarded unchanged. Only the ids that still have a record are
+/// returned — one read for the whole turn, so a turn that answered no command-line handover writes
+/// nothing to the shared core writer; a failed read returns them all and each guarded write decides.
+async fn turn_outcomes<'a>(
+    job: &'a AgentJob,
+    queued: &'a [AgentJob],
+    shape: crate::send_outcome::Shape,
+) -> Vec<(&'a str, crate::send_outcome::Shape)> {
+    let carried = queued.iter().map(|item| {
+        let forwarded = crate::send_outcome::Shape::of(item.answer_extract().is_some(), false);
+        (item, forwarded)
+    });
+    let outcomes: Vec<(&str, crate::send_outcome::Shape)> = carried
+        .chain(std::iter::once((job, shape)))
+        .filter_map(|(item, shape)| Some((item.pending_job_id.as_deref()?, shape)))
+        .collect();
+    let ids: Vec<&str> = outcomes.iter().map(|(id, _)| *id).collect();
+    let Some(running) = crate::send_outcome::running(&ids).await else {
+        return outcomes;
+    };
+    outcomes
+        .into_iter()
+        .filter(|(id, _)| running.contains(*id))
+        .collect()
+}
+
+/// Complete the records of the handovers this turn answered with its one answer.
+async fn finish_turn_outcomes(
+    job: &AgentJob,
+    queued: &[AgentJob],
+    answer: &str,
+    shape: crate::send_outcome::Shape,
+) {
+    for (id, shape) in turn_outcomes(job, queued, shape).await {
+        crate::send_outcome::finish(id, answer, shape).await;
+    }
+}
+
+/// End the records of the handovers this turn ended without an answer.
+async fn fail_turn_outcomes(job: &AgentJob, queued: &[AgentJob], reason: &str) {
+    for (id, _) in turn_outcomes(job, queued, crate::send_outcome::Shape::None).await {
+        crate::send_outcome::fail(id, reason).await;
     }
 }
 
@@ -2209,6 +2322,72 @@ mod tests {
         }
     }
 
+    /// One turn answers every message of its batch, so every command-line handover it carried is
+    /// settled with that one answer; an id with no record is untouched.
+    #[serial_test::serial(send_outcome)]
+    #[tokio::test]
+    async fn a_turn_settles_every_handover_it_answered() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let mut job = make_job(Role::Assistant, "settle_ws", "alice", "cli");
+        job.pending_job_id = Some("settle_turn_job".to_string());
+        let mut carried = make_job(Role::Assistant, "settle_ws", "alice", "cli");
+        carried.pending_job_id = Some("settle_queued_job".to_string());
+        let mut schema_asking = make_job(Role::Assistant, "settle_ws", "alice", "cli");
+        schema_asking.pending_job_id = Some("settle_schema_job".to_string());
+        schema_asking.extract = Some(
+            crate::extract::Extract::from_text(r#"{"type":"object"}"#)
+                .expect("the schema is accepted"),
+        );
+        let mut stranger = make_job(Role::Assistant, "settle_ws", "alice", "gui");
+        stranger.pending_job_id = Some("settle_no_record".to_string());
+        let batch = vec![carried, schema_asking, stranger];
+        let settled = ["settle_turn_job", "settle_queued_job", "settle_schema_job"];
+        for id in settled {
+            crate::send_outcome::begin(id, None).await;
+        }
+
+        finish_turn_outcomes(&job, &batch, "the answer", crate::send_outcome::Shape::Json).await;
+        // The turn's own job carries the shape the answer came back in; a carried handover asked
+        // for no schema (or for one the turn never applied), so its answer was forwarded unchanged.
+        for (id, shape) in [
+            ("settle_turn_job", Some(crate::send_outcome::Shape::Json)),
+            ("settle_queued_job", Some(crate::send_outcome::Shape::None)),
+            (
+                "settle_schema_job",
+                Some(crate::send_outcome::Shape::Forwarded),
+            ),
+        ] {
+            let record = crate::send_outcome::lookup(id)
+                .await
+                .expect("read the record")
+                .expect("the handover opened one");
+            assert_eq!(record.state, crate::send_outcome::State::Done);
+            assert_eq!(record.answer.as_deref(), Some("the answer"));
+            assert_eq!(record.shape, shape);
+        }
+
+        for id in settled {
+            crate::send_outcome::begin(id, None).await;
+        }
+        fail_turn_outcomes(&job, &batch, "the turn failed").await;
+        for id in settled {
+            let record = crate::send_outcome::lookup(id)
+                .await
+                .expect("read the record")
+                .expect("the handover opened one");
+            assert_eq!(record.state, crate::send_outcome::State::Failed);
+            assert_eq!(record.reason.as_deref(), Some("the turn failed"));
+        }
+        assert!(
+            crate::send_outcome::lookup("settle_no_record")
+                .await
+                .expect("read the record")
+                .is_none(),
+            "an id with no record is untouched"
+        );
+    }
+
     /// A delivered step's schema does not outlive it: the conversation stops carrying one, so a
     /// later dead-session recovery cannot rebuild the launch with a schema that turn never asked
     /// for. A turn that carried none leaves whatever the row says alone.
@@ -2294,8 +2473,11 @@ mod tests {
 
         assert_eq!(
             answer_to_deliver(&job, &agent, "conv", None, "the answer".into()).await,
-            Some(r#"{"a":"one"}"#.to_string()),
-            "the JSON document replaces the answer"
+            Some((
+                r#"{"a":"one"}"#.to_string(),
+                crate::send_outcome::Shape::Json
+            )),
+            "the JSON document replaces the answer, and the shape says so"
         );
         assert_eq!(fake.request_fingerprints.lock().unwrap().len(), 1);
 

@@ -83,7 +83,7 @@ struct RoundCaller<'a> {
 /// handover nor repeats it. The job row carries the command line's own user and channel;
 /// there is no agent session and no custom-role launch behind a shell caller, so neither is
 /// threaded through. `Err` is a failed row write: nothing was dispatched, and the caller may
-/// be told the handover did not happen.
+/// be told the handover did not happen. `Ok` is the id its acknowledgement names.
 pub(crate) async fn hand_over_worker_round(
     delivery: &Workspace,
     place: Option<&Workspace>,
@@ -91,7 +91,7 @@ pub(crate) async fn hand_over_worker_round(
     caller_role: Role,
     job_id: &str,
     extract: Option<&crate::extract::Extract>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     // Read the caller's identity synchronously BEFORE the spawn (task-local contract): the
     // job row must carry the command line's own user and channel.
     let user_name = crate::agent::tool_user_name();
@@ -114,6 +114,8 @@ pub(crate) async fn hand_over_worker_round(
 
 /// A CHAIN step's worker round: the same handover, carrying the chain's own identity (a step runs
 /// outside any agent turn, so there are no task-locals to read) and its deterministic record id.
+/// The chain's record is the chain's own id, opened where the chain starts, so this step opens
+/// none and reports none.
 pub(crate) async fn hand_over_chain_round(
     origin: &Workspace,
     place: Option<&Workspace>,
@@ -135,6 +137,7 @@ pub(crate) async fn hand_over_chain_round(
         },
     )
     .await
+    .map(|_| ())
 }
 
 /// The handover both callers share: the durable rows are written FIRST — the hand-off the caller
@@ -144,7 +147,7 @@ async fn hand_over_round(
     place: Option<&Workspace>,
     task: &str,
     caller: RoundCaller<'_>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let exec = place.unwrap_or(delivery);
     let args = crate::tools::CoreJobArgs {
         job_id: caller.job_id,
@@ -165,14 +168,23 @@ async fn hand_over_round(
     };
     spawn_implement_rows(exec, task, &args).await?;
 
-    // The rows are down: run the round as a RESUME of them, so a restart landing between the
-    // two starts the very round this call promised.
+    // The rows are down, so the handover is durable, and the round has not been spawned yet: the
+    // command line's own handover opens the record its id answers here. Only this caller reaches
+    // here without a chain — a chain step's record is the chain's own id, opened where the chain
+    // starts.
+    let opened = caller.chain.is_none();
+    if opened {
+        crate::send_outcome::begin(caller.job_id, None).await;
+    }
+
+    // Run the round as a RESUME of them, so a restart landing between the two starts the very
+    // round this call promised.
     crate::tools::SyncDurableCore::Worker.spawn_resume_round(
         caller.job_id.to_string(),
         delivery.clone(),
         place.map(|ws| ws.path.clone()),
     );
-    Ok(())
+    Ok(opened.then(|| caller.job_id.to_string()))
 }
 
 /// Spawn the implement job + single-worker roster (one tx), then run the worker. A resume

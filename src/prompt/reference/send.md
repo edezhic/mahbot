@@ -33,3 +33,5 @@ A message to a continuous role is handled one at a time, in the order sent, so a
 ## Result
 
 An acknowledgement naming where the work went — `Work handed to a worker in <folder>; its report arrives as a <worker-report> message.`, `Worker branch '<branch>' is on it in <folder>; …`, `Message delivered to the manager of workspace '<name>'.`, `custom role '<name>' launched on branch <agent> in <workspace>`, or the guest's one-way notice. Only a synchronous send returns the work's own result.
+
+Every command-line acknowledgement ends with `(job <id>)` — the id the `send_outcome` lookup answers. The one-way `guest` address prints no id, because nothing will answer it.

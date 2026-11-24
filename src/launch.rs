@@ -310,7 +310,8 @@ fn refuse_busy_folder_excluding(
 /// behaviour decides (one common branch, or a one-off run). `workspace` is the
 /// folder the launch runs in, already resolved by [`launch_workspace`]. The
 /// launch is persisted as a durable envelope BEFORE it is routed, so it survives
-/// a restart. Returns a one-line confirmation for the caller.
+/// a restart. Returns a one-line confirmation for the caller — with the id a status
+/// query names, when the command line made the launch.
 ///
 /// `busy` is the folder rule — checked here because every custom-role launch passes
 /// through this one place, so no launch path can forget it.
@@ -376,11 +377,14 @@ pub(crate) async fn custom_role(
         chain: busy.chain().cloned().map(Box::new),
         extract: extract.cloned(),
     };
-    hand_over_launch(launch, message, &workspace.name, answered_for).await?;
+    let id = hand_over_launch(launch, message, &workspace.name, answered_for).await?;
 
-    Ok(format!(
-        "custom role '{name}' launched on branch {agent_id} in {}",
-        workspace.name
+    Ok(crate::send_outcome::acknowledged(
+        format!(
+            "custom role '{name}' launched on branch {agent_id} in {}",
+            workspace.name
+        ),
+        id.as_deref(),
     ))
 }
 
@@ -394,8 +398,9 @@ pub(crate) async fn custom_role(
 /// worker runs today when none is given. A later use pointing at another folder
 /// runs it there; the branch name identifies the conversation and its history,
 /// so the same name resumes the same conversation. Returns a one-line
-/// acknowledgement with no job number — a worker branch's report arrives when its
-/// turn finishes, not as a durable round.
+/// acknowledgement — with the id a status query names, when the command line made
+/// the launch, since a worker branch's report arrives when its turn finishes
+/// rather than in a durable round.
 ///
 /// `asker` is the launch of the custom role that asked, when one did: it makes
 /// the report return into the asking role's branch rather than the admin's
@@ -457,23 +462,25 @@ pub(crate) async fn worker_branch(
         extract: extract.cloned(),
     };
 
-    hand_over_launch(launch, message, &workspace_name, answered_for).await?;
+    let id = hand_over_launch(launch, message, &workspace_name, answered_for).await?;
 
     let folder = folder.path.trim_end_matches(std::path::MAIN_SEPARATOR);
-    Ok(format!(
+    let ack = format!(
         "Worker branch '{branch}' is on it in {folder}; its report arrives as a <worker-report> message."
-    ))
+    );
+    Ok(crate::send_outcome::acknowledged(ack, id.as_deref()))
 }
 
 /// Hand a built launch over as one durable envelope: persisted BEFORE it is routed, so it survives
 /// a restart, and addressed by the launch's own agent id. The chain steps a launch carries ride on
-/// it, so a hand-off replayed after it committed finds the same durable record.
+/// it, so a hand-off replayed after it committed finds the same durable record. Returns the id a
+/// status query names, when the handover opened a record — the command line's own.
 pub(crate) async fn hand_over_launch(
     launch: crate::Launch,
     message: &str,
     workspace_name: &str,
     answered_for: crate::agent::message_router::AnsweredFor,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let target = launch.agent_id.clone();
     let job = launch_job(message.to_string(), workspace_name.to_string(), launch);
     crate::agent::message_router::hand_over(job, &target, "launch", answered_for).await

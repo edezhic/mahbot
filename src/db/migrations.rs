@@ -27,7 +27,7 @@
 //! if it can still be pending on a database that has run a 0.10.x build. The
 //! two halves select different entries, and confusing them is how a column,
 //! table or default disappears from an installation that has not yet reached
-//! the newest release. The catalog holds nine entries:
+//! the newest release. The catalog holds eleven entries:
 //!
 //! - `24` / `26` — the core and logs baselines. They always stay: they are what
 //!   a fresh install is built from, and the upgrade half alone would retire
@@ -60,6 +60,9 @@
 //!   existing store is still pending on them.
 //! - `85` — the `jobs.extract` / `session_metadata.extract` columns a `send` schema
 //!   rides on (see [`run_add_extract_columns`]), arriving with the same release.
+//! - `86` — the `send_outcomes` table the command line's `outcome` lookup reads (see
+//!   [`SEND_OUTCOMES_TABLE`]). It arrives with this release, so every existing store
+//!   is still pending on it.
 //!
 //! # The id → release record, and the retired ids
 //!
@@ -72,7 +75,8 @@
 //! - `82`, `83` — added after the 0.10.6 tag, so no shipped build records either.
 //! - `84` — the `send` chain's columns; no shipped build records it.
 //! - `85` — the `send` schema's columns; no shipped build records it.
-//! - Next id: `86`.
+//! - `86` — the `send_outcomes` table; no shipped build records it.
+//! - Next id: `87`.
 //!
 //! Retired, and never to be reused:
 //!
@@ -485,6 +489,16 @@ CREATE TABLE IF NOT EXISTS automations (
     retry_at            TEXT,
     unfinished_attempts INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS send_outcomes (
+    id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    answer TEXT,
+    reason TEXT,
+    shape TEXT,
+    chain_steps INTEGER,
+    created_at TEXT NOT NULL,
+    finished_at TEXT
+);
 CREATE TABLE IF NOT EXISTS custom_roles (
     name       TEXT PRIMARY KEY,
     prompt     TEXT NOT NULL,
@@ -660,12 +674,26 @@ const GUEST_REPORTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS guest_reports (
     PRIMARY KEY (user_name, day, digest)
 );";
 
+/// Entry `86` (existing installs): the `send_outcomes` table behind the command line's `outcome`
+/// lookup — one row per command-line handover, keyed by the id its acknowledgement printed. The
+/// baseline (`24`) already declares it, so on a fresh install this is an `IF NOT EXISTS` no-op.
+const SEND_OUTCOMES_TABLE: &str = "CREATE TABLE IF NOT EXISTS send_outcomes (
+    id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    answer TEXT,
+    reason TEXT,
+    shape TEXT,
+    chain_steps INTEGER,
+    created_at TEXT NOT NULL,
+    finished_at TEXT
+);";
+
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
-/// Nine entries, split by the module header's rule: the fresh-install half is
-/// `24`, `26` and `69`; the upgrade half is `79`, `80`, `81`, `82`, `83` and
-/// `84` — the entries that can still be pending on a store that has run a
-/// 0.10.x build. The header also carries the id → release record and the
+/// Eleven entries, split by the module header's rule: the fresh-install half is
+/// `24`, `26` and `69`; the upgrade half is `79`, `80`, `81`, `82`, `83`, `84`,
+/// `85` and `86` — the entries that can still be pending on a store that has run
+/// a 0.10.x build. The header also carries the id → release record and the
 /// retired ids.
 ///
 /// - `24` builds the full core schema; on an existing store every statement is
@@ -686,6 +714,10 @@ const GUEST_REPORTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS guest_reports (
 ///   [`run_set_media_model_lists`]).
 /// - `84` adds the nullable `jobs.chain` and `session_metadata.chain` columns a `send` chain
 ///   rides on (see [`run_add_chain_columns`]).
+/// - `85` adds the nullable `jobs.extract` and `session_metadata.extract` columns a `send`
+///   schema rides on (see [`run_add_extract_columns`]).
+/// - `86` creates `send_outcomes` on an existing core store (see
+///   [`SEND_OUTCOMES_TABLE`]).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -736,6 +768,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "85",
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_extract_columns),
+    },
+    Migration {
+        id: "86",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(SEND_OUTCOMES_TABLE),
     },
 ];
 
@@ -1174,6 +1211,19 @@ mod tests {
         ("research_jobs", &["id", "state"]),
         ("schema_migrations", &["id", "applied_at"]),
         (
+            "send_outcomes",
+            &[
+                "id",
+                "state",
+                "answer",
+                "reason",
+                "shape",
+                "chain_steps",
+                "created_at",
+                "finished_at",
+            ],
+        ),
+        (
             "session_metadata",
             &[
                 "agent_id",
@@ -1523,8 +1573,8 @@ mod tests {
         applied.sort();
         assert_eq!(
             applied,
-            ["24", "69", "79", "80", "81", "82", "83", "84", "85"].map(String::from),
-            "fresh core applies the baseline, the 69 seed and the seven upgrade entries exactly"
+            ["24", "69", "79", "80", "81", "82", "83", "84", "85", "86"].map(String::from),
+            "fresh core applies the baseline, the 69 seed and the eight upgrade entries exactly"
         );
     }
 

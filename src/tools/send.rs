@@ -749,13 +749,15 @@ impl Tool for SendTool {
                 // Only the command line reaches this arm: the owner's own assistant is not among
                 // the addressees an agent's holder declares, so an agent naming it is refused
                 // before dispatch.
-                crate::agent::message_router::deliver_command_line_message(message.to_string())
-                    .await?;
-                Ok(
+                let id =
+                    crate::agent::message_router::deliver_command_line_message(message.to_string())
+                        .await?;
+                Ok(crate::send_outcome::acknowledged(
                     "Message handed to your assistant, which answers on the channels it \
-                    normally uses."
+                     normally uses."
                         .to_string(),
-                )
+                    id.as_deref(),
+                ))
             }
             Addressee::Worker => {
                 if !self.dispatch_mode.is_async() {
@@ -770,7 +772,7 @@ impl Tool for SendTool {
                 let place = self.optional_place(&args).await?;
                 crate::launch::refuse_busy_folder(place.as_ref().unwrap_or(ws))?;
                 let job_id = crate::generate_id();
-                if Self::command_line() {
+                let id = if Self::command_line() {
                     // Answered and gone the moment this returns: the durable rows are written
                     // BEFORE the acknowledgement, and the round then runs as a resume of its own
                     // rows.
@@ -782,8 +784,10 @@ impl Tool for SendTool {
                         &job_id,
                         extract.as_ref(),
                     )
-                    .await?;
+                    .await?
                 } else {
+                    // An agent's own dispatch: its turn is durable already, and its report comes
+                    // back later, so it names no id.
                     super::SyncDurableCore::Worker.spawn_dispatch(
                         ws,
                         place.as_ref(),
@@ -792,13 +796,18 @@ impl Tool for SendTool {
                         job_id,
                         extract.clone(),
                     );
-                }
+                    None
+                };
                 let folder = place
                     .as_ref()
                     .map_or_else(|| ws.path.clone(), |p| p.path.clone());
-                Ok(format!(
-                    "Work handed to a worker in {}; its report arrives as a <worker-report> message.",
-                    folder.trim_end_matches(std::path::MAIN_SEPARATOR)
+                Ok(crate::send_outcome::acknowledged(
+                    format!(
+                        "Work handed to a worker in {}; its report arrives as a <worker-report> \
+                         message.",
+                        folder.trim_end_matches(std::path::MAIN_SEPARATOR)
+                    ),
+                    id.as_deref(),
                 ))
             }
             Addressee::WorkerBranch => {
@@ -852,7 +861,7 @@ impl Tool for SendTool {
                         ("{{message}}", message),
                     ],
                 );
-                crate::agent::message_router::route_agent_message_to_manager(
+                let id = crate::agent::message_router::route_agent_message_to_manager(
                     envelope,
                     project.name.clone(),
                     user_name,
@@ -864,9 +873,12 @@ impl Tool for SendTool {
                     Self::answered_for(),
                 )
                 .await?;
-                Ok(format!(
-                    "Message delivered to the manager of workspace '{}'.",
-                    project.name
+                Ok(crate::send_outcome::acknowledged(
+                    format!(
+                        "Message delivered to the manager of workspace '{}'.",
+                        project.name
+                    ),
+                    id.as_deref(),
                 ))
             }
             Addressee::Role => {
@@ -1215,12 +1227,7 @@ mod tests {
         )
         .await
         .expect("a quick analysis dispatches");
-        let quick_job_id = ack
-            .split("job ")
-            .nth(1)
-            .and_then(|rest| rest.split(')').next())
-            .expect("an analysis answer names its job")
-            .to_string();
+        let quick_job_id = ack_job_id(&ack).expect("an analysis answer names its job");
         assert_eq!(round_kind(&quick_job_id).await, "analyze");
         // Each report is picked by ITS job id, never by the shared envelope tag
         // alone — the at-least-once bookkeeping can replay an envelope.
@@ -1240,12 +1247,7 @@ mod tests {
         )
         .await
         .expect("a deep analysis dispatches");
-        let deep_job_id = ack
-            .split("job ")
-            .nth(1)
-            .and_then(|rest| rest.split(')').next())
-            .expect("a deep analysis answer names its job")
-            .to_string();
+        let deep_job_id = ack_job_id(&ack).expect("a deep analysis answer names its job");
         assert_eq!(round_kind(&deep_job_id).await, "research");
         // The deep investigation is long-running: its report is not awaited here — the round
         // row (a `research` job carrying the job id the deep answer names) is the proof that it
@@ -1836,12 +1838,34 @@ mod tests {
             .collect()
     }
 
+    /// The id an acknowledgement prints — `(job <id>)` — or `None` when it names none.
+    fn ack_job_id(ack: &str) -> Option<String> {
+        ack.split("(job ")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+            .map(str::to_string)
+    }
+
+    /// The record `ack` names is `running`, and names the chain's own length when the handover
+    /// started one.
+    async fn assert_running_record(ack: &str, chain_steps: Option<usize>) {
+        let id =
+            ack_job_id(ack).unwrap_or_else(|| panic!("the acknowledgement names its id: {ack}"));
+        let record = crate::send_outcome::lookup(&id)
+            .await
+            .expect("read the record")
+            .unwrap_or_else(|| panic!("a record stands under {id}"));
+        assert_eq!(record.state, crate::send_outcome::State::Running);
+        assert_eq!(record.chain_steps, chain_steps);
+    }
+
     /// The command line is answered and GONE the moment a call returns, so every handover must
     /// be durable BEFORE the acknowledgement. Each durability claim below is checked IMMEDIATELY
     /// after `execute` returns — no `deadline_poll` for the pin. Every provider call the round
     /// makes parks until this test opens the gate, so "immediately" cannot race its progress.
+    /// `send_outcome` serialises it against the boot sweep, which settles every `running` record.
     #[tokio::test]
-    #[serial_test::serial(provider, channel_registry, drain)]
+    #[serial_test::serial(provider, channel_registry, drain, send_outcome)]
     async fn the_command_lines_handovers_are_durable_before_the_acknowledgement() {
         use std::sync::Arc;
 
@@ -1961,6 +1985,7 @@ mod tests {
             ack.contains("<worker-report"),
             "a worker dispatch names its report: {ack}"
         );
+        let round_id = ack_job_id(&ack).expect("the acknowledgement names the round's id");
         let worker_jobs_after = command_line_round_ids().await;
         assert!(
             worker_jobs_after
@@ -1980,6 +2005,13 @@ mod tests {
             "the worker report names the folder the round ran in: {}",
             report.content
         );
+        // The round's record is the answer the round produced, once the answer is final.
+        let record = crate::send_outcome::lookup(&round_id)
+            .await
+            .expect("read the round's record")
+            .expect("the round opened a record");
+        assert_eq!(record.state, crate::send_outcome::State::Done);
+        assert_eq!(record.answer.as_deref(), Some("the work is done"));
 
         let before = pending_for_content(&manager_agent, MANAGER_TEXT).await;
         let ack = dispatch_command_line(
@@ -2074,6 +2106,226 @@ mod tests {
                 .await
                 .expect("reclaim the conversation row");
         }
+    }
+
+    /// Every command-line acknowledgement names the record its id answers, and the printed id
+    /// resolves to a record still `running` — for a chain, one naming the chain's own length. An
+    /// agent's own `send` and the one-way `guest` address open no record, so they print no id.
+    #[tokio::test]
+    #[serial_test::serial(provider, channel_registry, drain, send_outcome)]
+    async fn every_command_line_acknowledgement_names_its_record() {
+        use std::sync::Arc;
+
+        crate::util::test::init_management_test_stores().await;
+        let _policy =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let _provider = crate::util::test::install_fake_provider(Arc::new(
+            crate::util::test::FakeProvider::new().ok("the work is done"),
+        ));
+        crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+
+        let project_dir = tempfile::tempdir().unwrap();
+        let project_path =
+            crate::util::strip_verbatim_prefix(&std::fs::canonicalize(project_dir.path()).unwrap())
+                .to_str()
+                .unwrap()
+                .to_string();
+        let project = crate::util::test::create_test_workspace(&project_path, "ws_cli_ack").await;
+        let home = tempfile::tempdir().unwrap();
+        // The command line's own workspace: the admin's personal one, where a handover that names
+        // no folder runs.
+        let caller = crate::workspace::test_ws_named(
+            home.path().to_str().unwrap(),
+            &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+        );
+
+        // Every conversation a handover reaches is a registered consumer, so no envelope is left to
+        // spawn a turn of its own.
+        let assistant = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let mut assistant_spy = Spy::register(&assistant);
+        let manager_agent = crate::session::manager_agent_id(&project.name);
+        let mut manager_spy = Spy::register(&manager_agent);
+        let branch_agent = crate::session::worker_branch_agent_id("cli_ack_branch");
+        let mut branch_spy = Spy::register(&branch_agent);
+        let agent_branch_agent = crate::session::worker_branch_agent_id("cli_ack_agent_branch");
+        let mut agent_branch_spy = Spy::register(&agent_branch_agent);
+        crate::custom_role::create(
+            "cli_ack_role",
+            "you do the work",
+            &[],
+            crate::custom_role::CustomRoleBehavior::Continuous,
+        )
+        .await
+        .unwrap();
+        let role_agent = crate::session::custom_role_agent_id("cli_ack_role", None);
+        let mut role_spy = Spy::register(&role_agent);
+        let mut chain_spy =
+            Spy::register(&crate::session::worker_branch_agent_id("cli_ack_chain_one"));
+        crate::users::store()
+            .add_user("cli_ack_guest")
+            .await
+            .unwrap();
+        let mut guest_spy = Spy::register(&crate::session::assistant_agent_id("cli_ack_guest"));
+
+        // The deferred envelopes that already exist: cleanup removes only the rows this harness
+        // creates, because the shared global store is written by parallel tests too.
+        let pending_before: std::collections::HashSet<String> =
+            crate::jobs::list_pending_jobs(&crate::session::store().conn)
+                .await
+                .expect("list pending")
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+
+        let send = SendTool::admin(Role::Assistant);
+
+        let ack = dispatch_command_line(
+            &send,
+            &caller,
+            json!({ "message": "ack from the shell to the assistant" }),
+        )
+        .await
+        .expect("an unnamed command-line address means the owner's assistant");
+        assert_running_record(&ack, None).await;
+        let routed = assistant_spy.next_job().await;
+        assert_eq!(
+            routed.pending_job_id.as_deref(),
+            ack_job_id(&ack).as_deref(),
+            "the envelope carries the very id the acknowledgement printed"
+        );
+
+        let ack = dispatch_command_line(
+            &send,
+            &caller,
+            json!({
+                "message": "ack from the shell to the manager",
+                "addressee": "manager",
+                "place": &project.name,
+            }),
+        )
+        .await
+        .expect("the command line reaches a project's Manager");
+        assert_running_record(&ack, None).await;
+        manager_spy.next_job().await;
+
+        let ack = dispatch_command_line(
+            &send,
+            &caller,
+            json!({
+                "message": "ack from the shell to the branch",
+                "addressee": "worker_branch",
+                "branch": "cli_ack_branch",
+            }),
+        )
+        .await
+        .expect("the command line reaches a worker branch");
+        assert_running_record(&ack, None).await;
+        branch_spy.next_job().await;
+
+        let ack = dispatch_command_line(
+            &send,
+            &caller,
+            json!({
+                "message": "ack from the shell to the role",
+                "addressee": "role",
+                "name": "cli_ack_role",
+            }),
+        )
+        .await
+        .expect("the command line reaches a custom role");
+        assert_running_record(&ack, None).await;
+        role_spy.next_job().await;
+
+        // A chain's record is the chain's own id, and its length is the record's own field.
+        let ack = dispatch_command_line(
+            &send,
+            &caller,
+            json!({
+                "message": "ack from the shell to the chain",
+                "addressee": "worker_branch",
+                "branch": "cli_ack_chain_one",
+                "for": { "addressee": "worker_branch", "branch": "cli_ack_chain_two" },
+            }),
+        )
+        .await
+        .expect("the command line starts a chain");
+        assert_running_record(&ack, Some(2)).await;
+        chain_spy.next_job().await;
+
+        // An agent's own turn opens no record, so its acknowledgement names none — and the id its
+        // durable envelope carries answers `unknown`.
+        let ack = dispatch(
+            &send,
+            &caller,
+            json!({
+                "message": "ack from an agent's own turn",
+                "addressee": "worker_branch",
+                "branch": "cli_ack_agent_branch",
+            }),
+        )
+        .await
+        .expect("an agent's own send still reaches a worker branch");
+        assert!(
+            ack_job_id(&ack).is_none(),
+            "an agent's own send names no id: {ack}"
+        );
+        let routed = agent_branch_spy.next_job().await;
+        let pending = routed.pending_job_id.expect("the handover is durable");
+        assert!(
+            crate::send_outcome::lookup(&pending)
+                .await
+                .expect("read the record")
+                .is_none(),
+            "an agent's own handover opens no record"
+        );
+
+        // The one-way `guest` address answers nothing, so it names no id either.
+        let ack = dispatch_command_line(
+            &send,
+            &caller,
+            json!({
+                "message": "ack from the shell to the guest",
+                "addressee": "guest",
+                "name": "cli_ack_guest",
+            }),
+        )
+        .await
+        .expect("the owner's assistant reaches a guest's");
+        assert!(
+            ack_job_id(&ack).is_none(),
+            "a one-way handover names no id: {ack}"
+        );
+        let routed = guest_spy.next_job().await;
+        let pending = routed.pending_job_id.expect("the handover is durable");
+        assert!(
+            crate::send_outcome::lookup(&pending)
+                .await
+                .expect("read the record")
+                .is_none(),
+            "a one-way handover opens no record"
+        );
+
+        // Leave the shared store as the harness found it: the deferred envelopes are deleted, scoped
+        // by the snapshot taken before the first dispatch, and so is the owner's own message the
+        // assistant handover persisted.
+        for row in crate::jobs::list_pending_jobs(&crate::session::store().conn)
+            .await
+            .expect("list pending")
+        {
+            if !pending_before.contains(&row.id) {
+                crate::jobs::delete_pending_job(&crate::session::store().conn, &row.id)
+                    .await
+                    .expect("delete the harness's own envelope");
+            }
+        }
+        crate::channels::chat_history::store()
+            .conn
+            .execute(
+                "DELETE FROM chat_history WHERE content = ?1",
+                crate::db::params!["ack from the shell to the assistant"],
+            )
+            .await
+            .expect("reclaim the owner's own message");
     }
 
     /// A round that dies in flight reports its failure where its report would have gone: the

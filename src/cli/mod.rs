@@ -61,8 +61,13 @@ Usage:
                          tickets and board, and each workspace's own settings;
                          'mahbot workspace reference' lists every action and field
   mahbot send [flags]    Hand one message to an agent and finish — the answer
-                         arrives later in your assistant's conversation, or
-                         nothing does when the addressee is one-way
+                         arrives later in your assistant's conversation, and the
+                         acknowledgement names the id 'mahbot outcome' reports
+                         on; nothing comes back from the one-way address
+  mahbot outcome [flags]
+                         Report what became of a command-line send: one line
+                         of JSON with its state, answer, failure reason and,
+                         for a running chain, the step it is on
   mahbot document <operation> [flags]
                          Read a document with the RUNNING product's reader, or
                          produce one with its document tool
@@ -231,6 +236,19 @@ pub(crate) struct Family {
     pub(crate) purpose: &'static str,
     /// What follows the family's word: an operation to run, or nothing at all.
     pub(crate) surface: Surface,
+    /// What a refusal the product itself answered means for this family.
+    pub(crate) refusal: Refusal,
+}
+
+/// What a refusal the product itself answered means for one family. [`Refusal::Operation`]
+/// everywhere: the tool took the operation on and it did not happen, so the product's own
+/// wording is printed to stdout with the failed class. [`Refusal::Environment`] for the one
+/// family whose whole job is to READ a durable record: a read that failed answered nothing, so
+/// its wording is this command's diagnostic and the class is the environment's.
+#[derive(Clone, Copy)]
+pub(crate) enum Refusal {
+    Operation,
+    Environment,
 }
 
 pub(crate) enum Surface {
@@ -730,6 +748,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                 }],
             },
         ]),
+        refusal: Refusal::Operation,
     },
     Family {
         word: "workspace",
@@ -993,17 +1012,19 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
         ]),
+        refusal: Refusal::Operation,
     },
     Family {
         word: "send",
         tool: "send",
-        // The chain argument `for` and the schema argument `extract` are this build's own: a
-        // product built before them would run step one as the final one, or drop the schema and
-        // deliver prose, so the frame carries a value of its own and an older instance refuses it
-        // as the environment's class instead.
-        protocol: crate::db::ipc::CALL_STORE_SEND,
-        purpose: "Hand one message to an agent and finish — an answer arrives later in your \
-                  assistant's conversation, and nothing does for the one-way 'guest' address",
+        // The chain argument `for`, the schema argument `extract` and the id the acknowledgement
+        // names are this build's own: a product built before them would run step one as the final
+        // one, drop the schema and deliver prose, or answer without an id — so the frame carries a
+        // value of its own and an older instance refuses it as the environment's class instead.
+        protocol: crate::db::ipc::CALL_STORE_SEND_OUTCOME,
+        purpose: "Hand one message to an agent and finish — the answer arrives later in your \
+                  assistant's conversation, and the acknowledgement names the id 'mahbot \
+                  outcome' reports on; nothing comes back from the one-way 'guest' address",
         surface: Surface::Standalone(&[
             Flag {
                 arg: "message",
@@ -1061,6 +1082,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                           requires an explicit '--addressee'",
             },
         ]),
+        refusal: Refusal::Operation,
     },
     // These families front the tools every Assistant holds regardless of account (the
     // media models resolve per-user), so the command line reaches what the owner's own
@@ -1243,6 +1265,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
         ]),
+        refusal: Refusal::Operation,
     },
     Family {
         word: "image",
@@ -1260,6 +1283,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                 OUTPUT_DIR_FLAG,
             ],
         }]),
+        refusal: Refusal::Operation,
     },
     Family {
         word: "video",
@@ -1289,6 +1313,7 @@ pub(crate) const FAMILIES: &[Family] = &[
                 OUTPUT_DIR_FLAG,
             ],
         }]),
+        refusal: Refusal::Operation,
     },
     Family {
         word: "rasterize",
@@ -1296,6 +1321,7 @@ pub(crate) const FAMILIES: &[Family] = &[
         protocol: crate::db::ipc::CALL_STORE,
         purpose: "Turn a file into an ordinary picture with the running product's own rasterizer",
         surface: Surface::Standalone(&[RASTER_PATH_FLAG, RASTER_PAGE_FLAG, OUTPUT_DIR_FLAG]),
+        refusal: Refusal::Operation,
     },
     Family {
         word: "photocraft",
@@ -1343,6 +1369,20 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
         ]),
+        refusal: Refusal::Operation,
+    },
+    Family {
+        word: "outcome",
+        tool: "send_outcome",
+        protocol: crate::db::ipc::CALL_STORE_OUTCOME,
+        purpose: "Report what became of a command-line send, by the id its acknowledgement \
+                  printed, as one line of JSON",
+        surface: Surface::Standalone(&[Flag {
+            arg: "id",
+            kind: FlagKind::Value,
+            purpose: "The id the `send` acknowledgement printed",
+        }]),
+        refusal: Refusal::Environment,
     },
 ];
 
@@ -2279,15 +2319,34 @@ fn list_entries_from_file(flag: &Flag, file: &str) -> Result<Vec<serde_json::Val
     }
 }
 
-/// The exit classes and the one sentence that makes them the contract — shared by
-/// every help, so no two can word it differently.
-const EXIT_CLASS_HELP: &str = "\nExit codes:\n  0  the operation was carried out\n  1  the \
-     operation failed — the product refused it, carried it out only in part, or the exchange was \
-     severed after the call went out (an operation that may be under way is never the \
-     environment's class)\n  2  the environment — nothing ran: the product is not up, its \
-     channel was not reachable, or it could not take the operation on\n  3  this command was \
-     misused\nA script reads the exit code, not the text: a refusal still prints the product's \
-     own answer on stdout, so only the code says whether the operation happened.\n";
+/// The exit classes a family's help states: one skeleton, so no two can word it differently, and
+/// one pair of sentences per refusal class — see [`Refusal`].
+fn exit_class_help(refusal: Refusal) -> String {
+    let (failed, environment, closing) = match refusal {
+        Refusal::Operation => (
+            "the operation failed — the product refused it, carried it out only in part, or the \
+             exchange was severed after the call went out (an operation that may be under way is \
+             never the environment's class)",
+            "the environment — nothing ran: the product is not up, its channel was not reachable, \
+             or it could not take the operation on",
+            "a refusal still prints the product's own answer on stdout, so only the code says \
+             whether the operation happened.",
+        ),
+        // A read that failed answered nothing, so its wording is this command's diagnostic rather
+        // than the product's answer on stdout.
+        Refusal::Environment => (
+            "the operation failed — the exchange was severed after the call went out, so the record \
+             may or may not have been read",
+            "the environment — nothing was answered: the product is not up, its channel was not \
+             reachable, or the record could not be read",
+            "the state lives in the record, and only a read that worked prints it on stdout.",
+        ),
+    };
+    format!(
+        "\nExit codes:\n  0  the operation was carried out\n  1  {failed}\n  2  {environment}\n  \
+         3  this command was misused\nA script reads the exit code, not the text: {closing}\n"
+    )
+}
 
 /// What one of these command lines IS — shared by every help, so a caller entering
 /// through an operation's help learns the same contract as one reading the family's. `excepted`
@@ -2417,7 +2476,7 @@ fn family_help(family: &Family) -> String {
             out.push_str("\n  -h, --help  Print this help and exit\n");
         }
     }
-    out.push_str(EXIT_CLASS_HELP);
+    out.push_str(&exit_class_help(family.refusal));
     out.push_str(OUTPUT_HELP);
     out.push_str(VALUE_FILE_HELP);
     // Where the whole surface is written down: the asset a `reference` operation prints, here and
@@ -2535,7 +2594,7 @@ fn operation_help(family: &Family, operation: &Operation) -> String {
         running_contract_help("")
     };
     out.push_str(&contract);
-    out.push_str(EXIT_CLASS_HELP);
+    out.push_str(&exit_class_help(family.refusal));
     out.push_str(OUTPUT_HELP);
     out.push_str(VALUE_FILE_HELP);
     out
@@ -2682,6 +2741,7 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
     };
     let decision = verdict(
         family.word,
+        family.refusal,
         crate::db::ipc::ipc_call_with_wait(&root, &call, family.protocol).await,
     );
     if let Some(answer) = decision.answer {
@@ -2895,12 +2955,16 @@ struct Verdict {
 /// An answer the product gave goes to stdout whatever its outcome: the exit code,
 /// not the text, says whether the operation happened, and a partial run adds one
 /// short diagnostic, so the caller need not read the product's wording for a
-/// verdict. An operation never taken on has no answer: the product's wording (or
-/// this command's) goes to stderr and the class is the environment's. An exchange
-/// severed after the frame went out is NOT the environment's — it may have
-/// happened — so it is a failed operation, and the diagnostic states once that the
-/// outcome is unknown and that it was deliberately not sent again.
-fn verdict(word: &str, attempt: CallAttempt) -> Verdict {
+/// verdict. A refusal is the family's own class ([`Refusal`]): an operation's
+/// refusal is still the product's answer on stdout with the failed class, while the
+/// one family that only READS a durable record treats a refusal as this command's
+/// diagnostic and the environment's class. An operation never taken on has no
+/// answer: the product's wording (or this command's) goes to stderr and the class is
+/// the environment's. An exchange severed after the frame went out is NOT the
+/// environment's — it may have happened — so it is a failed operation, and the
+/// diagnostic states once that the outcome is unknown and that it was deliberately
+/// not sent again.
+fn verdict(word: &str, refusal: Refusal, attempt: CallAttempt) -> Verdict {
     match attempt {
         CallAttempt::Answered(reply) => match reply.outcome {
             CallOutcome::Done => Verdict {
@@ -2916,10 +2980,17 @@ fn verdict(word: &str, attempt: CallAttempt) -> Verdict {
                 )),
                 code: Exit::Failed,
             },
-            CallOutcome::Refused => Verdict {
-                answer: Some(reply.answer),
-                diagnostic: None,
-                code: Exit::Failed,
+            CallOutcome::Refused => match refusal {
+                Refusal::Operation => Verdict {
+                    answer: Some(reply.answer),
+                    diagnostic: None,
+                    code: Exit::Failed,
+                },
+                Refusal::Environment => Verdict {
+                    answer: None,
+                    diagnostic: Some(format!("mahbot {word}: {}", reply.answer)),
+                    code: Exit::Environment,
+                },
             },
             // A product that did not take the operation on: `Unavailable` reaches the
             // caller as the instance answered it (an unrestricted socket, a failed or
@@ -3793,15 +3864,16 @@ mod tests {
             vec!["document", "image", "rasterize"],
             "the families the channel's second generation added"
         );
-        let chained: Vec<&str> = FAMILIES
+        let named: Vec<&str> = FAMILIES
             .iter()
-            .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE_SEND)
+            .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE_SEND_OUTCOME)
             .map(|cli| cli.word)
             .collect();
         assert_eq!(
-            chained,
+            named,
             vec!["send"],
-            "the family whose surface gained the chain argument and then the answer's schema"
+            "the family whose surface gained the chain argument, the answer's schema and then the \
+             id its acknowledgement names"
         );
         let changed: Vec<&str> = FAMILIES
             .iter()
@@ -3834,12 +3906,23 @@ mod tests {
             "the two families whose surface this build widened — a product built before them \
              would answer a `set` as an unknown action and drop a `set_diagnostics` field"
         );
-        // The base generation and the retired `send` generation are served but carried by no family
-        // any more: a frontend one build behind still sends them, so the listener must keep
-        // answering them.
+        let outcome: Vec<&str> = FAMILIES
+            .iter()
+            .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE_OUTCOME)
+            .map(|cli| cli.word)
+            .collect();
+        assert_eq!(
+            outcome,
+            vec!["outcome"],
+            "the family added after the channel had served every earlier generation"
+        );
+        // The base generation and the `send` generations this build's `send` has outgrown are
+        // served but carried by no family any more: a frontend one build behind still sends them,
+        // so the listener must keep answering them.
         for retired in [
             crate::db::ipc::CALL_STORE_BASE,
             crate::db::ipc::CALL_STORE_SEND_CHAIN,
+            crate::db::ipc::CALL_STORE_SEND,
         ] {
             assert!(
                 crate::db::ipc::CALL_STORES.contains(&retired),
@@ -5034,6 +5117,7 @@ mod tests {
     fn attempt_decisions_map_to_the_documented_streams_and_exit_codes() {
         let done = verdict(
             "config",
+            Refusal::Operation,
             CallAttempt::Answered(CallReply::done("token saved")),
         );
         assert_eq!(done.answer.as_deref(), Some("token saved"));
@@ -5042,6 +5126,7 @@ mod tests {
 
         let refused = verdict(
             "config",
+            Refusal::Operation,
             CallAttempt::Answered(CallReply::refused("no such user 'bob'")),
         );
         assert_eq!(refused.answer.as_deref(), Some("no such user 'bob'"));
@@ -5050,6 +5135,7 @@ mod tests {
 
         let partial = verdict(
             "workspace",
+            Refusal::Operation,
             CallAttempt::Answered(CallReply::partial("froze 2 of 3")),
         );
         assert_eq!(partial.answer.as_deref(), Some("froze 2 of 3"));
@@ -5065,7 +5151,11 @@ mod tests {
             CallReply::unavailable("cannot serve operations"),
         ] {
             let wording = reply.answer.clone();
-            let decision = verdict("workspace", CallAttempt::Answered(reply));
+            let decision = verdict(
+                "workspace",
+                Refusal::Operation,
+                CallAttempt::Answered(reply),
+            );
             assert_eq!(decision.answer, None);
             assert_eq!(
                 decision.diagnostic.as_deref(),
@@ -5076,6 +5166,7 @@ mod tests {
 
         let not_served = verdict(
             "workspace",
+            Refusal::Operation,
             CallAttempt::NotServed("no endpoint".to_string()),
         );
         assert_eq!(not_served.answer, None);
@@ -5086,7 +5177,7 @@ mod tests {
         );
         assert_eq!(not_served.code, Exit::Environment);
 
-        let too_old = verdict("workspace", CallAttempt::TooOld);
+        let too_old = verdict("workspace", Refusal::Operation, CallAttempt::TooOld);
         assert_eq!(too_old.answer, None);
         assert!(
             too_old
@@ -5100,6 +5191,7 @@ mod tests {
 
         let severed = verdict(
             "workspace",
+            Refusal::Operation,
             CallAttempt::Severed(anyhow::anyhow!("the answer could not be read")),
         );
         assert_eq!(severed.answer, None);
@@ -5114,6 +5206,55 @@ mod tests {
             "the conclusion is stated once, with the cause beside it: {line}"
         );
         assert_eq!(severed.code, Exit::Failed);
+    }
+
+    /// A refusal is the operation's class everywhere but the `outcome` lookup: that family's
+    /// whole job is to read a durable record, so a read that failed answered nothing and is this
+    /// command's diagnostic with the environment's class, never a false report on stdout.
+    #[test]
+    fn a_refusal_is_the_environment_class_only_for_the_outcome_lookup() {
+        let refused = || CallAttempt::Answered(CallReply::refused("the record could not be read"));
+        let outcome = verdict("outcome", Refusal::Environment, refused());
+        assert_eq!(outcome.answer, None, "a failed read has no answer to print");
+        assert_eq!(
+            outcome.diagnostic.as_deref(),
+            Some("mahbot outcome: the record could not be read")
+        );
+        assert_eq!(outcome.code, Exit::Environment);
+
+        for family in FAMILIES.iter().filter(|family| family.word != "outcome") {
+            assert!(
+                matches!(family.refusal, Refusal::Operation),
+                "'mahbot {}' keeps the operation's refusal class",
+                family.word
+            );
+            let decision = verdict(family.word, family.refusal, refused());
+            assert_eq!(
+                decision.answer.as_deref(),
+                Some("the record could not be read")
+            );
+            assert_eq!(decision.diagnostic, None);
+            assert_eq!(decision.code, Exit::Failed);
+        }
+    }
+
+    /// The one family whose refusal is the environment's states that class in its own help: a
+    /// failed read answered nothing, so it is never printed as the product's answer.
+    #[test]
+    fn the_outcome_help_states_the_class_its_refusal_takes() {
+        let help = family_help(
+            FAMILIES
+                .iter()
+                .find(|family| family.word == "outcome")
+                .expect("the outcome family"),
+        );
+        assert!(help.contains("the record could not be read"), "{help}");
+        assert!(!help.contains("a refusal still prints"), "{help}");
+        for other in FAMILIES.iter().filter(|family| family.word != "outcome") {
+            let help = family_help(other);
+            assert!(help.contains("a refusal still prints"), "{help}");
+            assert!(!help.contains("the record could not be read"), "{help}");
+        }
     }
 
     /// Misuse is exit 3, decided before the environment is touched: no instance here.

@@ -179,6 +179,11 @@ async fn bootstrap_mahbot(
         );
     }
 
+    // A record a previous process left `running` is either replayed by the recovery the background
+    // set starts — its durable rows still stand — or failed here, before that replay, so nothing
+    // reads as running forever.
+    mahbot::send_outcome::fail_interrupted().await;
+
     spawn_background_tasks(log_store.clone());
 
     // The instance is whole from here, so command-line operations may be served — they are
@@ -310,6 +315,19 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         &shutdown_token,
         "log-cleanup",
         mahbot::log_retention::run_retention_loop(log_store.clone()),
+    );
+
+    // A handover's record is kept a day after it finishes, then deleted in paced batches
+    // (`mahbot::send_outcome`).
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "send-outcome-cleanup",
+        run_cleanup_loop(
+            "Send outcome cleanup",
+            mahbot::send_outcome::RETENTION_HOURS,
+            mahbot::send_outcome::purge_expired,
+        ),
     );
 
     spawn_cancellable(

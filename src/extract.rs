@@ -292,21 +292,23 @@ async fn transform(extract: &Extract, step: &StepContext<'_>, answer: &str) -> O
     }
 }
 
-/// The answer to deliver: its JSON form when a schema was asked for, else the answer unchanged. A
-/// transformation that fails forwards the whole answer, so a step's work is never lost and a chain
-/// never fails because of it. A turn that produced no answer spends no transformation call — the
-/// existing rules for an empty answer apply unchanged.
-pub(crate) async fn answer_as_json(
+/// The answer to deliver, and which of the two things happened: `true` when the answer came back
+/// as the schema's JSON, `false` when the whole answer was forwarded unchanged. A transformation
+/// that fails forwards the whole answer, so a step's work is never lost and a chain never fails
+/// because of it. A turn that produced no answer spends no transformation call — the existing rules
+/// for an empty answer apply unchanged.
+pub(crate) async fn answer_as_json_reporting(
     extract: Option<&Extract>,
     step: &StepContext<'_>,
     answer: &str,
-) -> String {
+) -> (String, bool) {
     let Some(extract) = extract.filter(|_| !answer.trim().is_empty()) else {
-        return answer.to_string();
+        return (answer.to_string(), false);
     };
-    transform(extract, step, answer)
-        .await
-        .unwrap_or_else(|| answer.to_string())
+    match transform(extract, step, answer).await {
+        Some(json) => (json, true),
+        None => (answer.to_string(), false),
+    }
 }
 
 /// Whether a node's keyword set is one this product can enforce.
@@ -874,8 +876,8 @@ mod tests {
             parent: None,
         };
         assert_eq!(
-            answer_as_json(Some(&schema), &step, "the whole answer").await,
-            r#"{"a":"one"}"#
+            answer_as_json_reporting(Some(&schema), &step, "the whole answer").await,
+            (r#"{"a":"one"}"#.to_string(), true)
         );
         // `request_messages` holds each request's messages as `Debug`, joined with NUL — one turn
         // has no NUL in it, and a quoted string is matched in its escaped form.
@@ -933,8 +935,8 @@ mod tests {
             parent: None,
         };
         assert_eq!(
-            answer_as_json(Some(&schema), &step, "the answer").await,
-            r#"{"a":"one"}"#
+            answer_as_json_reporting(Some(&schema), &step, "the answer").await,
+            (r#"{"a":"one"}"#.to_string(), true)
         );
         let sent = fake.sent.lock().unwrap();
         assert_eq!(sent[0].model, "step-model");
