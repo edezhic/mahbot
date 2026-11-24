@@ -997,9 +997,10 @@ pub(crate) const FAMILIES: &[Family] = &[
     Family {
         word: "send",
         tool: "send",
-        // The chain argument `for` is this build's own: a product built before it would run
-        // step one and deliver its answer as the final one, so the frame carries a value of
-        // its own and an older instance refuses it as the environment's class instead.
+        // The chain argument `for` and the schema argument `extract` are this build's own: a
+        // product built before them would run step one as the final one, or drop the schema and
+        // deliver prose, so the frame carries a value of its own and an older instance refuses it
+        // as the environment's class instead.
         protocol: crate::db::ipc::CALL_STORE_SEND,
         purpose: "Hand one message to an agent and finish — an answer arrives later in your \
                   assistant's conversation, and nothing does for the one-way 'guest' address",
@@ -1049,6 +1050,15 @@ pub(crate) const FAMILIES: &[Family] = &[
                           that address's own 'place', 'branch' or 'name', and its own 'for' for \
                           the step after it — at most ten steps including this call. Only the \
                           final answer arrives; requires an explicit '--addressee'",
+            },
+            Flag {
+                arg: "extract",
+                kind: FlagKind::Value,
+                purpose: "The JSON schema the answer must come back as, inline or as @file: the \
+                          answer then arrives as that JSON document instead of prose, and when \
+                          it cannot be produced the whole answer is forwarded unchanged. \
+                          Available for 'worker', 'worker_branch', 'manager' and 'role' only; \
+                          requires an explicit '--addressee'",
             },
         ]),
     },
@@ -3791,7 +3801,7 @@ mod tests {
         assert_eq!(
             chained,
             vec!["send"],
-            "the family whose surface gained the chain argument"
+            "the family whose surface gained the chain argument and then the answer's schema"
         );
         let changed: Vec<&str> = FAMILIES
             .iter()
@@ -3824,14 +3834,22 @@ mod tests {
             "the two families whose surface this build widened — a product built before them \
              would answer a `set` as an unknown action and drop a `set_diagnostics` field"
         );
-        // The base generation is served but carried by no family any more: a frontend one build
-        // behind still sends it, so the listener must keep answering it.
-        assert!(
-            FAMILIES
-                .iter()
-                .all(|cli| cli.protocol != crate::db::ipc::CALL_STORE_BASE),
-            "the base generation is served for older frontends only"
-        );
+        // The base generation and the retired `send` generation are served but carried by no family
+        // any more: a frontend one build behind still sends them, so the listener must keep
+        // answering them.
+        for retired in [
+            crate::db::ipc::CALL_STORE_BASE,
+            crate::db::ipc::CALL_STORE_SEND_CHAIN,
+        ] {
+            assert!(
+                crate::db::ipc::CALL_STORES.contains(&retired),
+                "the retired generation '{retired}' is still served for older frontends"
+            );
+            assert!(
+                FAMILIES.iter().all(|cli| cli.protocol != retired),
+                "the retired generation '{retired}' is served for older frontends only"
+            );
+        }
     }
 
     /// The instance serves a tool by NAME only when a family publishes it, so the

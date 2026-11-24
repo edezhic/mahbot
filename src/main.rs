@@ -1313,6 +1313,7 @@ async fn deliver_clear_reply(
             custom_role: None,
             reply_to_custom: None,
             urgent: false,
+            extract: None,
         },
         &effective_role,
         &[],

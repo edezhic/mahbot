@@ -121,13 +121,17 @@ pub(crate) fn tool_command_line() -> bool {
 ///
 /// The chain is stripped: a chain is the STEP's own record, never a delegation's, so a chain-step
 /// role that launches another agent must not hand the chain on with its caller identity — the
-/// delegation's answer is the step's own, and the chain never continues through it.
+/// delegation's answer is the step's own, and the chain never continues through it. The step's
+/// `extract` goes with it: it shapes the STEP's answer, and a delegation that kept it would have
+/// every report-triggered turn of that branch transformed into a schema its caller never asked of
+/// that turn.
 pub(crate) fn tool_delegation_launch() -> Option<crate::Launch> {
     CURRENT_TOOL_CUSTOM_LAUNCH
         .try_with(std::clone::Clone::clone)
         .unwrap_or(None)
         .map(|mut launch| {
             launch.chain = None;
+            launch.extract = None;
             launch
         })
 }
@@ -2888,6 +2892,7 @@ mod tests {
                 place: None,
                 branch: None,
                 name: None,
+                extract: None,
             },
             step: 1,
             next: Vec::new(),
@@ -2901,6 +2906,10 @@ mod tests {
             agent_id: crate::session::custom_role_agent_id("copywriter", None),
             reply_to: None,
             chain: Some(Box::new(chain)),
+            extract: Some(
+                crate::extract::Extract::from_text(r#"{"type":"string"}"#)
+                    .expect("the schema is accepted"),
+            ),
         };
         let carried = CURRENT_TOOL_CUSTOM_LAUNCH
             .scope(Some(launch), async { tool_delegation_launch() })
@@ -2910,6 +2919,10 @@ mod tests {
         assert!(
             carried.chain.is_none(),
             "a delegation carries no chain, so its answer is the step's own"
+        );
+        assert!(
+            carried.extract.is_none(),
+            "nor the step's schema: a report-triggered turn is not the step's answer"
         );
     }
 
@@ -3311,6 +3324,7 @@ mod tests {
                 custom_role: None,
                 reply_to_custom: None,
                 urgent: false,
+                extract: None,
             };
             let _ = tx.send(job);
 

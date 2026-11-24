@@ -586,6 +586,7 @@ pub(crate) fn call_kind_label(kind: &str) -> &'static str {
         "research_wrap_up" => "Research wrap-up",
         "research_orchestrator" => "Research orchestrator",
         "chain" => "Chained send",
+        "extract" => "Answer extraction",
         // The provider transcription path is gone, but the rows it left are not: they keep their
         // label on the page.
         "media_transcription" => "Media transcription",
@@ -617,6 +618,13 @@ mod tests {
             None,
             std::sync::Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    /// A call kind the product registers has a label of its own: the answer's transformation is not
+    /// lumped in with everything unnamed on the page.
+    #[test]
+    fn the_answer_transformation_has_its_own_call_kind_label() {
+        assert_eq!(call_kind_label("extract"), "Answer extraction");
     }
 
     #[test]

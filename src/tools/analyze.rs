@@ -298,6 +298,7 @@ impl Tool for AnalyzeTool {
                         message,
                         self.caller_role,
                         job_id.clone(),
+                        None,
                     );
                     return Ok(format!(
                         "Analysis dispatched (job {job_id}). The consolidated answer follows \
@@ -3257,6 +3258,7 @@ mod tests {
                 "gui",
                 job_id,
                 None,
+                None,
             )
             .await;
         assert!(delivered.is_none(), "a cancelled round delivers nothing");
@@ -3412,6 +3414,7 @@ mod tests {
             agent_id: branch.to_string(),
             reply_to: None,
             chain: None,
+            extract: None,
         };
         seed_round_row(&ws, branch_job, "branch-user", Role::Custom, Some(&launch)).await;
         let answer = run_as_caller(

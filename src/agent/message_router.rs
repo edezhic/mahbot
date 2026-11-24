@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
+use crate::agent::registry::ParentKey;
 use crate::channels::{
     broadcast_and_persist_agent_response, spawn_scoped_typing_task, stop_typing,
 };
@@ -76,7 +77,10 @@ pub enum MessageKind {
     GuestReport,
 }
 
+/// A field this build does not know makes the envelope unreadable rather than silently dropped, so
+/// a job that carried a schema never comes back as an ordinary one returning prose.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentJob {
     pub content: String,
     pub workspace_name: String,
@@ -110,6 +114,11 @@ pub struct AgentJob {
     /// Only a surface a user types into sets it ([`route_user_message`]).
     #[serde(default)]
     pub urgent: bool,
+    /// The schema this job's answer must come back as, when its caller asked for one
+    /// ([`crate::extract`]). A branch carries it on its launch instead ([`crate::Launch::extract`]);
+    /// the manager leg, which has no launch, carries it here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract: Option<crate::extract::Extract>,
 }
 
 /// The conversation that asked for a forwarded reply — the asking branch's launch and
@@ -129,6 +138,16 @@ impl AgentJob {
         self.custom_role
             .as_ref()
             .and_then(|launch| launch.chain.as_deref())
+    }
+
+    /// The schema this job's answer must come back as, when it asked for one — on the branch
+    /// launch when there is one, else on the job itself (the manager leg).
+    #[must_use]
+    fn answer_extract(&self) -> Option<&crate::extract::Extract> {
+        self.custom_role
+            .as_ref()
+            .and_then(|launch| launch.extract.as_ref())
+            .or(self.extract.as_ref())
     }
 }
 
@@ -308,6 +327,7 @@ fn user_message_job(
         custom_role: None,
         reply_to_custom: None,
         urgent: false,
+        extract: None,
     }
 }
 
@@ -441,6 +461,7 @@ fn agent_message_job(
     workspace_name: String,
     user_name: &str,
     asker: Option<Asker>,
+    extract: Option<crate::extract::Extract>,
 ) -> AgentJob {
     let user_name =
         crate::session::normalize_user_name(user_name, "route_agent_message_to_manager")
@@ -458,6 +479,7 @@ fn agent_message_job(
         custom_role: None,
         reply_to_custom: asker,
         urgent: false,
+        extract,
     }
 }
 
@@ -470,9 +492,10 @@ pub(crate) async fn route_agent_message_to_manager(
     workspace_name: String,
     user_name: String,
     asker: Option<Asker>,
+    extract: Option<crate::extract::Extract>,
     answered_for: AnsweredFor,
 ) -> anyhow::Result<()> {
-    let job = agent_message_job(content, workspace_name, &user_name, asker);
+    let job = agent_message_job(content, workspace_name, &user_name, asker, extract);
     let target = crate::jobs::envelope_target(&job);
     hand_over(job, &target, "agent message", answered_for).await
 }
@@ -503,6 +526,7 @@ pub(crate) async fn route_guest_message(
         custom_role: None,
         reply_to_custom: None,
         urgent: false,
+        extract: None,
     };
     let target = crate::jobs::envelope_target(&job);
     hand_over(job, &target, "guest message", answered_for).await
@@ -1023,6 +1047,8 @@ async fn consumer_loop(
         // reaches the queue meanwhile is the next turn's, so the urgent one is answered last.
         let message_refs: Vec<&str> = messages.iter().map(String::as_str).collect();
         let mut queue_open = true;
+        // The turn's own calls group under the same key its agents are registered with.
+        let answer_parent = parent_key.clone();
         let mut turn = std::pin::pin!(crate::agent::run_agent(
             agent_id.clone(),
             role,
@@ -1073,7 +1099,8 @@ async fn consumer_loop(
         if let Some(chain) = job.chain() {
             if !agent.is_cancelled() && !crate::shutdown::aborting() {
                 let reason = agent.failure_reason("the step ended without an answer");
-                crate::tools::chain::settle(chain, response.as_deref(), &reason).await;
+                crate::tools::chain::settle(chain, Some(&agent_id), response.as_deref(), &reason)
+                    .await;
             }
             // A drain keeps the step's record for the next boot, exactly as a worker step's row
             // is kept: the chain must not die with neither an advance nor a failure.
@@ -1145,6 +1172,17 @@ async fn consumer_loop(
             continue;
         }
 
+        // A schema the caller asked for replaces the answer with the JSON document that matches
+        // it; a transformation that fails forwards the whole answer unchanged, so the step's work
+        // is never lost.
+        let Some(response) =
+            answer_to_deliver(&job, &agent, &agent_id, answer_parent, response).await
+        else {
+            confirm_turn_delivery(&queued).await;
+            confirm_pending_delivery(&job).await;
+            continue;
+        };
+
         // Manager: a durable `<manager-message>` into the admin's Assistant, or back into the
         // asking branch. Custom role: `<custom-role-message>`. Worker branch: `<worker-report>`
         // into the asking conversation. Other roles: broadcast to the user's channel bindings,
@@ -1196,6 +1234,8 @@ async fn consumer_loop(
                 }
             }
         }
+        // The schema a step asked for is spent the moment its answer is delivered.
+        clear_spent_schema(&job, &agent_id).await;
         confirm_turn_delivery(&queued).await;
         confirm_pending_delivery(&job).await;
 
@@ -1204,6 +1244,50 @@ async fn consumer_loop(
         // cannot replay a delivered job), in the pause before the user's next message.
         agent.maybe_summarize_after_delivery().await;
     }
+}
+
+/// The schema a turn asked for is spent once its answer is delivered: the step is over, so the
+/// recorded state must not shape a later turn — or a recovery — that asked for none.
+async fn clear_spent_schema(job: &AgentJob, agent_id: &str) {
+    if job.answer_extract().is_none() {
+        return;
+    }
+    if let Err(e) = crate::session::store().clear_extract(agent_id).await {
+        warn!(agent_id = %agent_id, error = %e, "Failed to clear the spent schema");
+    }
+}
+
+/// The answer a turn delivers: its JSON form when the job asked for a schema, else the answer
+/// itself. `None` when the agent was stopped — the answer is discarded then, exactly as a stopped
+/// turn's is, and a turn already stopped when the transformation would begin spends no call on it.
+/// The transformation runs where the turn ran (this conversation's recorded model and provider) and
+/// appears in Running Agents under the turn's own group. A graceful drain is not a stop: the round
+/// already completed, so its answer is delivered.
+async fn answer_to_deliver(
+    job: &AgentJob,
+    agent: &crate::Agent,
+    agent_id: &str,
+    parent: Option<ParentKey>,
+    answer: String,
+) -> Option<String> {
+    let Some(extract) = job.answer_extract() else {
+        return Some(answer);
+    };
+    if agent.is_cancelled() {
+        return None;
+    }
+    let transformed = crate::extract::answer_as_json(
+        Some(extract),
+        &crate::extract::StepContext {
+            role: job.role,
+            workspace: &job.workspace_name,
+            conversation: Some(agent_id),
+            parent,
+        },
+        &answer,
+    )
+    .await;
+    (!agent.is_cancelled()).then_some(transformed)
 }
 
 /// The launch of a worker-branch job: `Some` only when the job carries a launch whose role
@@ -1404,6 +1488,7 @@ fn admin_assistant_job(
         custom_role: None,
         reply_to_custom: None,
         urgent: false,
+        extract: None,
     }
 }
 
@@ -1461,6 +1546,7 @@ fn branch_job(
         custom_role: Some(asker.launch.clone()),
         reply_to_custom: None,
         urgent: false,
+        extract: None,
     }
 }
 
@@ -2119,7 +2205,111 @@ mod tests {
             custom_role: None,
             reply_to_custom: None,
             urgent: false,
+            extract: None,
         }
+    }
+
+    /// A delivered step's schema does not outlive it: the conversation stops carrying one, so a
+    /// later dead-session recovery cannot rebuild the launch with a schema that turn never asked
+    /// for. A turn that carried none leaves whatever the row says alone.
+    #[tokio::test]
+    async fn a_delivered_steps_schema_does_not_outlive_it() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let agent_id = crate::session::worker_branch_agent_id("extract-spent");
+        let extract = crate::extract::Extract::from_text(
+            r#"{"type":"object","properties":{"a":{"type":"string"}}}"#,
+        )
+        .expect("the schema is accepted");
+        crate::session::store()
+            .set_branch(&agent_id, None, Some("spent"), None, None, Some(&extract))
+            .await
+            .expect("the conversation records the schema");
+
+        let stored = || async {
+            let rows = crate::session::store()
+                .conn
+                .query(
+                    "SELECT extract FROM session_metadata WHERE agent_id = ?1",
+                    crate::db::params![agent_id.as_str()],
+                )
+                .await
+                .expect("read the conversation's row");
+            rows.first()
+                .and_then(|row| row.get::<Option<String>>(0).ok().flatten())
+        };
+
+        // A turn with no schema of its own leaves the recorded one alone.
+        let plain = make_job(Role::Worker, "ws", "admin", "gui");
+        clear_spent_schema(&plain, &agent_id).await;
+        assert_eq!(
+            stored().await,
+            Some(extract.canonical()),
+            "a turn that asked for no schema does not clear another's"
+        );
+
+        // The delivering turn's schema is spent.
+        let mut shaped = plain;
+        shaped.extract = Some(extract);
+        clear_spent_schema(&shaped, &agent_id).await;
+        assert_eq!(
+            stored().await,
+            None,
+            "the step is over, so the conversation carries no schema"
+        );
+    }
+
+    /// A turn stopped before the transformation begins spends no call on an answer it would only
+    /// discard; the mid-transformation stop is covered through the real dispatch in
+    /// `tools::implement` (`a_stop_during_the_transformation_delivers_nothing`).
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn a_stopped_turn_spends_no_transformation_and_delivers_nothing() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = Arc::new(crate::util::test::FakeProvider::new().ok(r#"{"a":"one"}"#));
+        let _provider_guard = crate::util::test::install_fake_provider(fake.clone());
+        let ws = crate::workspace::test_ws("/tmp/test_ws_extract_stop");
+        let agent = crate::Agent::new(
+            "extract_stop_agent".to_string(),
+            Role::Worker,
+            &ws,
+            None,
+            "admin".to_string(),
+            "gui".to_string(),
+            false,
+            None,
+            None,
+            None,
+        );
+        let mut job = make_job(Role::Worker, &ws.name, "admin", "gui");
+        job.extract = Some(
+            crate::extract::Extract::from_text(
+                r#"{"type":"object","properties":{"a":{"type":"string"}}}"#,
+            )
+            .expect("the schema is accepted"),
+        );
+
+        assert_eq!(
+            answer_to_deliver(&job, &agent, "conv", None, "the answer".into()).await,
+            Some(r#"{"a":"one"}"#.to_string()),
+            "the JSON document replaces the answer"
+        );
+        assert_eq!(fake.request_fingerprints.lock().unwrap().len(), 1);
+
+        agent.cancel_token.cancel();
+        assert_eq!(
+            answer_to_deliver(&job, &agent, "conv", None, "the answer".into()).await,
+            None,
+            "a stopped turn delivers nothing"
+        );
+        assert_eq!(
+            fake.request_fingerprints.lock().unwrap().len(),
+            1,
+            "a turn already stopped spends no transformation call"
+        );
     }
 
     #[tokio::test]
@@ -2276,6 +2466,7 @@ mod tests {
             custom_role: None,
             reply_to_custom: None,
             urgent: false,
+            extract: None,
         };
 
         deliver_single_user_response(
@@ -2706,6 +2897,7 @@ mod tests {
             agent_id: crate::session::worker_branch_agent_id("feature"),
             reply_to: None,
             chain: None,
+            extract: None,
         };
         // The branch's durable ADDRESS (what a folder-less branch records) — the
         // report must name the resolved folder path instead of it.
@@ -2827,6 +3019,7 @@ mod tests {
             custom_role: None,
             reply_to_custom: None,
             urgent: false,
+            extract: None,
         };
 
         deliver_unregistered_user_response(
@@ -2869,6 +3062,7 @@ mod tests {
             agent_id: crate::session::custom_role_agent_id("briefer", None),
             reply_to: None,
             chain: None,
+            extract: None,
         };
         let asker = Asker {
             launch: asker_launch.clone(),
@@ -2921,6 +3115,7 @@ mod tests {
                 agent_id: crate::session::custom_role_agent_id("editor", None),
                 reply_to: None,
                 chain: None,
+                extract: None,
             })
         });
         assert!(
@@ -2948,10 +3143,12 @@ mod tests {
                     agent_id: "rolerun_purged_away".to_string(),
                     reply_to: None,
                     chain: None,
+                    extract: None,
                 },
                 workspace: "personal:admin".to_string(),
             })),
             chain: None,
+            extract: None,
         });
         assert!(
             asker_of(&job).await.is_none(),

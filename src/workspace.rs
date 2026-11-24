@@ -501,9 +501,11 @@ fn classify_discovery_failure(
         | crate::retry::FailureClass::InvalidRequest
         | crate::retry::FailureClass::ContentRejection
         | crate::retry::FailureClass::Guardrail
+        | crate::retry::FailureClass::Deadline
         | crate::retry::FailureClass::Shutdown => DiscoveryFailureKind::Transient,
         crate::retry::FailureClass::Parse
         | crate::retry::FailureClass::OutOfRangeScore
+        | crate::retry::FailureClass::SchemaMismatch
         | crate::retry::FailureClass::Membership
         | crate::retry::FailureClass::Completeness
         | crate::retry::FailureClass::ContradictionAgents
@@ -2539,6 +2541,7 @@ mod tests {
         for class in [
             crate::retry::FailureClass::Parse,
             crate::retry::FailureClass::OutOfRangeScore,
+            crate::retry::FailureClass::SchemaMismatch,
             crate::retry::FailureClass::Membership,
             crate::retry::FailureClass::Completeness,
             crate::retry::FailureClass::ContradictionAgents,

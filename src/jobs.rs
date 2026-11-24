@@ -396,12 +396,14 @@ pub(crate) async fn spawn_job(
         exec_dir,
         custom_launch,
         None,
+        None,
     )
     .await
 }
 
-/// [`spawn_job`] with a chain step's chain on the row, so a restart resumes the same chain
-/// instead of delivering the step's answer to the caller.
+/// [`spawn_job`] with a chain step's chain — or the schema its answer must come back as — on the
+/// row, so a restart resumes the same chain, or knows what the answer was asked to look like and
+/// runs the transformation again (fail-open: a replay can still forward the answer unchanged).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn spawn_job_with_chain(
     conn: &Connection,
@@ -417,6 +419,7 @@ pub(crate) async fn spawn_job_with_chain(
     exec_dir: Option<&str>,
     custom_launch: Option<&crate::Launch>,
     chain: Option<&crate::launch::Chain>,
+    extract: Option<&crate::extract::Extract>,
 ) -> Result<()> {
     let tx = conn.begin_tx().await?;
     insert_job_tx(
@@ -433,6 +436,7 @@ pub(crate) async fn spawn_job_with_chain(
         exec_dir,
         custom_launch,
         chain,
+        extract,
     )
     .await?;
     // Manual-cancel gate INSIDE the tx (after the INSERT, before the commit), scoped to the
@@ -471,6 +475,7 @@ async fn insert_job_tx(
     exec_dir: Option<&str>,
     custom_launch: Option<&crate::Launch>,
     chain: Option<&crate::launch::Chain>,
+    extract: Option<&crate::extract::Extract>,
 ) -> Result<()> {
     let kind = child.kind_str();
     let ticket_id = child_ticket_id(child);
@@ -493,12 +498,20 @@ async fn insert_job_tx(
         .map(serde_json::to_string)
         .transpose()
         .context("serialize jobs.chain")?;
+    // The schema this round's answer must come back as, read back on resume so the round still
+    // knows what was asked of it and runs the transformation again — fail-open, so a replay can
+    // still forward the answer unchanged.
+    let extract_json = extract
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serialize jobs.extract")?;
     let now = db::now();
     tx.execute(
         "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
          ticket_id, retry_count, created_at, updated_at, caller_agent_id, mode, exec_dir, \
-         custom_launch, chain) \
-         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9, ?10, ?11, ?12, ?13, ?14)",
+         custom_launch, chain, extract) \
+         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9, ?10, ?11, ?12, ?13, ?14, \
+         ?15)",
         params![
             id,
             kind,
@@ -514,6 +527,7 @@ async fn insert_job_tx(
             exec_dir,
             custom_launch_json,
             chain_json,
+            extract_json,
         ],
     )
     .await
@@ -652,6 +666,7 @@ pub(crate) async fn complete_durable_job(
         custom_role: custom,
         reply_to_custom: None,
         urgent: false,
+        extract: None,
     };
     // INSERT-failure policy: fall back to a non-durable best-effort route.
     if complete_job_with_envelope(&crate::session::store().conn, job_id, &envelope)
@@ -791,6 +806,7 @@ pub(crate) async fn transition_research_to_cleanup(
             task: cleanup_task.to_string(),
         }],
         &SpawnChild::ResearchCleanup,
+        None,
         None,
         None,
         None,
@@ -1099,6 +1115,11 @@ pub(crate) struct JobCaller {
     /// answer on instead of delivering it to the caller. An unreadable value is its own state,
     /// never "no chain": such a round is abandoned rather than delivered as an ordinary one.
     pub chain: crate::launch::Stored,
+    /// The schema this round's answer must come back as, when its caller asked for one — a resume
+    /// still knows what was asked of it and runs the transformation again, which is fail-open: a
+    /// replay can still forward the answer unchanged. An unreadable value is logged and treated as
+    /// absent: the answer is still delivered, whole.
+    pub extract: Option<crate::extract::Extract>,
 }
 
 /// Discriminated resume preamble: a sync caller never mistakes a gone job for a
@@ -1332,7 +1353,8 @@ pub(crate) async fn retire_chain_session(agent_id: &str) -> Result<()> {
 /// Load the task + caller identity of a job from the `jobs` row alone.
 async fn job_caller(conn: &Connection, job_id: &str) -> Result<Option<JobCaller>> {
     conn.query_optional(
-        "SELECT task, role, user_name, channel, custom_launch, chain FROM jobs WHERE id = ?1",
+        "SELECT task, role, user_name, channel, custom_launch, chain, extract FROM jobs \
+         WHERE id = ?1",
         params![job_id],
         |r| {
             Ok::<_, anyhow::Error>(JobCaller {
@@ -1342,6 +1364,7 @@ async fn job_caller(conn: &Connection, job_id: &str) -> Result<Option<JobCaller>
                 channel: r.get::<String>(3)?,
                 custom_launch: parse_custom_launch(r.get::<Option<String>>(4)?).map(Box::new),
                 chain: crate::launch::Stored::parse(r.get::<Option<String>>(5)?),
+                extract: crate::extract::Extract::from_stored(r.get::<Option<String>>(6)?),
             })
         },
     )
@@ -2176,6 +2199,7 @@ mod tests {
                 place: None,
                 branch: Some("replayed".to_string()),
                 name: None,
+                extract: None,
             },
             step: 1,
             next: Vec::new(),
@@ -2199,9 +2223,11 @@ mod tests {
                 agent_id: agent_id.clone(),
                 reply_to: None,
                 chain: Some(Box::new(chain.clone())),
+                extract: None,
             }),
             reply_to_custom: None,
             urgent: false,
+            extract: None,
         };
         let row = PendingJobRow {
             id: crate::launch::record_id(&chain.id, 1),
@@ -2342,6 +2368,52 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A round's schema survives its own row: the job a restart resumes still knows its answer must
+    /// come back as JSON matching it, and a round with no schema reads back as one that asked for
+    /// nothing — the answer is delivered whole.
+    #[serial_test::serial(recover_from_restart)]
+    #[tokio::test]
+    async fn a_rounds_schema_survives_its_row() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        let extract = crate::extract::Extract::from_text(
+            r#"{"type":"object","properties":{"summary":{"type":"string"}}}"#,
+        )
+        .expect("the schema is accepted");
+        let job_id = "extract_row_round";
+        spawn_job_with_chain(
+            conn,
+            job_id,
+            "summarize it",
+            "extract_row_ws",
+            crate::users::ADMIN_USER_NAME,
+            "gui",
+            crate::Role::Worker,
+            &[],
+            &SpawnChild::Implement,
+            None,
+            None,
+            None,
+            None,
+            Some(&extract),
+        )
+        .await
+        .expect("the round's row is written");
+
+        let (caller, role) = resume_job_preamble(conn, job_id, "test resume", "test resume")
+            .await
+            .expect("the round resumes from its row");
+        assert_eq!(role, crate::Role::Worker);
+        assert_eq!(
+            caller.extract.as_ref(),
+            Some(&extract),
+            "the row carries the schema its answer must come back as"
+        );
+        delete_round_rows(conn, job_id)
+            .await
+            .expect("clean up this test's row");
     }
 
     /// Insert a minimal ticket row so a [`SpawnChild::Phase`] job's `ticket_id` FK resolves.

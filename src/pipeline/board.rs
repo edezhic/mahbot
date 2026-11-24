@@ -1462,6 +1462,7 @@ impl BoardStore {
                 custom_role: None,
                 reply_to_custom: None,
                 urgent: false,
+                extract: None,
             };
 
             if crate::agent::message_router::try_route(&agent_id, job) {

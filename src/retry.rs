@@ -24,12 +24,15 @@
 //! keep retrying, and so does the router's no-provider answer ([`FailureClass::Unavailable`]): the
 //! request is fine and the same bytes succeed once a provider is back.
 //!
-//! Four policies, snapshotted once at operation start ([`RetryPolicy`]). All share the same
+//! Five policies, snapshotted once at operation start ([`RetryPolicy`]). All share the same
 //! mechanics: ±25% jitter on the SLEEP ONLY (never on request bytes); Retry-After honoured, clamped
-//! [5000 ms, 60000 ms]; shutdown-abortable. They differ only in attempt counts and backoff — no
-//! per-operation wall-clock cap exists; the only timing bound is the 600 s idle timeout
-//! ([`DEFAULT_IDLE_TIMEOUT`]), so worst case is roughly `attempts × 600 s + backoff` (a body that
-//! keeps trickling bytes is never cut):
+//! [5000 ms, 60000 ms]; shutdown-abortable. They differ only in attempt counts and backoff. No
+//! policy carries a wall-clock cap. The one caller that cannot spend the ladder's idle timeouts is
+//! the answer transformation, which bounds its whole operation with a deadline of its own
+//! ([`crate::extract::DEADLINE`], enforced by [`crate::agent::extraction::Rules`], not by a
+//! policy); every other caller's only timing bound is the 600 s idle timeout
+//! ([`DEFAULT_IDLE_TIMEOUT`]), so its worst case is roughly `attempts × 600 s + backoff` (a body
+//! that keeps trickling bytes is never cut):
 //!
 //! - Default ([`RetryPolicy::current`]) — 13 attempts over a 5/10/20/40/60/60… s ladder (base
 //!   5000 ms, doubled to a 60000 ms cap; 555 s of sleep in total) to ride out a sustained 503.
@@ -41,6 +44,9 @@
 //! - Continuation ([`RetryPolicy::continuation`]) — 3 attempts with no inter-attempt sleep, the
 //!   reasoning-only-stop recovery budget (see
 //!   [`crate::agent::Agent::recover_reasoning_only_stop`]).
+//! - Extract ([`RetryPolicy::extract`]) — 3 attempts on a 1–5 s band: delivery waits on a `send`
+//!   schema transformation, so its caller also bounds the whole operation with a deadline
+//!   ([`crate::extract::DEADLINE`]).
 //!
 //! Per-attempt timeout semantics come from [`Provider::chat_scoped`]: the header wait (TTFB) and
 //! each body-read chunk wait are bounded by the 600 s idle timeout, resetting while data flows — a
@@ -76,6 +82,9 @@ const DEFAULT_COMMENT_MAX_ATTEMPTS: u32 = 3;
 /// single `chat_scoped` call (no inner transport retry — the appended tail makes every new
 /// reasoning state a fresh request; retryable transport errors re-send the identical bytes).
 const DEFAULT_CONTINUATION_MAX_ATTEMPTS: u32 = 3;
+
+/// The `extract` transformation's attempt budget — see [`RetryPolicy::extract`].
+const DEFAULT_EXTRACT_MAX_ATTEMPTS: u32 = 3;
 
 /// The single timeout governing every LLM chat request — the response-header wait (TTFB) and each
 /// body-read chunk wait, resetting while data flows. A stalled attempt is aborted at 600 s and
@@ -151,6 +160,20 @@ impl RetryPolicy {
             max_attempts: DEFAULT_CONTINUATION_MAX_ATTEMPTS,
             base_backoff_ms: 0,
             max_backoff_ms: 0,
+        }
+        .apply_test_override()
+    }
+
+    /// The `extract` transformation's policy: 3 attempts on a short ladder, because delivery waits
+    /// on it. The whole operation is bounded by its own deadline (see
+    /// [`crate::extract::DEADLINE`]), so the ladder only has to keep a parse failure from costing
+    /// the same wait twice.
+    #[must_use]
+    pub(crate) fn extract() -> Self {
+        Self {
+            max_attempts: DEFAULT_EXTRACT_MAX_ATTEMPTS,
+            base_backoff_ms: 1_000,
+            max_backoff_ms: 5_000,
         }
         .apply_test_override()
     }
@@ -261,6 +284,9 @@ pub(crate) enum FailureClass {
     Parse,
     /// Parsed, but a validation hook rejected the value (e.g. verdict score outside [0,10]).
     OutOfRangeScore,
+    /// Parsed, but a caller-supplied JSON schema rejected the value's shape
+    /// ([`crate::extract`]) — a mismatch, not a score.
+    SchemaMismatch,
     /// Repair-round group rejected: a member's item id is out of range, or the member was already
     /// placed in a frozen group / pinned by an accepted contradiction reference.
     Membership,
@@ -285,6 +311,9 @@ pub(crate) enum FailureClass {
     Guardrail,
     /// Global shutdown fired mid-operation.
     Shutdown,
+    /// The operation's own wall-clock deadline was reached. Recorded where delivery waits on the
+    /// call: the budget is spent, so the attempts end and the answer is forwarded unchanged.
+    Deadline,
 }
 
 impl FailureClass {
@@ -292,17 +321,21 @@ impl FailureClass {
     pub(crate) const fn is_retryable(self) -> bool {
         !matches!(
             self,
-            Self::InvalidRequest | Self::ContentRejection | Self::Guardrail | Self::Shutdown
+            Self::InvalidRequest
+                | Self::ContentRejection
+                | Self::Guardrail
+                | Self::Shutdown
+                | Self::Deadline
         )
     }
 
     /// Whether re-sending the same request on the same history is pointless — the split the
     /// dead-session poller needs before it restarts an agent that already failed this way. Derived
-    /// from [`Self::is_retryable`] so the two can never drift; a shutdown is not a verdict on the
-    /// request.
+    /// from [`Self::is_retryable`] so the two can never drift; a shutdown and a spent deadline are
+    /// not verdicts on the request.
     #[must_use]
     pub(crate) const fn is_deterministic(self) -> bool {
-        !self.is_retryable() && !matches!(self, Self::Shutdown)
+        !self.is_retryable() && !matches!(self, Self::Shutdown | Self::Deadline)
     }
 
     /// Whether this failure means the provider could not serve the call — the set that starts a
@@ -322,6 +355,7 @@ impl FailureClass {
             Self::TruncatedEnvelope => "truncated_envelope",
             Self::Parse => "parse",
             Self::OutOfRangeScore => "out_of_range_score",
+            Self::SchemaMismatch => "schema_mismatch",
             Self::Membership => "membership",
             Self::Completeness => "completeness",
             Self::ContradictionAgents => "contradiction_agents",
@@ -332,6 +366,7 @@ impl FailureClass {
             Self::ContentRejection => "content_rejection",
             Self::Guardrail => "guardrail",
             Self::Shutdown => "shutdown",
+            Self::Deadline => "deadline",
         }
     }
 }
@@ -736,18 +771,22 @@ mod tests {
         assert!(FailureClass::TruncatedEnvelope.is_retryable());
         assert!(FailureClass::Parse.is_retryable());
         assert!(FailureClass::OutOfRangeScore.is_retryable());
+        assert!(FailureClass::SchemaMismatch.is_retryable());
         assert!(!FailureClass::InvalidRequest.is_retryable());
         assert!(!FailureClass::ContentRejection.is_retryable());
         assert!(!FailureClass::Guardrail.is_retryable());
         assert!(!FailureClass::Shutdown.is_retryable());
+        assert!(!FailureClass::Deadline.is_retryable());
         assert_eq!(
             FailureClass::TruncatedEnvelope.label(),
             "truncated_envelope"
         );
         assert_eq!(FailureClass::Unavailable.label(), "provider_unavailable");
+        assert_eq!(FailureClass::SchemaMismatch.label(), "schema_mismatch");
         assert_eq!(FailureClass::InvalidRequest.label(), "invalid_request");
         assert_eq!(FailureClass::ContentRejection.label(), "content_rejection");
         assert_eq!(FailureClass::Guardrail.label(), "guardrail");
+        assert_eq!(FailureClass::Deadline.label(), "deadline");
         // The provider-unavailable set starts an outage clock: transport and the router's
         // no-provider answer. A refusal, an invalid request, a bad answer and a shutdown say
         // nothing about whether the provider can serve the next call.
@@ -761,6 +800,8 @@ mod tests {
             FailureClass::ContentRejection,
             FailureClass::Guardrail,
             FailureClass::Shutdown,
+            FailureClass::Deadline,
+            FailureClass::SchemaMismatch,
         ] {
             assert!(
                 !class.provider_unavailable(),
@@ -768,8 +809,8 @@ mod tests {
             );
         }
         // Exactly the three provider refusals are deterministic: the same bytes are refused again,
-        // which is what the dead-session poller keys on. Shutdown is terminal but not deterministic
-        // (a later attempt is a new run, not the same refused request).
+        // which is what the dead-session poller keys on. Shutdown and a spent deadline are terminal
+        // but not deterministic (a later attempt is a new run, not the same refused request).
         for class in [
             FailureClass::InvalidRequest,
             FailureClass::ContentRejection,
@@ -784,6 +825,8 @@ mod tests {
             FailureClass::Parse,
             FailureClass::NoResponse,
             FailureClass::Shutdown,
+            FailureClass::Deadline,
+            FailureClass::SchemaMismatch,
         ] {
             assert!(!class.is_deterministic(), "{class:?} is not deterministic");
         }

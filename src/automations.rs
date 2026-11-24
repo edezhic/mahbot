@@ -676,6 +676,7 @@ async fn fire_custom_role_automation(automation: &Automation) -> Result<()> {
                 // An automation fires on its own schedule: it has no caller to answer with a
                 // refusal, and refusing it would disarm the automation over a busy folder.
                 crate::launch::BusyFolder::Ignore,
+                None,
                 crate::agent::message_router::AnsweredFor::Nobody,
             )
             .await

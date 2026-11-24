@@ -25,7 +25,12 @@ use crate::tools::send::Addressee;
 pub(crate) const MAX_STEPS: usize = 10;
 
 /// One step of a chain: the call's own shape minus `message`.
+///
+/// A field this build does not know makes the whole record unreadable
+/// ([`crate::launch::Stored::Unreadable`]) rather than silently dropped: a step that carried a
+/// schema must never come back as an ordinary delegation returning prose.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Step {
     pub addressee: Addressee,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -34,6 +39,10 @@ pub struct Step {
     pub branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The JSON schema this step's answer must come back as, when the call asked for one
+    /// ([`crate::extract`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract: Option<crate::extract::Extract>,
 }
 
 impl Step {
@@ -46,6 +55,22 @@ impl Step {
             place: None,
             branch: None,
             name: None,
+            extract: None,
+        }
+    }
+
+    /// The role this step runs as, which is the model its answer's transformation runs on.
+    ///
+    /// Every address names its own role, the three a chain refuses included, so a value this build
+    /// cannot run as a step still names the role its transformation would use rather than falling
+    /// back to a sentinel.
+    #[must_use]
+    pub(crate) fn role(&self) -> crate::Role {
+        match self.addressee {
+            Addressee::Worker | Addressee::WorkerBranch => crate::Role::Worker,
+            Addressee::Role => crate::Role::Custom,
+            Addressee::Manager => crate::Role::Manager,
+            Addressee::Guest | Addressee::Assistant => crate::Role::Assistant,
         }
     }
 
@@ -73,6 +98,7 @@ impl Step {
 /// It rides on the record of the step running now (see [`crate::tools::chain`]), never on a
 /// store of its own.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Chain {
     /// One id for the whole chain — its Running Agents group and its stop.
     pub id: String,
@@ -205,6 +231,7 @@ fn launch_job(
         custom_role: Some(launch),
         reply_to_custom: None,
         urgent: false,
+        extract: None,
     }
 }
 
@@ -292,6 +319,7 @@ fn refuse_busy_folder_excluding(
 /// [`crate::agent::message_router::hand_over`]. An agent's producer keeps the
 /// best-effort route on a failed write; the command line's gets the failure back
 /// and the launch does NOT happen.
+#[expect(clippy::too_many_arguments)] // one positional argument per fact
 pub(crate) async fn custom_role(
     name: &str,
     message: &str,
@@ -299,6 +327,7 @@ pub(crate) async fn custom_role(
     workspace: &crate::Workspace,
     asker: Option<crate::agent::message_router::Asker>,
     busy: BusyFolder<'_>,
+    extract: Option<&crate::extract::Extract>,
     answered_for: crate::agent::message_router::AnsweredFor,
 ) -> Result<String> {
     anyhow::ensure!(
@@ -345,6 +374,7 @@ pub(crate) async fn custom_role(
         agent_id: agent_id.clone(),
         reply_to: asker.map(Box::new),
         chain: busy.chain().cloned().map(Box::new),
+        extract: extract.cloned(),
     };
     hand_over_launch(launch, message, &workspace.name, answered_for).await?;
 
@@ -379,6 +409,7 @@ pub(crate) async fn custom_role(
 /// [`crate::agent::message_router::hand_over`]. An agent's producer keeps the
 /// best-effort route on a failed write; the command line's gets the failure back
 /// and the launch does NOT happen.
+#[expect(clippy::too_many_arguments)] // one positional argument per fact
 pub(crate) async fn worker_branch(
     caller_ws: &crate::Workspace,
     branch: &str,
@@ -386,6 +417,7 @@ pub(crate) async fn worker_branch(
     place: Option<&crate::Workspace>,
     asker: Option<crate::Launch>,
     busy: BusyFolder<'_>,
+    extract: Option<&crate::extract::Extract>,
     answered_for: crate::agent::message_router::AnsweredFor,
 ) -> Result<String> {
     anyhow::ensure!(
@@ -422,6 +454,7 @@ pub(crate) async fn worker_branch(
         agent_id: agent_id.clone(),
         reply_to: reply_to.map(Box::new),
         chain: busy.chain().cloned().map(Box::new),
+        extract: extract.cloned(),
     };
 
     hand_over_launch(launch, message, &workspace_name, answered_for).await?;

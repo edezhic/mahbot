@@ -496,6 +496,11 @@ pub(crate) struct CoreJobArgs<'a> {
     /// resumes the same chain, and read back on resume. It is also the round's Running Agents
     /// group: a chain step runs outside any agent turn, so there is no caller to inherit one from.
     pub chain: Option<&'a crate::launch::Chain>,
+    /// The schema this round's answer must come back as, when its caller asked for one — written
+    /// onto the `jobs` row at spawn, so a restart still knows what was asked of it and runs the
+    /// transformation again (fail-open: a replay can still forward the answer unchanged). Only a
+    /// spawning call carries it; a resume reads it back from the row.
+    pub extract: Option<&'a crate::extract::Extract>,
 }
 
 /// The jobs-row fields a fresh dispatch writes — read ONLY when the call actually spawns, so a
@@ -546,6 +551,17 @@ impl SyncDurableCore {
         match self {
             Self::Analyze => crate::jobs::SpawnChild::Analyze.kind_str(),
             Self::Worker => crate::jobs::SpawnChild::Implement.kind_str(),
+        }
+    }
+
+    /// The role the round itself runs as — the model its answer's transformation runs on, never
+    /// the caller's role. Only a worker round can carry a schema today, so an analyze round never
+    /// reaches a transformation; its arm keeps the mapping total.
+    #[must_use]
+    fn role(self) -> crate::Role {
+        match self {
+            Self::Analyze => crate::Role::Analyst,
+            Self::Worker => crate::Role::Worker,
         }
     }
 
@@ -676,6 +692,7 @@ impl SyncDurableCore {
             caller_agent_id: caller_agent_id.as_deref(),
             fail_on_checkpoint_error: caller_agent_id.is_some(),
             chain: None,
+            extract: None,
         };
         let outcome = match self.run(ws, task, args).await {
             Ok(outcome) => outcome,
@@ -768,6 +785,7 @@ impl SyncDurableCore {
             caller_agent_id: None,
             fail_on_checkpoint_error: sync_resume,
             chain: chain.as_ref(),
+            extract: None,
         };
         let run = self.run(ws, &caller.task, args).await;
         match run {
@@ -828,7 +846,7 @@ impl SyncDurableCore {
     /// resume; nothing is routed) or observed a cancel (the cancel action owns its rows).
     /// `delivery` is the caller's own workspace, `place` the directory the round executes in,
     /// `custom` the calling custom role's launch.
-    #[expect(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)] // one round's whole dispatch
     pub(crate) async fn dispatch_durable(
         self,
         delivery: &crate::Workspace,
@@ -839,6 +857,7 @@ impl SyncDurableCore {
         channel: &str,
         job_id: &str,
         custom: Option<crate::Launch>,
+        extract: Option<&crate::extract::Extract>,
     ) -> Option<AgentJob> {
         let exec = place.unwrap_or(delivery);
         let exec_dir = place.map(|p| p.path.as_str());
@@ -860,6 +879,7 @@ impl SyncDurableCore {
                     caller_agent_id: None,
                     fail_on_checkpoint_error: false,
                     chain: None,
+                    extract,
                 },
             )
             .await
@@ -897,6 +917,11 @@ impl SyncDurableCore {
         if let Some(place) = place {
             crate::tools::delegation::release_exec_engine(place);
         }
+        // The schema the caller asked for replaces the answer with JSON; a transformation that
+        // fails forwards the whole answer unchanged.
+        let result = self
+            .deliverable(job_id, &delivery.name, extract, result)
+            .await;
         Some(
             crate::jobs::complete_durable_job(
                 job_id,
@@ -910,6 +935,36 @@ impl SyncDurableCore {
             )
             .await,
         )
+    }
+
+    /// The answer a durable round delivers: its JSON form when the caller asked for a schema, else
+    /// the round's own result. A failed transformation forwards the whole answer, so the round's
+    /// work is never lost and the round is never re-run. The transformation runs where the round
+    /// ran — on the model and provider recorded for its conversation, read only when a schema asks
+    /// for it.
+    async fn deliverable(
+        self,
+        job_id: &str,
+        workspace: &str,
+        extract: Option<&crate::extract::Extract>,
+        result: anyhow::Result<String>,
+    ) -> anyhow::Result<String> {
+        let answer = result?;
+        let Some(extract) = extract else {
+            return Ok(answer);
+        };
+        let conversation = round_conversation(job_id).await;
+        Ok(crate::extract::answer_as_json(
+            Some(extract),
+            &crate::extract::StepContext {
+                role: self.role(),
+                workspace,
+                conversation: conversation.as_deref(),
+                parent: None,
+            },
+            &answer,
+        )
+        .await)
     }
 
     /// Boot-resume a durable round: resolve the execution workspace (the recorded directory when
@@ -1035,7 +1090,14 @@ impl SyncDurableCore {
         // A chain step's answer goes on to the next step, or comes back as the chain's final
         // answer. The hand-off consumes this round's row, so a replay finds the next step instead
         // of delivering the answer to the caller; a round that produced none names its own reason.
+        // The step's transformation runs where the round ran, so its conversation is read — before
+        // the row goes — only when the step carries a schema.
         if let Some(chain) = caller.chain.step() {
+            let conversation = if chain.current.extract.is_some() {
+                round_conversation(job_id).await
+            } else {
+                None
+            };
             let (answer, reason) = match &result {
                 Ok(answer) => (
                     Some(answer.as_str()),
@@ -1043,9 +1105,14 @@ impl SyncDurableCore {
                 ),
                 Err(e) => (None, e.to_string()),
             };
-            crate::tools::chain::settle(chain, answer, &reason).await;
+            crate::tools::chain::settle(chain, conversation.as_deref(), answer, &reason).await;
             return;
         }
+        // The schema the caller asked for replaces the answer with JSON; a transformation that
+        // fails forwards the whole answer unchanged.
+        let result = self
+            .deliverable(job_id, &delivery.name, caller.extract.as_ref(), result)
+            .await;
         let envelope = crate::jobs::complete_durable_job(
             job_id,
             self.build_async_message(job_id, &result, exec_dir, delivery),
@@ -1097,6 +1164,7 @@ impl SyncDurableCore {
         task: &str,
         caller_role: crate::Role,
         job_id: String,
+        extract: Option<crate::extract::Extract>,
     ) {
         let user_name = crate::agent::tool_user_name();
         let channel = crate::agent::tool_channel();
@@ -1126,6 +1194,7 @@ impl SyncDurableCore {
                     &channel,
                     &job_id,
                     custom.clone(),
+                    extract.as_ref(),
                 )
                 .await
             })
@@ -1162,6 +1231,7 @@ impl SyncDurableCore {
                         custom_role: custom,
                         reply_to_custom: None,
                         urgent: false,
+                        extract: None,
                     }
                 }
             };
@@ -1200,6 +1270,17 @@ pub(crate) fn build_async_result_envelope(
             format!("<{tag}>\n\nJob: {job_id}{dir_line}\n\nAn error occurred: {e}</{tag}>")
         }
     }
+}
+
+/// The conversation a durable round ran in: its single roster row's agent id. Read before the job's
+/// rows go, because the transformation runs where the round ran. `None` when the roster is already
+/// gone — a terminal failure, which has no answer to transform.
+async fn round_conversation(job_id: &str) -> Option<String> {
+    crate::jobs::list_agents_for_job(&crate::session::store().conn, job_id)
+        .await
+        .ok()?
+        .first()
+        .map(|row| row.agent_id.clone())
 }
 
 /// A worker's report text — the round's own text, or an explicit failure marker

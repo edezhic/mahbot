@@ -4,7 +4,7 @@
 //! retry logic.
 
 use serde::de::DeserializeOwned;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::prompt::load_prompt;
 use crate::retry::{
@@ -13,20 +13,86 @@ use crate::retry::{
 use crate::util::json::parse_fenced_json;
 use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 
+/// How one extraction departs from the shared schedule. [`Default`] is what every caller that does
+/// not opt in gets, so a rule never changes an existing extraction.
+#[derive(Clone, Copy)]
+pub(crate) struct Rules {
+    /// Re-ask with what was wrong with the previous reply, instead of the fixed sentence. Only the
+    /// validator's own message can tell the model how its JSON missed.
+    pub feedback: bool,
+    /// A reply cut short by the output limit ends the attempts: re-asking the same request cannot
+    /// produce a complete document.
+    pub truncation_terminal: bool,
+    /// The whole operation's wall-clock bound. Delivery waits on some extractions, so they cannot
+    /// spend the ladder's idle timeouts.
+    pub deadline: Option<Duration>,
+    /// The class a validator rejection is recorded under: the caller's own schema conformance
+    /// ([`FailureClass::SchemaMismatch`]) reads differently in `llm_failures` than a score outside
+    /// its range.
+    pub validator_class: FailureClass,
+}
+
+impl Default for Rules {
+    fn default() -> Self {
+        Self {
+            feedback: false,
+            truncation_terminal: false,
+            deadline: None,
+            validator_class: FailureClass::OutOfRangeScore,
+        }
+    }
+}
+
+/// The one record a spent deadline leaves. Its own class, so `llm_failures` and the stats rows never
+/// read a spent budget as a provider failure.
+fn deadline_record() -> RetryFailureRecord {
+    RetryFailureRecord::with_metadata(
+        FailureClass::Deadline,
+        &anyhow::anyhow!("the extraction deadline was reached"),
+        None,
+        None,
+    )
+}
+
 /// Scoped structured extraction with the hardened outer retry loop ([`crate::retry`] — default 13
 /// attempts). Used by verdict extraction, diagnostics discovery, comment summaries, and research
 /// orchestration. `policy_override` supplies a shorter schedule for fail-open comment-only callers
 /// ([`crate::retry::RetryPolicy::comment`] — 3 attempts); `None` uses the default policy.
+///
+/// [`Rules::default()`] — the fixed re-ask, truncation retried, no wall-clock bound — is what every
+/// existing caller gets; [`retry_extract_structured_with`] is the same loop for a caller that needs
+/// its own rules.
+pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
+    history: &[ChatMessage],
+    extraction_prompt: &str,
+    params: &ChatRequest,
+    validate: Option<&ExtractionValidator<T>>,
+    policy_override: Option<&RetryPolicy>,
+) -> Result<T, RetryExhausted> {
+    retry_extract_structured_with(
+        history,
+        extraction_prompt,
+        params,
+        validate,
+        policy_override,
+        Rules::default(),
+    )
+    .await
+}
+
+/// [`retry_extract_structured_scoped`] with per-operation [`Rules`].
 ///
 /// The outer loop is the SINGLE retry authority — provider-internal retries are suppressed via
 /// [`crate::providers::chat_scoped`], so total provider HTTP calls per operation are bounded by
 /// `max_attempts`.
 ///
 /// Retry semantics per attempt:
-/// - Provider/transport/truncation failure → retry byte-identical.
+/// - Provider/transport/truncation failure → retry byte-identical (unless
+///   [`Rules::truncation_terminal`], where a reply cut by the output limit ends the attempts).
 /// - Tool call, unparseable text, or validation failure (`validate` rejects)
 ///   → treat as parse failure: push raw text + `extraction/retry.md` re-prompt
-///   (the ONLY permitted request mutation — extends the cached prefix). An
+///   (the ONLY permitted request mutation — extends the cached prefix); with [`Rules::feedback`]
+///   the re-prompt is `extraction/schema_retry.md` naming what was wrong. An
 ///   empty last_raw pushes the `extraction/retry_no_output.md` marker instead
 ///   (a non-empty assistant turn is required to re-prompt).
 /// - Valid JSON matching `T` and passing `validate` → return immediately.
@@ -41,12 +107,14 @@ use crate::{ChatMessage, ChatRequest, ExtractionValidator};
 ///
 /// The history is bounded by the request picture cap before the first attempt, so every retry sends
 /// the same bounded request.
-pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
+#[expect(clippy::too_many_lines)] // one loop: attempt, classify, re-ask
+pub(crate) async fn retry_extract_structured_with<T: DeserializeOwned>(
     history: &[ChatMessage],
     extraction_prompt: &str,
     params: &ChatRequest,
     validate: Option<&ExtractionValidator<T>>,
     policy_override: Option<&RetryPolicy>,
+    rules: Rules,
 ) -> Result<T, RetryExhausted> {
     let mut extraction_history = history.to_vec();
     let operation_started = Instant::now();
@@ -76,48 +144,88 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
     let mut last_raw: Option<String> = None;
 
     for attempt in 1..=policy.max_attempts {
+        // The whole operation is bounded when delivery waits on it: a spent budget starts no
+        // attempt at all (a timeout alone would still let an immediately-ready call through), and
+        // the remaining time caps the attempt that does start, so a stalled provider cannot hold
+        // the answer past the deadline.
+        let remaining = rules
+            .deadline
+            .map(|limit| limit.saturating_sub(operation_started.elapsed()));
+        if remaining.is_some_and(|left| left.is_zero()) {
+            loop_state.record(deadline_record());
+            break;
+        }
         loop_state.begin_attempt(Instant::now());
         let request = ChatRequest {
             messages: extraction_history.clone(),
             ..record_request.clone()
         };
 
-        match crate::providers::chat_scoped(request).await {
+        let call = crate::providers::chat_scoped(request);
+        let outcome = match remaining {
+            Some(left) => {
+                let Ok(outcome) = tokio::time::timeout(left, call).await else {
+                    loop_state.record(deadline_record());
+                    break;
+                };
+                outcome
+            }
+            None => call.await,
+        };
+        match outcome {
             Ok(response) => {
                 last_raw = Some(response.text_or_empty().to_string());
 
-                let (class, detail): (FailureClass, String) = if response.tool_calls.is_empty() {
-                    let raw = last_raw.as_deref().unwrap_or_default();
-                    match parse_fenced_json::<T>(raw) {
-                        Ok(result) => {
-                            if let Some(validate) = validate
-                                && let Err(msg) = validate(&result)
-                            {
-                                (
-                                    FailureClass::OutOfRangeScore,
-                                    format!("extracted value rejected by validation: {msg}"),
-                                )
-                            } else {
-                                crate::stats::record_llm_success(
-                                    &record_request,
-                                    operation_started,
-                                    attempt,
-                                    &response,
-                                );
-                                return Ok(result);
+                // A reply cut short by the output limit cannot be re-asked into a complete
+                // document, so it ends the attempts instead of spending the budget.
+                if rules.truncation_terminal && response.finish_reason.as_deref() == Some("length")
+                {
+                    let err = anyhow::anyhow!("the reply was cut short by the output limit");
+                    loop_state.record(RetryFailureRecord::with_metadata(
+                        FailureClass::TruncatedOutput,
+                        &err,
+                        response.finish_reason.clone(),
+                        None,
+                    ));
+                    break;
+                }
+
+                let (class, detail, feedback): (FailureClass, String, String) =
+                    if response.tool_calls.is_empty() {
+                        let raw = last_raw.as_deref().unwrap_or_default();
+                        match parse_fenced_json::<T>(raw) {
+                            Ok(result) => {
+                                if let Some(validate) = validate
+                                    && let Err(msg) = validate(&result)
+                                {
+                                    (
+                                        rules.validator_class,
+                                        format!("extracted value rejected by validation: {msg}"),
+                                        msg,
+                                    )
+                                } else {
+                                    crate::stats::record_llm_success(
+                                        &record_request,
+                                        operation_started,
+                                        attempt,
+                                        &response,
+                                    );
+                                    return Ok(result);
+                                }
                             }
+                            Err(e) => (
+                                FailureClass::Parse,
+                                format!("failed to parse extracted JSON: {e}"),
+                                "the reply was not valid JSON".to_string(),
+                            ),
                         }
-                        Err(e) => (
+                    } else {
+                        (
                             FailureClass::Parse,
-                            format!("failed to parse extracted JSON: {e}"),
-                        ),
-                    }
-                } else {
-                    (
-                        FailureClass::Parse,
-                        "extraction attempt returned a tool call instead of JSON".to_string(),
-                    )
-                };
+                            "extraction attempt returned a tool call instead of JSON".to_string(),
+                            "you called a tool instead of replying".to_string(),
+                        )
+                    };
 
                 let err = anyhow::anyhow!("{detail}");
                 let rec = RetryFailureRecord::with_metadata(
@@ -137,9 +245,18 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
                     extraction_history.push(ChatMessage::assistant(
                         prev.unwrap_or_else(|| load_prompt("extraction/retry_no_output.md")),
                     ));
-                    extraction_history.push(ChatMessage::user(retry_prompt.as_str()));
+                    let reask = if rules.feedback {
+                        crate::prompt::substitute(
+                            &load_prompt("extraction/schema_retry.md"),
+                            &[("{{error}}", &feedback)],
+                        )
+                    } else {
+                        retry_prompt.clone()
+                    };
+                    extraction_history.push(ChatMessage::user(reask.as_str()));
                 }
             }
+
             Err(scoped_err) => {
                 // The final attempt died before producing text (transport / truncation / budget) —
                 // clear any earlier text so the ticket comment never labels it 'last attempt'.
@@ -159,10 +276,26 @@ pub(crate) async fn retry_extract_structured_scoped<T: DeserializeOwned>(
             }
         }
 
-        if let Err(class) = loop_state.sleep_between(attempt).await {
-            let exhausted =
-                RetryExhausted::with_last_raw(loop_state.into_failures(), class, last_raw);
-            return fail_exhausted(&record_request, operation_started, exhausted);
+        // The sleep is part of the same bound: delivery waits on the whole operation, so a backoff
+        // that would run past the deadline ends the attempts instead of being served.
+        let slept = match rules
+            .deadline
+            .map(|limit| limit.saturating_sub(operation_started.elapsed()))
+        {
+            Some(left) => tokio::time::timeout(left, loop_state.sleep_between(attempt)).await,
+            None => Ok(loop_state.sleep_between(attempt).await),
+        };
+        match slept {
+            Ok(Err(class)) => {
+                let exhausted =
+                    RetryExhausted::with_last_raw(loop_state.into_failures(), class, last_raw);
+                return fail_exhausted(&record_request, operation_started, exhausted);
+            }
+            Ok(Ok(())) => {}
+            Err(_) => {
+                loop_state.record(deadline_record());
+                break;
+            }
         }
     }
 
@@ -226,6 +359,205 @@ mod tests {
             None,
         )
         .await
+    }
+
+    /// The same extraction under a caller's own [`Rules`].
+    async fn extract_with_rules(
+        fake: Arc<FakeProvider>,
+        rules: Rules,
+    ) -> Result<FakeVerdict, crate::retry::RetryExhausted> {
+        let provider: Arc<dyn crate::Provider> = fake.clone();
+        let _guard = install_fake_provider(provider);
+        retry_extract_structured_with::<FakeVerdict>(
+            &history(),
+            "return JSON verdict",
+            &test_params(),
+            Some(&score_validator),
+            None,
+            rules,
+        )
+        .await
+    }
+
+    /// A reply cut short by the output limit ends the attempts under the schema's own rules: the same
+    /// request re-asked cannot produce a complete document, so the budget is not spent on it.
+    #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
+    async fn a_truncated_reply_ends_the_attempts_at_once() {
+        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy()); // 3 attempts
+        let fake = Arc::new(
+            FakeProvider::new()
+                .ok_with_finish("{\"score\": 1", Some("length"))
+                .ok(r#"{"score": 5}"#),
+        );
+        let failure = extract_with_rules(
+            fake.clone(),
+            Rules {
+                truncation_terminal: true,
+                ..Rules::default()
+            },
+        )
+        .await
+        .expect_err("a truncated reply cannot be re-asked into a complete one");
+        assert_eq!(
+            failure.final_class,
+            crate::retry::FailureClass::TruncatedOutput,
+            "a reply cut by the output limit classifies as truncated"
+        );
+        assert_eq!(failure.failures.len(), 1, "one attempt, no retry");
+        assert_eq!(
+            fake.request_fingerprints.lock().unwrap().len(),
+            1,
+            "one provider call"
+        );
+    }
+
+    /// The deadline bounds the BACKOFF too: a ladder that would sleep past it ends the attempts
+    /// instead of holding delivery, so the whole operation really is bounded.
+    #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
+    async fn the_deadline_bounds_the_backoff() {
+        let fake = Arc::new(FakeProvider::new().ok("not json"));
+        let provider: Arc<dyn crate::Provider> = fake.clone();
+        let _guard = install_fake_provider(provider);
+        let started = std::time::Instant::now();
+        let failure = retry_extract_structured_with::<FakeVerdict>(
+            &history(),
+            "return JSON verdict",
+            &test_params(),
+            Some(&score_validator),
+            Some(&crate::retry::RetryPolicy {
+                max_attempts: 3,
+                base_backoff_ms: 60_000,
+                max_backoff_ms: 60_000,
+            }),
+            Rules {
+                deadline: Some(Duration::from_millis(50)),
+                ..Rules::default()
+            },
+        )
+        .await
+        .expect_err("the backoff would run past the deadline");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the deadline bounds the backoff: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            fake.request_fingerprints.lock().unwrap().len(),
+            1,
+            "no second attempt after the deadline"
+        );
+        assert_eq!(
+            failure.failures.len(),
+            2,
+            "the parse failure, then the deadline that ended the backoff"
+        );
+        assert_eq!(failure.final_class, crate::retry::FailureClass::Deadline);
+    }
+
+    /// With feedback, the re-ask carries the validator's own message: only that can tell the model
+    /// how its JSON missed.
+    #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
+    async fn a_rejected_reply_is_re_asked_with_what_was_wrong() {
+        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
+        let fake = Arc::new(
+            FakeProvider::new()
+                .ok(r#"{"score": 101}"#) // out of [0,10]
+                .ok(r#"{"score": 5}"#),
+        );
+        let verdict = extract_with_rules(
+            fake.clone(),
+            Rules {
+                feedback: true,
+                ..Rules::default()
+            },
+        )
+        .await
+        .expect("the second reply passes");
+        assert_eq!(verdict.score, 5);
+
+        let messages = fake.request_messages.lock().unwrap().clone();
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages[1].contains("score 101 out of range"),
+            "the validator's own message is the re-ask: {}",
+            messages[1]
+        );
+        assert!(
+            !messages[1].contains("not valid JSON"),
+            "the fixed sentence is replaced: {}",
+            messages[1]
+        );
+    }
+
+    /// The whole operation is bounded by its deadline: a stalled provider ends the attempts within
+    /// the bound instead of holding the caller for the ladder's idle timeouts.
+    #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
+    async fn the_deadline_bounds_the_whole_operation() {
+        /// A provider that never answers, so only the deadline can end the attempt.
+        struct Stalled;
+
+        #[async_trait::async_trait]
+        impl crate::Provider for Stalled {
+            async fn chat_scoped(
+                &self,
+                _request: ChatRequest,
+            ) -> Result<crate::ChatResponse, crate::providers::ScopedCallError> {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                Ok(crate::ChatResponse::default())
+            }
+
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
+        let provider: Arc<dyn crate::Provider> = Arc::new(Stalled);
+        let _guard = install_fake_provider(provider);
+        let started = std::time::Instant::now();
+        let failure = retry_extract_structured_with::<FakeVerdict>(
+            &history(),
+            "return JSON verdict",
+            &test_params(),
+            Some(&score_validator),
+            None,
+            Rules {
+                deadline: Some(std::time::Duration::from_millis(50)),
+                ..Rules::default()
+            },
+        )
+        .await
+        .expect_err("the stalled attempt never answers");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the deadline bounds the operation: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(failure.failures.len(), 1, "the deadline is not retried");
+        assert_eq!(failure.final_class, crate::retry::FailureClass::Deadline);
+    }
+
+    /// The default rules keep the fixed re-ask sentence every existing extraction was built on.
+    #[tokio::test]
+    #[serial_test::serial(provider)] // serializes the process-global fake provider (providers::PROVIDER)
+    async fn the_default_rules_re_ask_with_the_fixed_sentence() {
+        let _policy_guard = crate::util::test::install_test_retry_policy(tiny_test_policy());
+        let fake = Arc::new(FakeProvider::new().ok("garbage text").ok(r#"{"score": 5}"#));
+        let verdict = extract_with(fake.clone())
+            .await
+            .expect("recovers after a re-ask");
+        assert_eq!(verdict.score, 5);
+        let messages = fake.request_messages.lock().unwrap().clone();
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages[1].contains(load_prompt("extraction/retry.md").trim()),
+            "the fixed sentence is the re-ask: {}",
+            messages[1]
+        );
     }
 
     /// A provider that has been failing for the whole window does not get the rest of the ladder:

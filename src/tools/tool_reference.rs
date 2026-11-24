@@ -81,12 +81,34 @@ pub(crate) struct ReferenceTool {
     /// The tools the caller holds — the only references it may ask for. Handing out the detail of
     /// a capability a role's toolset withholds would document what that role cannot do.
     holders: Vec<&'static str>,
+    /// Whether this caller's `send` takes `extract`. The shared `send` reference documents neither
+    /// `extract` nor `for`, so the detail is appended only for a holder that can use the argument:
+    /// a holder without it reads everything it can reach and learns nothing of either.
+    accepts_extract: bool,
 }
+
+/// The detail a holder of an argument may read on top of the shared reference, by tool. Kept as a
+/// table so the rule reads as deliberate: the shared `send` reference names neither argument, and
+/// only a caller whose toolset declares them is handed this asset.
+const ARGUMENT_DETAIL: &[(&str, &str)] = &[("send", "reference/send_extract.md")];
 
 impl ReferenceTool {
     #[must_use]
-    pub(crate) fn new(holders: Vec<&'static str>) -> Self {
-        Self { holders }
+    pub(crate) fn new(holders: Vec<&'static str>, accepts_extract: bool) -> Self {
+        Self {
+            holders,
+            accepts_extract,
+        }
+    }
+
+    /// One tool's reference, with the detail only a holder of `extract` may read appended.
+    fn scoped(&self, tool: &str, text: String) -> String {
+        match ARGUMENT_DETAIL.iter().find(|(name, _)| *name == tool) {
+            Some((_, asset)) if self.accepts_extract => {
+                format!("{text}\n\n{}", crate::prompt::load_prompt(asset).trim_end())
+            }
+            _ => text,
+        }
     }
 
     /// The index an argument-less call answers with: the names this caller can ask for, so
@@ -182,7 +204,9 @@ impl Tool for ReferenceTool {
         if SELF_SERVING.contains(&tool.as_str()) {
             anyhow::bail!("`{tool}` answers for itself: ask it with its own `reference` action");
         }
-        text(&tool).ok_or_else(|| anyhow::anyhow!("`{tool}` has no reference — {}", self.index()))
+        let text = text(&tool)
+            .ok_or_else(|| anyhow::anyhow!("`{tool}` has no reference — {}", self.index()))?;
+        Ok(self.scoped(&tool, text))
     }
 }
 
@@ -234,6 +258,7 @@ mod tests {
                 .map(|tool| tool.name())
                 .filter(|name| *name != SELF)
                 .collect(),
+            false,
         )
     }
 
@@ -370,7 +395,7 @@ mod tests {
     #[tokio::test]
     async fn the_reference_is_scoped_to_the_callers_tools() {
         let ws = crate::workspace::test_ws("reference");
-        let engineer = ReferenceTool::new(vec!["read", "edit", "search", "shell"]);
+        let engineer = ReferenceTool::new(vec!["read", "edit", "search", "shell"], false);
 
         engineer
             .execute(&ws, serde_json::json!({"tool": "read"}))
@@ -403,8 +428,38 @@ mod tests {
 
         // A set with nothing to offer — empty, or only tools that answer for themselves — is not
         // advertised at all: its index would name no tool.
-        assert!(!ReferenceTool::new(Vec::new()).is_advertised());
-        assert!(!ReferenceTool::new(vec!["workspace"]).is_advertised());
+        assert!(!ReferenceTool::new(Vec::new(), false).is_advertised());
+        assert!(!ReferenceTool::new(vec!["workspace"], false).is_advertised());
         assert!(engineer.is_advertised());
+    }
+
+    /// The schema argument's detail reaches only a holder whose `send` takes it: the shared `send`
+    /// reference documents neither `extract` nor the chain beside it, so a holder without the
+    /// argument reads everything it can reach and learns nothing of either.
+    #[tokio::test]
+    async fn the_schema_detail_reaches_only_a_holder_that_can_use_it() {
+        let ws = crate::workspace::test_ws("reference");
+        let plain = ReferenceTool::new(vec!["send"], false)
+            .execute(&ws, serde_json::json!({"tool": "send"}))
+            .await
+            .expect("a held tool's reference arrives");
+        for absent in ["extract", "`for`"] {
+            assert!(
+                !plain.contains(absent),
+                "a holder without the argument never reads {absent}: {plain}"
+            );
+        }
+        let full = ReferenceTool::new(vec!["send"], true)
+            .execute(&ws, serde_json::json!({"tool": "send"}))
+            .await
+            .expect("a held tool's reference arrives");
+        assert_eq!(
+            full,
+            format!(
+                "{plain}\n\n{}",
+                crate::prompt::load_prompt("reference/send_extract.md").trim_end()
+            ),
+            "the detail is appended whole to the same reference"
+        );
     }
 }

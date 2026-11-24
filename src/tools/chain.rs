@@ -31,6 +31,7 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::Workspace;
 use crate::agent::message_router::AnsweredFor;
+use crate::agent::registry::ParentKey;
 use crate::launch::{BusyFolder, Chain, MAX_STEPS, Step, Stored, record_id};
 use crate::tools::send::{Addressee, Argument, FOR_ARG};
 use crate::util::UnwrapPoison as _;
@@ -44,8 +45,14 @@ pub(crate) fn id_of(task: &str, outer: &Step, next: &[Step]) -> String {
     use std::fmt::Write as _;
     let mut hasher = Sha256::new();
     hasher.update(task.as_bytes());
+    // A step's schema is part of what makes this chain this chain, and two schemas differing only
+    // in key order or whitespace are the same one. It joins the identity only when a step carries
+    // one, so a call without a schema produces exactly the identity it produced before.
+    let schemas = std::iter::once(outer)
+        .chain(next)
+        .any(|step| step.extract.is_some());
     for step in std::iter::once(outer).chain(next) {
-        // Every step is the same four length-prefixed fields, so no two calls can hash alike.
+        // Every step is the same length-prefixed fields, so no two calls can hash alike.
         for part in [
             Some(step.addressee.as_str()),
             step.place.as_deref(),
@@ -56,6 +63,16 @@ pub(crate) fn id_of(task: &str, outer: &Step, next: &[Step]) -> String {
                 Some(part) => {
                     hasher.update((part.len() as u64).to_le_bytes());
                     hasher.update(part.as_bytes());
+                }
+                None => hasher.update(u64::MAX.to_le_bytes()),
+            }
+        }
+        if schemas {
+            match step.extract.as_ref() {
+                Some(extract) => {
+                    let canonical = extract.canonical();
+                    hasher.update((canonical.len() as u64).to_le_bytes());
+                    hasher.update(canonical.as_bytes());
                 }
                 None => hasher.update(u64::MAX.to_le_bytes()),
             }
@@ -97,8 +114,16 @@ const SHAPE: &str = "usage: `for` must be a JSON object with an `addressee` and,
                      addressee needs them, `place`, `branch` or `name`";
 
 /// Every key one step may carry, `for` included.
-const STEP_KEYS: [&str; 5] = ["addressee", "place", "branch", "name", FOR_ARG];
+const STEP_KEYS: [&str; 6] = [
+    "addressee",
+    "place",
+    "branch",
+    "name",
+    FOR_ARG,
+    crate::extract::ARG,
+];
 
+/// The `for` value's own shape, whichever form it was given in.
 fn as_object(value: &serde_json::Value) -> Result<serde_json::Map<String, serde_json::Value>> {
     let object = match value {
         serde_json::Value::Object(map) => Some(map.clone()),
@@ -117,7 +142,7 @@ fn step_from(object: &serde_json::Map<String, serde_json::Value>) -> Result<Step
         if !STEP_KEYS.contains(&key.as_str()) {
             bail!(
                 "usage: `for` has no `{key}` — a step names an `addressee` and, when that addressee \
-                 needs them, its `place`, `branch` or `name`, and nothing else"
+                 needs them, its `place`, `branch` or `name`, plus its own `for` and `extract`"
             );
         }
     }
@@ -164,6 +189,12 @@ fn step_from(object: &serde_json::Map<String, serde_json::Value>) -> Result<Step
         place: text("place")?,
         branch: text("branch")?,
         name: text("name")?,
+        // The schema the step asks its answer to match: an object or its JSON text, validated
+        // whole before anything runs.
+        extract: match object.get(crate::extract::ARG) {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(crate::extract::Extract::from_arg(value)?),
+        },
     };
     // The same per-address argument rules the command line applies: an argument the step's own
     // address does not take is refused rather than half-understood.
@@ -353,6 +384,10 @@ pub(crate) async fn dispatch(
                 place.as_ref(),
                 None,
                 BusyFolder::Chain(chain),
+                // The chain record owns the step's schema (`settle` reads it from there), so the
+                // launch carries none: two carriers could disagree, and the launch's copy would
+                // outlive the step it describes.
+                None,
                 answered_for,
             )
             .await
@@ -372,6 +407,8 @@ pub(crate) async fn dispatch(
                 workspace,
                 None,
                 BusyFolder::Chain(chain),
+                // The chain record owns the step's schema — see the worker-branch arm.
+                None,
                 answered_for,
             )
             .await
@@ -438,11 +475,33 @@ async fn hand_on(chain: &Chain, answer: &str) {
 
 /// What a step's turn came to: its answer, or none at all plus why. The one place the "hand the
 /// answer on, or end the chain" rule lives — whichever path ran the step: a worker round, a branch
-/// turn or a role turn. A turn with no answer is a failure inside a chain, and `reason` is where the
-/// caller says why, so a generic sentence is never the only thing the owner learns.
-pub(crate) async fn settle(chain: &Chain, answer: Option<&str>, reason: &str) {
+/// turn or a role turn. `conversation` is the session that produced the answer, whose recorded
+/// model and provider the transformation follows. A turn with no answer is a failure inside a chain,
+/// and `reason` is where the caller says why, so a generic sentence is never the only thing the
+/// owner learns.
+pub(crate) async fn settle(
+    chain: &Chain,
+    conversation: Option<&str>,
+    answer: Option<&str>,
+    reason: &str,
+) {
     match answer {
-        Some(answer) if !answer.trim().is_empty() => hand_on(chain, answer).await,
+        Some(answer) if !answer.trim().is_empty() => {
+            // A step that asked for JSON hands JSON on; a transformation that fails forwards the
+            // whole answer, and a stop landing meanwhile is caught by `hand_on`.
+            let answer = crate::extract::answer_as_json(
+                chain.current.extract.as_ref(),
+                &crate::extract::StepContext {
+                    role: chain.current.role(),
+                    workspace: &chain.workspace,
+                    conversation,
+                    parent: Some(ParentKey::Chain(chain.id.clone())),
+                },
+                answer,
+            )
+            .await;
+            hand_on(chain, &answer).await;
+        }
         _ => fail(chain, reason).await,
     }
 }
@@ -669,6 +728,7 @@ mod tests {
             place: None,
             branch: Some(branch.to_string()),
             name: None,
+            extract: None,
         }
     }
 
@@ -678,6 +738,7 @@ mod tests {
             place: None,
             branch: None,
             name: Some(name.to_string()),
+            extract: None,
         }
     }
 
@@ -687,6 +748,7 @@ mod tests {
             place: None,
             branch: None,
             name: None,
+            extract: None,
         }
     }
 
@@ -768,6 +830,35 @@ mod tests {
         );
     }
 
+    /// A step's schema is read from the step that names it, in either form a call can carry it —
+    /// the object an agent passes and the JSON text the command line passes.
+    #[test]
+    fn a_step_reads_the_schema_it_names() {
+        let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        let expected = crate::extract::Extract::from_arg(&schema).expect("the schema is accepted");
+        let parsed: Vec<Option<crate::extract::Extract>> =
+            [schema.clone(), json!(schema.to_string())]
+                .into_iter()
+                .map(|given| {
+                    let steps = parse(&json!({"addressee": "worker", "extract": given}))
+                        .expect("a well-formed step");
+                    steps[0].extract.clone()
+                })
+                .collect();
+        assert_eq!(
+            parsed,
+            vec![Some(expected.clone()), Some(expected)],
+            "a step carries the schema it names, in either form"
+        );
+        // A schema a step cannot use is refused whole, before anything runs.
+        for bad in [
+            json!({"addressee": "worker", "extract": "not json"}),
+            json!({"addressee": "worker", "extract": {"type": "object", "allOf": []}}),
+        ] {
+            assert!(parse(&bad).is_err(), "must refuse {bad}");
+        }
+    }
+
     #[test]
     fn a_chain_is_at_most_ten_steps() {
         // The `for` value holds steps two onwards: nine of them plus the call is ten.
@@ -804,6 +895,133 @@ mod tests {
         );
     }
 
+    /// A step's schema is part of the chain's identity, and two schemas differing only in key order
+    /// or whitespace are one schema — so a re-issued call finds its chain either way. A call that
+    /// carries no schema keeps exactly the identity it had before the argument existed.
+    #[test]
+    fn a_steps_schema_is_part_of_the_chains_identity() {
+        let plain = id_of("draft it", &branch("one"), &[role("editor")]);
+        assert_eq!(
+            plain,
+            id_of("draft it", &branch("one"), &[role("editor")]),
+            "two schema-less calls are one chain"
+        );
+        // Exactly the identity the call had before the argument existed, so a chain started by an
+        // older build is still found by the same call.
+        assert_eq!(plain, "aa0f6e84e78c572f");
+
+        let with_schema = |text: &str| Step {
+            extract: Some(
+                crate::extract::Extract::from_text(text).expect("the schema is accepted"),
+            ),
+            ..branch("one")
+        };
+        let first = with_schema(r#"{"type":"object","properties":{"a":{"type":"string"}}}"#);
+        let reordered =
+            with_schema(r#"{ "properties": { "a": { "type": "string" } }, "type": "object" }"#);
+        assert_ne!(
+            id_of("draft it", &first, &[role("editor")]),
+            plain,
+            "a schema changes the chain's identity"
+        );
+        assert_eq!(
+            id_of("draft it", &first, &[role("editor")]),
+            id_of("draft it", &reordered, &[role("editor")]),
+            "key order and whitespace are not identity"
+        );
+        assert_ne!(
+            id_of("draft it", &first, &[role("editor")]),
+            id_of(
+                "draft it",
+                &with_schema(r#"{"type":"string"}"#),
+                &[role("editor")]
+            ),
+            "a different schema is a different chain"
+        );
+        // A schema on a step AFTER the call is the chain's identity too.
+        let later = Step {
+            extract: Some(crate::extract::Extract::from_text(r#"{"type":"string"}"#).expect("ok")),
+            ..role("editor")
+        };
+        assert_ne!(
+            id_of("draft it", &branch("one"), &[later]),
+            plain,
+            "a schema on a later step changes the identity as well"
+        );
+    }
+
+    /// A field a stored record carries and this build does not know makes the whole record
+    /// unreadable, never silently reduced: a step that carried a schema must not come back as an
+    /// ordinary delegation returning prose.
+    #[test]
+    fn an_unknown_field_makes_a_stored_record_unreadable() {
+        let base = json!({
+            "id": "drifted",
+            "task": "draft it",
+            "user": crate::users::ADMIN_USER_NAME,
+            "channel": "gui",
+            "workspace": "ws",
+            "current": {"addressee": "worker"},
+            "step": 1,
+        });
+        assert!(
+            Stored::parse(Some(base.to_string())).step().is_some(),
+            "the shape this build knows reads as a step"
+        );
+        let mut drifted = base.clone();
+        drifted["current"]["unknown"] = json!(1);
+        assert!(
+            Stored::parse(Some(drifted.to_string())).is_unreadable(),
+            "an unknown field of a step"
+        );
+        let mut drifted = base;
+        drifted["unknown"] = json!(1);
+        assert!(
+            Stored::parse(Some(drifted.to_string())).is_unreadable(),
+            "an unknown field of the chain itself"
+        );
+
+        // The envelopes that carry a schema fail to decode whole for the same reason.
+        let launch = crate::Launch {
+            role: crate::Role::Worker,
+            name: String::new(),
+            identifier: None,
+            prompt: String::new(),
+            tools: Vec::new(),
+            agent_id: crate::session::worker_branch_agent_id("drifted"),
+            reply_to: None,
+            chain: None,
+            extract: None,
+        };
+        let mut value = serde_json::to_value(&launch).expect("a launch serializes");
+        value["unknown"] = json!(1);
+        assert!(
+            serde_json::from_value::<crate::Launch>(value).is_err(),
+            "a launch carrying an unknown field is refused whole"
+        );
+        let job = crate::agent::message_router::AgentJob {
+            content: "draft it".to_string(),
+            workspace_name: "ws".to_string(),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "gui".to_string(),
+            kind: crate::agent::message_router::MessageKind::UserMessage,
+            role: crate::Role::Worker,
+            reply_target: None,
+            pending_job_id: None,
+            originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
+            urgent: false,
+            extract: None,
+        };
+        let mut value = serde_json::to_value(&job).expect("an envelope serializes");
+        value["unknown"] = json!(1);
+        assert!(
+            serde_json::from_value::<crate::agent::message_router::AgentJob>(value).is_err(),
+            "an envelope carrying an unknown field is refused whole"
+        );
+    }
+
     /// A stored chain value has three states, and "unreadable" is never "no chain": a step whose
     /// record is corrupt must be abandoned, not delivered as an ordinary delegation.
     #[test]
@@ -824,6 +1042,135 @@ mod tests {
         ));
         assert!(drifted.is_unreadable());
         assert_eq!(drifted.unreadable_chain(), Some("drifted"));
+    }
+
+    /// A schema that can be filled replaces the step's answer with the JSON document: the caller
+    /// receives JSON as the chain's final answer, and the prose is gone.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn a_schema_that_can_be_filled_replaces_the_answer() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("chain_filled")
+                .to_string_lossy(),
+            "chain_filled_ws",
+        )
+        .await;
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(crate::util::test::FakeProvider::new().ok(r#"{"a":"one"}"#));
+        let _provider_guard = crate::util::test::install_fake_provider(fake.clone());
+        let mut current = role("writer");
+        current.extract = Some(
+            crate::extract::Extract::from_text(
+                r#"{"type":"object","properties":{"a":{"type":"string"}},"required":["a"]}"#,
+            )
+            .expect("the schema is accepted"),
+        );
+        let filled = chain("filled", "chain_filled_ws", 1, 1, current, Vec::new());
+        seed_step(&filled, &ws).await;
+        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let mut admin_rx = crate::agent::message_router::register_agent(&admin);
+
+        settle(&filled, None, Some("the whole answer"), "no answer").await;
+
+        let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
+            .await
+            .expect("the final answer is delivered")
+            .expect("the final envelope");
+        assert!(
+            job.content.contains(r#"{"a":"one"}"#),
+            "the JSON document is the answer: {}",
+            job.content
+        );
+        assert!(
+            !job.content.contains("the whole answer"),
+            "the prose is gone: {}",
+            job.content
+        );
+        assert_eq!(
+            fake.sent.lock().unwrap().len(),
+            1,
+            "one conforming reply is enough"
+        );
+        crate::agent::message_router::unregister_agent(&admin);
+    }
+
+    /// A schema that cannot be filled forwards the step's whole answer unchanged: the step's work is
+    /// never lost, and the chain is never failed because of it.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn a_schema_that_cannot_be_filled_forwards_the_whole_answer() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("chain_failopen")
+                .to_string_lossy(),
+            "chain_failopen_ws",
+        )
+        .await;
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = std::sync::Arc::new(
+            crate::util::test::FakeProvider::new()
+                .ok("not json at all")
+                .ok("not json at all")
+                .ok("not json at all"),
+        );
+        let _provider_guard = crate::util::test::install_fake_provider(fake.clone());
+        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let mut admin_rx = crate::agent::message_router::register_agent(&admin);
+
+        let mut current = role("writer");
+        current.extract = Some(
+            crate::extract::Extract::from_text(
+                r#"{"type":"object","properties":{"a":{"type":"string"}}}"#,
+            )
+            .expect("the schema is accepted"),
+        );
+        let failopen = chain("failopen", "chain_failopen_ws", 1, 1, current, Vec::new());
+        seed_step(&failopen, &ws).await;
+        settle(&failopen, None, Some("the whole answer"), "no answer").await;
+        let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
+            .await
+            .expect("the final answer is delivered")
+            .expect("the final envelope");
+        assert!(
+            job.content.contains("the whole answer"),
+            "an answer that cannot be turned into JSON is forwarded whole: {}",
+            job.content
+        );
+        assert_eq!(
+            fake.sent.lock().unwrap().len(),
+            3,
+            "the transformation spends its own attempt budget, then gives up"
+        );
+
+        // A step that asked for nothing is handed on untouched, with no call at all.
+        let plain = chain(
+            "plain",
+            "chain_failopen_ws",
+            1,
+            1,
+            role("writer"),
+            Vec::new(),
+        );
+        seed_step(&plain, &ws).await;
+        settle(&plain, None, Some("the whole answer"), "no answer").await;
+        let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
+            .await
+            .expect("the final answer is delivered")
+            .expect("the final envelope");
+        assert!(job.content.contains("the whole answer"));
+        assert_eq!(
+            fake.sent.lock().unwrap().len(),
+            3,
+            "a step with no schema makes no call"
+        );
+        crate::agent::message_router::unregister_agent(&admin);
     }
 
     /// A worker step's `jobs` row carries the chain and the chain's own identity, so a restart
@@ -862,6 +1209,7 @@ mod tests {
             caller_agent_id: None,
             fail_on_checkpoint_error: false,
             chain: Some(&chain),
+            extract: None,
         };
         crate::tools::implement::spawn_implement_rows(&ws, "draft it", &args)
             .await
@@ -1213,9 +1561,11 @@ mod tests {
                     agent_id: crate::session::worker_branch_agent_id("shared"),
                     reply_to: None,
                     chain: Some(Box::new(queued)),
+                    extract: None,
                 }),
                 reply_to_custom: None,
                 urgent: false,
+                extract: None,
             };
             crate::agent::message_router::persist_pending(&job, record_id(&chain.id, 2))
                 .await
@@ -1309,7 +1659,14 @@ mod tests {
         seed_step(&chain, &ws).await;
         let conversation = crate::session::worker_branch_agent_id("editor");
         crate::session::store()
-            .set_branch(&conversation, None, Some("editor"), None, Some(&chain))
+            .set_branch(
+                &conversation,
+                None,
+                Some("editor"),
+                None,
+                Some(&chain),
+                None,
+            )
             .await
             .expect("the step's conversation records its chain");
 
@@ -1416,7 +1773,7 @@ mod tests {
         let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
-        settle(&chain, None, "the provider refused the request (401)").await;
+        settle(&chain, None, None, "the provider refused the request (401)").await;
 
         let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
             .await
@@ -1478,6 +1835,7 @@ mod tests {
             custom_role: None,
             reply_to_custom: None,
             urgent: false,
+            extract: None,
         };
         crate::agent::message_router::persist_pending(&job, record_id(&chain.id, 1))
             .await
@@ -1498,7 +1856,7 @@ mod tests {
             ..chain.clone()
         };
         crate::session::store()
-            .set_branch(&conversation, None, Some("two"), None, Some(&second))
+            .set_branch(&conversation, None, Some("two"), None, Some(&second), None)
             .await
             .expect("the step's conversation records its chain");
         assert_eq!(
@@ -1543,7 +1901,7 @@ mod tests {
         );
         let sibling = crate::session::worker_branch_agent_id("one");
         crate::session::store()
-            .set_branch(&sibling, None, Some("one"), None, Some(&chain))
+            .set_branch(&sibling, None, Some("one"), None, Some(&chain), None)
             .await
             .expect("an earlier step's conversation records the chain");
         let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
@@ -1615,7 +1973,7 @@ mod tests {
         keep_visible(&chain);
         let sibling = crate::session::worker_branch_agent_id("one");
         crate::session::store()
-            .set_branch(&sibling, None, Some("one"), None, Some(&chain))
+            .set_branch(&sibling, None, Some("one"), None, Some(&chain), None)
             .await
             .expect("an earlier step's conversation records the chain");
         let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);

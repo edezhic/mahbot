@@ -55,19 +55,22 @@ pub(crate) async fn spawn_implement_rows(
         record.custom_launch,
         // A chain step's row carries the chain, so a restart resumes the same chain.
         args.chain,
+        // An ordinary round's row carries the schema, so a restart still transforms the answer.
+        args.extract,
     )
     .await?;
     Ok(worker_agent_id)
 }
 
-/// Who a worker round runs for: the identity its durable `jobs` row carries and the chain it is a
-/// step of.
+/// Who a worker round runs for: the identity its durable `jobs` row carries, the chain it is a
+/// step of, and the schema its answer must come back as.
 struct RoundCaller<'a> {
     job_id: &'a str,
     caller_role: Role,
     user_name: &'a str,
     channel: &'a str,
     chain: Option<&'a crate::launch::Chain>,
+    extract: Option<&'a crate::extract::Extract>,
 }
 
 /// The COMMAND LINE's handover of a worker round.
@@ -87,6 +90,7 @@ pub(crate) async fn hand_over_worker_round(
     task: &str,
     caller_role: Role,
     job_id: &str,
+    extract: Option<&crate::extract::Extract>,
 ) -> anyhow::Result<()> {
     // Read the caller's identity synchronously BEFORE the spawn (task-local contract): the
     // job row must carry the command line's own user and channel.
@@ -102,6 +106,7 @@ pub(crate) async fn hand_over_worker_round(
             user_name: &user_name,
             channel: &channel,
             chain: None,
+            extract,
         },
     )
     .await
@@ -125,6 +130,8 @@ pub(crate) async fn hand_over_chain_round(
             user_name: &chain.user,
             channel: &chain.channel,
             chain: Some(chain),
+            // A chain step's schema travels on the step itself, which the hand-off clones on.
+            extract: None,
         },
     )
     .await
@@ -154,6 +161,7 @@ async fn hand_over_round(
         caller_agent_id: None,
         fail_on_checkpoint_error: false,
         chain: caller.chain,
+        extract: caller.extract,
     };
     spawn_implement_rows(exec, task, &args).await?;
 
@@ -317,6 +325,7 @@ mod tests {
                 "admin",
                 "gui",
                 job_id,
+                None,
                 None,
             )
             .await
@@ -552,5 +561,145 @@ mod tests {
             serde_json::from_str(&rows[2].get::<String>(2).unwrap()).unwrap();
         assert_eq!(payload.tool_call_id, "call_implement_h");
         assert_eq!(payload.content, "WORKER_RESPONSE");
+    }
+
+    /// The durable round's own entry point delivers the schema's JSON document as its answer, and
+    /// a round that asked for nothing delivers its own text with no transformation call.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn a_durable_round_delivers_the_schema_it_asked_for() {
+        crate::util::test::init_management_test_stores().await;
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let _provider_guard = install_fake_provider(std::sync::Arc::new(
+            FakeProvider::new().ok("WORKER DONE").ok(r#"{"ok":true}"#),
+        ));
+        let ws = test_ws("/tmp/test_ws_worker_extract");
+        let schema = crate::extract::Extract::from_text(
+            r#"{"type":"object","properties":{"ok":{"type":"boolean"}}}"#,
+        )
+        .expect("the schema is accepted");
+        let envelope = crate::tools::SyncDurableCore::Worker
+            .dispatch_durable(
+                &ws,
+                None,
+                "do the work",
+                Role::Assistant,
+                "admin",
+                "gui",
+                "worker_extract_job",
+                None,
+                Some(&schema),
+            )
+            .await
+            .expect("the round completes");
+        assert!(
+            envelope.content.contains(r#"{"ok":true}"#),
+            "the JSON document replaces the round's answer: {}",
+            envelope.content
+        );
+        assert!(
+            !envelope.content.contains("WORKER DONE"),
+            "the prose is gone: {}",
+            envelope.content
+        );
+    }
+
+    /// A stop landing while the transformation runs stops the delivery too: the last look before
+    /// the route sees it, so nothing reaches the caller — while a round nobody stopped delivers its
+    /// JSON, which is what makes the assertion mean something.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain)]
+    async fn a_stop_during_the_transformation_delivers_nothing() {
+        crate::util::test::init_management_test_stores().await;
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fake = std::sync::Arc::new(
+            FakeProvider::new()
+                .ok("WORKER DONE")
+                .ok(r#"{"ok":true}"#)
+                .hold_call(2, gate.clone())
+                .ok("WORKER DONE")
+                .ok(r#"{"ok":true}"#),
+        );
+        let _provider_guard = install_fake_provider(fake.clone());
+        let ws = test_ws("/tmp/test_ws_worker_extract_stop");
+        let schema = || {
+            crate::extract::Extract::from_text(
+                r#"{"type":"object","properties":{"ok":{"type":"boolean"}}}"#,
+            )
+            .expect("the schema is accepted")
+        };
+        let stopped = "worker_extract_stopped";
+        let _cancel_guard = crate::round_cancel::register(stopped, None);
+        // The id `envelope_target` computes for this envelope: the owner's Assistant in the
+        // round's workspace.
+        let caller = crate::jobs::target_agent_id(
+            None,
+            crate::users::ADMIN_USER_NAME,
+            Role::Assistant.as_str(),
+            &ws.name,
+        );
+        let mut rx = crate::agent::message_router::register_agent(&caller);
+
+        crate::agent::CURRENT_TOOL_USER_NAME
+            .scope(crate::users::ADMIN_USER_NAME.to_string(), async {
+                crate::agent::CURRENT_TOOL_CHANNEL
+                    .scope("gui".to_string(), async {
+                        crate::tools::SyncDurableCore::Worker.spawn_dispatch(
+                            &ws,
+                            None,
+                            "do the work",
+                            Role::Assistant,
+                            stopped.to_string(),
+                            Some(schema()),
+                        );
+                        // The transformation is in flight: stop the round, then let it finish.
+                        wait_for_calls(&fake, 2).await;
+                        crate::round_cancel::cancel(stopped);
+                        gate.notify_one();
+                        assert!(
+                            tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+                                .await
+                                .is_err(),
+                            "a stopped round delivers nothing"
+                        );
+
+                        // The control: the same dispatch, nobody stopping it, delivers its JSON.
+                        crate::tools::SyncDurableCore::Worker.spawn_dispatch(
+                            &ws,
+                            None,
+                            "do the work",
+                            Role::Assistant,
+                            "worker_extract_delivered".to_string(),
+                            Some(schema()),
+                        );
+                        let delivered =
+                            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                                .await
+                                .expect("the round's answer is delivered")
+                                .expect("the envelope");
+                        assert!(
+                            delivered.content.contains(r#"{"ok":true}"#),
+                            "{}",
+                            delivered.content
+                        );
+                    })
+                    .await;
+            })
+            .await;
+        crate::agent::message_router::unregister_agent(&caller);
+    }
+
+    /// Wait until the fake provider has received `calls` requests.
+    async fn wait_for_calls(fake: &FakeProvider, calls: usize) {
+        for _ in 0..500 {
+            if fake.request_fingerprints.lock().unwrap().len() >= calls {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the fake provider never received {calls} calls");
     }
 }

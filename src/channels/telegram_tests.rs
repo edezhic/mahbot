@@ -5337,12 +5337,16 @@ async fn a_dropped_listener_leaves_its_frame_open_until_the_burst_is_handed_on()
         }
     });
 
-    // The burst is in the collector's hands before the listener is dropped: the poll the intake
-    // issues after taking the event on is the sign (a failed hand-over never polls again).
-    until("the intake handed the burst to the collector", || async {
-        fake.count("getUpdates") >= 2
+    // The frame is the collector's before the listener is dropped. Two things have to be true, and
+    // neither is a poll count (the startup handshake polls too): the intake took the event on —
+    // the record says so — and the collector has taken the part into its burst, which is what the
+    // wait past its own quiet window guarantees. A full pipeline then blocks the hand-over, so the
+    // frame cannot end under the abort.
+    until("the intake took the event on", || async {
+        !still_held(&store, "700").await.is_empty()
     })
     .await;
+    tokio::time::sleep(check_windows().quiet + Duration::from_millis(100)).await;
     listener.abort();
     let _ = listener.await;
 

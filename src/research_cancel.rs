@@ -304,6 +304,7 @@ mod tests {
                         custom_role: None,
                         reply_to_custom: None,
                         urgent: false,
+                        extract: None,
                     },
                     id.to_string(),
                 )

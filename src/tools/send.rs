@@ -15,8 +15,9 @@
 //!
 //! The owner's Assistant (and its command-line twin) may also chain the call with `for`: the
 //! addressee's answer then goes straight on to the next addressee instead of coming back, so one
-//! call runs a whole sequence and only the final answer arrives ([`crate::tools::chain`]). No
-//! other holder declares the argument.
+//! call runs a whole sequence and only the final answer arrives ([`crate::tools::chain`]). The
+//! same holders may ask for the answer as JSON with `extract`, which replaces it
+//! ([`crate::extract`]). No other holder declares either argument.
 //!
 //! Every call that would start a worker or a custom role first refuses a folder another one is
 //! already working in (see [`crate::launch::BusyFolder`]).
@@ -245,6 +246,15 @@ impl Addressee {
         }
     }
 
+    /// Whether this address returns an answer of its own, which a schema can shape. `guest` and
+    /// `assistant` never do, so a schema combined with either is refused whole.
+    fn returns_an_answer(self) -> bool {
+        matches!(
+            self,
+            Self::Worker | Self::WorkerBranch | Self::Manager | Self::Role
+        )
+    }
+
     /// The choice declaration's clause: what this addressee does and what it cannot do without.
     fn clause(self) -> String {
         let required: Vec<String> = self
@@ -355,10 +365,33 @@ impl SendTool {
         crate::agent::tool_command_line()
     }
 
-    /// Whether this holder's `send` declares `for` — the owner's Assistant's own surface, and its
-    /// command-line twin, which is the same toolset. No other holder has it.
-    fn accepts_for(&self) -> bool {
-        self.caller_role == Role::Assistant
+    /// Whether this holder's `send` is the owner's Assistant's own surface — the only one that
+    /// declares `for` and `extract` — or its command-line twin, which is the same toolset. No
+    /// other holder has either argument.
+    fn owner_surface(&self) -> bool {
+        self.caller_role.is_owner_assistant()
+    }
+
+    /// An argument that needs an answer of its own must name where that answer goes: the command
+    /// line's unnamed address is the owner's own assistant, which `consequence` says cannot take it.
+    fn require_named_addressee(
+        args: &serde_json::Value,
+        arg: &str,
+        consequence: &str,
+    ) -> Result<()> {
+        if Self::command_line()
+            && matches!(
+                args.get(Addressee::ARG),
+                None | Some(serde_json::Value::Null)
+            )
+        {
+            anyhow::bail!(
+                "usage: `{arg}` needs an explicit `{}` — the command line's unnamed address is your \
+                 own assistant, which {consequence}",
+                Addressee::ARG
+            );
+        }
+        Ok(())
     }
 
     /// The addressees THIS CALL may name: the holder's own inside an agent session, the
@@ -473,6 +506,37 @@ impl SendTool {
         }
     }
 
+    /// The schema this call asks its answer to match, when it asks for one. The argument belongs
+    /// to the owner's Assistant and its command-line twin alone; an address that returns no answer
+    /// of its own refuses it whole rather than silently ignoring it.
+    fn extract(
+        &self,
+        args: &serde_json::Value,
+        addressee: Addressee,
+    ) -> Result<Option<crate::extract::Extract>> {
+        let Some(raw) = args
+            .get(crate::extract::ARG)
+            .filter(|value| !value.is_null())
+        else {
+            return Ok(None);
+        };
+        if !self.owner_surface() {
+            anyhow::bail!(
+                "usage: `{}` is not an argument of this tool",
+                crate::extract::ARG
+            );
+        }
+        Self::require_named_addressee(args, crate::extract::ARG, "returns no answer of its own")?;
+        if !addressee.returns_an_answer() {
+            anyhow::bail!(
+                "usage: `{}` is not an argument of the `{}` address",
+                crate::extract::ARG,
+                addressee.as_str()
+            );
+        }
+        Ok(Some(crate::extract::Extract::from_arg(raw)?))
+    }
+
     /// The chain this call starts, when it carries `for`. The whole value is read and every step
     /// checked before anything runs, so a chain that cannot finish is refused whole.
     async fn chain(
@@ -481,36 +545,24 @@ impl SendTool {
         ws: &Workspace,
         addressee: Addressee,
         task: &str,
+        extract: Option<&crate::extract::Extract>,
     ) -> Result<Option<crate::launch::Chain>> {
         let Some(raw) = args.get(FOR_ARG).filter(|value| !value.is_null()) else {
             return Ok(None);
         };
         // `for` belongs to the owner's Assistant and its command-line twin alone. The other
         // holders refuse it as an argument they do not have, without saying what it is.
-        if !self.accepts_for() {
+        if !self.owner_surface() {
             anyhow::bail!("usage: `{FOR_ARG}` is not an argument of this tool");
         }
-        // The command line's unnamed address is the owner's own assistant, which can never be a
-        // chain step — so a chain there must say where step one goes.
-        if Self::command_line()
-            && matches!(
-                args.get(Addressee::ARG),
-                None | Some(serde_json::Value::Null)
-            )
-        {
-            anyhow::bail!(
-                "usage: `{}` needs an explicit `{}` — the command line's unnamed address is your \
-                 own assistant, which can never be a chain step",
-                FOR_ARG,
-                Addressee::ARG
-            );
-        }
+        Self::require_named_addressee(args, FOR_ARG, "can never be a chain step")?;
         let next = super::chain::parse(raw)?;
         let current = crate::launch::Step {
             addressee,
             place: self.optional(args, Argument::Place)?.map(str::to_string),
             branch: self.optional(args, Argument::Branch)?.map(str::to_string),
             name: self.optional(args, Argument::Name)?.map(str::to_string),
+            extract: extract.cloned(),
         };
         // Everything knowable now is checked now: an unknown role, an invalid branch, an unusable
         // place or a malformed value refuses the whole call, so no step runs.
@@ -603,8 +655,16 @@ impl Tool for SendTool {
         }
         // `for` is the owner's Assistant's own argument: one clause here, its shape in the
         // argument's own schema description, and nothing on any other holder's description.
-        if self.accepts_for() {
+        if self.owner_surface() {
             parts.push(labelled(&[FOR_ARG], load_prompt("tool/send_for.md").trim()));
+        }
+        // `extract` likewise: one clause here, the subset and the outcome in the on-demand
+        // reference only a holder of the argument can reach.
+        if self.owner_surface() {
+            parts.push(labelled(
+                &[crate::extract::ARG],
+                load_prompt("tool/send_extract.md").trim(),
+            ));
         }
         // One pointer, last, whatever the holder's addressees and mode assembled above.
         crate::tools::tool_reference::standing(self.name(), &parts.join("\n\n"))
@@ -647,11 +707,18 @@ impl Tool for SendTool {
         }
         // The chain argument is an object of the call's own shape; a recursive schema is not
         // reliably produced by every model, so the shape lives in its description.
-        if self.accepts_for() {
+        if self.owner_surface() {
             // The command line carries the value as JSON text, so both forms are declared.
             properties[FOR_ARG] = json!({
                 "type": ["object", "string"],
                 "description": load_prompt("tool/send_for_schema.md").trim(),
+            });
+        }
+        // Likewise `extract`: an object or its JSON text.
+        if self.owner_surface() {
+            properties[crate::extract::ARG] = json!({
+                "type": ["object", "string"],
+                "description": load_prompt("tool/send_extract_schema.md").trim(),
             });
         }
         super::tool_params_schema(&properties, &required)
@@ -666,9 +733,14 @@ impl Tool for SendTool {
         if Self::command_line() {
             Self::refuse_unused(&args, addressee)?;
         }
+        // The schema, when the call asks for one: read and validated whole before anything runs.
+        let extract = self.extract(&args, addressee)?;
         // A chain replaces the per-addressee acknowledgement: one acknowledgement for the whole
         // chain, and only the final answer comes back.
-        if let Some(chain) = self.chain(&args, ws, addressee, message).await? {
+        if let Some(chain) = self
+            .chain(&args, ws, addressee, message, extract.as_ref())
+            .await?
+        {
             return super::chain::start(chain, ws, Self::answered_for()).await;
         }
 
@@ -708,6 +780,7 @@ impl Tool for SendTool {
                         message,
                         self.caller_role,
                         &job_id,
+                        extract.as_ref(),
                     )
                     .await?;
                 } else {
@@ -717,6 +790,7 @@ impl Tool for SendTool {
                         message,
                         self.caller_role,
                         job_id,
+                        extract.clone(),
                     );
                 }
                 let folder = place
@@ -742,6 +816,7 @@ impl Tool for SendTool {
                     place.as_ref(),
                     asker,
                     crate::launch::BusyFolder::Refuse,
+                    extract.as_ref(),
                     Self::answered_for(),
                 )
                 .await
@@ -785,6 +860,7 @@ impl Tool for SendTool {
                         launch,
                         workspace: ws.name.clone(),
                     }),
+                    extract.clone(),
                     Self::answered_for(),
                 )
                 .await?;
@@ -815,6 +891,7 @@ impl Tool for SendTool {
                     &workspace,
                     asker,
                     crate::launch::BusyFolder::Refuse,
+                    extract.as_ref(),
                     Self::answered_for(),
                 )
                 .await
@@ -2604,29 +2681,37 @@ mod tests {
         }
     }
 
-    /// `for` is the owner's Assistant's own argument: its schema and description carry it, no
-    /// other holder's does.
+    /// `for` and `extract` are the owner's Assistant's own arguments: its schema and description
+    /// carry both, no other holder's does.
     #[test]
-    fn only_the_owner_assistants_send_declares_for() {
+    fn only_the_owner_assistants_send_declares_for_and_extract() {
         let admin = SendTool::admin(Role::Assistant);
-        assert!(
-            admin.parameters_schema()["properties"].get("for").is_some(),
-            "the admin's schema offers `for`"
-        );
-        assert!(admin.description().contains("`for`"));
+        for arg in [FOR_ARG, crate::extract::ARG] {
+            assert!(
+                admin.parameters_schema()["properties"].get(arg).is_some(),
+                "the admin's schema offers `{arg}`"
+            );
+            assert!(
+                admin.description().contains(&format!("`{arg}`")),
+                "the admin's description mentions `{arg}`: {}",
+                admin.description()
+            );
+        }
         for other in [
             SendTool::engineer(),
             SendTool::granted(&[Addressee::Worker]),
         ] {
-            assert!(
-                other.parameters_schema()["properties"].get("for").is_none(),
-                "no other holder's schema offers `for`"
-            );
-            assert!(
-                !other.description().contains("`for`"),
-                "no other holder's description mentions `for`: {}",
-                other.description()
-            );
+            for arg in [FOR_ARG, crate::extract::ARG] {
+                assert!(
+                    other.parameters_schema()["properties"].get(arg).is_none(),
+                    "no other holder's schema offers `{arg}`"
+                );
+                assert!(
+                    !other.description().contains(&format!("`{arg}`")),
+                    "no other holder's description mentions `{arg}`: {}",
+                    other.description()
+                );
+            }
         }
     }
 
@@ -2747,6 +2832,217 @@ mod tests {
         .expect_err("an unknown role is refused whole")
         .to_string();
         assert!(err.contains("no_such_role_anywhere"), "{err}");
+
+        // `extract` belongs to the same holders, and its refusal says no more than that: it never
+        // describes what the argument does.
+        let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        for tool in [
+            SendTool::engineer(),
+            SendTool::granted(&[Addressee::Worker]),
+        ] {
+            let err = dispatch(
+                &tool,
+                &ws,
+                json!({"message": "x", "addressee": "worker", "extract": schema}),
+            )
+            .await
+            .expect_err("only the owner's Assistant takes a schema")
+            .to_string();
+            assert!(err.contains("is not an argument"), "{err}");
+            for undescribed in ["schema", "JSON", "answer", "chain"] {
+                assert!(
+                    !err.contains(undescribed),
+                    "the refusal does not describe the argument: {err}"
+                );
+            }
+        }
+        // The addresses that return no answer of their own refuse a schema whole, whatever the
+        // holder — on the agent path and on the command line's.
+        let guest =
+            json!({"message": "x", "addressee": "guest", "name": "someone", "extract": schema});
+        let err = dispatch(&SendTool::admin(Role::Assistant), &ws, guest.clone())
+            .await
+            .expect_err("a guest returns no answer to shape")
+            .to_string();
+        assert!(
+            err.contains("`extract`") && err.contains("`guest`"),
+            "{err}"
+        );
+        let err = dispatch_command_line(&SendTool::admin(Role::Assistant), &ws, guest)
+            .await
+            .expect_err("a guest returns no answer to shape")
+            .to_string();
+        assert!(
+            err.contains("`extract`") && err.contains("`guest`"),
+            "{err}"
+        );
+        let err = dispatch_command_line(
+            &SendTool::admin(Role::Assistant),
+            &ws,
+            json!({"message": "x", "addressee": "assistant", "extract": schema}),
+        )
+        .await
+        .expect_err("the owner's own assistant returns no answer to shape")
+        .to_string();
+        assert!(
+            err.contains("`extract`") && err.contains("`assistant`"),
+            "{err}"
+        );
+        // The command line's unnamed address is that same assistant, so a schema there must say
+        // where the answer goes.
+        let err = dispatch_command_line(
+            &SendTool::admin(Role::Assistant),
+            &ws,
+            json!({"message": "x", "extract": schema}),
+        )
+        .await
+        .expect_err("an unnamed address returns no answer to shape")
+        .to_string();
+        assert!(
+            err.contains("explicit") && err.contains("`extract`"),
+            "{err}"
+        );
+    }
+
+    /// A schema is an argument of every address that returns an answer of its own — a worker run, a
+    /// branch, a manager and a custom role — and of no other.
+    #[test]
+    fn a_schema_is_read_for_every_address_that_returns_an_answer() {
+        let tool = SendTool::admin(Role::Assistant);
+        let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        let expected = crate::extract::Extract::from_arg(&schema).expect("the schema is accepted");
+        for addressee in [
+            Addressee::Worker,
+            Addressee::WorkerBranch,
+            Addressee::Manager,
+            Addressee::Role,
+        ] {
+            assert!(
+                addressee.returns_an_answer(),
+                "{} takes a schema",
+                addressee.as_str()
+            );
+            let args = json!({"message": "x", "extract": schema});
+            assert_eq!(
+                tool.extract(&args, addressee)
+                    .expect("this address takes a schema"),
+                Some(expected.clone()),
+                "the schema is read for {}",
+                addressee.as_str()
+            );
+        }
+        for addressee in [Addressee::Guest, Addressee::Assistant] {
+            let args = json!({"message": "x", "extract": schema});
+            let err = tool
+                .extract(&args, addressee)
+                .expect_err("this address returns no answer to shape")
+                .to_string();
+            assert!(
+                err.contains("`extract`") && err.contains(&format!("`{}`", addressee.as_str())),
+                "{err}"
+            );
+        }
+        // No schema, no transformation: an ordinary call reads `None`.
+        assert_eq!(
+            tool.extract(&json!({"message": "x"}), Addressee::Worker)
+                .expect("an absent schema is not a refusal"),
+            None
+        );
+    }
+
+    /// The schema arrives as the object an agent passes or as the JSON text the command line
+    /// passes, and both are the same schema.
+    #[test]
+    fn a_schema_is_the_same_object_or_json_text() {
+        let tool = SendTool::admin(Role::Assistant);
+        let object = json!({"type": "object", "properties": {"a": {"type": "string"}}});
+        let from_object = tool
+            .extract(&json!({"extract": object}), Addressee::Worker)
+            .expect("an object is accepted");
+        let from_text = tool
+            .extract(&json!({"extract": object.to_string()}), Addressee::Worker)
+            .expect("JSON text is accepted");
+        assert_eq!(from_object, from_text);
+        assert!(from_object.is_some(), "and both name a schema");
+    }
+
+    /// A schema is refused by an address that returns no answer of its own, even for the holder that
+    /// has the argument — and before the address does any work of its own (the account is never
+    /// looked up).
+    #[tokio::test]
+    async fn a_guest_address_refuses_a_schema_even_for_the_holder_that_has_it() {
+        let ws = crate::workspace::test_ws("send_schema_guest");
+        let err = dispatch(
+            &SendTool::admin(Role::Assistant),
+            &ws,
+            json!({
+                "message": "x",
+                "addressee": "guest",
+                "name": "no_such_account_anywhere",
+                "extract": {"type": "object", "properties": {"a": {"type": "string"}}},
+            }),
+        )
+        .await
+        .expect_err("a guest returns no answer to shape")
+        .to_string();
+        assert!(
+            err.contains("`extract`") && err.contains("`guest`"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("no_such_account_anywhere"),
+            "the schema is refused before the account is even looked up: {err}"
+        );
+    }
+
+    /// A schema that cannot be enforced is refused whole, before anything runs: no round is spawned
+    /// and no envelope is queued.
+    #[tokio::test]
+    #[serial_test::serial(drain)]
+    async fn a_malformed_schema_is_refused_before_anything_runs() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("send_schema_refused")
+                .to_string_lossy(),
+            "send_schema_refused_ws",
+        )
+        .await;
+        let conn = &crate::session::store().conn;
+        let pending = || async {
+            let mut ids: Vec<String> = crate::jobs::list_pending_jobs(conn)
+                .await
+                .expect("list pending")
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        let before = pending().await;
+        let oversized = format!(
+            "{{\"type\":\"string\",\"description\":\"{}\"}}",
+            "x".repeat(crate::extract::MAX_TEXT_BYTES)
+        );
+        for bad in [
+            // A keyword this product cannot enforce is refused rather than silently ignored.
+            json!({"type": "object", "allOf": []}),
+            json!(""),
+            json!("not json at all"),
+            json!(oversized),
+        ] {
+            let err = dispatch(
+                &SendTool::admin(Role::Assistant),
+                &ws,
+                json!({"message": "x", "addressee": "worker", "extract": bad}),
+            )
+            .await
+            .expect_err("a schema that cannot be enforced is refused whole")
+            .to_string();
+            assert!(err.contains("extract"), "{bad}: {err}");
+        }
+        assert_eq!(before, pending().await, "nothing was dispatched or queued");
     }
 
     /// A chain starts with ONE acknowledgement for the whole chain, and step one's durable

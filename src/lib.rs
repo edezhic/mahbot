@@ -23,6 +23,8 @@ pub(crate) mod custom_role;
 pub mod jobs;
 // Branch lifecycle for custom roles and worker branches.
 pub(crate) mod launch;
+// The `extract` schema of `send`: the answer comes back as JSON matching it.
+pub(crate) mod extract;
 
 // Where parallel participants' answers are merged into one verdict.
 pub(crate) mod consensus;
@@ -841,7 +843,11 @@ pub enum Role {
 /// role it carries the authorial definition as it stood when the launch was created — a
 /// later edit of the record takes effect on the NEXT launch — for a worker branch the
 /// definition fields are empty.
+///
+/// A field this build does not know makes the envelope unreadable rather than silently dropped,
+/// so a launch that carried a schema never comes back as an ordinary one returning prose.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Launch {
     /// `custom` for an administrator-defined role, `worker` for a worker branch.
     /// Envelopes stored before the field existed can only be custom-role launches.
@@ -873,6 +879,11 @@ pub struct Launch {
     /// `None` for every ordinary launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<Box<crate::launch::Chain>>,
+    /// The JSON schema this launch's answer must come back as, when its caller asked for one
+    /// ([`crate::extract`]). It also rides the branch's conversation (`session_metadata.extract`),
+    /// so a turn resumed after a restart still knows what was asked of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extract: Option<crate::extract::Extract>,
 }
 
 impl Launch {
@@ -890,6 +901,17 @@ impl Role {
     #[must_use]
     pub(crate) fn for_launch(self, launch: Option<&Launch>) -> Self {
         launch.map_or(self, |launch| launch.role)
+    }
+
+    /// The owner's own assistant — the one role whose toolset, with admin rights, holds the
+    /// owner's `send` and with it the `for` and `extract` arguments. A guest's assistant is the same
+    /// role without `send` at all, which is why the admin check stays where the toolset is built:
+    /// [`crate::tools::send`] asks this for its arguments, and [`Self::tools`] asks it before
+    /// handing the `reference` tool the detail, so the argument and the detail it needs can never
+    /// diverge.
+    #[must_use]
+    pub(crate) fn is_owner_assistant(self) -> bool {
+        self == Role::Assistant
     }
 }
 

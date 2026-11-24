@@ -556,9 +556,11 @@ mod tests {
                 agent_id: branch.clone(),
                 reply_to: None,
                 chain: None,
+                extract: None,
             }),
             reply_to_custom: None,
             urgent: false,
+            extract: None,
         };
         crate::agent::message_router::persist_pending(&job, "stop_marker_pending".to_string())
             .await

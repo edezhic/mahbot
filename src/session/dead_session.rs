@@ -517,6 +517,8 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
         // by the report path; this field's remaining user is the Manager leg.
         reply_to_custom: None,
         urgent: false,
+        // A recovered turn transforms its answer exactly as the interrupted one would have.
+        extract: ctx.extract.clone(),
     };
 
     crate::agent::message_router::route(agent_id, job);
@@ -568,6 +570,7 @@ async fn recovered_launch(
                 // of the owner's Assistant (an absent/NULL column leaves it `None`).
                 reply_to: ctx.reply_to.clone().map(Box::new),
                 chain: chain.cloned().map(Box::new),
+                extract: ctx.extract.clone(),
             })),
             Ok(None) => {
                 tracing::warn!(
@@ -611,6 +614,7 @@ async fn recovered_launch(
             // every existing session).
             reply_to: ctx.reply_to.clone().map(Box::new),
             chain: chain.cloned().map(Box::new),
+            extract: ctx.extract.clone(),
         }));
     }
     RecoveredLaunch::Launch(None)
@@ -649,6 +653,7 @@ async fn recovered_chain(agent_id: &str, ctx: &SessionContext) -> ChainStep {
                     place: None,
                     branch: ctx.custom_identifier.clone(),
                     name: Some(name.to_string()),
+                    extract: None,
                 },
                 None => crate::launch::Step {
                     branch: ctx.custom_identifier.clone(),
@@ -708,6 +713,7 @@ mod tests {
             custom_identifier: None,
             reply_to: None,
             chain: crate::launch::Stored::Ordinary,
+            extract: None,
         };
         assert!(
             !attempt_recovery("role_test_launchless", &ctx, Role::Custom).await,
@@ -748,6 +754,7 @@ mod tests {
                 place: None,
                 branch: None,
                 name: Some("ghost_role".to_string()),
+                extract: None,
             },
             step: 1,
             next: Vec::new(),
@@ -761,6 +768,7 @@ mod tests {
             custom_identifier: None,
             reply_to: None,
             chain: crate::launch::Stored::Step(Box::new(chain.clone())),
+            extract: None,
         };
         let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
@@ -809,6 +817,7 @@ mod tests {
                 place: None,
                 branch: None,
                 name: Some("oneoff_editor".to_string()),
+                extract: None,
             },
             step: 1,
             next: Vec::new(),
@@ -823,6 +832,7 @@ mod tests {
             custom_identifier: None,
             reply_to: None,
             chain: crate::launch::Stored::Step(Box::new(chain.clone())),
+            extract: None,
         };
         let mut rx = crate::agent::message_router::register_agent(&conversation);
         assert!(
@@ -872,10 +882,12 @@ mod tests {
                     agent_id: crate::session::custom_role_agent_id("briefer", Some("hourly")),
                     reply_to: None,
                     chain: None,
+                    extract: None,
                 },
                 workspace: asker_folder,
             }),
             chain: crate::launch::Stored::Ordinary,
+            extract: None,
         };
         let mut rx = crate::agent::message_router::register_agent(&branch);
         assert!(
@@ -919,6 +931,7 @@ mod tests {
                 place: None,
                 branch: Some("editor".to_string()),
                 name: None,
+                extract: None,
             },
             step: 1,
             next: vec![crate::launch::Step {
@@ -926,11 +939,12 @@ mod tests {
                 place: None,
                 branch: None,
                 name: None,
+                extract: None,
             }],
         };
         // No `jobs` row and no queued envelope: the conversation is the step's whole record.
         crate::session::store()
-            .set_branch(&branch, None, Some("editor"), None, Some(&chain))
+            .set_branch(&branch, None, Some("editor"), None, Some(&chain), None)
             .await
             .expect("the conversation records the chain it is a step of");
         let ctx = SessionContext {
@@ -942,6 +956,7 @@ mod tests {
             custom_identifier: Some("editor".to_string()),
             reply_to: None,
             chain: crate::launch::Stored::Step(Box::new(chain.clone())),
+            extract: None,
         };
         let mut rx = crate::agent::message_router::register_agent(&branch);
         assert!(
@@ -963,6 +978,50 @@ mod tests {
             .expect("clean up this test's chain");
     }
 
+    /// An ordinary send's schema survives a restart on its conversation: the recovered turn still
+    /// knows what its answer was asked to look like and runs the transformation again (fail-open,
+    /// so a replay can still forward the answer unchanged).
+    #[tokio::test]
+    async fn an_ordinary_send_recovers_with_its_schema() {
+        crate::util::test::init_management_test_stores().await;
+        let branch = crate::session::worker_branch_agent_id("shaped");
+        let workspace = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
+        let extract = crate::extract::Extract::from_text(
+            r#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}"#,
+        )
+        .expect("the schema is accepted");
+        crate::session::store()
+            .set_branch(&branch, None, Some("shaped"), None, None, Some(&extract))
+            .await
+            .expect("the conversation records the schema its answer must come back as");
+        let ctx = SessionContext {
+            channel: "gui".to_string(),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            workspace_name: workspace,
+            role: Role::Worker.as_str().to_string(),
+            custom_role: None,
+            custom_identifier: Some("shaped".to_string()),
+            reply_to: None,
+            chain: crate::launch::Stored::Ordinary,
+            extract: Some(extract.clone()),
+        };
+        let mut rx = crate::agent::message_router::register_agent(&branch);
+        assert!(
+            attempt_recovery(&branch, &ctx, Role::Worker).await,
+            "an ordinary branch turn is recoverable"
+        );
+        let job = rx.try_recv().expect("the retry job is routed");
+        let launch = job
+            .custom_role
+            .expect("a worker branch's job carries its launch");
+        assert_eq!(
+            launch.extract.as_ref(),
+            Some(&extract),
+            "the recovered turn still knows the schema its answer must match"
+        );
+        crate::agent::message_router::unregister_agent(&branch);
+    }
+
     /// A step of a chain the owner stopped is never resumed: the poller leaves the conversation
     /// alone instead of rebuilding an ordinary delegation whose answer would reach the owner.
     #[tokio::test]
@@ -982,12 +1041,13 @@ mod tests {
                 place: None,
                 branch: Some("stopped".to_string()),
                 name: None,
+                extract: None,
             },
             step: 1,
             next: Vec::new(),
         };
         crate::session::store()
-            .set_branch(&branch, None, Some("stopped"), None, Some(&chain))
+            .set_branch(&branch, None, Some("stopped"), None, Some(&chain), None)
             .await
             .expect("the conversation records the chain it is a step of");
         let ctx = SessionContext {
@@ -999,6 +1059,7 @@ mod tests {
             custom_identifier: Some("stopped".to_string()),
             reply_to: None,
             chain: crate::launch::Stored::Step(Box::new(chain.clone())),
+            extract: None,
         };
         crate::tools::chain::stop(&chain.id)
             .await
@@ -1029,7 +1090,7 @@ mod tests {
         let branch = crate::session::worker_branch_agent_id("corrupt");
         let workspace = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
         crate::session::store()
-            .set_branch(&branch, None, Some("corrupt"), None, None)
+            .set_branch(&branch, None, Some("corrupt"), None, None, None)
             .await
             .expect("the conversation exists");
         let ctx = SessionContext {
@@ -1041,6 +1102,7 @@ mod tests {
             custom_identifier: Some("corrupt".to_string()),
             reply_to: None,
             chain: crate::launch::Stored::Unreadable(None),
+            extract: None,
         };
         let mut rx = crate::agent::message_router::register_agent(&branch);
         let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);

@@ -58,6 +58,8 @@
 //! - `84` — the `jobs.chain` / `session_metadata.chain` columns a `send` chain rides
 //!   on (see [`run_add_chain_columns`]). They arrive with this release, so every
 //!   existing store is still pending on them.
+//! - `85` — the `jobs.extract` / `session_metadata.extract` columns a `send` schema
+//!   rides on (see [`run_add_extract_columns`]), arriving with the same release.
 //!
 //! # The id → release record, and the retired ids
 //!
@@ -69,7 +71,8 @@
 //! - `80`, `81` — added by 0.10.5.
 //! - `82`, `83` — added after the 0.10.6 tag, so no shipped build records either.
 //! - `84` — the `send` chain's columns; no shipped build records it.
-//! - Next id: `85`.
+//! - `85` — the `send` schema's columns; no shipped build records it.
+//! - Next id: `86`.
 //!
 //! Retired, and never to be reused:
 //!
@@ -306,7 +309,8 @@ CREATE TABLE IF NOT EXISTS session_metadata (
     image_count    INTEGER,
     provider       TEXT,
     provider_model TEXT,
-    chain          TEXT
+    chain          TEXT,
+    extract        TEXT
 );
 CREATE TABLE IF NOT EXISTS session_personal_changes (
     agent_id TEXT PRIMARY KEY REFERENCES session_metadata(agent_id) ON DELETE CASCADE,
@@ -329,7 +333,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     mode           TEXT,
     exec_dir       TEXT,
     custom_launch  TEXT,
-    chain          TEXT
+    chain          TEXT,
+    extract        TEXT
 );
 CREATE TABLE IF NOT EXISTS agents (
     job_id     TEXT REFERENCES jobs(id) ON DELETE CASCADE,
@@ -727,6 +732,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         target: TargetDb::Core,
         body: MigrationBody::Rust(add_chain_columns),
     },
+    Migration {
+        id: "85",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_extract_columns),
+    },
 ];
 
 /// Apply the catalog to `conn` for one physical database. Each SQL entry's
@@ -867,6 +877,21 @@ fn add_chain_columns(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
 async fn run_add_chain_columns(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "jobs", "chain", "TEXT").await?;
     add_column_if_missing(conn, "session_metadata", "chain", "TEXT").await
+}
+
+fn add_extract_columns(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_extract_columns(conn))
+}
+
+/// Entry `85`: add the nullable `jobs.extract` and `session_metadata.extract` columns — the JSON
+/// schema a `send` asked its answer to match, carried by the record the delegation already has (a
+/// worker round's row, a branch session) rather than a store of its own. A job or conversation with
+/// no schema (every one predating the columns) behaves exactly as before, and a build that predates
+/// the columns never selects them: a schema-carrying row resumed there delivers prose. Guarded by
+/// [`add_column_if_missing`], so this body is idempotent.
+async fn run_add_extract_columns(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "jobs", "extract", "TEXT").await?;
+    add_column_if_missing(conn, "session_metadata", "extract", "TEXT").await
 }
 
 fn add_session_metadata_provider(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1139,6 +1164,7 @@ mod tests {
                 "exec_dir",
                 "custom_launch",
                 "chain",
+                "extract",
             ],
         ),
         (
@@ -1171,6 +1197,7 @@ mod tests {
                 "image_count",
                 "provider",
                 "provider_model",
+                "extract",
             ],
         ),
         ("session_personal_changes", &["agent_id", "baseline"]),
@@ -1496,8 +1523,8 @@ mod tests {
         applied.sort();
         assert_eq!(
             applied,
-            ["24", "69", "79", "80", "81", "82", "83", "84"].map(String::from),
-            "fresh core applies the baseline, the 69 seed and the six upgrade entries exactly"
+            ["24", "69", "79", "80", "81", "82", "83", "84", "85"].map(String::from),
+            "fresh core applies the baseline, the 69 seed and the seven upgrade entries exactly"
         );
     }
 

@@ -377,6 +377,7 @@ impl Session {
                         launch.identifier.as_deref(),
                         launch.reply_to.as_deref(),
                         launch.chain.as_deref(),
+                        launch.extract.as_ref(),
                     )
                     .await
             {
@@ -2182,6 +2183,7 @@ mod tests {
             agent_id: "role_briefer:week2".to_string(),
             reply_to: None,
             chain: None,
+            extract: None,
         };
         let (messages, _) = Session::build_context_messages(
             &ws,
@@ -2227,6 +2229,7 @@ mod tests {
             agent_id: "role_briefer".to_string(),
             reply_to: None,
             chain: None,
+            extract: None,
         };
         let (messages, _) = Session::build_context_messages(
             &ws,
@@ -2322,6 +2325,7 @@ mod tests {
             agent_id: agent_id.clone(),
             reply_to: None,
             chain: None,
+            extract: None,
         };
         let block_b = block_len(&ws_b, &launch).await;
         let mut session = Session {

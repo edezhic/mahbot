@@ -79,6 +79,15 @@ pub(crate) fn install_test_retry_policy(policy: crate::retry::RetryPolicy) -> Re
     RetryPolicyGuard { previous }
 }
 
+/// The route one request was sent on: the model it named and the provider it pinned. The message
+/// text is already on [`FakeProvider::request_messages`], so recording it again would be the
+/// full-request clone this projection exists to avoid.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SentRequest {
+    pub model: String,
+    pub provider: Option<String>,
+}
+
 /// Scripted [`crate::Provider`] test double for the scoped retry loops: each
 /// [`chat_scoped`](crate::Provider::chat_scoped) call pops the next outcome — `Ok(ChatResponse)`
 /// or an error carrying an explicit [`FailureClass`], so classification needs no HTTP. Every
@@ -93,6 +102,12 @@ pub(crate) struct FakeProvider {
     /// property is asserted: per-message `Debug` joined with NUL (which cannot appear in `Debug`
     /// output), so a plain `starts_with` check holds for appended-only growth.
     pub request_messages: std::sync::Mutex<Vec<String>>,
+    /// The route each request was sent on, for assertions about the fields the fingerprints do not
+    /// name.
+    pub sent: std::sync::Mutex<Vec<SentRequest>>,
+    /// One scripted call that waits for its gate before answering, so a test can land a stop while
+    /// that call is in flight: the 1-based number of the request, and its gate.
+    gate: std::sync::Mutex<Option<(usize, std::sync::Arc<tokio::sync::Notify>)>>,
 }
 
 impl FakeProvider {
@@ -102,7 +117,17 @@ impl FakeProvider {
             script: std::sync::Mutex::new(std::collections::VecDeque::new()),
             request_fingerprints: std::sync::Mutex::new(Vec::new()),
             request_messages: std::sync::Mutex::new(Vec::new()),
+            sent: std::sync::Mutex::new(Vec::new()),
+            gate: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Hold the `call`-th request (1-based) until `gate` is notified, so a test can land a stop
+    /// while that call is in flight.
+    #[must_use]
+    pub(crate) fn hold_call(self, call: usize, gate: std::sync::Arc<tokio::sync::Notify>) -> Self {
+        *self.gate.lock().unwrap() = Some((call, gate));
+        self
     }
 
     #[must_use]
@@ -286,6 +311,16 @@ impl crate::Provider for FakeProvider {
                 .collect::<Vec<_>>()
                 .join("\u{0}"),
         );
+        self.sent.lock().unwrap().push(SentRequest {
+            model: request.model.clone(),
+            provider: request.provider.clone(),
+        });
+        let hold = self.gate.lock().unwrap().clone();
+        if let Some((call, gate)) = hold
+            && call == self.request_fingerprints.lock().unwrap().len()
+        {
+            gate.notified().await;
+        }
         self.script.lock().unwrap().pop_front().unwrap_or_else(|| {
             Ok(crate::ChatResponse {
                 text: Some("unscripted default".to_string()),

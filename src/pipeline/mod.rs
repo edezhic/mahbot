@@ -896,6 +896,7 @@ fn notify_manager_system(ws_name: &str, content: String) {
             custom_role: None,
             reply_to_custom: None,
             urgent: false,
+            extract: None,
         },
     );
 }
@@ -1151,6 +1152,7 @@ async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
             custom_role: None,
             reply_to_custom: None,
             urgent: false,
+            extract: None,
         },
     );
 }

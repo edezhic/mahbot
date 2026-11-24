@@ -249,6 +249,9 @@ pub(crate) struct SessionContext {
     /// exactly as the interrupted one would have. An unreadable record abandons the branch instead
     /// of running it as an ordinary delegation.
     pub chain: crate::launch::Stored,
+    /// The schema this branch's answer must come back as, when its caller asked for one: a
+    /// recovered turn transforms the answer exactly as the interrupted one would have.
+    pub extract: Option<crate::extract::Extract>,
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -576,6 +579,7 @@ enum MetadataColumn {
     CustomIdentifier,
     ReplyTo,
     Chain,
+    Extract,
     LaunchStopped,
     WorkspaceName,
     ContextBlockLen,
@@ -594,6 +598,7 @@ impl MetadataColumn {
             Self::CustomIdentifier => "custom_identifier",
             Self::ReplyTo => "reply_to",
             Self::Chain => "chain",
+            Self::Extract => "extract",
             Self::LaunchStopped => "launch_stopped",
             Self::WorkspaceName => "workspace_name",
             Self::ContextBlockLen => "context_block_len",
@@ -1124,7 +1129,7 @@ impl SessionStore {
             .conn
             .query(
                 "SELECT channel, user_name, workspace_name, role, custom_role, custom_identifier, \
-                 reply_to, chain FROM session_metadata WHERE agent_id = ?1",
+                 reply_to, chain, extract FROM session_metadata WHERE agent_id = ?1",
                 params![agent_id],
             )
             .await
@@ -1142,6 +1147,8 @@ impl SessionStore {
                 .flatten()
                 .and_then(|json| serde_json::from_str(&json).ok());
             let chain = crate::launch::Stored::parse(row.get::<Option<String>>(7).ok().flatten());
+            let extract =
+                crate::extract::Extract::from_stored(row.get::<Option<String>>(8).ok().flatten());
             Some(SessionContext {
                 channel: channel?,
                 user_name: user_name?,
@@ -1151,6 +1158,7 @@ impl SessionStore {
                 custom_identifier,
                 reply_to,
                 chain,
+                extract,
             })
         })
     }
@@ -1440,7 +1448,9 @@ impl SessionStore {
     /// a recorded role.
     ///
     /// `reply_to` is the asking conversation this launch's work reports back to
-    /// ([`crate::Launch::reply_to`]); stored as JSON, `None` as NULL.
+    /// ([`crate::Launch::reply_to`]); stored as JSON, `None` as NULL. `extract` is the schema the
+    /// launch's answer must come back as ([`crate::Launch::extract`]), so a turn resumed after a
+    /// restart still knows what was asked of it.
     pub(crate) async fn set_branch(
         &self,
         agent_id: &str,
@@ -1448,6 +1458,7 @@ impl SessionStore {
         identifier: Option<&str>,
         reply_to: Option<&crate::agent::message_router::Asker>,
         chain: Option<&crate::launch::Chain>,
+        extract: Option<&crate::extract::Extract>,
     ) -> Result<()> {
         let now = db::now();
         let created_at = now.clone();
@@ -1455,6 +1466,7 @@ impl SessionStore {
         let id_col = MetadataColumn::CustomIdentifier.as_str();
         let reply_col = MetadataColumn::ReplyTo.as_str();
         let chain_col = MetadataColumn::Chain.as_str();
+        let extract_col = MetadataColumn::Extract.as_str();
         let reply_json = reply_to
             .map(serde_json::to_string)
             .transpose()
@@ -1463,11 +1475,15 @@ impl SessionStore {
             .map(serde_json::to_string)
             .transpose()
             .context("Failed to encode the branch's chain")?;
+        let extract_json = extract
+            .map(serde_json::to_string)
+            .transpose()
+            .context("Failed to encode the branch's schema")?;
         self.conn
             .upsert_row(
                 &format!(
                     "UPDATE session_metadata SET {role_col} = ?1, {id_col} = ?2, {reply_col} = ?3, \
-                     {chain_col} = ?4 WHERE agent_id = ?5"
+                     {chain_col} = ?4, {extract_col} = ?5 WHERE agent_id = ?6"
                 ),
                 || {
                     params![
@@ -1475,14 +1491,15 @@ impl SessionStore {
                         identifier,
                         reply_json.clone(),
                         chain_json.clone(),
+                        extract_json.clone(),
                         agent_id
                     ]
                 },
                 &format!(
                     "INSERT INTO session_metadata \
                      (agent_id, last_activity, {role_col}, {id_col}, {reply_col}, {chain_col}, \
-                     created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     {extract_col}, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                      ON CONFLICT(agent_id) DO NOTHING"
                 ),
                 params![
@@ -1492,11 +1509,20 @@ impl SessionStore {
                     identifier,
                     reply_json.clone(),
                     chain_json.clone(),
+                    extract_json.clone(),
                     created_at.as_str()
                 ],
             )
             .await?;
         Ok(())
+    }
+
+    /// Clear the schema a turn asked its answer to be shaped into. The step is over once its answer
+    /// is delivered, so the recorded state must not shape a later turn or a recovery that asked for
+    /// none.
+    pub(crate) async fn clear_extract(&self, agent_id: &str) -> Result<()> {
+        self.set_metadata_value(agent_id, MetadataColumn::Extract, Value::Null)
+            .await
     }
 
     /// Persist the launch-stopped marker (`"1"`) or clear it (`"0"`) for a branch session whose
@@ -2777,6 +2803,69 @@ mod tests {
                     .unwrap()
             ),
             "and a transient conversation that is no chain step stays excluded"
+        );
+    }
+
+    /// The schema a branch's answer must come back as rides the conversation, so a turn resumed
+    /// after a restart still knows what was asked of it. A branch's FIRST write records it too: the
+    /// conversation has no row yet, and the schema must land with everything else in that one write.
+    #[tokio::test]
+    async fn a_branch_records_the_schema_its_answer_must_come_back_as() {
+        let (store, _dir) = crate::open_test_store!(crate::session::SessionStore, "session");
+        let agent_id = crate::session::worker_branch_agent_id(&unique_key());
+        let extract = crate::extract::Extract::from_text(
+            r#"{"type":"object","properties":{"summary":{"type":"string"}}}"#,
+        )
+        .expect("the schema is accepted");
+        // The branch's own first write, before any message: this is the row's creation.
+        store
+            .set_branch(&agent_id, None, Some("night"), None, None, Some(&extract))
+            .await
+            .expect("the conversation records the schema");
+        let rows = store
+            .conn
+            .query(
+                "SELECT extract FROM session_metadata WHERE agent_id = ?1",
+                params![agent_id.as_str()],
+            )
+            .await
+            .expect("read the conversation's row");
+        assert_eq!(
+            rows.first()
+                .and_then(|row| row.get::<Option<String>>(0).ok().flatten()),
+            Some(extract.canonical()),
+            "a row created by this write carries the schema"
+        );
+
+        // The branch runs, and the schema is still there for the resume that reads it back.
+        store
+            .batch_append_with_context(
+                &agent_id,
+                &[ChatMessage::user("draft the summary")],
+                BatchMetadata::context("gui", "test_user", "test_ws", "worker"),
+            )
+            .await
+            .unwrap();
+        let ctx = store
+            .get_session_context(&agent_id)
+            .await
+            .expect("the conversation reads back");
+        assert_eq!(ctx.extract.as_ref(), Some(&extract));
+
+        // A later turn with no schema records none, so an ordinary turn is never shaped by an
+        // earlier one's.
+        store
+            .set_branch(&agent_id, None, Some("night"), None, None, None)
+            .await
+            .expect("the conversation is rewritten");
+        assert!(
+            store
+                .get_session_context(&agent_id)
+                .await
+                .expect("the conversation reads back")
+                .extract
+                .is_none(),
+            "a turn with no schema records none"
         );
     }
 

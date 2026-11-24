@@ -541,6 +541,7 @@ pub(crate) fn dispatch_deep_analysis(ws: &Workspace, question: &str, caller_role
                     custom_role: custom,
                     reply_to_custom: None,
                     urgent: false,
+                    extract: None,
                 }
             }
         };
