@@ -207,9 +207,9 @@ pub(crate) async fn fail_dropped(pending_job_id: Option<&str>, reason: &str) {
     }
 }
 
-/// The ids among `ids` that still have a `running` record — the one read a turn makes before it
-/// settles its handovers, so a turn with none of them writes nothing to the shared core writer.
-/// `None` when the read failed: the caller settles every id and each guarded write decides.
+/// The ids among `ids` that still have a `running` record — the one read a turn or a durable round
+/// makes before it settles, so nothing writes to the shared core writer for an id that has no
+/// record. `None` when the read failed: the caller settles every id and each guarded write decides.
 pub(crate) async fn running(ids: &[&str]) -> Option<HashSet<String>> {
     if ids.is_empty() {
         return Some(HashSet::new());

@@ -679,6 +679,28 @@ impl SyncDurableCore {
         true
     }
 
+    /// Whether a command-line handover's record can stand under `job_id`, and still be settled:
+    /// only an implement round ever opens one ([`implement::hand_over_worker_round`]), and the
+    /// record's own existence is the marker — an analysis round settles nothing, and an implement
+    /// round the assistant dispatched itself writes nothing to the shared writer. A failed read
+    /// settles as before, each guarded write deciding.
+    async fn holds_record(self, job_id: &str) -> bool {
+        match self {
+            Self::Analyze => false,
+            Self::Worker => crate::send_outcome::running(&[job_id])
+                .await
+                .is_none_or(|running| running.contains(job_id)),
+        }
+    }
+
+    /// Fail the record under `job_id`, when this round holds one: a round that opened none has
+    /// nothing to fail.
+    async fn fail_record(self, job_id: &str, reason: &str) {
+        if self.holds_record(job_id).await {
+            crate::send_outcome::fail(job_id, reason).await;
+        }
+    }
+
     /// Shared sync dispatch: read the task-locals, generate a fresh job id, run the core as a fresh
     /// spawn (it writes the jobs row), then terminalize or surface [`CallSuspended`] on a
     /// drain-cut. Every outcome but a drain-cut abandons the row with the call's own result.
@@ -1053,7 +1075,7 @@ impl SyncDurableCore {
             // The row is gone (an explicit abandon, or a cancel that removed it while this resume
             // ran): nothing will answer this handover, so its record must not read as running.
             Ok(crate::jobs::SyncResumeOutcome::Gone) => {
-                crate::send_outcome::fail(job_id, GONE_BEFORE_RESUME).await;
+                self.fail_record(job_id, GONE_BEFORE_RESUME).await;
                 return;
             }
             // Resume infra failure, an unusable recorded directory, or a panicked round: deliver an
@@ -1074,7 +1096,7 @@ impl SyncDurableCore {
                     // A row gone under this resume has no caller to report to — but the handover
                     // still gets its record settled.
                     crate::jobs::ResumePreamble::Gone => {
-                        crate::send_outcome::fail(job_id, GONE_BEFORE_RESUME).await;
+                        self.fail_record(job_id, GONE_BEFORE_RESUME).await;
                         return;
                     }
                     // A drain keeps the record for the boot resume; an unreadable row is retried
@@ -1103,7 +1125,7 @@ impl SyncDurableCore {
                     return;
                 }
                 // The caller is told the round failed, so its record must not read as running.
-                crate::send_outcome::fail(job_id, &e.to_string()).await;
+                self.fail_record(job_id, &e.to_string()).await;
                 let envelope = crate::jobs::complete_durable_job(
                     job_id,
                     self.build_async_message(job_id, &Err(e), exec_dir, delivery),
@@ -1164,12 +1186,15 @@ impl SyncDurableCore {
             .deliverable(job_id, &delivery.name, caller.extract.as_ref(), result)
             .await;
         // The round's answer is final here: a command-line handover's record takes it, and a round
-        // that failed takes its reason. No-op for an id with no record — an analysis round.
-        match &delivered {
-            Ok(delivered) => {
-                crate::send_outcome::finish(job_id, &delivered.answer, delivered.shape).await;
+        // that failed takes its reason. A round that opened no record — an analysis round, or an
+        // implement round the assistant dispatched itself — is settled by nothing.
+        if self.holds_record(job_id).await {
+            match &delivered {
+                Ok(delivered) => {
+                    crate::send_outcome::finish(job_id, &delivered.answer, delivered.shape).await;
+                }
+                Err(e) => crate::send_outcome::fail(job_id, &e.to_string()).await,
             }
-            Err(e) => crate::send_outcome::fail(job_id, &e.to_string()).await,
         }
         let result = delivered.map(Delivered::into_answer);
         let envelope = crate::jobs::complete_durable_job(
@@ -2885,5 +2910,39 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A record can stand only under an implement round, and only while it is `running`: the one
+    /// question a resume asks before it writes, so a round that opened none settles nothing.
+    #[tokio::test]
+    async fn only_a_running_implement_record_is_settled() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+
+        assert!(
+            !SyncDurableCore::Analyze.holds_record("probe_record").await,
+            "an analysis round never opens a record"
+        );
+        assert!(
+            !SyncDurableCore::Worker.holds_record("probe_record").await,
+            "an implement round that opened no record has nothing to settle"
+        );
+
+        crate::send_outcome::begin("probe_record", None).await;
+        assert!(
+            SyncDurableCore::Worker.holds_record("probe_record").await,
+            "a running record is what a resume settles"
+        );
+
+        crate::send_outcome::finish(
+            "probe_record",
+            "the answer",
+            crate::send_outcome::Shape::None,
+        )
+        .await;
+        assert!(
+            !SyncDurableCore::Worker.holds_record("probe_record").await,
+            "a settled record has nothing left to settle"
+        );
     }
 }

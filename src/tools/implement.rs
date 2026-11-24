@@ -714,4 +714,69 @@ mod tests {
         }
         panic!("the fake provider never received {calls} calls");
     }
+
+    /// A boot-resumed round settles the record its command-line handover opened: the record's own
+    /// existence is the marker, so the resume asks before it writes and the record takes the
+    /// round's stored answer.
+    #[tokio::test]
+    #[serial_test::serial(drain, send_outcome)]
+    async fn a_resumed_round_settles_the_record_its_handover_opened() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = test_ws("/tmp/test_ws_resume_record");
+        let conn = &crate::session::store().conn;
+        let job_id = "implement_resume_record";
+        let worker = format!("{job_id}_worker");
+        crate::jobs::spawn_job(
+            conn,
+            job_id,
+            "do the work",
+            &ws.name,
+            "caller-user",
+            "cli",
+            Role::Assistant,
+            &[crate::jobs::NewAgent {
+                agent_id: worker.clone(),
+                kind: crate::jobs::AgentKind::Worker,
+                idx: Some(0),
+                task: "do the work".to_string(),
+            }],
+            &crate::jobs::SpawnChild::Implement,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("the round's own row");
+        crate::jobs::write_agent_outcome(
+            conn,
+            job_id,
+            &worker,
+            crate::jobs::RowStatus::Done,
+            Some("the work is done"),
+        )
+        .await
+        .expect("the worker's stored outcome");
+        // The handover opened the record before its round left; the restart kept it running.
+        crate::send_outcome::begin(job_id, None).await;
+        // The report's own consumer, so the delivered envelope does not start a turn.
+        let target =
+            crate::jobs::target_agent_id(None, "caller-user", Role::Assistant.as_str(), &ws.name);
+        let mut report = crate::agent::message_router::register_agent(&target);
+
+        resume_implement_round(job_id, &ws, None).await;
+        crate::agent::message_router::unregister_agent(&target);
+
+        let record = crate::send_outcome::lookup(job_id)
+            .await
+            .expect("read the record")
+            .expect("the handover opened one");
+        assert_eq!(record.state, crate::send_outcome::State::Done);
+        assert_eq!(record.answer.as_deref(), Some("the work is done"));
+        assert!(
+            report
+                .try_recv()
+                .is_ok_and(|job| job.content.contains("<worker-report")),
+            "the round's report still reaches its caller"
+        );
+    }
 }
