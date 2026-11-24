@@ -445,7 +445,18 @@ impl SessionsState {
             }
             SessionsMessage::SessionMessages(key, messages) => {
                 if self.selected_session.as_deref() == Some(&key) {
-                    let (entries, rows) = session_view::build_ledger_with_sources(&messages);
+                    let (mut entries, mut rows) =
+                        session_view::build_ledger_with_sources(&messages);
+                    // An unreadable message's row is written by the conversation's next turn; until
+                    // then the line itself stands in, so the owner does not have to wait for a turn
+                    // to see that something arrived and was not read. A pending line has no stored
+                    // row, and a cut past the end deletes nothing.
+                    let pending = crate::session::unreadable::pending_lines(&key);
+                    if !pending.is_empty() {
+                        let (lines, _) = session_view::build_ledger_with_sources(&pending);
+                        rows.extend(std::iter::repeat_n(messages.len(), lines.len()));
+                        entries.extend(lines);
+                    }
                     self.entries = entries;
                     self.entry_rows = Some(rows);
                     self.adopt_workspace_root(workspaces);
@@ -694,7 +705,13 @@ impl SessionsState {
         let Some(snapshot) = crate::session::TRANSCRIPT_REGISTRY.snapshot(key) else {
             return Task::none();
         };
-        let live = session_view::build_ledger(&snapshot.history);
+        let mut live = session_view::build_ledger(&snapshot.history);
+        // A pending unreadable line is not in the in-memory history yet — the next turn writes it —
+        // so it is shown here until then.
+        let pending = crate::session::unreadable::pending_lines(key);
+        if !pending.is_empty() {
+            live.extend(session_view::build_ledger(&pending));
+        }
         // A workspace resolved after the first load re-parses the whole ledger.
         let root_changed = self.adopt_workspace_root(workspaces);
         let common = if root_changed {

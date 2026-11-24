@@ -1605,6 +1605,8 @@ async fn process_channel_message(msg: ChannelMessage) {
     // assistant receives the whole burst as one request below. The bubbles appear once the slowest
     // part is enriched, which keeps them in send order instead of interleaved with a late
     // transcription.
+    // Every part belongs to the one incoming message, so they share its page allowance.
+    let mut links = mahbot::channels::LinkBudget::per_message();
     for (part, original_content) in parts.iter_mut().zip(&originals) {
         // Broadcast/mirror. The owner's bubble shows the display form — a clip's timeline without
         // the frames the model reads as pictures. `persist_content` decides what reaches chat
@@ -1615,7 +1617,7 @@ async fn process_channel_message(msg: ChannelMessage) {
         broadcast_and_persist_incoming_message(part, display, &content_for_history).await;
 
         // After broadcast, so AI summaries don't appear in the user's own bubble.
-        let enriched = mahbot::channels::enrich_links(&part.content).await;
+        let enriched = mahbot::channels::enrich_links(&part.content, &mut links).await;
         if let Cow::Owned(s) = enriched {
             tracing::info!(
                 channel = %part.channel,

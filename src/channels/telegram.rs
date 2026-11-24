@@ -1,6 +1,12 @@
 //! The Telegram transport: Bot API long polling, update decoding, send and edit with Telegram's
 //! HTML subset, media up/down, and the forward-only intake ledger that stops an update being
 //! handled twice.
+//!
+//! Two reading rules live here. An article-formatted message (Bot API 10.1's `rich_message`, which
+//! carries no plain text at all) is flattened to text by the `telegram_rich` module and delivered
+//! as ordinary text. And no update is closed silently: one that ends without a delivered message
+//! leaves a warning naming the update, its chat, its sender when the product knows them and why it
+//! ended — never the sender's own text, since warnings are never pruned.
 
 use crate::channels::ReplyReference;
 use crate::channels::reply::normalize_reply_text;
@@ -66,8 +72,9 @@ pub enum ControlInput {
 /// message that opened with the urgent mark is never one.
 #[must_use]
 pub fn control_input(msg: &ChannelMessage) -> Option<ControlInput> {
-    // The mark was consumed from `!/clear`, which arrives here as `/clear`.
-    if msg.urgent {
+    // The mark was consumed from `!/clear`, which arrives here as `/clear`. An article is
+    // content whatever its first line looks like, so it is never read as a command or a payload.
+    if msg.urgent || msg.article {
         return None;
     }
     if let Some(action) = decode_action(&msg.content) {
@@ -246,6 +253,7 @@ fn telegram_sender_person(source: &serde_json::Value) -> Option<TelegramSender> 
 }
 
 /// Extracted metadata common to both text and attachment message parsing.
+#[derive(Clone)]
 struct MessageContext {
     user_name: String,
     chat_id: String,
@@ -287,6 +295,7 @@ impl MessageContext {
             update_ids: Vec::new(),
             dictated: false,
             urgent: false,
+            article: false,
         }
     }
 
@@ -298,6 +307,359 @@ impl MessageContext {
             ..self.into_channel_message(content, None)
         }
     }
+}
+
+/// What one update turned out to be.
+#[expect(clippy::large_enum_variant)] // the message is the payload; the enum is transient
+enum Event {
+    /// A message to hand to the pipeline.
+    Message(ChannelMessage),
+    /// Nothing the product can read, with what the record must say about it.
+    Unreadable(Unreadable),
+}
+
+/// The readable part of a message: its plain text, its article, or both.
+struct Reading {
+    content: String,
+    /// The text opened with the urgent mark, which was consumed from it.
+    urgent: bool,
+    /// The content carries an article (see [`ChannelMessage::article`]).
+    article: bool,
+}
+
+/// The message's readable content: its plain text and/or its article, the text first and the
+/// article after it, a blank line apart. `None` when it carries neither — an article that flattens
+/// to nothing but whitespace yields nothing.
+///
+/// Control input is read from plain text alone, so a message carrying an article is content
+/// whatever its first line looks like: no `@BotUsername` suffix is stripped, no urgent mark
+/// consumed, no leading command or action payload recognised.
+fn readable_content(message: &serde_json::Value) -> Option<Reading> {
+    // An empty `text` is no text: a message that says nothing is not read as one that does.
+    let text = message
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty());
+    let article = crate::channels::telegram_rich::article_text(message);
+    match (text, article) {
+        (Some(text), None) => {
+            // Strip the `@BotUsername` suffix Telegram appends in group chats (`/new@MyBot`).
+            let text = if text.starts_with('/') {
+                text.split('@').next().unwrap_or(text)
+            } else {
+                text
+            };
+            // Read on the typed text, before the forward attribution is composed onto content.
+            let (text, urgent) = crate::channels::take_urgent(text);
+            // A lone urgent mark is control input — it cuts the running turn and says nothing —
+            // so it is delivered as one, never reported as unreadable content.
+            if text.trim().is_empty() && !urgent {
+                return None;
+            }
+            Some(Reading {
+                content: text.into_owned(),
+                urgent,
+                article: false,
+            })
+        }
+        (Some(text), Some(article)) => Some(Reading {
+            content: format!("{text}\n\n{article}"),
+            urgent: false,
+            article: true,
+        }),
+        (None, Some(article)) => Some(Reading {
+            content: article,
+            urgent: false,
+            article: true,
+        }),
+        (None, None) => None,
+    }
+}
+
+/// The one message a message's readings make: the file first when it carried one, the text after
+/// it, so both are delivered and the file keeps the forward attribution it was built with. `None`
+/// when neither reading produced anything.
+fn compose_message(
+    ctx: MessageContext,
+    reading: Option<Reading>,
+    attachment: Option<ChannelMessage>,
+) -> Option<ChannelMessage> {
+    match (reading, attachment) {
+        (reading, Some(mut file)) => {
+            if let Some(reading) = reading {
+                file.content = format!("{}\n\n{}", file.content, reading.content);
+                file.urgent |= reading.urgent;
+                file.article |= reading.article;
+            }
+            Some(file)
+        }
+        (Some(reading), None) => {
+            let mut msg = ctx.into_channel_message(reading.content, None);
+            msg.urgent = reading.urgent;
+            msg.article = reading.article;
+            Some(msg)
+        }
+        (None, None) => None,
+    }
+}
+
+/// Why an update ended without a delivered message, and what closing it owes the person who sent
+/// it. Only a message the product does not recognise is a person trying to say something that was
+/// lost; a kind it deliberately leaves alone is recorded and nothing else.
+enum Unreadable {
+    /// The sender is not an account the product serves: a stranger, a bot, or a post attributed
+    /// to a chat.
+    UnknownSender {
+        /// The chat it came from, when the update names one: `"123456"` or `"123456:789"`.
+        reply_target: Option<String>,
+        /// The Telegram handle, when the sender has one — the only thing that makes a stranger's
+        /// record actionable.
+        sender: Option<String>,
+    },
+    /// The update carries no message at all — a kind this product never asks the platform for.
+    NoMessage,
+    /// A served account sent nothing the product can read.
+    NothingReadable {
+        reply_target: String,
+        user_name: String,
+        /// The message's own content and service fields, sorted — never the envelope's, which
+        /// every message carries. This is what it held instead of readable content.
+        fields: Vec<String>,
+        /// The kind to name in the line the sender is owed, or `None` for a kind the product
+        /// deliberately leaves alone (a sticker, a poll, a location) or a service event: nobody
+        /// expects those to be read, so the record is all they get.
+        kind: Option<&'static str>,
+    },
+}
+
+impl Unreadable {
+    fn unknown_sender(message: &serde_json::Value) -> Self {
+        let sender = extract_sender_user_name(message);
+        Self::UnknownSender {
+            reply_target: extract_chat_context(message).map(|(_, reply_target)| reply_target),
+            // The reserved sentinel means Telegram gave no handle.
+            sender: (sender != crate::users::TELEGRAM_UNKNOWN_SENTINEL).then_some(sender),
+        }
+    }
+
+    fn nothing_readable(
+        message: &serde_json::Value,
+        user_name: String,
+        reply_target: String,
+    ) -> Self {
+        let fields = message_fields(message);
+        let kind = unreadable_kind(&fields);
+        Self::NothingReadable {
+            reply_target,
+            user_name,
+            fields,
+            kind,
+        }
+    }
+
+    /// The warning-level record every update that closed without a message leaves: the update
+    /// number, the chat it came from, the sender when the product knows them, and why it ended.
+    /// Never the sender's own text — warnings are never pruned.
+    fn warn(&self, update_id: i64) {
+        match self {
+            Self::UnknownSender {
+                reply_target,
+                sender,
+            } => tracing::warn!(
+                update_id,
+                chat = reply_target.as_deref().unwrap_or("-"),
+                sender = sender.as_deref().unwrap_or("-"),
+                "Telegram update closed without a message: the sender is not recognised"
+            ),
+            Self::NoMessage => tracing::warn!(
+                update_id,
+                "Telegram update closed without a message: the update carries no message"
+            ),
+            Self::NothingReadable {
+                reply_target,
+                user_name,
+                fields,
+                ..
+            } => tracing::warn!(
+                update_id,
+                chat = %reply_target,
+                sender = %user_name,
+                message_fields = %fields.join(", "),
+                "Telegram update closed without a message: nothing the product can read"
+            ),
+        }
+    }
+}
+
+/// The fields a message carries whatever it holds: its identity, its author, its chat and its
+/// provenance. The record names only what is not here, because these say nothing about what the
+/// message was. Kept level with the Bot API's `Message` envelope fields — one added there belongs
+/// here unless it says what the message *was*.
+const MESSAGE_ENVELOPE_FIELDS: &[&str] = &[
+    "author_signature",
+    "business_connection_id",
+    "caption_entities",
+    "chat",
+    "date",
+    "direct_messages_topic",
+    "edit_date",
+    "effect_id",
+    "entities",
+    "ephemeral_message_id",
+    "external_reply",
+    "forward_date",
+    "forward_from",
+    "forward_from_chat",
+    "forward_from_message_id",
+    "forward_origin",
+    "forward_signature",
+    "from",
+    "guest_bot_caller_chat",
+    "guest_bot_caller_user",
+    "guest_query_id",
+    "has_media_spoiler",
+    "has_protected_content",
+    "is_automatic_forward",
+    "is_from_offline",
+    "is_paid_post",
+    "is_topic_message",
+    "link_preview_options",
+    "media_group_id",
+    "message_id",
+    "message_thread_id",
+    "paid_star_count",
+    "quote",
+    "receiver_user",
+    "reply_markup",
+    "reply_to_checklist_task_id",
+    "reply_to_message",
+    "reply_to_poll_option_id",
+    "reply_to_story",
+    "sender_boost_count",
+    "sender_business_bot",
+    "sender_chat",
+    "sender_tag",
+    "show_caption_above_media",
+    "suggested_post_info",
+    "via_bot",
+];
+
+/// The fields the product knowingly leaves unread: content kinds nobody expects a bot to read
+/// (a sticker, a poll, a location) and service events (someone joined, a message was pinned, the
+/// topic changed). Their sender is told nothing — the record is all they get. Kept level with the
+/// Bot API's `Message` fields: every service field it adds belongs here, or its event would be
+/// reported to its sender as a message the product failed to read. A field in neither list falls
+/// to the last line of [`unreadable_kind`], which is the safe direction — a new content kind is
+/// exactly what its sender is owed a line about.
+const LEFT_UNREAD_FIELDS: &[&str] = &[
+    "boost_added",
+    "channel_chat_created",
+    "chat_background_set",
+    "chat_owner_changed",
+    "chat_owner_left",
+    "chat_shared",
+    "checklist",
+    "checklist_tasks_added",
+    "checklist_tasks_done",
+    "community_chat_added",
+    "community_chat_joined",
+    "community_chat_removed",
+    "connected_website",
+    "contact",
+    "delete_chat_photo",
+    "dice",
+    "direct_message_price_changed",
+    "forum_topic_closed",
+    "forum_topic_created",
+    "forum_topic_edited",
+    "forum_topic_reopened",
+    "game",
+    "general_forum_topic_hidden",
+    "general_forum_topic_unhidden",
+    "gift",
+    "gift_upgrade_sent",
+    "giveaway",
+    "giveaway_completed",
+    "giveaway_created",
+    "giveaway_winners",
+    "group_chat_created",
+    "invoice",
+    "left_chat_member",
+    "live_photo",
+    "location",
+    "managed_bot_created",
+    "message_auto_delete_timer_changed",
+    "migrate_from_chat_id",
+    "migrate_to_chat_id",
+    "new_chat_members",
+    "new_chat_photo",
+    "new_chat_title",
+    "paid_media",
+    "paid_message_price_changed",
+    "paid_messages_waived",
+    "passport_data",
+    "pinned_message",
+    "poll",
+    "poll_option_added",
+    "poll_option_deleted",
+    "proximity_alert_triggered",
+    "refunded_payment",
+    "sticker",
+    "story",
+    "successful_payment",
+    "suggested_post_approval_failed",
+    "suggested_post_approved",
+    "suggested_post_declined",
+    "suggested_post_paid",
+    "suggested_post_refunded",
+    "supergroup_chat_created",
+    "ton_wallet_transfer",
+    "unique_gift",
+    "users_shared",
+    "venue",
+    "video_chat_ended",
+    "video_chat_participants_invited",
+    "video_chat_scheduled",
+    "video_chat_started",
+    "web_app_data",
+    "widget",
+    "write_access_allowed",
+];
+
+/// The message's own fields, sorted: what it held instead of readable content.
+fn message_fields(message: &serde_json::Value) -> Vec<String> {
+    let mut fields: Vec<String> = message
+        .as_object()
+        .map(|object| {
+            object
+                .keys()
+                .filter(|key| !MESSAGE_ENVELOPE_FIELDS.contains(&key.as_str()))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    fields.sort();
+    fields
+}
+
+/// The kind to name in the line a sender is owed, or `None` when the message held only kinds the
+/// product deliberately leaves alone.
+fn unreadable_kind(fields: &[String]) -> Option<&'static str> {
+    // A caption rides the media field beside it, so it never names a kind of its own.
+    let kinds: Vec<&str> = fields
+        .iter()
+        .map(String::as_str)
+        .filter(|field| *field != "caption")
+        .collect();
+    // An empty set is not "deliberately unread": a message that named nothing at all is reported
+    // like an unknown kind, which is the safe direction.
+    if !kinds.is_empty() && kinds.iter().all(|field| LEFT_UNREAD_FIELDS.contains(field)) {
+        return None;
+    }
+    if kinds.contains(&"rich_message") {
+        return Some("an article-formatted message");
+    }
+    Some("a message of an unsupported kind")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2012,8 +2374,9 @@ impl TelegramChannel {
     }
 
     /// Sender info, the allow check, chat/message/thread ids and the reply target. `Ok(None)` when
-    /// the sender is not allowed; `Err` is the binding read failing, which is no decision and must
-    /// not become a refusal by the caller.
+    /// the sender is not an account this product serves; `Err` is the binding read failing, which
+    /// is no decision and must not become a refusal by the caller. The refusal itself is recorded
+    /// by the caller, which is the one place that knows the update it came from.
     async fn extract_message_context(
         &self,
         message: &serde_json::Value,
@@ -2021,10 +2384,6 @@ impl TelegramChannel {
         let Some((user_name, chat_id, reply_target)) =
             resolve_authorized_sender(message, message).await?
         else {
-            tracing::debug!(
-                "Telegram: ignoring message from unknown user '{}'",
-                extract_sender_user_name(message)
-            );
             return Ok(None);
         };
 
@@ -2223,18 +2582,6 @@ impl TelegramChannel {
         anyhow::bail!("{description}")
     }
 
-    fn handle_non_parseable_message(update: &serde_json::Value) {
-        let Some(message) = update.get("message") else {
-            return;
-        };
-
-        let text = message
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("<non-text content>");
-        tracing::debug!("Telegram: message not parseable (unsupported type), skipping: {text}");
-    }
-
     /// The file path for a file ID, with the size the server reports when it does.
     async fn get_file_path(&self, file_id: &str) -> anyhow::Result<(String, Option<u64>)> {
         let url = self.api_url("getFile");
@@ -2401,31 +2748,25 @@ impl TelegramChannel {
         })
     }
 
-    /// Parse an update as an attachment message: download it into this message's own staging
+    /// Parse a message as an attachment message: download it into this message's own staging
     /// directory (recorded in the returned message's `attachment_dirs`) and return it. `Ok(None)`
-    /// when it is no attachment or the sender is unauthorized — `Err` is the binding read failing,
-    /// which the caller keeps the event held for. An attachment the bot cannot retrieve still
-    /// yields a message, so the caption reaches the agent with the failure in it.
+    /// when it is no attachment — the sender is already resolved, so this costs nothing for a
+    /// message that carried none. `Err` is a read failing, which the caller keeps the event held
+    /// for. An attachment the bot cannot retrieve still yields a message, so the caption reaches
+    /// the agent with the failure in it.
     ///
     /// A recorded voice message and an `audio` sound file both take the ordinary path. The whole
     /// preparation, fetch included, is marked in [`TelegramChannel::preparations`], so the
     /// collector holds that sender's group in that chat until the part is handed over.
     async fn try_parse_attachment_message(
         &self,
-        update: &serde_json::Value,
+        ctx: &MessageContext,
+        message: &serde_json::Value,
     ) -> anyhow::Result<Option<ChannelMessage>> {
-        let Some(message) = update.get("message") else {
-            return Ok(None);
-        };
-
-        // Authorization first: an unauthorized sender is ignored silently, before any work.
-        let Some(ctx) = self.extract_message_context(message).await? else {
-            return Ok(None);
-        };
-
         let Some(attachment) = Self::parse_attachment_metadata(message) else {
             return Ok(None);
         };
+        let ctx = ctx.clone();
 
         // Held for the whole preparation, the fetch included, so the group this sender has open in
         // this chat waits for the part this call produces.
@@ -2614,34 +2955,6 @@ impl TelegramChannel {
                     }),
                 _ => None,
             })
-    }
-
-    async fn parse_update_message(
-        &self,
-        update: &serde_json::Value,
-    ) -> anyhow::Result<Option<ChannelMessage>> {
-        let Some(message) = update.get("message") else {
-            return Ok(None);
-        };
-        let Some(text) = message.get("text").and_then(serde_json::Value::as_str) else {
-            return Ok(None);
-        };
-        let Some(ctx) = self.extract_message_context(message).await? else {
-            return Ok(None);
-        };
-
-        // Strip the `@BotUsername` suffix Telegram appends in group chats (`/new@MyBot`).
-        let text = if text.starts_with('/') {
-            text.split('@').next().unwrap_or(text)
-        } else {
-            text
-        };
-
-        // Read on the typed text, before the forward attribution is composed onto content.
-        let (text, urgent) = crate::channels::take_urgent(text);
-        let mut msg = ctx.into_channel_message(text.into_owned(), None);
-        msg.urgent = urgent;
-        Ok(Some(msg))
     }
 
     /// POST a JSON body to an API method: the response on 2xx, `(status, body)` otherwise.
@@ -3168,20 +3481,30 @@ impl TelegramChannel {
         Ok(id.to_string())
     }
 
-    /// Parse one polled or recovered update into a message, or (logged and skipped) nothing. A
-    /// parsed update gets its acknowledgement reaction. `Err` is the sender-resolution read
-    /// failing, which the caller keeps the event held for.
-    async fn parse_incoming_update(
-        &self,
-        update: &serde_json::Value,
-    ) -> anyhow::Result<Option<ChannelMessage>> {
-        let msg = if let Some(msg) = self.parse_update_message(update).await? {
-            msg
-        } else if let Some(msg) = self.try_parse_attachment_message(update).await? {
-            msg
-        } else {
-            Self::handle_non_parseable_message(update);
-            return Ok(None);
+    /// Parse one polled or recovered update into a message, or into the record of why it closed
+    /// without one. A parsed update gets its acknowledgement reaction. `Err` is the
+    /// sender-resolution read failing, which the caller keeps the event held for.
+    async fn parse_incoming_update(&self, update: &serde_json::Value) -> anyhow::Result<Event> {
+        let Some(message) = update.get("message") else {
+            return Ok(Event::Unreadable(Unreadable::NoMessage));
+        };
+        // Authorization first: an unbound sender is ignored before any work, and the record says
+        // so rather than reading as an unsupported content kind.
+        let Some(ctx) = self.extract_message_context(message).await? else {
+            return Ok(Event::Unreadable(Unreadable::unknown_sender(message)));
+        };
+        // Kept before the context is consumed: an unreadable message still has a sender and a chat
+        // to name, and nothing left of it to build a message from.
+        let (user_name, reply_target) = (ctx.user_name.clone(), ctx.reply_target.clone());
+
+        let reading = readable_content(message);
+        let attachment = self.try_parse_attachment_message(&ctx, message).await?;
+        let Some(msg) = compose_message(ctx, reading, attachment) else {
+            return Ok(Event::Unreadable(Unreadable::nothing_readable(
+                message,
+                user_name,
+                reply_target,
+            )));
         };
 
         // Send ACK reaction for every individual update (fire-and-forget)
@@ -3190,7 +3513,7 @@ impl TelegramChannel {
         {
             self.try_add_ack_reaction_nonblocking(reaction_chat_id, reaction_message_id);
         }
-        Ok(Some(msg))
+        Ok(Event::Message(msg))
     }
 
     /// Take one polled batch on: record every event, then hand the processor the ones this call was
@@ -3293,9 +3616,11 @@ impl TelegramChannel {
     }
 
     /// Parse a recorded batch and hand it to the collector. `fresh` are the events this call was
-    /// the first to record; the rest are skipped, and one nothing can be made of is settled by its
-    /// taker ([`Self::settle_or_hold`]). An album is parsed whole at its first member's position,
-    /// so it is delivered where the user sent it. `false` when the collector is gone.
+    /// the first to record; the rest are skipped, and one nothing can be made of is closed by its
+    /// own taker — [`Self::take_event`] for a message, which also records why it closed, or
+    /// [`Self::handle_callback_press`] for a button press. An album is parsed whole at its first
+    /// member's position, so it is delivered where the user sent it. `false` when the collector is
+    /// gone.
     async fn process_updates(
         &self,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
@@ -3364,35 +3689,33 @@ impl TelegramChannel {
         fresh.remove(&id).then_some(id)
     }
 
-    /// Turn one recorded unit's parse into the message to hand on, or write the record's decision
-    /// about it: `Ok(None)` is settled and never comes back, `Err` is no decision, so the unit
-    /// stays held — payload and all — exactly as one a crash left behind ([`Intake::settle`]).
-    async fn settle_or_hold(
-        intake: &Intake,
+    /// Take one parsed event on: `Ok(Some(msg))` gets its update id, `Ok(None)` has already been
+    /// closed by its taker, and `Err` is no decision, so the unit stays held — payload and all —
+    /// exactly as one a crash left behind, for a later run to try again.
+    fn take_parsed(
         update_id: i64,
         parsed: anyhow::Result<Option<ChannelMessage>>,
     ) -> Option<ChannelMessage> {
-        let mut msg = match parsed {
-            Ok(Some(msg)) => msg,
-            Ok(None) => {
-                intake.settle(&[update_id]).await;
-                return None;
+        match parsed {
+            Ok(Some(mut msg)) => {
+                msg.update_ids.push(update_id);
+                Some(msg)
             }
+            Ok(None) => None,
             Err(err) => {
                 tracing::warn!(
                     update_id,
                     %err,
                     "Telegram intake: could not decide an event; it stays held for a later run"
                 );
-                return None;
+                None
             }
-        };
-        msg.update_ids.push(update_id);
-        Some(msg)
+        }
     }
 
-    /// Take one recorded event on: parse it, hand it over or settle it, and refuse control input of
-    /// unknown age ([`BatchOrigin::Stale`]) instead of executing it out of context.
+    /// Take one recorded event on: parse it, hand it over or record why it closed, and refuse
+    /// control input of unknown age ([`BatchOrigin::Stale`]) instead of executing it out of
+    /// context.
     async fn take_event(
         &self,
         intake: &Intake,
@@ -3400,13 +3723,71 @@ impl TelegramChannel {
         update_id: i64,
         update: &serde_json::Value,
     ) -> Option<ChannelMessage> {
-        let msg = Self::settle_or_hold(intake, update_id, self.parse_incoming_update(update).await)
-            .await?;
+        // An unreadable event is closed here, while the reason it closed is still in hand.
+        let parsed = match self.parse_incoming_update(update).await {
+            Ok(Event::Message(msg)) => Ok(Some(msg)),
+            Ok(Event::Unreadable(unreadable)) => {
+                self.close_unreadable(intake, update_id, &unreadable).await;
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        };
+        let msg = Self::take_parsed(update_id, parsed)?;
         if origin == BatchOrigin::Stale && is_control_message(&msg) {
             self.refuse_unacted_control(intake, &msg).await;
             return None;
         }
         Some(msg)
+    }
+
+    /// Close an event nothing was delivered for: settle it in the record, then record why, and
+    /// tell a served sender their message could not be read — unless it held only kinds the product
+    /// deliberately leaves alone. The record comes first: a settle that did not land leaves the
+    /// event held for a later run, and a line sent now would be sent a second time then. Everything
+    /// after the settle is best-effort, so a failed send never holds the update for another try.
+    async fn close_unreadable(&self, intake: &Intake, update_id: i64, unreadable: &Unreadable) {
+        let settled = match unreadable {
+            // The body is the only record of what arrived, so it outlives the decision.
+            Unreadable::NothingReadable { .. } => intake.settle_keeping_payload(&[update_id]).await,
+            _ => intake.settle(&[update_id]).await,
+        };
+        if !settled {
+            return;
+        }
+        unreadable.warn(update_id);
+        if let Unreadable::NothingReadable {
+            reply_target,
+            user_name,
+            kind: Some(kind),
+            ..
+        } = unreadable
+        {
+            self.tell_sender_unreadable(reply_target, user_name, kind)
+                .await;
+        }
+    }
+
+    /// Tell a served sender their message could not be read, and queue what the owner and the
+    /// conversation's next turn are owed: the fixed line in the chat now, and — for that turn to
+    /// write — the same line in the transcript and the fact alone for its message
+    /// ([`crate::session::unreadable`]).
+    async fn tell_sender_unreadable(
+        &self,
+        reply_target: &str,
+        user_name: &str,
+        kind: &'static str,
+    ) {
+        let (chat_id, thread_id) = parse_recipient(reply_target);
+        if let Err(err) = self
+            .send_text_chunks(crate::session::unreadable::NOTICE, chat_id, thread_id, None)
+            .await
+        {
+            tracing::warn!(%err, "Telegram: could not report an unreadable message to its sender");
+        }
+        let (role, workspace) = crate::users::resolve_session_target(user_name).await;
+        let agent_id =
+            crate::agent::message_router::user_message_agent_id(user_name, role, &workspace.name);
+        crate::session::unreadable::record(&agent_id, user_name, kind);
     }
 
     /// Tell the user a control input was not acted on, and settle it: input in a batch of unknown
@@ -3448,9 +3829,15 @@ impl TelegramChannel {
             self.answer_callback_query(id, None).await;
         }
 
-        let Some(msg) =
-            Self::settle_or_hold(intake, update_id, self.parse_callback_query(cq).await).await
-        else {
+        // A press with nothing to hand on is settled here and never comes back.
+        let parsed = match self.parse_callback_query(cq).await {
+            Ok(None) => {
+                intake.settle(&[update_id]).await;
+                return true;
+            }
+            parsed => parsed,
+        };
+        let Some(msg) = Self::take_parsed(update_id, parsed) else {
             return true;
         };
         // A press is control input by construction, refused by the same rule `take_event` uses.
@@ -3657,8 +4044,10 @@ fn merge_album_member(album: Option<ChannelMessage>, member: ChannelMessage) -> 
             album.attachment_dirs.extend(member.attachment_dirs);
             album.update_ids.extend(member.update_ids);
             album.forwarded |= member.forwarded;
-            // An album is one message: it is urgent when any of its members is.
+            // An album is one message: it is urgent when any of its members is, and carries an
+            // article when any of them does — so its body is never read as control input.
             album.urgent |= member.urgent;
+            album.article |= member.article;
             album
         }
         None => member,

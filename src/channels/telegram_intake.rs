@@ -11,6 +11,9 @@
 //! attachment's bytes, which are fetched again from the platform while it still has them —
 //! and drops the payload once the event is resolved, keeping only the decision, so an
 //! update the platform offers again after a restart is recognised as already dealt with.
+//! The one exception is an event closed because nothing in it could be read: its body is
+//! the only evidence of what arrived, so it is kept for the whole retention window
+//! ([`Intake::settle_keeping_payload`]) and goes with the row.
 //! The record is keyed by the event's own `update_id` and the bot account it belongs to
 //! (the account's own identity, so rotating the token for the same account still recovers).
 //!
@@ -235,14 +238,32 @@ impl Intake {
     /// decision that cannot be written. The hand-over cannot be atomic with this
     /// write, so a failure here is decided the same way a crash in that instant is:
     /// the event stays held and a later run takes it up again, which risks a second
-    /// handling but never a lost event — the side to err on.
-    pub(crate) async fn settle(&self, ids: &[i64]) {
+    /// handling but never a lost event — the side to err on. Returns whether the
+    /// record took the decision, so a caller that would act on the event again (say,
+    /// answer its sender) can stay silent when it did not.
+    pub(crate) async fn settle(&self, ids: &[i64]) -> bool {
+        self.settle_decision(ids, false).await
+    }
+
+    /// Settle these events but keep the update body. An event closed because nothing in
+    /// it could be read is the one case where the body is the only evidence of what
+    /// arrived: it stays until the retention sweep takes the whole row, and no run ever
+    /// takes up a settled event, so a kept body is a record and not a replay.
+    pub(crate) async fn settle_keeping_payload(&self, ids: &[i64]) -> bool {
+        self.settle_decision(ids, true).await
+    }
+
+    /// The one settle, keeping or dropping the body with the decision. Returns whether the
+    /// decision landed; an empty id list is nothing to write and counts as settled.
+    async fn settle_decision(&self, ids: &[i64], keep_payload: bool) -> bool {
         if ids.is_empty() {
-            return;
+            return true;
         }
-        if let Err(err) = self.resolve(ids).await {
+        if let Err(err) = self.resolve(ids, keep_payload).await {
             tracing::warn!(?ids, %err, "Telegram intake: could not settle an event in the record");
+            return false;
         }
+        true
     }
 
     /// Write the durable record of a released burst, and log one that cannot be
@@ -256,18 +277,21 @@ impl Intake {
 
     /// Write the decision for these events in one statement, so a unit settles whole
     /// or not at all: half-settled members of an album would read as a duplicate on a
-    /// later start. The payload is dropped because only the decision needs keeping.
-    async fn resolve(&self, ids: &[i64]) -> Result<()> {
+    /// later start. The payload is dropped unless the caller keeps it, because only the
+    /// decision needs keeping — except for an event whose body is the record of what it
+    /// could not read.
+    async fn resolve(&self, ids: &[i64], keep_payload: bool) -> Result<()> {
         let mut values = Vec::with_capacity(ids.len() + 3);
         values.push(db::Value::from(DONE));
         values.push(db::Value::from(db::now()));
         values.push(db::Value::from(self.account_id.as_ref()));
         values.extend(ids.iter().copied().map(db::Value::from));
+        let drop_payload = if keep_payload { "" } else { ", payload = NULL" };
         self.store
             .conn
             .execute(
                 &format!(
-                    "UPDATE telegram_intake SET state = ?, payload = NULL, decided_at = ? \
+                    "UPDATE telegram_intake SET state = ?, decided_at = ?{drop_payload} \
                      WHERE account_id = ? AND update_id IN ({})",
                     db::sql_in_placeholders(ids.len())
                 ),
@@ -339,6 +363,48 @@ mod tests {
 
     fn intake(store: &TelegramIntakeStore, claim: &str, account: &str) -> Intake {
         Intake::new(store.clone(), Arc::from(claim), account)
+    }
+
+    /// A settled event never comes back, and one closed because nothing in it could be read keeps
+    /// its body until the retention sweep takes the row.
+    #[tokio::test]
+    async fn a_settled_event_keeps_its_body_only_when_asked() {
+        let (store, _tmp) = test_store().await;
+        let kept = json!({ "update_id": 11, "message": { "rich_message": { "blocks": [] } } });
+        let dropped = json!({ "update_id": 12, "message": { "text": "hi" } });
+        let run = intake(&store, "run-a", "1");
+        run.hold(&[&kept, &dropped]).await.expect("hold");
+
+        run.settle_keeping_payload(&[11]).await;
+        run.settle(&[12]).await;
+        assert!(
+            intake(&store, "run-b", "1")
+                .take_over()
+                .await
+                .expect("take over")
+                .is_empty(),
+            "a settled event is never taken up again, body or not"
+        );
+        assert_eq!(
+            payload_of(&store, 11).await.as_deref(),
+            Some(&*kept.to_string())
+        );
+        assert_eq!(payload_of(&store, 12).await, None);
+    }
+
+    /// The body the record holds for an update.
+    async fn payload_of(store: &TelegramIntakeStore, update_id: i64) -> Option<String> {
+        store
+            .conn
+            .query(
+                "SELECT payload FROM telegram_intake WHERE account_id = '1' AND update_id = ?1",
+                params![update_id],
+            )
+            .await
+            .expect("read the record")
+            .into_iter()
+            .next()
+            .and_then(|row| row.get::<Option<String>>(0).ok().flatten())
     }
 
     #[tokio::test]

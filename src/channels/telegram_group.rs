@@ -450,6 +450,7 @@ fn group_message(mut parts: Vec<ChannelMessage>) -> ChannelMessage {
         .flat_map(|part| std::mem::take(&mut part.update_ids))
         .collect();
     let urgent = parts.iter().any(|part| part.urgent);
+    let article = parts.iter().any(|part| part.article);
     ChannelMessage {
         user_name,
         reply_target,
@@ -457,6 +458,7 @@ fn group_message(mut parts: Vec<ChannelMessage>) -> ChannelMessage {
         parts,
         update_ids,
         urgent,
+        article,
         ..Default::default()
     }
 }

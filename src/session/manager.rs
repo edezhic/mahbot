@@ -25,6 +25,7 @@ use crate::agent::skills;
 use crate::automations::Automation;
 use crate::custom_role::{CUSTOM_ROLES, CustomRole};
 use crate::tools::active_models::{ModelKind, ModelSnapshot};
+use crate::user_activity::Location;
 use crate::{ChatMessage, ChatRole, Role, Workspace};
 
 use super::TranscriptSnapshot;
@@ -60,6 +61,19 @@ pub(crate) struct Session {
     /// survives a restart, a resumed run and a re-dispatched agent: loaded at
     /// [`init`](Self::init) and kept in step by the caller that resolves it.
     provider: Option<crate::providers::selection::StoredProvider>,
+}
+
+/// What one turn's per-turn blocks produced, for [`Session::append_turn_message`].
+#[derive(Default)]
+struct TurnBlocks {
+    /// The message with the blocks composed onto it.
+    content: String,
+    /// The models snapshot to persist with the message, when a model change was announced.
+    snapshot: Option<ModelSnapshot>,
+    /// The activity state to record once the message is stored.
+    activity: Option<Location>,
+    /// The transcript rows an unreadable message left, to be written ahead of the message.
+    unreadable_lines: Vec<ChatMessage>,
 }
 
 /// Outcome of a [`Session::finalize`] call. The guard is deliberately logging-free: whether an
@@ -183,9 +197,9 @@ impl Session {
 
     /// Append a turn's messages and session context into the loaded session. A turn answers one
     /// message, or several when an urgent message cut the previous turn: each lands as its own user
-    /// message in arrival order. The per-turn blocks — personal-workspace report, model-change
-    /// line, activity line — ride the FIRST message only, so a turn carrying several never repeats
-    /// them.
+    /// message in arrival order. The per-turn blocks — personal-workspace report, the note of a
+    /// message that arrived and could not be read, model-change line, activity line — ride the
+    /// FIRST message only, so a turn carrying several never repeats them.
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn append_turn_messages(
         &mut self,
@@ -245,32 +259,20 @@ impl Session {
         if !msg.is_empty() {
             let is_new = self.history.is_empty();
 
-            // The one composition point for both branches below: the activity line at the very
-            // head, then the personal-workspace report, then a later Assistant turn's machine
-            // change-info (a first turn's system prompt holds the models instead). The
-            // session-start `<workspace-structure>` block cannot stand in for the report: it is a
-            // shape — folder names with counts, never a path — so it cannot say what the user just
-            // touched. Every block here is per-turn: on a turn carrying several messages they ride
-            // the first one only.
-            let (content, new_snapshot) =
-                if turn_first && !is_new && matches!(role, Role::Assistant) {
-                    Self::prepend_model_change(agent_id, msg, user_name).await
-                } else {
-                    (msg.to_string(), None)
-                };
-            let content = if turn_first {
-                crate::session::personal_changes::prepend_changes(&content, ws, role).await
-            } else {
-                content
-            };
-            let (content, activity) = if turn_first {
-                super::activity::prepend(&content, agent_id, role, is_admin).await
-            } else {
-                (content, None)
-            };
+            // Every per-turn block rides the turn's first message only, so a turn carrying several
+            // never repeats them.
+            let TurnBlocks {
+                content,
+                snapshot: new_snapshot,
+                activity,
+                unreadable_lines,
+            } = Self::turn_blocks(
+                agent_id, msg, ws, role, user_name, is_admin, is_new, turn_first,
+            )
+            .await;
 
             if is_new {
-                let (msgs, snapshot) = Self::build_turn_messages(
+                let (mut msgs, snapshot) = Self::build_turn_messages(
                     &content,
                     ws,
                     role,
@@ -285,10 +287,14 @@ impl Session {
                 // Batch-write all messages and session context atomically. A launch session's
                 // leading context block is `msgs` minus the one turn message, and its length is
                 // recorded in the SAME transaction so a later folder change rebuilds the block from
-                // what was WRITTEN, not from live workspace state.
+                // what was WRITTEN, not from live workspace state. The unreadable-message rows sit
+                // after the block and ahead of the turn message.
+                let block_len = self.launch.as_ref().map(|_| msgs.len() - 1);
+                let at = msgs.len() - 1;
+                msgs.splice(at..at, unreadable_lines);
                 let meta =
                     super::BatchMetadata::context(channel, user_name, &ws.name, role.as_str())
-                        .block_len(self.launch.as_ref().map(|_| msgs.len() - 1));
+                        .block_len(block_len);
                 crate::session::store()
                     .batch_append_with_context(agent_id, &msgs, meta)
                     .await?;
@@ -323,10 +329,14 @@ impl Session {
                 // the full first-turn message set. The rebuild paths are the folder change above
                 // and `apply_summary` below.
                 let user_msg = crate::session::user_msg_with_ts(&content, round_ts);
+                // The unreadable-message rows land in the same transaction, ahead of the message
+                // that carries their note.
+                let mut batch = unreadable_lines;
+                batch.push(user_msg);
                 crate::session::store()
-                    .append_with_context(
+                    .batch_append_with_context(
                         agent_id,
-                        &user_msg,
+                        &batch,
                         super::BatchMetadata::context(channel, user_name, &ws.name, role.as_str()),
                     )
                     .await?;
@@ -339,7 +349,7 @@ impl Session {
                 if let Some(snapshot) = new_snapshot {
                     Self::persist_active_models_snapshot(agent_id, &snapshot).await;
                 }
-                self.take_persisted(std::iter::once(user_msg));
+                self.take_persisted(batch);
             }
             // The activity state the message just written carries — recorded only once the append
             // landed, so a failed write cannot silently swallow the change.
@@ -402,10 +412,13 @@ impl Session {
             .await
             .unwrap_or_else(|| {
                 // Recorded before the column existed: the block is the leading run of system
-                // messages.
+                // messages — which stops at an unreadable-message row, since that one is the
+                // product speaking mid-conversation and not part of the block.
                 self.history
                     .iter()
-                    .take_while(|message| message.role == ChatRole::System)
+                    .take_while(|message| {
+                        message.role == ChatRole::System && !super::unreadable::is_notice(message)
+                    })
                     .count()
             })
             // Written with the block it describes, so it always fits; clamped so the slice cannot
@@ -1044,6 +1057,51 @@ impl Session {
                 .video
                 .clone()
                 .or_else(|| previous.as_ref().and_then(|p| p.video.clone())),
+        }
+    }
+
+    /// The message one turn writes with the blocks it carries, from the top: the activity note, the
+    /// personal-workspace report, an unreadable-message note, and — nearest the user's own text —
+    /// a later Assistant turn's machine change-info (a first turn's system prompt holds the models
+    /// instead). Only a turn's first message carries them. The session-start
+    /// `<workspace-structure>` block cannot stand in for the report: it is a shape — folder names
+    /// with counts, never a path — so it cannot say what the user just touched.
+    #[expect(clippy::too_many_arguments)]
+    async fn turn_blocks(
+        agent_id: &str,
+        msg: &str,
+        ws: &Workspace,
+        role: &Role,
+        user_name: &str,
+        is_admin: bool,
+        is_new: bool,
+        turn_first: bool,
+    ) -> TurnBlocks {
+        if !turn_first {
+            return TurnBlocks {
+                content: msg.to_string(),
+                ..TurnBlocks::default()
+            };
+        }
+        let unreadable = super::unreadable::drain(agent_id);
+        let (content, snapshot) = if !is_new && matches!(role, Role::Assistant) {
+            Self::prepend_model_change(agent_id, msg, user_name).await
+        } else {
+            (msg.to_string(), None)
+        };
+        let content = if unreadable.note.is_empty() {
+            content
+        } else {
+            format!("{}\n\n{content}", unreadable.note)
+        };
+        let content = crate::session::personal_changes::prepend_changes(&content, ws, role).await;
+        let (content, activity) =
+            super::activity::prepend(&content, agent_id, role, is_admin).await;
+        TurnBlocks {
+            content,
+            snapshot,
+            activity,
+            unreadable_lines: unreadable.lines,
         }
     }
 
@@ -2309,6 +2367,65 @@ mod tests {
         assert!(
             msgs[block_b + 1].content.starts_with("second"),
             "the second earlier row is untouched too"
+        );
+    }
+
+    /// A message that could not be read is written into the transcript by the conversation's own
+    /// next turn — one product line immediately ahead of that turn's message, in the same append —
+    /// and never by the listener that received it, so a running turn's bookkeeping stays its own.
+    #[tokio::test]
+    async fn an_unreadable_line_is_written_by_the_next_turn_ahead_of_its_message() {
+        crate::util::test::init_test_stores().await;
+        let agent_id = "unreadable_turn_probe";
+        let ws = crate::workspace::test_ws_named("/data/proj", "personal:admin");
+        let mut session = Session::default();
+        session.init(agent_id).await.unwrap();
+
+        crate::session::unreadable::record(agent_id, "Ada", "an article-formatted message");
+        assert!(
+            crate::session::store().load(agent_id).await.is_empty(),
+            "the listener writes nothing into the conversation"
+        );
+
+        session
+            .append_turn_message(
+                agent_id,
+                "next message",
+                &ws,
+                &crate::Role::Worker,
+                None,
+                "telegram",
+                "ada",
+                None,
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let rows = crate::session::store().load(agent_id).await;
+        let line = rows
+            .iter()
+            .position(|row| row.content == crate::session::unreadable::NOTICE)
+            .expect("the product line is in the transcript");
+        assert_eq!(rows[line].role, crate::ChatRole::System);
+        assert_eq!(
+            line + 2,
+            rows.len(),
+            "the line sits immediately ahead of the turn's own message: {rows:?}"
+        );
+        assert_eq!(rows[line + 1].role, crate::ChatRole::User);
+        assert!(
+            rows[line + 1].content.contains("<unreadable-message>"),
+            "the note rides the message the turn stores: {}",
+            rows[line + 1].content
+        );
+        assert!(
+            rows[line + 1]
+                .content
+                .contains("Ada sent an article-formatted message"),
+            "{}",
+            rows[line + 1].content
         );
     }
 

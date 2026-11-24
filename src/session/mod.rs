@@ -12,6 +12,7 @@ pub(crate) mod image_strip;
 mod manager;
 pub(crate) mod personal_changes;
 pub(crate) mod transcript;
+pub(crate) mod unreadable;
 pub(crate) use manager::FinalizeOutcome;
 pub(crate) use manager::RewriteOutcome;
 pub(crate) use manager::Session;
@@ -764,17 +765,6 @@ impl SessionStore {
         self.append_messages(agent_id, messages, false, meta).await
     }
 
-    /// Like [`batch_append`], but also sets session context in the same transaction.
-    async fn append_with_context(
-        &self,
-        agent_id: &str,
-        message: &ChatMessage,
-        meta: BatchMetadata<'_>,
-    ) -> Result<()> {
-        self.batch_append_with_context(agent_id, std::slice::from_ref(message), meta)
-            .await
-    }
-
     /// Rewrite the whole history, recording the leading context block's length in the same
     /// transaction when this rewrite wrote the block
     /// ([`crate::session::Session::refresh_context_block`]).
@@ -972,8 +962,9 @@ impl SessionStore {
         // discarded pipeline session) goes through here, so this is where a launch folder's search
         // engine is released (`workspace_index::release_path_named_engine`), where the computer
         // tool's session ends (`tools::computer::end_session`), and where the conversation's
-        // announcement memory is forgotten with its rows. Read the recorded folder before the rows
-        // go; the engine is released only for a real removal.
+        // in-memory memories — announced failures, unreadable facts — are forgotten with its rows.
+        // Read the recorded folder before the rows go; the engine is released only for a real
+        // removal.
         let workspace = self.session_workspace_name(agent_id).await;
         let tx = self.conn.begin_tx().await?;
         let deleted = tx
@@ -990,6 +981,7 @@ impl SessionStore {
         tx.commit().await?;
         crate::tools::computer::end_session(agent_id);
         crate::agent::message_router::forget_announced_media_failures(agent_id);
+        crate::session::unreadable::forget(agent_id);
         if deleted > 0
             && let Some(workspace) = workspace
         {
@@ -1693,6 +1685,7 @@ pub async fn cleanup_old_transient_sessions() -> Result<u64> {
     // longer referenced by anything, and their conversations are new again.
     for (agent_id, workspace) in purged {
         crate::agent::message_router::forget_announced_media_failures(&agent_id);
+        crate::session::unreadable::forget(&agent_id);
         if let Some(workspace) = workspace {
             crate::workspace_index::release_path_named_engine(&workspace);
         }
@@ -2296,9 +2289,9 @@ mod tests {
         let k = unique_key();
 
         store()
-            .append_with_context(
+            .batch_append_with_context(
                 &k,
-                &ChatMessage::user("u1"),
+                &[ChatMessage::user("u1")],
                 BatchMetadata::context("test_channel", "test_user", "test_ws", "engineer"),
             )
             .await
@@ -2452,9 +2445,9 @@ mod tests {
         // vanishes with them, nothing to drift.
         let transient = format!("ticket_{}", unique_key());
         store()
-            .append_with_context(
+            .batch_append_with_context(
                 &transient,
-                &ChatMessage::user("u1"),
+                &[ChatMessage::user("u1")],
                 BatchMetadata::context("test_channel", "test_user", "test_ws", "engineer"),
             )
             .await
@@ -2477,9 +2470,9 @@ mod tests {
         // because the metadata row goes in the same transaction as the messages.
         let stale = format!("ticket_{}", unique_key());
         store()
-            .append_with_context(
+            .batch_append_with_context(
                 &stale,
-                &ChatMessage::user("u1"),
+                &[ChatMessage::user("u1")],
                 BatchMetadata::context("test_channel", "test_user", "test_ws", "engineer"),
             )
             .await
@@ -2507,9 +2500,9 @@ mod tests {
         // older than the window, not whatever is transient.
         let fresh = format!("ticket_{}", unique_key());
         store()
-            .append_with_context(
+            .batch_append_with_context(
                 &fresh,
-                &ChatMessage::user("u1"),
+                &[ChatMessage::user("u1")],
                 BatchMetadata::context("test_channel", "test_user", "test_ws", "engineer"),
             )
             .await
@@ -2676,9 +2669,9 @@ mod tests {
             // list_sessions_with_metadata reads FROM session_metadata directly; the append path
             // upserts the row.
             store
-                .append_with_context(
+                .batch_append_with_context(
                     id,
-                    &ChatMessage::user("msg"),
+                    &[ChatMessage::user("msg")],
                     BatchMetadata::context("test_channel", "test_user", "test_ws", "engineer"),
                 )
                 .await
@@ -2738,9 +2731,9 @@ mod tests {
         let excluded_prefixes: Vec<&str> = reserved_agent_id_prefixes().collect();
         let step_id = format!("{CUSTOM_ROLE_RUN_AGENT_ID_PREFIX}{}", unique_key());
         store
-            .append_with_context(
+            .batch_append_with_context(
                 &step_id,
-                &ChatMessage::user("msg"),
+                &[ChatMessage::user("msg")],
                 BatchMetadata::context("test_channel", "test_user", "test_ws", "custom"),
             )
             .await

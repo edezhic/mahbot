@@ -1057,14 +1057,46 @@ fn extract_urls(text: &str) -> Vec<String> {
     result
 }
 
+/// How many pages one incoming message may make the product fetch on its own. Every part of the
+/// message draws from the same allowance, so a link-dense article — or a burst of them — cannot
+/// turn one message into dozens of background fetches on the owner's browser.
+const MAX_PAGES_PER_MESSAGE: usize = 5;
+
+/// One incoming message's remaining page allowance, shared by every part of it. The parts of a
+/// burst are enriched in send order, so the allowance goes to the earliest links.
+#[derive(Debug)]
+pub struct LinkBudget {
+    remaining: usize,
+}
+
+impl LinkBudget {
+    /// A fresh allowance for one incoming message.
+    #[must_use]
+    pub const fn per_message() -> Self {
+        Self {
+            remaining: MAX_PAGES_PER_MESSAGE,
+        }
+    }
+
+    /// Take up to `wanted` pages from the allowance, returning how many were granted.
+    fn take(&mut self, wanted: usize) -> usize {
+        let granted = wanted.min(self.remaining);
+        self.remaining -= granted;
+        granted
+    }
+}
+
 /// Prepends link summaries for any URLs found in the text; with none, the message is returned
 /// unchanged. Links are fetched concurrently through the shared `ChromeTool` — each URL gets
 /// its own isolated session tab, closed after text extraction.
-pub async fn enrich_links(content: &str) -> Cow<'_, str> {
+///
+/// The caller owns the page allowance: every part of one incoming message must draw from the
+/// same [`LinkBudget`], so a burst cannot multiply the pages the product fetches.
+pub async fn enrich_links<'a>(content: &'a str, budget: &mut LinkBudget) -> Cow<'a, str> {
     // The cap is in bytes: it is the only bound on page text reaching the model, so it must not
     // grow with a page's character count.
     const MAX_TEXT_BYTES: usize = 5000;
-    let urls = extract_urls(content);
+    let mut urls = extract_urls(content);
     if urls.is_empty() {
         return Cow::Borrowed(content);
     }
@@ -1079,6 +1111,14 @@ pub async fn enrich_links(content: &str) -> Cow<'_, str> {
         ))
     {
         tracing::debug!("chrome-use not available, skipping link enrichment");
+        return Cow::Borrowed(content);
+    }
+
+    // Spend the allowance on the pages this part will attempt: a failed fetch spends its page
+    // too, which is what bounds the work one message can cause.
+    urls.truncate(budget.take(urls.len()));
+    if urls.is_empty() {
+        tracing::debug!("page allowance spent, skipping link enrichment");
         return Cow::Borrowed(content);
     }
 
@@ -1161,6 +1201,20 @@ mod tests {
         }
     }
 
+    /// A request inside the allowance is granted whole, one over it is clipped to what remains,
+    /// and an exhausted allowance grants nothing.
+    #[test]
+    fn the_page_allowance_is_granted_whole_then_clipped() {
+        let mut budget = LinkBudget::per_message();
+        assert_eq!(budget.remaining, MAX_PAGES_PER_MESSAGE);
+        assert_eq!(budget.take(2), 2);
+        assert_eq!(
+            budget.take(MAX_PAGES_PER_MESSAGE),
+            MAX_PAGES_PER_MESSAGE - 2
+        );
+        assert_eq!(budget.take(1), 0);
+    }
+
     /// The chat id every inbound fixture belongs to: the test messages carry it and the fixture
     /// directories are named after it.
     const TEST_CHAT_ID: &str = "1";
@@ -1187,6 +1241,7 @@ mod tests {
             update_ids: Vec::new(),
             dictated: false,
             urgent: false,
+            article: false,
         }
     }
 

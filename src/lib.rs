@@ -470,6 +470,7 @@ pub fn parse_bot_command(content: &str) -> Option<BotCommand> {
 /// collected burst, whose text lives in its [`parts`](Self::parts). A new
 /// non-`Option` field is silently defaulted at every spread site.
 #[derive(Debug, Clone, Default)]
+#[expect(clippy::struct_excessive_bools)] // four independent facts about one message, not states
 pub struct ChannelMessage {
     /// The user's canonical name, resolved from channel binding at auth time —
     /// never derived from Telegram `@username`.
@@ -528,6 +529,11 @@ pub struct ChannelMessage {
     /// Assistant's running turn instead of waiting behind it. Only a surface a user
     /// types into sets it; anything the product composes or routes leaves it `false`.
     pub urgent: bool,
+    /// `content` carries a Telegram article (Bot API 10.1's `rich_message`, flattened to text
+    /// by `channels::telegram_rich`). An article is content, never control input: a message
+    /// carrying one is not read as a command, an action payload or an urgent mark, so an
+    /// article's own body can never be dropped by being mistaken for one.
+    pub article: bool,
 }
 
 /// An outbound message to deliver on a channel.

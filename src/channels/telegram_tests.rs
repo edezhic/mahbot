@@ -1373,33 +1373,534 @@ fn attachment_rejection_content_shapes() {
 }
 
 #[tokio::test]
-async fn parse_update_message_denies_user_without_username() {
-    let ch = test_channel().await;
+async fn an_unknown_sender_is_recorded_and_never_answered() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let (store, _dir) = test_store().await;
+    let ch = channel("token-a", &fake, &store);
     let update = test_update(&[(
         "message",
         serde_json::json!({
             "message_id": 9,
             "text": "ping",
             "from": {
-                "id": 555
+                "id": 555,
+                "username": "stranger"
             },
             "chat": {
                 "id": 12345
             }
         }),
     )]);
+    let Event::Unreadable(Unreadable::UnknownSender {
+        reply_target,
+        sender,
+    }) = ch
+        .parse_incoming_update(&update)
+        .await
+        .expect("parse the update")
+    else {
+        panic!("an unbound sender must not produce a message");
+    };
+    assert_eq!(reply_target.as_deref(), Some("12345"));
+    assert_eq!(
+        sender.as_deref(),
+        Some("stranger"),
+        "a stranger's record names the handle that makes it actionable"
+    );
 
+    let _lock = crate::util::test::STORE_LOCK.lock().await;
+    assert!(take_one(&ch, &store, &update).await.is_none());
+    assert!(fake.sent_texts().is_empty(), "a stranger is never answered");
+}
+
+/// The article a message carries reaches the assistant as ordinary text, and no picture inside it
+/// is delivered as a file.
+#[tokio::test]
+async fn an_article_formatted_message_is_read_as_text() {
+    let ch = test_channel().await;
+    let update = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 21,
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": 12345 },
+            "rich_message": { "blocks": [
+                { "type": "heading", "text": "Weekly report", "size": 1 },
+                { "type": "paragraph", "text": "All good." },
+                { "type": "photo", "photo": [{ "file_id": "p" }], "caption": { "text": "A cat" } }
+            ]}
+        }),
+    )]);
+
+    let msg = parsed_message(&ch, &update).await;
+    assert!(msg.article);
+    assert_eq!(
+        msg.content,
+        "Weekly report\n\nAll good.\n\n(picture: A cat)"
+    );
     assert!(
-        ch.parse_update_message(&update)
-            .await
-            .expect("parse the update")
-            .is_none(),
-        "user without username should be denied"
+        msg.attachment_dirs.is_empty(),
+        "an article's picture is no file"
+    );
+    assert!(!msg.urgent);
+}
+
+/// The plain text comes first, then the article, a blank line apart.
+#[tokio::test]
+async fn plain_text_and_an_article_arrive_together() {
+    let ch = test_channel().await;
+    let update = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 22,
+            "text": "look at this",
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": 12345 },
+            "rich_message": { "blocks": [{ "type": "paragraph", "text": "The article." }] }
+        }),
+    )]);
+
+    let msg = parsed_message(&ch, &update).await;
+    assert!(msg.article);
+    assert_eq!(msg.content, "look at this\n\nThe article.");
+}
+
+/// A message carrying an article is content: its first line is never read as a command, an action
+/// payload or an urgent mark, whatever it looks like.
+#[tokio::test]
+async fn an_article_is_never_control_input() {
+    let ch = test_channel().await;
+    for first_line in ["/clear", "__act__set_model|x", "!urgent"] {
+        let update = test_update(&[(
+            "message",
+            serde_json::json!({
+                "message_id": 23,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": 12345 },
+                "rich_message": { "blocks": [{ "type": "paragraph", "text": first_line }] }
+            }),
+        )]);
+
+        let msg = parsed_message(&ch, &update).await;
+        assert_eq!(
+            msg.content, first_line,
+            "the article's body must survive intact"
+        );
+        assert!(
+            !msg.urgent,
+            "an article's leading mark is not an urgent mark"
+        );
+        assert!(
+            control_input(&msg).is_none(),
+            "{first_line} was read as control input out of an article"
+        );
+    }
+}
+
+/// A message can carry an article and a file at once: both are delivered.
+#[tokio::test]
+async fn an_article_and_a_file_are_both_delivered() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let (store, _dir) = test_store().await;
+    let ch = channel("token-a", &fake, &store);
+    // A declared size past Telegram's own download cap is refused before any fetch, so the file's
+    // own reading is a refusal note and no transfer is spent.
+    let update = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 24,
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": 12345 },
+            "photo": [{ "file_id": "huge", "file_size": 30 * 1024 * 1024 }],
+            "rich_message": { "blocks": [{ "type": "paragraph", "text": "Read the report." }] }
+        }),
+    )]);
+
+    let msg = parsed_message(&ch, &update).await;
+    assert!(msg.article);
+    assert!(
+        msg.content.starts_with("[File "),
+        "the file's reading comes first: {}",
+        msg.content
+    );
+    assert!(
+        msg.content.ends_with("Read the report."),
+        "the article rides with the file: {}",
+        msg.content
+    );
+}
+
+/// A kind the product deliberately leaves alone is recorded and its sender told nothing: nobody
+/// expects a sticker to be read.
+#[tokio::test]
+async fn a_sticker_is_recorded_and_its_sender_told_nothing() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let (store, _dir) = test_store().await;
+    let ch = channel("token-a", &fake, &store);
+    let update = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 25,
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": 12345 },
+            "sticker": { "file_id": "s", "emoji": "👍" }
+        }),
+    )]);
+
+    assert!(take_one(&ch, &store, &update).await.is_none());
+    let Event::Unreadable(Unreadable::NothingReadable { fields, kind, .. }) = ch
+        .parse_incoming_update(&update)
+        .await
+        .expect("parse the update")
+    else {
+        panic!("a sticker is nothing the product can read");
+    };
+    assert_eq!(fields, vec!["sticker".to_string()]);
+    assert!(
+        kind.is_none(),
+        "a sticker is not something its sender is owed a line about"
+    );
+    assert!(
+        fake.sent_texts().is_empty(),
+        "a sticker's sender must not be answered"
+    );
+}
+
+/// A service event — someone joined, a message was pinned — is recorded and nobody is told.
+#[tokio::test]
+async fn a_service_event_is_recorded_and_nobody_is_told() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let (store, _dir) = test_store().await;
+    let ch = channel("token-a", &fake, &store);
+    let update = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 26,
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": 12345 },
+            "new_chat_members": [{ "id": 9, "username": "carol" }]
+        }),
+    )]);
+
+    assert!(take_one(&ch, &store, &update).await.is_none());
+    let Event::Unreadable(Unreadable::NothingReadable { fields, kind, .. }) = ch
+        .parse_incoming_update(&update)
+        .await
+        .expect("parse the update")
+    else {
+        panic!("a service event is nothing the product can read");
+    };
+    assert_eq!(fields, vec!["new_chat_members".to_string()]);
+    assert!(kind.is_none(), "a service event owes its sender nothing");
+    assert!(fake.sent_texts().is_empty());
+}
+
+/// Something the product does not recognise is a person trying to say something that was lost:
+/// the sender is told, and the fact is queued for the conversation's next turn.
+#[tokio::test]
+async fn an_unrecognised_content_kind_is_told_and_recorded_for_the_next_turn() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let (store, _dir) = test_store().await;
+    let ch = channel("token-a", &fake, &store);
+    let _lock = crate::util::test::STORE_LOCK.lock().await;
+    let update = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 27,
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": 12345 },
+            "brand_new_kind": { "anything": true }
+        }),
+    )]);
+
+    assert!(take_one(&ch, &store, &update).await.is_none());
+    assert_eq!(
+        fake.sent_texts(),
+        vec![crate::session::unreadable::NOTICE.to_string()]
+    );
+    assert_eq!(
+        fake.sent_targets(),
+        vec!["12345".to_string()],
+        "the line goes to the chat the message came from"
+    );
+
+    let (role, workspace) = crate::users::resolve_session_target("alice").await;
+    let agent_id =
+        crate::agent::message_router::user_message_agent_id("alice", role, &workspace.name);
+    let noted = crate::session::unreadable::drain(&agent_id).note;
+    assert!(
+        noted.contains("a message of an unsupported kind")
+            && noted.starts_with("<unreadable-message>"),
+        "the note names the kind and rides the conversation's next turn: {noted}"
+    );
+}
+
+/// A caption rides the media field beside it, so a kind the product deliberately leaves alone stays
+/// that way when it carries one; a caption beside a kind the product does not know is still that
+/// unknown kind.
+#[test]
+fn a_caption_never_names_a_kind_of_its_own() {
+    assert_eq!(
+        unreadable_kind(&["caption".to_string(), "paid_media".to_string()]),
+        None,
+        "a caption must not turn an ignored kind into an unreadable one"
+    );
+    assert_eq!(
+        unreadable_kind(&["brand_new_kind".to_string(), "caption".to_string()]),
+        Some("a message of an unsupported kind")
+    );
+}
+
+/// A message that named nothing at all is reported like an unknown kind — the safe direction —
+/// rather than passing for one the product deliberately leaves alone.
+#[test]
+fn a_message_with_no_content_fields_is_not_treated_as_deliberately_unread() {
+    assert_eq!(
+        unreadable_kind(&[]),
+        Some("a message of an unsupported kind")
+    );
+}
+
+/// One captured tracing event: its level, its message and its rendered fields.
+#[derive(Debug, Clone)]
+struct CapturedEvent {
+    level: tracing::Level,
+    message: String,
+    fields: String,
+}
+
+/// Captures the events emitted while it is the thread's subscriber, so a test can assert what a
+/// warning record actually says — tests install no process-wide subscriber.
+#[derive(Clone, Default)]
+struct EventRecorder {
+    events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+}
+
+impl EventRecorder {
+    fn events(&self) -> Vec<CapturedEvent> {
+        self.events.lock().unwrap_poison().clone()
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventRecorder {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut visitor = FieldVisitor::default();
+        event.record(&mut visitor);
+        self.events.lock().unwrap_poison().push(CapturedEvent {
+            level: *event.metadata().level(),
+            message: visitor.message,
+            fields: visitor.fields.join(" "),
+        });
+    }
+}
+
+#[derive(Default)]
+struct FieldVisitor {
+    message: String,
+    fields: Vec<String>,
+}
+
+impl FieldVisitor {
+    fn push(&mut self, field: &tracing::field::Field, value: String) {
+        if field.name() == "message" {
+            self.message = value;
+        } else {
+            self.fields.push(format!("{}={value}", field.name()));
+        }
+    }
+}
+
+impl tracing::field::Visit for FieldVisitor {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.push(field, value.to_string());
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        self.push(field, value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.push(field, format!("{value:?}"));
+    }
+}
+
+/// The record of an update that closed without a message names its parts — the update number, the
+/// chat, the sender and the message's own fields — and never what the sender wrote.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unreadable_update_leaves_one_warning_naming_its_parts() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let (store, _dir) = test_store().await;
+    let ch = channel("token-a", &fake, &store);
+    let _lock = crate::util::test::STORE_LOCK.lock().await;
+    let update = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 30,
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": 12345 },
+            "brand_new_kind": { "words": "the sender's own text" }
+        }),
+    )]);
+
+    let recorder = EventRecorder::default();
+    {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let _capture =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(recorder.clone()));
+        assert!(take_one(&ch, &store, &update).await.is_none());
+    }
+
+    let warnings: Vec<CapturedEvent> = recorder
+        .events()
+        .into_iter()
+        .filter(|event| {
+            event.level == tracing::Level::WARN
+                && event.message.contains("closed without a message")
+        })
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        1,
+        "one warning per closed update: {warnings:?}"
+    );
+    let warning = &warnings[0];
+    assert!(
+        warning.message.contains("nothing the product can read"),
+        "{warning:?}"
+    );
+    for field in [
+        "update_id=1",
+        "chat=12345",
+        "sender=alice",
+        "message_fields=brand_new_kind",
+    ] {
+        assert!(
+            warning.fields.contains(field),
+            "{field} missing from {warning:?}"
+        );
+    }
+    assert!(
+        !warning.fields.contains("the sender's own text"),
+        "a warning never carries the sender's text: {warning:?}"
+    );
+}
+
+/// An article that flattens to nothing is nothing the product can read, and its sender is told.
+#[tokio::test]
+async fn an_article_that_flattens_to_nothing_is_told() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let (store, _dir) = test_store().await;
+    let ch = channel("token-a", &fake, &store);
+    let _lock = crate::util::test::STORE_LOCK.lock().await;
+    let update = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 28,
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": 12345 },
+            "rich_message": { "blocks": [{ "type": "divider" }] }
+        }),
+    )]);
+
+    assert!(take_one(&ch, &store, &update).await.is_none());
+    assert_eq!(
+        fake.sent_texts(),
+        vec![crate::session::unreadable::NOTICE.to_string()]
+    );
+    let Event::Unreadable(Unreadable::NothingReadable { kind, .. }) = ch
+        .parse_incoming_update(&update)
+        .await
+        .expect("parse the update")
+    else {
+        panic!("an empty article is nothing the product can read");
+    };
+    assert_eq!(kind, Some("an article-formatted message"));
+}
+
+/// An empty `text` is no text: the message is recorded as unreadable, never delivered blank.
+#[tokio::test]
+async fn a_message_whose_text_is_empty_is_unreadable() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let (store, _dir) = test_store().await;
+    let ch = channel("token-a", &fake, &store);
+    let _lock = crate::util::test::STORE_LOCK.lock().await;
+    let update = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 29,
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": 12345 },
+            "text": "   "
+        }),
+    )]);
+
+    assert!(take_one(&ch, &store, &update).await.is_none());
+    assert_eq!(
+        fake.sent_texts(),
+        vec![crate::session::unreadable::NOTICE.to_string()]
+    );
+    let Event::Unreadable(Unreadable::NothingReadable { fields, .. }) = ch
+        .parse_incoming_update(&update)
+        .await
+        .expect("parse the update")
+    else {
+        panic!("a blank body is nothing the product can read");
+    };
+    assert_eq!(fields, vec!["text".to_string()]);
+}
+
+/// An event that carried nothing readable keeps its body for the retention window; one that was
+/// read drops it with the decision.
+#[tokio::test]
+async fn only_an_unreadable_event_keeps_its_body() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    let (store, _dir) = test_store().await;
+    let ch = channel("token-a", &fake, &store);
+    let _lock = crate::util::test::STORE_LOCK.lock().await;
+
+    let intake = run(&store, "run-check", "700");
+    let readable = test_update(&[]);
+    intake.hold(&[&readable]).await.expect("hold the event");
+    let msg = ch
+        .take_event(&intake, BatchOrigin::Fresh, 1, &readable)
+        .await
+        .expect("a readable event is handed on");
+    // The pipeline settles a message it took; the record drops the body with the decision.
+    intake.settle(&msg.update_ids).await;
+    assert_eq!(
+        recorded_payload(&store, "700", 1).await,
+        None,
+        "a read event keeps only its decision"
+    );
+
+    let unreadable = test_update(&[
+        ("update_id", serde_json::json!(2)),
+        (
+            "message",
+            serde_json::json!({
+                "message_id": 29,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": 12345 },
+                "brand_new_kind": { "anything": true }
+            }),
+        ),
+    ]);
+    assert!(take_one(&ch, &store, &unreadable).await.is_none());
+    let kept = recorded_payload(&store, "700", 2)
+        .await
+        .expect("an unreadable event keeps its body");
+    assert!(
+        kept.contains("brand_new_kind"),
+        "the kept body is the update itself: {kept}"
     );
 }
 
 #[tokio::test]
-async fn parse_update_message_extracts_thread_id_for_forum_topic() {
+async fn a_forum_topic_message_keeps_its_thread_id() {
     let ch = test_channel().await;
     let update = test_update(&[(
         "message",
@@ -1417,11 +1918,7 @@ async fn parse_update_message_extracts_thread_id_for_forum_topic() {
         }),
     )]);
 
-    let msg = ch
-        .parse_update_message(&update)
-        .await
-        .expect("parse the update")
-        .expect("message with thread_id should parse");
+    let msg = parsed_message(&ch, &update).await;
 
     assert_eq!(msg.user_name, "alice");
     assert_eq!(msg.reply_target, "-100200300:789");
@@ -1876,7 +2373,7 @@ fn replied_to_sender_label_chain() {
 }
 
 #[tokio::test]
-async fn parse_update_message_populates_reply_reference() {
+async fn a_message_that_replies_carries_its_reference() {
     let ch = test_channel().await;
     let update = test_update(&[(
         "message",
@@ -1891,11 +2388,7 @@ async fn parse_update_message_populates_reply_reference() {
             }
         }),
     )]);
-    let parsed = ch
-        .parse_update_message(&update)
-        .await
-        .expect("parse the update")
-        .expect("a message");
+    let parsed = parsed_message(&ch, &update).await;
     assert_eq!(parsed.content, "translate this");
     let reply = parsed
         .reply_reference
@@ -1947,11 +2440,7 @@ async fn reply_that_is_a_command_parses_as_command() {
             }
         }),
     )]);
-    let parsed = ch
-        .parse_update_message(&update)
-        .await
-        .expect("parse the update")
-        .expect("a message");
+    let parsed = parsed_message(&ch, &update).await;
     assert_eq!(parsed.content, "/clear");
     assert!(crate::parse_bot_command(&parsed.content).is_some());
 }
@@ -1972,11 +2461,7 @@ async fn reply_to_command_keeps_reference() {
             }
         }),
     )]);
-    let parsed = ch
-        .parse_update_message(&update)
-        .await
-        .expect("parse the update")
-        .expect("a message");
+    let parsed = parsed_message(&ch, &update).await;
     // A non-command reply to a command message keeps its reference and routes to the agent.
     assert_eq!(parsed.content, "why did you clear?");
     assert!(crate::parse_bot_command(&parsed.content).is_none());
@@ -2594,6 +3079,27 @@ async fn a_mark_is_read_only_at_the_start_of_the_typed_text() {
     }
 }
 
+/// A message that is nothing but the urgent mark stays control input: it is delivered so the cut
+/// happens, and it is never reported as content the product could not read.
+#[tokio::test]
+async fn a_lone_urgent_mark_is_control_input_not_unreadable_content() {
+    let ch = test_channel().await;
+    let update = test_update(&[(
+        "message",
+        serde_json::json!({
+            "message_id": 46,
+            "text": "!",
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": -100_200_300 }
+        }),
+    )]);
+
+    let msg = parsed_message(&ch, &update).await;
+    assert!(msg.urgent, "the cut must still happen");
+    assert_eq!(msg.content, "");
+    assert!(!msg.article);
+}
+
 /// A caption is text the user typed, so it carries the mark like any message does; the album its
 /// parts fold into keeps it.
 #[test]
@@ -2643,11 +3149,16 @@ fn a_caption_carries_the_mark_and_the_album_keeps_it() {
     assert!(!album.urgent);
 }
 
+/// The message an update produced, for the checks that only care about what was read.
 async fn parsed_message(ch: &TelegramChannel, update: &serde_json::Value) -> ChannelMessage {
-    ch.parse_update_message(update)
+    match ch
+        .parse_incoming_update(update)
         .await
         .expect("parse the update")
-        .expect("a message")
+    {
+        Event::Message(msg) => msg,
+        Event::Unreadable(_) => panic!("expected the update to carry a message"),
+    }
 }
 
 /// Every forward attribution: each labelled `forward_origin` renders it, and an origin with no
@@ -2873,11 +3384,7 @@ async fn a_refused_forwarded_attachment_keeps_its_attribution() {
     let ch = channel("token-a", &fake, &store);
     let update = forwarded_photo_update(1, 33, "huge", 30 * 1024 * 1024);
 
-    let msg = ch
-        .parse_incoming_update(&update)
-        .await
-        .expect("parse the update")
-        .expect("a message");
+    let msg = parsed_message(&ch, &update).await;
     assert!(msg.forwarded);
     assert!(
         msg.content
@@ -2993,6 +3500,7 @@ fn test_msg(user_name: &str, content: &str, channel: &str, reply_target: &str) -
         update_ids: Vec::new(),
         dictated: false,
         urgent: false,
+        article: false,
     }
 }
 
@@ -3437,6 +3945,7 @@ struct FakeState {
     batches: Mutex<HashMap<String, VecDeque<Vec<serde_json::Value>>>>,
     requests: Mutex<Vec<ServedRequest>>,
     sent_texts: Mutex<Vec<String>>,
+    sent_targets: Mutex<Vec<String>>,
     files: Mutex<HashMap<String, FakeFile>>,
 }
 
@@ -3481,6 +3990,7 @@ impl FakeTelegram {
             batches: Mutex::new(HashMap::new()),
             requests: Mutex::new(Vec::new()),
             sent_texts: Mutex::new(Vec::new()),
+            sent_targets: Mutex::new(Vec::new()),
             files: Mutex::new(HashMap::new()),
         });
         let stop = Arc::new(AtomicBool::new(false));
@@ -3579,6 +4089,15 @@ impl FakeTelegram {
             .sent_texts
             .lock()
             .expect("fake sendMessage log")
+            .clone()
+    }
+
+    /// The chats `sendMessage` was addressed to, in call order.
+    fn sent_targets(&self) -> Vec<String> {
+        self.state
+            .sent_targets
+            .lock()
+            .expect("fake sendMessage targets")
             .clone()
     }
 }
@@ -3796,8 +4315,9 @@ fn pop_batch(state: &FakeState, token: &str) -> Option<Vec<serde_json::Value>> {
 }
 
 fn serve_send_message(stream: &mut TcpStream, state: &FakeState, request: &FakeRequest) {
-    if let Some(text) = serde_json::from_slice::<serde_json::Value>(&request.body)
-        .ok()
+    let body = serde_json::from_slice::<serde_json::Value>(&request.body).ok();
+    if let Some(text) = body
+        .as_ref()
         .and_then(|body| body["text"].as_str().map(str::to_string))
     {
         state
@@ -3805,6 +4325,18 @@ fn serve_send_message(stream: &mut TcpStream, state: &FakeState, request: &FakeR
             .lock()
             .expect("fake sendMessage log")
             .push(text);
+    }
+    let target = body.as_ref().and_then(|body| match &body["chat_id"] {
+        serde_json::Value::String(chat) => Some(chat.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    });
+    if let Some(target) = target {
+        state
+            .sent_targets
+            .lock()
+            .expect("fake sendMessage targets")
+            .push(target);
     }
     respond(
         stream,
@@ -3939,6 +4471,41 @@ async fn next_message_within(
         .unwrap_or_else(|| panic!("the pipeline closed before delivering: {what}"))
 }
 
+/// An article-formatted update walks the whole listener: recorded, parsed, collected and handed to
+/// the pipeline as ordinary text.
+#[tokio::test]
+async fn an_article_reaches_the_pipeline_through_the_listener() {
+    let fake = FakeTelegram::start(&[("token-a", 700)]);
+    fake.push_batch(
+        "token-a",
+        vec![test_update(&[(
+            "message",
+            serde_json::json!({
+                "message_id": 41,
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300 },
+                "rich_message": { "blocks": [
+                    { "type": "heading", "text": "Trip plan", "size": 2 },
+                    { "type": "list", "items": [
+                        { "label": "1.", "blocks": [{ "type": "paragraph", "text": "Book the train" }] }
+                    ]}
+                ]}
+            }),
+        )])],
+    );
+    let (store, _dir) = test_store().await;
+    let telegram = channel("token-a", &fake, &store);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let listener = tokio::spawn(async move {
+        let _ = telegram.listen(tx).await;
+    });
+
+    let msg = next_message(&mut rx, "the article").await;
+    assert_eq!(msg.content, "Trip plan\n\n1. Book the train");
+    assert!(msg.article);
+    listener.abort();
+}
+
 fn test_text_update(update_id: i64, text: &str) -> serde_json::Value {
     test_update(&[
         ("update_id", serde_json::json!(update_id)),
@@ -3968,6 +4535,39 @@ fn test_album_member(update_id: i64, group: &str, text: &str) -> serde_json::Val
             }),
         ),
     ])
+}
+
+/// Take one update the way the listener does: record it, then parse and close it. `None` is an
+/// update that produced no message.
+async fn take_one(
+    ch: &TelegramChannel,
+    store: &TelegramIntakeStore,
+    update: &serde_json::Value,
+) -> Option<ChannelMessage> {
+    let intake = run(store, "run-check", "700");
+    let update_id = update["update_id"].as_i64().expect("an update id");
+    intake.hold(&[update]).await.expect("hold the event");
+    ch.take_event(&intake, BatchOrigin::Fresh, update_id, update)
+        .await
+}
+
+/// The body the record kept for an update, when it kept one.
+async fn recorded_payload(
+    store: &TelegramIntakeStore,
+    account: &str,
+    update_id: i64,
+) -> Option<String> {
+    store
+        .conn
+        .query(
+            "SELECT payload FROM telegram_intake WHERE account_id = ?1 AND update_id = ?2",
+            crate::db::params![account, update_id],
+        )
+        .await
+        .expect("read the record")
+        .into_iter()
+        .next()
+        .and_then(|row| row.get::<Option<String>>(0).ok().flatten())
 }
 
 /// A forwarded photo from alice as Telegram sends one: the attachment is what a slow fetch is

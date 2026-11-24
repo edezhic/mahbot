@@ -2,7 +2,7 @@
 //! for `channels::reply`.
 
 use super::*;
-use crate::channels::enrich_links;
+use crate::channels::{LinkBudget, enrich_links};
 
 /// The normalization runs its rules in one order: entities decode first (so
 /// their angle brackets are then stripped), a `<blockquote>` wrapper comes off,
@@ -84,7 +84,9 @@ async fn marker_injection_follows_link_enrichment() {
         snippet: "look".to_string(),
     };
     let original = "[Forwarded from @bob] check https://example.com";
-    let enriched = enrich_links(original).await.to_string();
+    let enriched = enrich_links(original, &mut LinkBudget::per_message())
+        .await
+        .to_string();
     let routed = apply_reply_marker(&enriched, &reply);
     assert!(routed.starts_with("<reply-to>alice: look</reply-to>:\n"));
     assert!(
