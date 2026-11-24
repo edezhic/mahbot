@@ -1280,6 +1280,24 @@ impl Dashboard {
                             )))
                         },
                     ),
+                    // Stopping a chain: cancel the step running now, drop the chain's own rows so
+                    // no step replays, and deliver nothing further — another chain's step in the
+                    // same conversation is untouched.
+                    running::StopTarget::Chain(chain_id) => Task::perform(
+                        async move {
+                            match crate::tools::chain::stop(&chain_id).await {
+                                Ok(()) => Ok(
+                                    "Chain stopped — its remaining steps were dropped and nothing \
+                                     further will be delivered."
+                                        .to_string(),
+                                ),
+                                Err(e) => Err(format!("could not stop the chain: {e}")),
+                            }
+                        },
+                        |result| {
+                            Message::RunningAgents(running::RunningMessage::StopFinished(result))
+                        },
+                    ),
                     // Stopping a launch: cancel its agent, mark the branch deliberately stopped,
                     // drop its pending messages. A failure is a toast, never swallowed.
                     running::StopTarget::Launch(agent_id) => Task::perform(

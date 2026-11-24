@@ -4,8 +4,188 @@
 //! they are routed, so they survive a restart, and stopped through one path.
 //! A custom role runs the administrator's authored role; a worker branch runs a
 //! normal [`crate::Role::Worker`] agent on a continuation of its own conversation.
+//!
+//! The durable record types of a `send` chain live here, beside the launch that carries them
+//! ([`crate::Launch::chain`]), so the persistence and session layers can read a chain without
+//! depending on a tool module; the chain's behaviour is [`crate::tools::chain`].
+//!
+//! [`Step`] names its addressee in `send`'s vocabulary ([`crate::tools::send::Addressee`]), so this
+//! module and that tool reference each other by type. The dependency is deliberate and one-way in
+//! behaviour: `send` is the only producer of a chain, and nothing here calls into the tool.
+//!
+//! The rule that two agents must not work in one folder lives here too ([`BusyFolder`]), because
+//! every launch is the place that has to apply it.
 
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+
+use crate::tools::send::Addressee;
+
+/// The longest chain: the outer call plus nine nested `for`.
+pub(crate) const MAX_STEPS: usize = 10;
+
+/// One step of a chain: the call's own shape minus `message`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Step {
+    pub addressee: Addressee,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub place: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl Step {
+    /// The step a chain-carrying durable round is: `send`'s worker, the only round kind a chain
+    /// hands its answer on from.
+    #[must_use]
+    pub(crate) fn worker() -> Self {
+        Self {
+            addressee: Addressee::Worker,
+            place: None,
+            branch: None,
+            name: None,
+        }
+    }
+
+    /// What this step is, for the step after it and for the failure it may cause.
+    #[must_use]
+    pub(crate) fn label(&self) -> String {
+        match self.addressee {
+            Addressee::Worker => crate::Role::Worker.display_label().to_string(),
+            Addressee::WorkerBranch => {
+                display_label(crate::Role::Worker, "", self.branch.as_deref())
+            }
+            Addressee::Role => display_label(
+                crate::Role::Custom,
+                self.name.as_deref().unwrap_or_default(),
+                self.branch.as_deref(),
+            ),
+            // Parsing refuses every other address, so this arm only serves the type.
+            other => other.as_str().to_string(),
+        }
+    }
+}
+
+/// A chain in flight: the step running now, the steps after it, and where it answers.
+///
+/// It rides on the record of the step running now (see [`crate::tools::chain`]), never on a
+/// store of its own.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Chain {
+    /// One id for the whole chain — its Running Agents group and its stop.
+    pub id: String,
+    /// The task exactly as first sent: every step receives it unchanged.
+    pub task: String,
+    /// The user the chain answers to (the owner) and the channel it started on.
+    pub user: String,
+    pub channel: String,
+    /// The workspace a step that names no `place` runs in — the one the same delegation from the
+    /// owner's Assistant runs in today.
+    pub workspace: String,
+    /// The address of the step running now, and its 1-based position.
+    pub current: Step,
+    pub step: usize,
+    /// The steps after it, in order. Empty means the current step is the last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next: Vec<Step>,
+}
+
+impl Chain {
+    /// How many steps the chain has: the one running now and the ones after it.
+    #[must_use]
+    pub(crate) fn total(&self) -> usize {
+        self.step + self.next.len()
+    }
+}
+
+/// A chain value read back from a store: `jobs.chain` or `session_metadata.chain`.
+///
+/// A chain step must never come back as an ordinary delegation — its answer would reach the caller
+/// mid-chain — so a record that can no longer be read is its own state rather than "no chain".
+#[derive(Clone, Debug)]
+pub enum Stored {
+    /// An ordinary round or branch.
+    Ordinary,
+    /// A chain step.
+    Step(Box<Chain>),
+    /// A chain step whose record this build cannot read. Nothing can be handed on, so the step is
+    /// abandoned and its caller told the chain stopped. The chain id is kept when the value still
+    /// names one, so the ending can retire the chain's other conversations.
+    Unreadable(Option<String>),
+}
+
+impl Stored {
+    /// Read a stored value. An unreadable one is logged here, once, where it is recognised.
+    #[must_use]
+    pub(crate) fn parse(raw: Option<String>) -> Self {
+        match raw {
+            None => Self::Ordinary,
+            Some(raw) => match serde_json::from_str(&raw) {
+                Ok(chain) => Self::Step(Box::new(chain)),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "a stored chain is unreadable — its step must be abandoned, not delivered",
+                    );
+                    Self::Unreadable(named_chain_id(&raw))
+                }
+            },
+        }
+    }
+
+    /// The chain this round is a step of, when it is one.
+    #[must_use]
+    pub(crate) fn step(&self) -> Option<&Chain> {
+        match self {
+            Self::Step(chain) => Some(chain),
+            Self::Ordinary | Self::Unreadable(_) => None,
+        }
+    }
+
+    /// Whether the record is a chain step that can no longer be read.
+    #[must_use]
+    pub(crate) fn is_unreadable(&self) -> bool {
+        matches!(self, Self::Unreadable(_))
+    }
+
+    /// The chain an unreadable record still names, when it names one: enough to end that chain
+    /// properly, though not to run any step of it.
+    #[must_use]
+    pub(crate) fn unreadable_chain(&self) -> Option<&str> {
+        match self {
+            Self::Unreadable(id) => id.as_deref(),
+            Self::Ordinary | Self::Step(_) => None,
+        }
+    }
+}
+
+/// The chain id a value this build cannot read as a chain still names. The field is read on its own
+/// because an ending must still retire the chain's conversations; a value that names nothing is
+/// unidentifiable, and only the one failure is left.
+fn named_chain_id(raw: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()?
+        .get("id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The durable record id of one step. Deterministic, so a hand-off replayed after it committed
+/// finds the next step's record instead of starting it twice.
+#[must_use]
+pub(crate) fn record_id(chain_id: &str, step: usize) -> String {
+    format!("chain_{chain_id}_{step}")
+}
+
+/// The chain id and step a record id names, when it names one — all a corrupt record still says.
+#[must_use]
+pub(crate) fn record_parts(record: &str) -> Option<(&str, usize)> {
+    let rest = record.strip_prefix("chain_")?;
+    let (chain_id, step) = rest.rsplit_once('_')?;
+    Some((chain_id, step.parse().ok()?))
+}
 
 fn launch_job(
     content: String,
@@ -28,6 +208,75 @@ fn launch_job(
     }
 }
 
+/// How a launch treats a folder another agent is already working in.
+#[derive(Clone, Copy)]
+pub(crate) enum BusyFolder<'a> {
+    /// An ordinary delegation refuses it: two agents in one folder overwrite each other's edits.
+    Refuse,
+    /// A chain step. Its own chain's earlier steps and the conversation it targets are not another
+    /// agent — it waits its turn there — while any other agent in the folder still fails it.
+    Chain(&'a Chain),
+    /// A launch nobody asked for and nobody can refuse, an automation's: run it as before.
+    Ignore,
+}
+
+impl BusyFolder<'_> {
+    /// The chain a step of which this launch is, when it is one.
+    fn chain(&self) -> Option<&Chain> {
+        match self {
+            Self::Chain(chain) => Some(chain),
+            Self::Refuse | Self::Ignore => None,
+        }
+    }
+
+    /// Refuse `folder` under this rule. `target` is the conversation the launch is aimed at, when
+    /// it has one: a chain step waits its turn in it.
+    pub(crate) fn check(&self, folder: &crate::Workspace, target: Option<&str>) -> Result<()> {
+        // The caller is not ANOTHER agent: its own run is dispatching, and a custom role handing a
+        // worker its own folder is the normal delegation. The command line has no session.
+        let caller = crate::agent::tool_agent_id().ok();
+        let (ignore, chain) = match self {
+            Self::Refuse => (caller.as_deref(), None),
+            Self::Chain(chain) => (target, Some(chain.id.as_str())),
+            Self::Ignore => return Ok(()),
+        };
+        refuse_busy_folder_excluding(folder, ignore, chain)
+    }
+}
+
+/// Refuse a folder another agent is already working in: two agents in one folder overwrite each
+/// other's edits, so parallel agents that can collide must not be started in one folder.
+pub(crate) fn refuse_busy_folder(folder: &crate::Workspace) -> Result<()> {
+    BusyFolder::Refuse.check(folder, None)
+}
+
+fn refuse_busy_folder_excluding(
+    folder: &crate::Workspace,
+    ignore: Option<&str>,
+    chain: Option<&str>,
+) -> Result<()> {
+    let Some(running) = crate::agent::registry::AGENT_REGISTRY.worker_in_folder_excluding_chain(
+        folder.as_path(),
+        ignore,
+        chain,
+    ) else {
+        return Ok(());
+    };
+    let working = if running.role == crate::Role::Worker.as_str() {
+        "a worker"
+    } else {
+        "a custom role"
+    };
+    // The folder as the acknowledgements spell it — the resolved path, one way.
+    let folder = folder.path.trim_end_matches(std::path::MAIN_SEPARATOR);
+    Err(anyhow::anyhow!(
+        "usage: {working} is already working in {folder}; the message was not sent, because two \
+         agents in one folder overwrite each other's edits and parallel agents that can collide \
+         must not be started in one folder — hint: split the work across different folders, or wait \
+         for the running one to finish, then send again."
+    ))
+}
+
 /// Launch `name`'s custom role with `message` as the launch message.
 ///
 /// `branch` selects a continuable named branch; without one the record's
@@ -35,6 +284,9 @@ fn launch_job(
 /// folder the launch runs in, already resolved by [`launch_workspace`]. The
 /// launch is persisted as a durable envelope BEFORE it is routed, so it survives
 /// a restart. Returns a one-line confirmation for the caller.
+///
+/// `busy` is the folder rule — checked here because every custom-role launch passes
+/// through this one place, so no launch path can forget it.
 ///
 /// `answered_for` decides what a failed durable write means — see
 /// [`crate::agent::message_router::hand_over`]. An agent's producer keeps the
@@ -45,6 +297,8 @@ pub(crate) async fn custom_role(
     message: &str,
     branch: Option<&str>,
     workspace: &crate::Workspace,
+    asker: Option<crate::agent::message_router::Asker>,
+    busy: BusyFolder<'_>,
     answered_for: crate::agent::message_router::AnsweredFor,
 ) -> Result<String> {
     anyhow::ensure!(
@@ -75,6 +329,13 @@ pub(crate) async fn custom_role(
         },
     };
 
+    // A chain step waits its turn in the conversation it names — its own steps and that
+    // conversation are not another agent — while any other agent in the folder still fails the
+    // chain; an ordinary delegation refuses the folder outright.
+    busy.check(workspace, Some(&agent_id))?;
+
+    // The answer (and the failure notice) returns to the agent that launched this one, or to the
+    // owner's Assistant when nothing launched it — one carrier, the launch itself.
     let launch = crate::Launch {
         role: crate::Role::Custom,
         name: name.to_string(),
@@ -82,12 +343,10 @@ pub(crate) async fn custom_role(
         prompt: role.prompt,
         tools: role.tools,
         agent_id: agent_id.clone(),
-        reply_to: None,
+        reply_to: asker.map(Box::new),
+        chain: busy.chain().cloned().map(Box::new),
     };
-    let job = launch_job(message.to_string(), workspace.name.clone(), launch);
-
-    crate::agent::message_router::hand_over(job, &agent_id, "custom role launch", answered_for)
-        .await?;
+    hand_over_launch(launch, message, &workspace.name, answered_for).await?;
 
     Ok(format!(
         "custom role '{name}' launched on branch {agent_id} in {}",
@@ -113,6 +372,9 @@ pub(crate) async fn custom_role(
 /// Assistant, addressed by the caller's own workspace. A worker branch has
 /// nothing to configure and no place in Settings.
 ///
+/// `busy` is the folder rule — checked here because every worker-branch launch passes
+/// through this one place.
+///
 /// `answered_for` decides what a failed durable write means — see
 /// [`crate::agent::message_router::hand_over`]. An agent's producer keeps the
 /// best-effort route on a failed write; the command line's gets the failure back
@@ -123,6 +385,7 @@ pub(crate) async fn worker_branch(
     message: &str,
     place: Option<&crate::Workspace>,
     asker: Option<crate::Launch>,
+    busy: BusyFolder<'_>,
     answered_for: crate::agent::message_router::AnsweredFor,
 ) -> Result<String> {
     anyhow::ensure!(
@@ -138,8 +401,10 @@ pub(crate) async fn worker_branch(
     // stores for a folder, so the next turn and a recovery resolve the branch
     // back into the same place.
     let workspace_name = place.map_or_else(|| caller_ws.name.clone(), |ws| ws.path.clone());
-
+    let folder = place.unwrap_or(caller_ws);
     let agent_id = crate::session::worker_branch_agent_id(branch);
+    busy.check(folder, Some(&agent_id))?;
+
     // The report returns to the conversation that asked: this branch's own
     // address when a custom role asked (the launch carries the asker), the
     // admin's Assistant otherwise. The routed job's destination is read from the
@@ -156,28 +421,39 @@ pub(crate) async fn worker_branch(
         tools: Vec::new(),
         agent_id: agent_id.clone(),
         reply_to: reply_to.map(Box::new),
+        chain: busy.chain().cloned().map(Box::new),
     };
 
-    let job = launch_job(message.to_string(), workspace_name.clone(), launch);
+    hand_over_launch(launch, message, &workspace_name, answered_for).await?;
 
-    crate::agent::message_router::hand_over(job, &agent_id, "worker branch launch", answered_for)
-        .await?;
-
-    let folder = place.map_or_else(|| caller_ws.path.clone(), |ws| ws.path.clone());
-    let folder = folder.trim_end_matches(std::path::MAIN_SEPARATOR);
+    let folder = folder.path.trim_end_matches(std::path::MAIN_SEPARATOR);
     Ok(format!(
         "Worker branch '{branch}' is on it in {folder}; its report arrives as a <worker-report> message."
     ))
 }
 
+/// Hand a built launch over as one durable envelope: persisted BEFORE it is routed, so it survives
+/// a restart, and addressed by the launch's own agent id. The chain steps a launch carries ride on
+/// it, so a hand-off replayed after it committed finds the same durable record.
+pub(crate) async fn hand_over_launch(
+    launch: crate::Launch,
+    message: &str,
+    workspace_name: &str,
+    answered_for: crate::agent::message_router::AnsweredFor,
+) -> Result<()> {
+    let target = launch.agent_id.clone();
+    let job = launch_job(message.to_string(), workspace_name.to_string(), launch);
+    crate::agent::message_router::hand_over(job, &target, "launch", answered_for).await
+}
+
+/// How a launch names itself — in Running Agents, and as the producer a chain step is told about.
 #[must_use]
-pub(crate) fn display_label(launch: &crate::Launch) -> String {
-    let identifier = launch.identifier.as_deref();
-    match launch.role {
+pub(crate) fn display_label(role: crate::Role, name: &str, identifier: Option<&str>) -> String {
+    match role {
         crate::Role::Worker => format!("Worker branch \"{}\"", identifier.unwrap_or_default()),
         _ => match identifier {
-            Some(id) => format!("Custom role \"{}\" — branch \"{id}\"", launch.name),
-            None => format!("Custom role \"{}\"", launch.name),
+            Some(id) => format!("Custom role \"{name}\" — branch \"{id}\""),
+            None => format!("Custom role \"{name}\""),
         },
     }
 }

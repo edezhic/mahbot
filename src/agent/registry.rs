@@ -39,6 +39,9 @@ static NEXT_ENTRY_GENERATION: AtomicU64 = AtomicU64::new(1);
 ///   run (members share the durable job id).
 /// - [`Launch`](ParentKey::Launch) — one branch launch, keyed by the launch's agent id (one
 ///   launch is one conversation).
+/// - [`Chain`](ParentKey::Chain) — one `send` chain, keyed by its own id: every step of the chain
+///   groups here, including while a step waits in a conversation's queue, so the owner can stop
+///   that chain without touching another chain's step in the same conversation.
 ///
 /// `None` means a workspace singleton (manager / maintainer / discovery / direct chat) or, for
 /// non-agent calls, genuinely unattributable orchestrator work.
@@ -48,6 +51,7 @@ pub enum ParentKey {
     AnalyzeRound(String),
     Research(String),
     Launch(String),
+    Chain(String),
 }
 
 /// One tool call in the GUI's session-ledger projection (`session_view`) — the payload of a
@@ -384,15 +388,25 @@ impl AgentRegistry {
             .collect()
     }
 
-    /// The worker or custom-role agent working in `folder` right now, other than `caller` —
-    /// the roles that edit a folder's tree. Path equality is component-based, so a stored
+    /// The worker or custom-role agent working in `folder` right now, other than `caller` — the
+    /// roles that edit a folder's tree — ignoring the steps of `chain`, whose own previous step
+    /// finishing there is not another agent. Path equality is component-based, so a stored
     /// trailing separator is not a different folder.
     #[must_use]
-    pub fn worker_in_folder(&self, folder: &Path, caller: Option<&str>) -> Option<AgentHandle> {
+    pub fn worker_in_folder_excluding_chain(
+        &self,
+        folder: &Path,
+        caller: Option<&str>,
+        chain: Option<&str>,
+    ) -> Option<AgentHandle> {
         self.list().into_iter().find(|agent| {
             let role = agent.role.as_str();
+            let same_chain = chain.is_some_and(
+                |id| matches!(&agent.parent_key, Some(ParentKey::Chain(held)) if held == id),
+            );
             (role == crate::Role::Worker.as_str() || role == crate::Role::Custom.as_str())
                 && Some(agent.agent_id.as_str()) != caller
+                && !same_chain
                 && Path::new(&agent.workspace_path) == folder
         })
     }
@@ -571,6 +585,7 @@ pub(crate) fn call_kind_label(kind: &str) -> &'static str {
         "confirm_links" => "Research link confirmation",
         "research_wrap_up" => "Research wrap-up",
         "research_orchestrator" => "Research orchestrator",
+        "chain" => "Chained send",
         // The provider transcription path is gone, but the rows it left are not: they keep their
         // label on the page.
         "media_transcription" => "Media transcription",

@@ -13,8 +13,13 @@
 //! and a custom role dispatch asynchronously: a `<worker-report>`, a worker branch's answer into
 //! the asking conversation, an `<manager-message>`, a `<custom-role-message>`.
 //!
+//! The owner's Assistant (and its command-line twin) may also chain the call with `for`: the
+//! addressee's answer then goes straight on to the next addressee instead of coming back, so one
+//! call runs a whole sequence and only the final answer arrives ([`crate::tools::chain`]). No
+//! other holder declares the argument.
+//!
 //! Every call that would start a worker or a custom role first refuses a folder another one is
-//! already working in (see `refuse_busy_folder`).
+//! already working in (see [`crate::launch::BusyFolder`]).
 
 use crate::prompt::load_prompt;
 use crate::tools::Tool;
@@ -22,11 +27,12 @@ use crate::tools::analyze::DispatchMode;
 use crate::{Role, Workspace};
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 /// One of `send`'s optional arguments — the shared `message` is not one.
 #[derive(Copy, Clone, PartialEq, Eq)]
-enum Argument {
+pub(crate) enum Argument {
     /// The folder the addressee works in (which project a `manager` call messages).
     Place,
     /// The branch a worker branch or a custom role continues.
@@ -37,9 +43,9 @@ enum Argument {
 
 impl Argument {
     /// Every optional argument, in the order their descriptions are declared.
-    const ALL: [Self; 3] = [Self::Place, Self::Branch, Self::Name];
+    pub(crate) const ALL: [Self; 3] = [Self::Place, Self::Branch, Self::Name];
 
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Place => "place",
             Self::Branch => "branch",
@@ -47,6 +53,10 @@ impl Argument {
         }
     }
 }
+
+/// `send`'s chain argument — where this step's answer goes next. Only the owner's Assistant's
+/// `send`, and its command-line twin, declare it (see [`crate::tools::chain`]).
+pub(crate) const FOR_ARG: &str = "for";
 
 /// What one addressee takes besides the shared `message`: which argument, the note describing
 /// what it holds for that addressee, and whether the addressee cannot do without it.
@@ -64,7 +74,11 @@ struct Requirement {
 /// [`Self::COMMAND_LINE`] what the command line may name, [`Self::STRS`] what a custom
 /// role's grant may name.
 /// [`Self::STRS`] is the narrower set a custom role's grant may name.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+///
+/// The wire spelling is [`Self::as_str`]/[`Self::parse`] alone: serde goes through them, so a
+/// stored chain or launch can never spell an address differently from a call.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub enum Addressee {
     /// The owner's own assistant — the command line's default address, and one
     /// an agent is never offered.
@@ -158,6 +172,24 @@ impl Addressee {
         }
     }
 
+    /// Whether this addressee takes `arg` besides the shared `message`.
+    #[must_use]
+    pub(crate) fn takes(self, arg: Argument) -> bool {
+        self.requirements()
+            .iter()
+            .any(|requirement| requirement.arg == arg)
+    }
+
+    /// The arguments this addressee cannot do without.
+    #[must_use]
+    pub(crate) fn requires(self) -> Vec<Argument> {
+        self.requirements()
+            .iter()
+            .filter(|requirement| requirement.required)
+            .map(|requirement| requirement.arg)
+            .collect()
+    }
+
     /// The arguments this addressee takes besides the shared `message`.
     fn requirements(self) -> &'static [Requirement] {
         /// The worker's folder rule, shared by both worker kinds so their `place` text is one
@@ -216,16 +248,29 @@ impl Addressee {
     /// The choice declaration's clause: what this addressee does and what it cannot do without.
     fn clause(self) -> String {
         let required: Vec<String> = self
-            .requirements()
-            .iter()
-            .filter(|requirement| requirement.required)
-            .map(|requirement| format!("`{}`", requirement.arg.as_str()))
+            .requires()
+            .into_iter()
+            .map(|arg| format!("`{}`", arg.as_str()))
             .collect();
         if required.is_empty() {
             self.does().to_string()
         } else {
             format!("{} ({} required)", self.does(), required.join(", "))
         }
+    }
+}
+
+impl From<Addressee> for String {
+    fn from(addressee: Addressee) -> Self {
+        addressee.as_str().to_string()
+    }
+}
+
+impl TryFrom<String> for Addressee {
+    type Error = String;
+
+    fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
+        Self::parse(&value).ok_or_else(|| format!("`{value}` is not an address"))
     }
 }
 
@@ -238,37 +283,6 @@ fn labelled(labels: &[&str], note: &str) -> String {
         .collect::<Vec<_>>()
         .join("/");
     format!("{names}: {note}")
-}
-
-/// Refuse to start a worker or a custom role in a folder another one is already working in
-/// — the one check `send` makes before anything is enqueued or dispatched, since two agents
-/// in one folder overwrite each other's edits.
-///
-/// It answers for what is running right now, so it needs nothing written down: a finished
-/// run is no longer in the registry. A call racing another is therefore deliberately
-/// missed — it catches the model that forgot, not a determined one.
-fn refuse_busy_folder(folder: &Workspace) -> Result<()> {
-    // The caller is not ANOTHER agent: its own run is dispatching, and a custom role handing a
-    // worker its own folder is the normal delegation. The command line has no session.
-    let caller = crate::agent::tool_agent_id().ok();
-    let Some(running) = crate::agent::registry::AGENT_REGISTRY
-        .worker_in_folder(folder.as_path(), caller.as_deref())
-    else {
-        return Ok(());
-    };
-    let working = if running.role == Role::Worker.as_str() {
-        "a worker"
-    } else {
-        "a custom role"
-    };
-    // The folder as the acknowledgements spell it — the resolved path, one way.
-    let folder = folder.path.trim_end_matches(std::path::MAIN_SEPARATOR);
-    Err(anyhow::anyhow!(
-        "usage: {working} is already working in {folder}; the message was not sent, because two \
-         agents in one folder overwrite each other's edits and parallel agents that can collide \
-         must not be started in one folder — hint: split the work across different folders, or wait \
-         for the running one to finish, then send again."
-    ))
 }
 
 pub struct SendTool {
@@ -341,6 +355,12 @@ impl SendTool {
         crate::agent::tool_command_line()
     }
 
+    /// Whether this holder's `send` declares `for` — the owner's Assistant's own surface, and its
+    /// command-line twin, which is the same toolset. No other holder has it.
+    fn accepts_for(&self) -> bool {
+        self.caller_role == Role::Assistant
+    }
+
     /// The addressees THIS CALL may name: the holder's own inside an agent session, the
     /// command line's own vocabulary outside one — which adds the owner's own assistant, the
     /// one address an agent's holder never has.
@@ -405,11 +425,7 @@ impl SendTool {
     fn refuse_unused(args: &serde_json::Value, addressee: Addressee) -> Result<()> {
         for arg in Argument::ALL {
             let given = args.get(arg.as_str()).is_some_and(|value| !value.is_null());
-            let taken = addressee
-                .requirements()
-                .iter()
-                .any(|requirement| requirement.arg == arg);
-            if given && !taken {
+            if given && !addressee.takes(arg) {
                 return Err(anyhow::anyhow!(
                     "usage: `{}` is not an argument of the `{}` address",
                     arg.as_str(),
@@ -435,10 +451,7 @@ impl SendTool {
     /// rendered description, the schema and the reading path all ask.
     fn declares(&self, arg: Argument) -> bool {
         (arg != Argument::Place || self.accepts_place)
-            && self
-                .kinds
-                .iter()
-                .any(|addressee| addressee.requirements().iter().any(|req| req.arg == arg))
+            && self.kinds.iter().any(|addressee| addressee.takes(arg))
     }
 
     /// The optional argument this call names: `None` when it names none **or when the holder
@@ -458,6 +471,63 @@ impl SendTool {
         } else {
             Ok(None)
         }
+    }
+
+    /// The chain this call starts, when it carries `for`. The whole value is read and every step
+    /// checked before anything runs, so a chain that cannot finish is refused whole.
+    async fn chain(
+        &self,
+        args: &serde_json::Value,
+        ws: &Workspace,
+        addressee: Addressee,
+        task: &str,
+    ) -> Result<Option<crate::launch::Chain>> {
+        let Some(raw) = args.get(FOR_ARG).filter(|value| !value.is_null()) else {
+            return Ok(None);
+        };
+        // `for` belongs to the owner's Assistant and its command-line twin alone. The other
+        // holders refuse it as an argument they do not have, without saying what it is.
+        if !self.accepts_for() {
+            anyhow::bail!("usage: `{FOR_ARG}` is not an argument of this tool");
+        }
+        // The command line's unnamed address is the owner's own assistant, which can never be a
+        // chain step — so a chain there must say where step one goes.
+        if Self::command_line()
+            && matches!(
+                args.get(Addressee::ARG),
+                None | Some(serde_json::Value::Null)
+            )
+        {
+            anyhow::bail!(
+                "usage: `{}` needs an explicit `{}` — the command line's unnamed address is your \
+                 own assistant, which can never be a chain step",
+                FOR_ARG,
+                Addressee::ARG
+            );
+        }
+        let next = super::chain::parse(raw)?;
+        let current = crate::launch::Step {
+            addressee,
+            place: self.optional(args, Argument::Place)?.map(str::to_string),
+            branch: self.optional(args, Argument::Branch)?.map(str::to_string),
+            name: self.optional(args, Argument::Name)?.map(str::to_string),
+        };
+        // Everything knowable now is checked now: an unknown role, an invalid branch, an unusable
+        // place or a malformed value refuses the whole call, so no step runs.
+        super::chain::precheck(&current).await?;
+        for step in &next {
+            super::chain::precheck(step).await?;
+        }
+        Ok(Some(crate::launch::Chain {
+            id: super::chain::id_of(task, &current, &next),
+            task: task.to_string(),
+            user: crate::agent::tool_user_name(),
+            channel: crate::agent::tool_channel(),
+            workspace: ws.name.clone(),
+            current,
+            step: 1,
+            next,
+        }))
     }
 
     /// The description of one optional argument: what it holds for every addressee that takes
@@ -531,10 +601,14 @@ impl Tool for SendTool {
         if self.dispatch_mode.is_async() {
             parts.push(load_prompt("tool/send_async.md"));
         }
+        // `for` is the owner's Assistant's own argument: one clause here, its shape in the
+        // argument's own schema description, and nothing on any other holder's description.
+        if self.accepts_for() {
+            parts.push(labelled(&[FOR_ARG], load_prompt("tool/send_for.md").trim()));
+        }
         // One pointer, last, whatever the holder's addressees and mode assembled above.
         crate::tools::tool_reference::standing(self.name(), &parts.join("\n\n"))
     }
-
     fn parameters_schema(&self) -> serde_json::Value {
         let mut properties = json!({
             "message": {
@@ -569,17 +643,21 @@ impl Tool for SendTool {
         // A one-addressee holder declares the choice like any other, so the single addressee's
         // required arguments are stated as required: there is no other to choose between.
         if let [only] = self.kinds.as_slice() {
-            required.extend(
-                only.requirements()
-                    .iter()
-                    .filter(|requirement| requirement.required)
-                    .map(|requirement| requirement.arg.as_str()),
-            );
+            required.extend(only.requires().into_iter().map(Argument::as_str));
+        }
+        // The chain argument is an object of the call's own shape; a recursive schema is not
+        // reliably produced by every model, so the shape lives in its description.
+        if self.accepts_for() {
+            // The command line carries the value as JSON text, so both forms are declared.
+            properties[FOR_ARG] = json!({
+                "type": ["object", "string"],
+                "description": load_prompt("tool/send_for_schema.md").trim(),
+            });
         }
         super::tool_params_schema(&properties, &required)
     }
 
-    #[expect(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)] // one call's whole dispatch: its address, its chain, its path
     async fn execute(&self, ws: &Workspace, args: serde_json::Value) -> Result<String> {
         let message = super::get_dispatch_message(&args)?;
         let addressee = self.addressee(&args)?;
@@ -587,6 +665,11 @@ impl Tool for SendTool {
         // that cannot mean anything is refused here (see [`Self::refuse_unused`]).
         if Self::command_line() {
             Self::refuse_unused(&args, addressee)?;
+        }
+        // A chain replaces the per-addressee acknowledgement: one acknowledgement for the whole
+        // chain, and only the final answer comes back.
+        if let Some(chain) = self.chain(&args, ws, addressee, message).await? {
+            return super::chain::start(chain, ws, Self::answered_for()).await;
         }
 
         match addressee {
@@ -605,7 +688,7 @@ impl Tool for SendTool {
             Addressee::Worker => {
                 if !self.dispatch_mode.is_async() {
                     // The Engineer's sync worker run: the report returns inline.
-                    refuse_busy_folder(ws)?;
+                    crate::launch::refuse_busy_folder(ws)?;
                     return super::SyncDurableCore::Worker
                         .run_sync_dispatch(ws, message, self.caller_role)
                         .await;
@@ -613,7 +696,7 @@ impl Tool for SendTool {
                 // A worker round writes outside the managed workspaces: only a durable background
                 // round can honour the optional `place`.
                 let place = self.optional_place(&args).await?;
-                refuse_busy_folder(place.as_ref().unwrap_or(ws))?;
+                crate::launch::refuse_busy_folder(place.as_ref().unwrap_or(ws))?;
                 let job_id = crate::generate_id();
                 if Self::command_line() {
                     // Answered and gone the moment this returns: the durable rows are written
@@ -649,16 +732,16 @@ impl Tool for SendTool {
                 // A branch is pointed at a folder by the same rule as a single
                 // worker run — the branch may not be a way around the worker's refusals.
                 let place = self.optional_place(&args).await?;
-                refuse_busy_folder(place.as_ref().unwrap_or(ws))?;
                 // Read the asker before the launch: the report returns to the
                 // conversation that asked.
-                let asker = crate::agent::tool_custom_launch();
+                let asker = crate::agent::tool_delegation_launch();
                 crate::launch::worker_branch(
                     ws,
                     branch,
                     message,
                     place.as_ref(),
                     asker,
+                    crate::launch::BusyFolder::Refuse,
                     Self::answered_for(),
                 )
                 .await
@@ -677,7 +760,7 @@ impl Tool for SendTool {
                 );
                 // Read before any spawn: routes the Manager's answer back into
                 // this branch when the caller is a custom role.
-                let asker = crate::agent::tool_custom_launch();
+                let asker = crate::agent::tool_delegation_launch();
                 // A project's Manager cannot do without the project it messages, so `place` is a
                 // required argument of a holder that can reach this arm; `get_str` still refuses a
                 // call omitting it.
@@ -717,12 +800,21 @@ impl Tool for SendTool {
                 // personal-workspace spelling too.
                 let workspace =
                     crate::launch::launch_workspace(self.optional(&args, Argument::Place)?).await?;
-                refuse_busy_folder(&workspace)?;
+                // The answer (and the failure notice) returns to the agent that launched this
+                // role, or to the owner's Assistant when nothing did.
+                let asker = crate::agent::tool_delegation_launch().map(|launch| {
+                    crate::agent::message_router::Asker {
+                        launch,
+                        workspace: ws.name.clone(),
+                    }
+                });
                 crate::launch::custom_role(
                     name,
                     message,
                     self.optional(&args, Argument::Branch)?,
                     &workspace,
+                    asker,
+                    crate::launch::BusyFolder::Refuse,
                     Self::answered_for(),
                 )
                 .await
@@ -1505,7 +1597,7 @@ mod tests {
         // It is the folder that is busy, not the tool: another folder is fine.
         let elsewhere = tempfile::tempdir().unwrap();
         assert!(
-            refuse_busy_folder(&crate::Workspace::ephemeral_run(
+            crate::launch::refuse_busy_folder(&crate::Workspace::ephemeral_run(
                 "elsewhere",
                 elsewhere.path()
             ))
@@ -1532,7 +1624,10 @@ mod tests {
         );
         crate::agent::CURRENT_TOOL_AGENT_ID
             .scope(Some(own.clone()), async {
-                refuse_busy_folder(&crate::Workspace::ephemeral_run("own", dir.path()))
+                crate::launch::refuse_busy_folder(&crate::Workspace::ephemeral_run(
+                    "own",
+                    dir.path(),
+                ))
             })
             .await
             .expect("the caller's own run never blocks its own call");
@@ -2087,12 +2182,8 @@ mod tests {
                 help.contains(&spelling),
                 "the help must name the {spelling} address: {help}"
             );
-            for requirement in addressee
-                .requirements()
-                .iter()
-                .filter(|requirement| requirement.required)
-            {
-                let flag = format!("--{}", requirement.arg.as_str().replace('_', "-"));
+            for arg in addressee.requires() {
+                let flag = format!("--{}", arg.as_str().replace('_', "-"));
                 assert!(
                     help.contains(&flag),
                     "the help must say the {spelling} address needs {flag}: {help}"
@@ -2511,5 +2602,232 @@ mod tests {
                     .expect("delete this test's own envelope");
             }
         }
+    }
+
+    /// `for` is the owner's Assistant's own argument: its schema and description carry it, no
+    /// other holder's does.
+    #[test]
+    fn only_the_owner_assistants_send_declares_for() {
+        let admin = SendTool::admin(Role::Assistant);
+        assert!(
+            admin.parameters_schema()["properties"].get("for").is_some(),
+            "the admin's schema offers `for`"
+        );
+        assert!(admin.description().contains("`for`"));
+        for other in [
+            SendTool::engineer(),
+            SendTool::granted(&[Addressee::Worker]),
+        ] {
+            assert!(
+                other.parameters_schema()["properties"].get("for").is_none(),
+                "no other holder's schema offers `for`"
+            );
+            assert!(
+                !other.description().contains("`for`"),
+                "no other holder's description mentions `for`: {}",
+                other.description()
+            );
+        }
+    }
+
+    /// An address spells the same in a stored chain or launch as in a call: one wire spelling,
+    /// [`Addressee::as_str`], because a stored step's answer depends on it.
+    #[test]
+    fn an_address_spells_the_same_in_a_store_as_in_a_call() {
+        for addressee in Addressee::COMMAND_LINE {
+            let stored = serde_json::to_value(addressee).expect("an address serializes");
+            assert_eq!(
+                stored,
+                serde_json::json!(addressee.as_str()),
+                "the stored spelling is the call's"
+            );
+            assert_eq!(
+                serde_json::from_value::<Addressee>(stored).expect("and reads back"),
+                addressee
+            );
+        }
+        assert!(
+            serde_json::from_value::<Addressee>(serde_json::json!("nobody")).is_err(),
+            "an address outside the vocabulary is refused"
+        );
+    }
+
+    /// A chain belongs to the owner's Assistant and its command-line twin: the other holders
+    /// refuse `for` as an argument they do not have (without saying what it is), and no chain can
+    /// start with an address that is not a step.
+    #[tokio::test]
+    #[serial_test::serial(drain)]
+    async fn a_chain_belongs_to_the_owner_assistant_alone() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("send_chain_gate")
+                .to_string_lossy(),
+            "send_chain_gate_ws",
+        )
+        .await;
+        let next = json!({"addressee": "worker"});
+
+        // The Engineer's worker-only instance has no such argument.
+        let err = dispatch(
+            &SendTool::engineer(),
+            &ws,
+            json!({"message": "x", "addressee": "worker", "for": next}),
+        )
+        .await
+        .expect_err("the Engineer refuses `for`")
+        .to_string();
+        assert!(err.contains("is not an argument"), "{err}");
+        assert!(
+            !err.contains("chain") && !err.contains("step"),
+            "the refusal does not describe the argument: {err}"
+        );
+        // A custom role holding a grant likewise.
+        let err = dispatch(
+            &SendTool::granted(&[Addressee::Worker]),
+            &ws,
+            json!({"message": "x", "addressee": "worker", "for": next}),
+        )
+        .await
+        .expect_err("a granted role refuses `for`")
+        .to_string();
+        assert!(err.contains("is not an argument"), "{err}");
+
+        // No chain starts with an address that cannot be a step.
+        for (addressee, extra) in [
+            ("guest", json!({"name": "someone"})),
+            ("manager", json!({"place": &ws.name})),
+        ] {
+            let mut args = json!({"message": "x", "addressee": addressee, "for": next});
+            for (key, value) in extra.as_object().expect("object") {
+                args[key] = value.clone();
+            }
+            let err = dispatch(&SendTool::admin(Role::Assistant), &ws, args)
+                .await
+                .expect_err("a chain cannot start there")
+                .to_string();
+            assert!(err.contains("cannot"), "{addressee}: {err}");
+        }
+
+        // The command line may name the owner's own assistant — but never as a chain's step.
+        let err = dispatch_command_line(
+            &SendTool::admin(Role::Assistant),
+            &ws,
+            json!({"message": "x", "addressee": "assistant", "for": next}),
+        )
+        .await
+        .expect_err("the assistant cannot start a chain")
+        .to_string();
+        assert!(err.contains("cannot"), "{err}");
+
+        // The command line's unnamed address is the owner's own assistant, which can never be a
+        // step, so a chain there must say where step one goes.
+        let err = dispatch_command_line(
+            &SendTool::admin(Role::Assistant),
+            &ws,
+            json!({"message": "x", "for": next}),
+        )
+        .await
+        .expect_err("an unnamed address cannot start a chain")
+        .to_string();
+        assert!(err.contains("explicit"), "{err}");
+
+        // A step that names no such role is refused whole, before anything runs.
+        let err = dispatch(
+            &SendTool::admin(Role::Assistant),
+            &ws,
+            json!({
+                "message": "x",
+                "addressee": "worker",
+                "for": {"addressee": "role", "name": "no_such_role_anywhere"},
+            }),
+        )
+        .await
+        .expect_err("an unknown role is refused whole")
+        .to_string();
+        assert!(err.contains("no_such_role_anywhere"), "{err}");
+    }
+
+    /// A chain starts with ONE acknowledgement for the whole chain, and step one's durable
+    /// envelope already carries the chain, the original task and where in the chain it is.
+    #[tokio::test]
+    #[serial_test::serial(drain)]
+    async fn a_chain_starts_with_one_acknowledgement() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("send_chain_start")
+                .to_string_lossy(),
+            "send_chain_start_ws",
+        )
+        .await;
+        let conn = &crate::session::store().conn;
+        let before: Vec<String> = crate::jobs::list_pending_jobs(conn)
+            .await
+            .expect("list pending")
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+
+        let ack = dispatch(
+            &SendTool::admin(Role::Assistant),
+            &ws,
+            json!({
+                "message": "write it, then polish it",
+                "addressee": "worker_branch",
+                "branch": "drafting",
+                "for": {"addressee": "worker_branch", "branch": "polishing"},
+            }),
+        )
+        .await
+        .expect("a chain starts");
+        assert!(ack.contains("Chain of 2 steps"), "{ack}");
+        assert!(ack.contains("only the final answer"), "{ack}");
+        assert!(
+            !ack.contains("its report arrives"),
+            "the chain's acknowledgement replaces the per-addressee one: {ack}"
+        );
+
+        let branch = crate::session::worker_branch_agent_id("drafting");
+        let row = crate::jobs::list_pending_jobs(conn)
+            .await
+            .expect("list pending")
+            .into_iter()
+            .find(|row| !before.contains(&row.id) && row.target_agent_id == branch)
+            .expect("step one's durable envelope");
+        let job: crate::agent::message_router::AgentJob =
+            serde_json::from_str(&row.envelope).expect("a decodable envelope");
+        assert!(
+            job.content.contains("write it, then polish it"),
+            "{}",
+            job.content
+        );
+        assert!(job.content.contains("chain-step"), "{}", job.content);
+        assert!(job.content.contains("step=\"1\""), "{}", job.content);
+        assert!(job.content.contains("of=\"2\""), "{}", job.content);
+        assert!(
+            job.content.contains("continues to"),
+            "step one is told its answer continues: {}",
+            job.content
+        );
+        let chain = job
+            .custom_role
+            .as_ref()
+            .and_then(|launch| launch.chain.as_deref())
+            .expect("step one carries the chain");
+        assert_eq!(chain.total(), 2);
+        assert_eq!(chain.next.len(), 1);
+        assert_eq!(chain.task, "write it, then polish it");
+        assert_eq!(
+            row.id,
+            crate::launch::record_id(&chain.id, 1),
+            "step one's record id is the chain's own, so a replay finds it"
+        );
+
+        crate::jobs::delete_chain_rows(&chain.id)
+            .await
+            .expect("clean up this test's chain");
     }
 }

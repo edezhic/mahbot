@@ -27,7 +27,7 @@
 //! if it can still be pending on a database that has run a 0.10.x build. The
 //! two halves select different entries, and confusing them is how a column,
 //! table or default disappears from an installation that has not yet reached
-//! the newest release. The catalog holds eight entries:
+//! the newest release. The catalog holds nine entries:
 //!
 //! - `24` / `26` — the core and logs baselines. They always stay: they are what
 //!   a fresh install is built from, and the upgrade half alone would retire
@@ -55,6 +55,9 @@
 //!   cannot drift.
 //! - `83` — re-runs the same body as `82` because `82` never shipped in a release,
 //!   so a store that already recorded it would otherwise keep the old list.
+//! - `84` — the `jobs.chain` / `session_metadata.chain` columns a `send` chain rides
+//!   on (see [`run_add_chain_columns`]). They arrive with this release, so every
+//!   existing store is still pending on them.
 //!
 //! # The id → release record, and the retired ids
 //!
@@ -65,7 +68,8 @@
 //! - `79` — added by 0.10.4.
 //! - `80`, `81` — added by 0.10.5.
 //! - `82`, `83` — added after the 0.10.6 tag, so no shipped build records either.
-//! - Next id: `84`.
+//! - `84` — the `send` chain's columns; no shipped build records it.
+//! - Next id: `85`.
 //!
 //! Retired, and never to be reused:
 //!
@@ -301,7 +305,8 @@ CREATE TABLE IF NOT EXISTS session_metadata (
     user_activity  TEXT,
     image_count    INTEGER,
     provider       TEXT,
-    provider_model TEXT
+    provider_model TEXT,
+    chain          TEXT
 );
 CREATE TABLE IF NOT EXISTS session_personal_changes (
     agent_id TEXT PRIMARY KEY REFERENCES session_metadata(agent_id) ON DELETE CASCADE,
@@ -323,7 +328,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     caller_agent_id TEXT,
     mode           TEXT,
     exec_dir       TEXT,
-    custom_launch  TEXT
+    custom_launch  TEXT,
+    chain          TEXT
 );
 CREATE TABLE IF NOT EXISTS agents (
     job_id     TEXT REFERENCES jobs(id) ON DELETE CASCADE,
@@ -651,10 +657,11 @@ const GUEST_REPORTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS guest_reports (
 
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
-/// Eight entries, split by the module header's rule: the fresh-install half is
-/// `24`, `26` and `69`; the upgrade half is `79`, `80`, `81`, `82` and `83` — the
-/// entries that can still be pending on a store that has run a 0.10.x build. The
-/// header also carries the id → release record and the retired ids.
+/// Nine entries, split by the module header's rule: the fresh-install half is
+/// `24`, `26` and `69`; the upgrade half is `79`, `80`, `81`, `82`, `83` and
+/// `84` — the entries that can still be pending on a store that has run a
+/// 0.10.x build. The header also carries the id → release record and the
+/// retired ids.
 ///
 /// - `24` builds the full core schema; on an existing store every statement is
 ///   `IF NOT EXISTS`, so it is a strict no-op.
@@ -672,6 +679,8 @@ const GUEST_REPORTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS guest_reports (
 ///   [`run_set_media_model_lists`]).
 /// - `83` re-runs the same body, because `82` never shipped in a release (see
 ///   [`run_set_media_model_lists`]).
+/// - `84` adds the nullable `jobs.chain` and `session_metadata.chain` columns a `send` chain
+///   rides on (see [`run_add_chain_columns`]).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -712,6 +721,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "83",
         target: TargetDb::Core,
         body: MigrationBody::Rust(set_media_model_lists),
+    },
+    Migration {
+        id: "84",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_chain_columns),
     },
 ];
 
@@ -839,6 +853,20 @@ async fn add_column_if_missing(
             .with_context(|| format!("Failed to add {table}.{column}"))?;
     }
     Ok(())
+}
+
+fn add_chain_columns(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_chain_columns(conn))
+}
+
+/// Entry `84`: add the nullable `jobs.chain` and `session_metadata.chain` columns — the remaining
+/// steps of a `send` chain, its final recipient and where it is, carried by the record a hop
+/// already has (a worker round's row, a branch session) rather than a store of its own. A
+/// conversation or job with no chain (every one predating the columns) behaves exactly as before.
+/// Guarded by [`add_column_if_missing`], so this body is idempotent.
+async fn run_add_chain_columns(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(conn, "jobs", "chain", "TEXT").await?;
+    add_column_if_missing(conn, "session_metadata", "chain", "TEXT").await
 }
 
 fn add_session_metadata_provider(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1110,6 +1138,7 @@ mod tests {
                 "mode",
                 "exec_dir",
                 "custom_launch",
+                "chain",
             ],
         ),
         (
@@ -1136,6 +1165,7 @@ mod tests {
                 "custom_identifier",
                 "launch_stopped",
                 "reply_to",
+                "chain",
                 "context_block_len",
                 "user_activity",
                 "image_count",
@@ -1466,8 +1496,8 @@ mod tests {
         applied.sort();
         assert_eq!(
             applied,
-            ["24", "69", "79", "80", "81", "82", "83"].map(String::from),
-            "fresh core applies the baseline, the 69 seed and the five upgrade entries exactly"
+            ["24", "69", "79", "80", "81", "82", "83", "84"].map(String::from),
+            "fresh core applies the baseline, the 69 seed and the six upgrade entries exactly"
         );
     }
 

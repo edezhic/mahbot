@@ -555,6 +555,7 @@ mod tests {
                 tools: Vec::new(),
                 agent_id: branch.clone(),
                 reply_to: None,
+                chain: None,
             }),
             reply_to_custom: None,
             urgent: false,

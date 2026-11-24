@@ -115,13 +115,21 @@ pub(crate) fn tool_command_line() -> bool {
         .unwrap_or(false)
 }
 
-/// Synchronous read of [`CURRENT_TOOL_CUSTOM_LAUNCH`]: a tool that dispatches a
-/// durable round must read it before its `tokio::spawn` boundary so the round
-/// carries the caller's branch.
-pub(crate) fn tool_custom_launch() -> Option<crate::Launch> {
+/// Synchronous read of [`CURRENT_TOOL_CUSTOM_LAUNCH`] as a DELEGATION must carry it: a tool that
+/// dispatches a durable round reads it before its `tokio::spawn` boundary so the round carries the
+/// caller's branch.
+///
+/// The chain is stripped: a chain is the STEP's own record, never a delegation's, so a chain-step
+/// role that launches another agent must not hand the chain on with its caller identity — the
+/// delegation's answer is the step's own, and the chain never continues through it.
+pub(crate) fn tool_delegation_launch() -> Option<crate::Launch> {
     CURRENT_TOOL_CUSTOM_LAUNCH
         .try_with(std::clone::Clone::clone)
         .unwrap_or(None)
+        .map(|mut launch| {
+            launch.chain = None;
+            launch
+        })
 }
 
 /// Synchronous read of [`CURRENT_TOOL_OUTPUT_DIR`]: where a command-line call's
@@ -2862,6 +2870,47 @@ mod tests {
 
     struct TestTool {
         output: String,
+    }
+
+    /// A chain is the STEP's own record, never a delegation's: a chain-step role that launches
+    /// another agent must not hand the chain on with its caller identity, or the delegation's
+    /// answer would be taken for the step's own and handed to the next agent.
+    #[tokio::test]
+    async fn a_delegation_never_carries_the_launching_steps_chain() {
+        let chain = crate::launch::Chain {
+            id: "strip".to_string(),
+            task: "draft it".to_string(),
+            user: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "gui".to_string(),
+            workspace: crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+            current: crate::launch::Step {
+                addressee: crate::tools::send::Addressee::Worker,
+                place: None,
+                branch: None,
+                name: None,
+            },
+            step: 1,
+            next: Vec::new(),
+        };
+        let launch = crate::Launch {
+            role: crate::Role::Custom,
+            name: "copywriter".to_string(),
+            identifier: None,
+            prompt: "write it".to_string(),
+            tools: Vec::new(),
+            agent_id: crate::session::custom_role_agent_id("copywriter", None),
+            reply_to: None,
+            chain: Some(Box::new(chain)),
+        };
+        let carried = CURRENT_TOOL_CUSTOM_LAUNCH
+            .scope(Some(launch), async { tool_delegation_launch() })
+            .await
+            .expect("the caller's launch is read");
+        assert_eq!(carried.name, "copywriter", "the branch identity travels");
+        assert!(
+            carried.chain.is_none(),
+            "a delegation carries no chain, so its answer is the step's own"
+        );
     }
 
     #[async_trait]

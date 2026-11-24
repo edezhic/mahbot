@@ -283,7 +283,8 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
     // SQL-side filtering keeps excluded sessions (manager_ and every TRANSIENT_AGENT_ID_PREFIXES
     // prefix) from being loaded; the per-session `get_last_message_tail` reads below are
     // lightweight (indexed `ORDER BY id DESC LIMIT 1`) and run only for eligible sessions. A custom
-    // role's continuable `role_` branch is deliberately not excluded.
+    // role's continuable `role_` branch is deliberately not excluded, and a chain step is always
+    // listed — a one-off role's `rolerun_` conversation is its step's whole durable record.
     let sessions = crate::session::store()
         .list_sessions_with_metadata_excluding(
             &crate::session::non_user_facing_agent_id_prefixes().collect::<Vec<&str>>(),
@@ -473,69 +474,15 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
         return false;
     };
 
-    // A custom-role branch is resumable only while its record still exists: the
-    // record owns the authorial prompt and the tool subset, so a deleted role
-    // leaves nothing to run. Abandon the branch permanently in that case. A worker
-    // branch carries no record — its branch name is enough to rebuild the launch.
-    let launch = if role == Role::Custom {
-        let Some(name) = ctx.custom_role.as_deref() else {
-            tracing::warn!(
-                agent_id = %agent_id,
-                "Dead session recovery: custom-role session without a role name — skipping permanently"
-            );
-            return false;
-        };
-        match crate::custom_role::get(name).await {
-            Ok(Some(record)) => Some(crate::Launch {
-                role: Role::Custom,
-                name: name.to_string(),
-                identifier: ctx.custom_identifier.clone(),
-                prompt: record.prompt,
-                tools: record.tools,
-                agent_id: agent_id.to_string(),
-                reply_to: None,
-            }),
-            Ok(None) => {
-                tracing::warn!(
-                    agent_id = %agent_id,
-                    role = %name,
-                    "Dead session recovery: custom role no longer exists — skipping permanently"
-                );
-                return false;
-            }
-            Err(e) => {
-                // A transient read failure must not abandon a branch forever —
-                // count the attempt and let the backoff retry later.
-                tracing::warn!(
-                    agent_id = %agent_id,
-                    role = %name,
-                    error = %e,
-                    "Dead session recovery: custom role lookup failed — skipping this cycle"
-                );
-                return true;
-            }
-        }
-    } else if role == Role::Worker && crate::session::is_worker_branch_agent_id(agent_id) {
-        // The branch name is the recorded identifier, or — when that write
-        // failed — the agent id's own suffix, which is the same name.
-        let branch = ctx
-            .custom_identifier
-            .clone()
-            .or_else(|| crate::session::worker_branch_name(agent_id).map(str::to_string));
-        Some(crate::Launch {
-            role: Role::Worker,
-            name: String::new(),
-            identifier: branch,
-            prompt: String::new(),
-            tools: Vec::new(),
-            agent_id: agent_id.to_string(),
-            // The conversation that asked for this branch's work, so its report
-            // returns there instead of the admin's Assistant (an absent/NULL
-            // column leaves it `None`, as for every existing session).
-            reply_to: ctx.reply_to.clone().map(Box::new),
-        })
-    } else {
-        None
+    let chain = match recovered_chain(agent_id, ctx).await {
+        ChainStep::Resume(chain) => chain,
+        ChainStep::Retire => return false,
+    };
+
+    let launch = match recovered_launch(agent_id, ctx, role, chain.as_deref()).await {
+        RecoveredLaunch::Launch(launch) => launch,
+        RecoveredLaunch::Refuse => return false,
+        RecoveredLaunch::Retry => return true,
     };
 
     // Recovery retry: uses `RecoveryRetry` kind with empty content so the
@@ -576,6 +523,159 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
     true
 }
 
+/// The launch a recovered branch continues, or why there is none.
+enum RecoveredLaunch {
+    /// The launch to route, `None` for a built-in role that needs none.
+    Launch(Option<crate::Launch>),
+    /// Nothing to run, ever: a deleted role or a conversation that lost its role name.
+    Refuse,
+    /// The store could not be read: count the attempt and let the backoff retry later.
+    Retry,
+}
+
+/// Rebuild a recovered branch's launch from its conversation's record. A custom-role branch is
+/// resumable only while its record still exists: the record owns the authorial prompt and the tool
+/// subset, so a deleted role leaves nothing to run — and a chain step that cannot run ends its chain
+/// loudly rather than leaving the caller waiting for an answer that never comes. A worker branch
+/// carries no record: its branch name is enough.
+async fn recovered_launch(
+    agent_id: &str,
+    ctx: &SessionContext,
+    role: Role,
+    chain: Option<&crate::launch::Chain>,
+) -> RecoveredLaunch {
+    if role == Role::Custom {
+        let Some(name) = ctx.custom_role.as_deref() else {
+            tracing::warn!(
+                agent_id = %agent_id,
+                "Dead session recovery: custom-role session without a role name — skipping permanently"
+            );
+            if let Some(chain) = chain {
+                crate::tools::chain::fail(chain, "the step's conversation lost its role name")
+                    .await;
+            }
+            return RecoveredLaunch::Refuse;
+        };
+        return match crate::custom_role::get(name).await {
+            Ok(Some(record)) => RecoveredLaunch::Launch(Some(crate::Launch {
+                role: Role::Custom,
+                name: name.to_string(),
+                identifier: ctx.custom_identifier.clone(),
+                prompt: record.prompt,
+                tools: record.tools,
+                agent_id: agent_id.to_string(),
+                // The conversation that asked for this role's answer, so it returns there instead
+                // of the owner's Assistant (an absent/NULL column leaves it `None`).
+                reply_to: ctx.reply_to.clone().map(Box::new),
+                chain: chain.cloned().map(Box::new),
+            })),
+            Ok(None) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    role = %name,
+                    "Dead session recovery: custom role no longer exists — skipping permanently"
+                );
+                if let Some(chain) = chain {
+                    crate::tools::chain::fail(chain, "the step's custom role no longer exists")
+                        .await;
+                }
+                RecoveredLaunch::Refuse
+            }
+            Err(e) => {
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    role = %name,
+                    error = %e,
+                    "Dead session recovery: custom role lookup failed — skipping this cycle"
+                );
+                RecoveredLaunch::Retry
+            }
+        };
+    }
+    if role == Role::Worker && crate::session::is_worker_branch_agent_id(agent_id) {
+        // The branch name is the recorded identifier, or — when that write failed — the agent id's
+        // own suffix, which is the same name.
+        let branch = ctx
+            .custom_identifier
+            .clone()
+            .or_else(|| crate::session::worker_branch_name(agent_id).map(str::to_string));
+        return RecoveredLaunch::Launch(Some(crate::Launch {
+            role: Role::Worker,
+            name: String::new(),
+            identifier: branch,
+            prompt: String::new(),
+            tools: Vec::new(),
+            agent_id: agent_id.to_string(),
+            // The conversation that asked for this branch's work, so its report returns there
+            // instead of the admin's Assistant (an absent/NULL column leaves it `None`, as for
+            // every existing session).
+            reply_to: ctx.reply_to.clone().map(Box::new),
+            chain: chain.cloned().map(Box::new),
+        }));
+    }
+    RecoveredLaunch::Launch(None)
+}
+
+/// Whether a recovered conversation continues its chain step.
+enum ChainStep {
+    /// It resumes as this chain's step — `None` for a conversation that is no chain step at all.
+    Resume(Option<Box<crate::launch::Chain>>),
+    /// It must not run: the chain was stopped, or its record cannot be read.
+    Retire,
+}
+
+/// Decide from the conversation's own chain record. A chain step resumes WITH its chain, so its
+/// answer is handed on instead of reaching the owner — and the pointer on the conversation is the
+/// step's whole durable record, which is what lets a role or worker-branch step survive a restart
+/// whose boot replay reclaimed its queued envelope. A step the owner stopped must not run again,
+/// and a record that cannot be read hands nothing on at all: the caller is told, and the
+/// conversation retired.
+async fn recovered_chain(agent_id: &str, ctx: &SessionContext) -> ChainStep {
+    match &ctx.chain {
+        crate::launch::Stored::Ordinary => ChainStep::Resume(None),
+        crate::launch::Stored::Step(chain) if !crate::tools::chain::stopped(chain) => {
+            ChainStep::Resume(Some(chain.clone()))
+        }
+        crate::launch::Stored::Step(_) => {
+            retire_chain_step(agent_id).await;
+            ChainStep::Retire
+        }
+        crate::launch::Stored::Unreadable(_) => {
+            // The address itself is what could not be read, so the failure names the conversation's
+            // own kind: a role when it has a role name, a worker branch otherwise.
+            let step = match ctx.custom_role.as_deref() {
+                Some(name) => crate::launch::Step {
+                    addressee: crate::tools::send::Addressee::Role,
+                    place: None,
+                    branch: ctx.custom_identifier.clone(),
+                    name: Some(name.to_string()),
+                },
+                None => crate::launch::Step {
+                    branch: ctx.custom_identifier.clone(),
+                    ..crate::launch::Step::worker()
+                },
+            };
+            crate::tools::chain::abandon_unreadable(&ctx.chain, &step, &ctx.workspace_name, None)
+                .await;
+            retire_chain_step(agent_id).await;
+            ChainStep::Retire
+        }
+    }
+}
+
+/// Take one conversation out of its chain step for good: the deliberate-stop mark keeps automatic
+/// recovery away from the dangling turn, and the pointer goes so a later launch there is an
+/// ordinary branch again.
+async fn retire_chain_step(agent_id: &str) {
+    if let Err(e) = crate::jobs::retire_chain_session(agent_id).await {
+        tracing::warn!(
+            agent_id = %agent_id,
+            error = %e,
+            "Failed to retire a chain step's conversation"
+        );
+    }
+}
+
 /// Whether a dead session is a continuable branch (a custom role's or a worker branch's). Such a
 /// session is exempt from the workspace-pause guard: a pause freezes only launches tied to a
 /// ticket.
@@ -607,6 +707,7 @@ mod tests {
             custom_role: None,
             custom_identifier: None,
             reply_to: None,
+            chain: crate::launch::Stored::Ordinary,
         };
         assert!(
             !attempt_recovery("role_test_launchless", &ctx, Role::Custom).await,
@@ -620,6 +721,130 @@ mod tests {
             !attempt_recovery("role_test_ghost", &deleted, Role::Custom).await,
             "a branch whose custom role was deleted is permanently un-recoverable"
         );
+    }
+
+    /// A chain step whose custom role was deleted ends its chain loudly: the caller gets the one
+    /// step-numbered failure instead of the chain going silent.
+    #[tokio::test]
+    #[serial_test::serial(drain)]
+    async fn a_deleted_role_ends_its_chain_loudly() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("dead_chain_role")
+                .to_string_lossy(),
+            "dead_chain_role_ws",
+        )
+        .await;
+        let chain = crate::launch::Chain {
+            id: "deadrole".to_string(),
+            task: "draft it".to_string(),
+            user: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "gui".to_string(),
+            workspace: ws.name.clone(),
+            current: crate::launch::Step {
+                addressee: crate::tools::send::Addressee::Role,
+                place: None,
+                branch: None,
+                name: Some("ghost_role".to_string()),
+            },
+            step: 1,
+            next: Vec::new(),
+        };
+        let ctx = SessionContext {
+            channel: "gui".to_string(),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            workspace_name: ws.name.clone(),
+            role: Role::Custom.as_str().to_string(),
+            custom_role: Some("ghost_role".to_string()),
+            custom_identifier: None,
+            reply_to: None,
+            chain: crate::launch::Stored::Step(Box::new(chain.clone())),
+        };
+        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let mut admin_rx = crate::agent::message_router::register_agent(&admin);
+
+        assert!(
+            !attempt_recovery("role_test_ghost_chain", &ctx, Role::Custom).await,
+            "the step cannot run"
+        );
+
+        let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
+            .await
+            .expect("the chain's failure is delivered")
+            .expect("the failure envelope");
+        assert!(
+            job.content
+                .contains("Step 1 of 1 failed: the step's custom role no longer exists"),
+            "{}",
+            job.content
+        );
+        crate::agent::message_router::unregister_agent(&admin);
+    }
+
+    /// A one-off custom role's chain step resumes WITH its chain: the step has no round of its own,
+    /// so its `rolerun_` conversation is its whole durable record, and a restart that resumed it as
+    /// an ordinary delegation would deliver the intermediate answer to the owner.
+    #[tokio::test]
+    async fn a_one_off_role_step_resumes_with_its_chain() {
+        crate::util::test::init_management_test_stores().await;
+        crate::custom_role::create(
+            "oneoff_editor",
+            "you edit",
+            &[],
+            crate::custom_role::CustomRoleBehavior::OneOff,
+        )
+        .await
+        .expect("create the step's role");
+        let workspace = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
+        let chain = crate::launch::Chain {
+            id: "oneoff_step".to_string(),
+            task: "draft it".to_string(),
+            user: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "gui".to_string(),
+            workspace: workspace.clone(),
+            current: crate::launch::Step {
+                addressee: crate::tools::send::Addressee::Role,
+                place: None,
+                branch: None,
+                name: Some("oneoff_editor".to_string()),
+            },
+            step: 1,
+            next: Vec::new(),
+        };
+        let conversation = crate::session::custom_role_run_agent_id("oneoff_editor");
+        let ctx = SessionContext {
+            channel: "gui".to_string(),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            workspace_name: workspace,
+            role: Role::Custom.as_str().to_string(),
+            custom_role: Some("oneoff_editor".to_string()),
+            custom_identifier: None,
+            reply_to: None,
+            chain: crate::launch::Stored::Step(Box::new(chain.clone())),
+        };
+        let mut rx = crate::agent::message_router::register_agent(&conversation);
+        assert!(
+            attempt_recovery(&conversation, &ctx, Role::Custom).await,
+            "a one-off role's chain step is recoverable"
+        );
+        let job = rx.try_recv().expect("the retry job is routed");
+        assert_eq!(job.kind, MessageKind::RecoveryRetry);
+        let launch = job.custom_role.expect("the step's launch is rebuilt");
+        assert_eq!(
+            launch.chain.as_ref().map(|chain| chain.step),
+            Some(1),
+            "the resumed step carries its chain, so its answer is handed on"
+        );
+        assert_eq!(
+            launch.agent_id, conversation,
+            "and it continues in the conversation the step was mid-turn in"
+        );
+        crate::agent::message_router::unregister_agent(&conversation);
+        crate::jobs::delete_chain_rows(&chain.id)
+            .await
+            .expect("clean up this test's chain");
     }
 
     /// A worker branch survives a restart: the poller rebuilds its launch from the recorded branch
@@ -646,9 +871,11 @@ mod tests {
                     tools: Vec::new(),
                     agent_id: crate::session::custom_role_agent_id("briefer", Some("hourly")),
                     reply_to: None,
+                    chain: None,
                 },
                 workspace: asker_folder,
             }),
+            chain: crate::launch::Stored::Ordinary,
         };
         let mut rx = crate::agent::message_router::register_agent(&branch);
         assert!(
@@ -671,6 +898,169 @@ mod tests {
             Some("briefer"),
             "the asking conversation is restored, so the report returns there"
         );
+    }
+
+    /// A role or worker-branch step survives a restart on its conversation ALONE: the boot replay
+    /// reclaims its queued envelope as already appended, so `session_metadata.chain` is the only
+    /// record left — and it is enough for the poller to resume the step WITH its chain.
+    #[tokio::test]
+    async fn a_branch_step_survives_a_restart_on_its_conversation_alone() {
+        crate::util::test::init_management_test_stores().await;
+        let branch = crate::session::worker_branch_agent_id("editor");
+        let workspace = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
+        let chain = crate::launch::Chain {
+            id: "recovered".to_string(),
+            task: "draft it".to_string(),
+            user: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "gui".to_string(),
+            workspace: workspace.clone(),
+            current: crate::launch::Step {
+                addressee: crate::tools::send::Addressee::WorkerBranch,
+                place: None,
+                branch: Some("editor".to_string()),
+                name: None,
+            },
+            step: 1,
+            next: vec![crate::launch::Step {
+                addressee: crate::tools::send::Addressee::Worker,
+                place: None,
+                branch: None,
+                name: None,
+            }],
+        };
+        // No `jobs` row and no queued envelope: the conversation is the step's whole record.
+        crate::session::store()
+            .set_branch(&branch, None, Some("editor"), None, Some(&chain))
+            .await
+            .expect("the conversation records the chain it is a step of");
+        let ctx = SessionContext {
+            channel: "gui".to_string(),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            workspace_name: workspace,
+            role: Role::Worker.as_str().to_string(),
+            custom_role: None,
+            custom_identifier: Some("editor".to_string()),
+            reply_to: None,
+            chain: crate::launch::Stored::Step(Box::new(chain.clone())),
+        };
+        let mut rx = crate::agent::message_router::register_agent(&branch);
+        assert!(
+            attempt_recovery(&branch, &ctx, Role::Worker).await,
+            "a chain step is recoverable — it continues from where it was"
+        );
+        let job = rx.try_recv().expect("the retry job is routed");
+        let launch = job
+            .custom_role
+            .expect("a worker branch's job carries its launch");
+        assert_eq!(
+            launch.chain.as_ref().map(|chain| chain.step),
+            Some(1),
+            "the recovered turn carries its chain, so its answer is handed on"
+        );
+        crate::agent::message_router::unregister_agent(&branch);
+        crate::jobs::delete_chain_rows(&chain.id)
+            .await
+            .expect("clean up this test's chain");
+    }
+
+    /// A step of a chain the owner stopped is never resumed: the poller leaves the conversation
+    /// alone instead of rebuilding an ordinary delegation whose answer would reach the owner.
+    #[tokio::test]
+    #[serial_test::serial(drain)]
+    async fn a_stopped_chain_step_is_never_resumed() {
+        crate::util::test::init_management_test_stores().await;
+        let branch = crate::session::worker_branch_agent_id("stopped");
+        let workspace = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
+        let chain = crate::launch::Chain {
+            id: "stopped_step".to_string(),
+            task: "draft it".to_string(),
+            user: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "gui".to_string(),
+            workspace: workspace.clone(),
+            current: crate::launch::Step {
+                addressee: crate::tools::send::Addressee::WorkerBranch,
+                place: None,
+                branch: Some("stopped".to_string()),
+                name: None,
+            },
+            step: 1,
+            next: Vec::new(),
+        };
+        crate::session::store()
+            .set_branch(&branch, None, Some("stopped"), None, Some(&chain))
+            .await
+            .expect("the conversation records the chain it is a step of");
+        let ctx = SessionContext {
+            channel: "gui".to_string(),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            workspace_name: workspace,
+            role: Role::Worker.as_str().to_string(),
+            custom_role: None,
+            custom_identifier: Some("stopped".to_string()),
+            reply_to: None,
+            chain: crate::launch::Stored::Step(Box::new(chain.clone())),
+        };
+        crate::tools::chain::stop(&chain.id)
+            .await
+            .expect("stop the chain");
+
+        let mut rx = crate::agent::message_router::register_agent(&branch);
+        assert!(
+            !attempt_recovery(&branch, &ctx, Role::Worker).await,
+            "a stopped chain step is not resumed"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "and nothing is routed into its conversation"
+        );
+        assert!(
+            crate::session::store().get_launch_stopped(&branch).await,
+            "the stopped conversation is never restarted by the poller"
+        );
+        crate::agent::message_router::unregister_agent(&branch);
+    }
+
+    /// A step whose stored chain cannot be read is abandoned loudly: the caller is told the chain
+    /// stopped, and the conversation is retired so nothing retries it.
+    #[tokio::test]
+    #[serial_test::serial(drain)]
+    async fn an_unreadable_chain_step_is_abandoned_loudly() {
+        crate::util::test::init_management_test_stores().await;
+        let branch = crate::session::worker_branch_agent_id("corrupt");
+        let workspace = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
+        crate::session::store()
+            .set_branch(&branch, None, Some("corrupt"), None, None)
+            .await
+            .expect("the conversation exists");
+        let ctx = SessionContext {
+            channel: "gui".to_string(),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            workspace_name: workspace,
+            role: Role::Worker.as_str().to_string(),
+            custom_role: None,
+            custom_identifier: Some("corrupt".to_string()),
+            reply_to: None,
+            chain: crate::launch::Stored::Unreadable(None),
+        };
+        let mut rx = crate::agent::message_router::register_agent(&branch);
+        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let mut admin_rx = crate::agent::message_router::register_agent(&admin);
+
+        assert!(
+            !attempt_recovery(&branch, &ctx, Role::Worker).await,
+            "an unreadable chain step is abandoned"
+        );
+        assert!(rx.try_recv().is_err(), "nothing is routed into it");
+        let job = admin_rx
+            .try_recv()
+            .expect("the caller is told the chain stopped");
+        assert!(job.content.contains("could not be read"), "{}", job.content);
+        assert!(
+            crate::session::store().get_launch_stopped(&branch).await,
+            "the abandoned conversation is never restarted"
+        );
+        crate::agent::message_router::unregister_agent(&branch);
+        crate::agent::message_router::unregister_agent(&admin);
     }
 
     #[test]

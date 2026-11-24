@@ -15,7 +15,7 @@ use anyhow::anyhow;
 /// [`CoreJobArgs`](crate::tools::CoreJobArgs).
 /// The fresh-spawn half of [`run_implement_with_job`], shared with the command line's
 /// handover ([`hand_over_worker_round`]), which needs these rows down BEFORE it answers.
-async fn spawn_implement_rows(
+pub(crate) async fn spawn_implement_rows(
     exec: &Workspace,
     task: &str,
     args: &crate::tools::CoreJobArgs<'_>,
@@ -37,8 +37,9 @@ async fn spawn_implement_rows(
         idx: Some(0),
         task: task.to_string(),
     }];
-    crate::jobs::spawn_job(
-        &crate::session::store().conn,
+    let conn = &crate::session::store().conn;
+    crate::jobs::spawn_job_with_chain(
+        conn,
         args.job_id,
         task,
         record.delivery_name,
@@ -52,9 +53,21 @@ async fn spawn_implement_rows(
         record.exec_dir,
         // The calling custom role's launch, so a resume rebuilds an envelope to its branch.
         record.custom_launch,
+        // A chain step's row carries the chain, so a restart resumes the same chain.
+        args.chain,
     )
     .await?;
     Ok(worker_agent_id)
+}
+
+/// Who a worker round runs for: the identity its durable `jobs` row carries and the chain it is a
+/// step of.
+struct RoundCaller<'a> {
+    job_id: &'a str,
+    caller_role: Role,
+    user_name: &'a str,
+    channel: &'a str,
+    chain: Option<&'a crate::launch::Chain>,
 }
 
 /// The COMMAND LINE's handover of a worker round.
@@ -79,34 +92,78 @@ pub(crate) async fn hand_over_worker_round(
     // job row must carry the command line's own user and channel.
     let user_name = crate::agent::tool_user_name();
     let channel = crate::agent::tool_channel();
+    hand_over_round(
+        delivery,
+        place,
+        task,
+        RoundCaller {
+            job_id,
+            caller_role,
+            user_name: &user_name,
+            channel: &channel,
+            chain: None,
+        },
+    )
+    .await
+}
 
+/// A CHAIN step's worker round: the same handover, carrying the chain's own identity (a step runs
+/// outside any agent turn, so there are no task-locals to read) and its deterministic record id.
+pub(crate) async fn hand_over_chain_round(
+    origin: &Workspace,
+    place: Option<&Workspace>,
+    message: &str,
+    chain: &crate::launch::Chain,
+) -> anyhow::Result<()> {
+    hand_over_round(
+        origin,
+        place,
+        message,
+        RoundCaller {
+            job_id: &crate::launch::record_id(&chain.id, chain.step),
+            caller_role: Role::Assistant,
+            user_name: &chain.user,
+            channel: &chain.channel,
+            chain: Some(chain),
+        },
+    )
+    .await
+}
+
+/// The handover both callers share: the durable rows are written FIRST — the hand-off the caller
+/// depends on exists before anything runs — and the round then runs as a resume of its own rows.
+async fn hand_over_round(
+    delivery: &Workspace,
+    place: Option<&Workspace>,
+    task: &str,
+    caller: RoundCaller<'_>,
+) -> anyhow::Result<()> {
     let exec = place.unwrap_or(delivery);
     let args = crate::tools::CoreJobArgs {
-        job_id,
-        caller_role,
-        user_name: &user_name,
-        channel: &channel,
+        job_id: caller.job_id,
+        caller_role: caller.caller_role,
+        user_name: caller.user_name,
+        channel: caller.channel,
         spawn: Some(crate::tools::SpawnRecord {
             delivery_name: &delivery.name,
             exec_dir: place.map(|ws| ws.path.as_str()),
             custom_launch: None,
         }),
-        // No agent session behind the command line: no caller session pin, and the row write
-        // is not a caller's retry (nothing is running yet).
+        // No agent session behind the caller: no caller session pin, and the row write is not a
+        // caller's retry (nothing is running yet).
         caller_agent_id: None,
         fail_on_checkpoint_error: false,
+        chain: caller.chain,
     };
     spawn_implement_rows(exec, task, &args).await?;
 
     // The rows are down: run the round as a RESUME of them, so a restart landing between the
     // two starts the very round this call promised.
-    let (delivery, job_id) = (delivery.clone(), job_id.to_string());
-    let exec_dir = place.map(|ws| ws.path.clone());
-    tokio::spawn(async move {
-        crate::tools::SyncDurableCore::Worker
-            .resume_durable_round(&job_id, &delivery, exec_dir.as_deref())
-            .await;
-    });
+    crate::tools::SyncDurableCore::Worker.spawn_resume_round(
+        caller.job_id.to_string(),
+        delivery.clone(),
+        place.map(|ws| ws.path.clone()),
+    );
     Ok(())
 }
 
@@ -142,13 +199,23 @@ pub(crate) async fn run_implement_with_job(
     }
 
     // Fresh (or resume-without-outcome) run. On resume the worker reuses its persisted
-    // session, so an interrupted attempt continues rather than redoing the task.
-    let parent_key = crate::agent::CURRENT_TOOL_PARENT_KEY
-        .try_with(std::clone::Clone::clone)
-        .unwrap_or(None);
-    let parent_label = crate::agent::CURRENT_TOOL_PARENT_LABEL
-        .try_with(std::clone::Clone::clone)
-        .unwrap_or(None);
+    // session, so an interrupted attempt continues rather than redoing the task. A chain step
+    // carries its own group (it runs outside any agent turn); everything else inherits the
+    // caller's.
+    let (parent_key, parent_label) = match &args.chain {
+        Some(chain) => (
+            Some(crate::agent::registry::ParentKey::Chain(chain.id.clone())),
+            Some(chain.task.clone()),
+        ),
+        None => (
+            crate::agent::CURRENT_TOOL_PARENT_KEY
+                .try_with(std::clone::Clone::clone)
+                .unwrap_or(None),
+            crate::agent::CURRENT_TOOL_PARENT_LABEL
+                .try_with(std::clone::Clone::clone)
+                .unwrap_or(None),
+        ),
+    };
     let has_session = resume && crate::session::store().has_content(&worker_agent_id).await;
     let (agent, response) = run_agent(
         worker_agent_id.clone(),

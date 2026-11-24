@@ -5,6 +5,7 @@ pub(crate) mod active_models;
 pub(crate) mod analyze;
 pub(crate) mod automations;
 pub mod bun;
+pub(crate) mod chain;
 pub mod chrome;
 pub mod chrome_daemon;
 pub(crate) mod chrome_groups;
@@ -491,6 +492,10 @@ pub(crate) struct CoreJobArgs<'a> {
     /// A checkpoint DB error fails a sync call so it is retried; async and boot-resume warn and go
     /// on.
     pub fail_on_checkpoint_error: bool,
+    /// The chain this round is a step of, when it is one — written onto the `jobs` row so a restart
+    /// resumes the same chain, and read back on resume. It is also the round's Running Agents
+    /// group: a chain step runs outside any agent turn, so there is no caller to inherit one from.
+    pub chain: Option<&'a crate::launch::Chain>,
 }
 
 /// The jobs-row fields a fresh dispatch writes — read ONLY when the call actually spawns, so a
@@ -550,6 +555,16 @@ impl SyncDurableCore {
     /// re-executed instead.
     #[must_use]
     pub(crate) fn from_call(name: &str, args: &serde_json::Value) -> Option<Self> {
+        // A chain call is never settled as an ordinary round: binding its first step would
+        // deliver an intermediate answer to the caller and drop the rest of the chain. The call
+        // is re-executed instead, and its chain id is derived from the call, so that re-execution
+        // resumes the chain it already started rather than starting a second one.
+        if args
+            .get(crate::tools::send::FOR_ARG)
+            .is_some_and(|value| !value.is_null())
+        {
+            return None;
+        }
         // A cancel call names an existing round instead of starting one: a
         // dangling cancel frame is re-executed, never resolved to a dispatch.
         if name == "analyze"
@@ -647,7 +662,7 @@ impl SyncDurableCore {
         // Never binds to prior jobs: a call re-issued after a settled resume spawns fresh.
 
         let job_id = crate::generate_id();
-        let custom = crate::agent::tool_custom_launch();
+        let custom = crate::agent::tool_delegation_launch();
         let args = CoreJobArgs {
             job_id: &job_id,
             caller_role: caller_role.for_launch(custom.as_ref()),
@@ -660,6 +675,7 @@ impl SyncDurableCore {
             }),
             caller_agent_id: caller_agent_id.as_deref(),
             fail_on_checkpoint_error: caller_agent_id.is_some(),
+            chain: None,
         };
         let outcome = match self.run(ws, task, args).await {
             Ok(outcome) => outcome,
@@ -727,6 +743,22 @@ impl SyncDurableCore {
                 return Err(e.context(format!("{label} resume: job row unreadable")));
             }
         };
+        // A chain step resumes with its chain: the row is the authority, never the (absent)
+        // caller's task-locals.
+        let chain = caller.chain.step().cloned();
+        // A chain step whose record can no longer be read must not deliver as an ordinary
+        // delegation — its answer would reach the caller mid-chain. Nothing can be handed on, so
+        // the round is abandoned (its row goes with the chain's) without delivery.
+        if crate::tools::chain::abandon_unreadable(
+            &caller.chain,
+            &crate::launch::Step::worker(),
+            &ws.name,
+            Some(job_id),
+        )
+        .await
+        {
+            return Ok(crate::jobs::SyncResumeOutcome::Gone);
+        }
         let args = CoreJobArgs {
             job_id,
             caller_role,
@@ -735,6 +767,7 @@ impl SyncDurableCore {
             spawn: None,
             caller_agent_id: None,
             fail_on_checkpoint_error: sync_resume,
+            chain: chain.as_ref(),
         };
         let run = self.run(ws, &caller.task, args).await;
         match run {
@@ -781,7 +814,6 @@ impl SyncDurableCore {
                 build_async_result_envelope(job_id, result, "analyze-tool-result", exec_dir)
             }
             Self::Worker => build_worker_envelope(
-                "worker_report.md",
                 exec_dir.unwrap_or(&delivery.path),
                 None,
                 &worker_report_text(result),
@@ -827,6 +859,7 @@ impl SyncDurableCore {
                     }),
                     caller_agent_id: None,
                     fail_on_checkpoint_error: false,
+                    chain: None,
                 },
             )
             .await
@@ -886,6 +919,7 @@ impl SyncDurableCore {
     /// the caller's own. A panicking round is caught and reported through the same arm as a round
     /// that produced no outcome. Drain aborts quietly (the row stays for the next boot); a cancel
     /// discards the round's own result.
+    #[expect(clippy::too_many_lines)] // one round's whole resume: run, settle, deliver
     pub(crate) async fn resume_durable_round(
         self,
         job_id: &str,
@@ -946,6 +980,25 @@ impl SyncDurableCore {
                     return;
                 };
                 let custom = caller.custom_launch.as_deref().cloned();
+                // A chain step whose record can no longer be read is abandoned here too: a gone
+                // recorded directory reaches this arm without `resume_sync_core` ever reading the
+                // preamble, so this is the only check that path gets.
+                if crate::tools::chain::abandon_unreadable(
+                    &caller.chain,
+                    &crate::launch::Step::worker(),
+                    &delivery.name,
+                    Some(job_id),
+                )
+                .await
+                {
+                    return;
+                }
+                // A chain step that could not resume fails the chain — it never becomes an
+                // ordinary delegation whose answer goes back to the caller.
+                if let Some(chain) = caller.chain.step() {
+                    crate::tools::chain::fail(chain, &e.to_string()).await;
+                    return;
+                }
                 let envelope = crate::jobs::complete_durable_job(
                     job_id,
                     self.build_async_message(job_id, &Err(e), exec_dir, delivery),
@@ -979,6 +1032,20 @@ impl SyncDurableCore {
             );
             return;
         }
+        // A chain step's answer goes on to the next step, or comes back as the chain's final
+        // answer. The hand-off consumes this round's row, so a replay finds the next step instead
+        // of delivering the answer to the caller; a round that produced none names its own reason.
+        if let Some(chain) = caller.chain.step() {
+            let (answer, reason) = match &result {
+                Ok(answer) => (
+                    Some(answer.as_str()),
+                    "the step ended without an answer".to_string(),
+                ),
+                Err(e) => (None, e.to_string()),
+            };
+            crate::tools::chain::settle(chain, answer, &reason).await;
+            return;
+        }
         let envelope = crate::jobs::complete_durable_job(
             job_id,
             self.build_async_message(job_id, &result, exec_dir, delivery),
@@ -996,6 +1063,21 @@ impl SyncDurableCore {
             return;
         }
         crate::agent::message_router::route(&crate::jobs::envelope_target(&envelope), envelope);
+    }
+
+    /// Spawn a boot-resume of one durable round. A plain function on purpose: a chain step's
+    /// re-dispatch reaches this from inside a resume, and inlining the spawn would make the two
+    /// futures refer to each other.
+    pub(crate) fn spawn_resume_round(
+        self,
+        job_id: String,
+        delivery: crate::Workspace,
+        exec_dir: Option<String>,
+    ) {
+        tokio::spawn(async move {
+            self.resume_durable_round(&job_id, &delivery, exec_dir.as_deref())
+                .await;
+        });
     }
 
     /// Async dispatch entry of `analyze`'s quick depth and `send`'s worker addressee: read the
@@ -1021,7 +1103,7 @@ impl SyncDurableCore {
         // Read synchronously before the spawn (task-local contract): the round's envelope and job
         // row must carry the caller's branch for a custom role, the default construction role
         // otherwise.
-        let custom = crate::agent::tool_custom_launch();
+        let custom = crate::agent::tool_delegation_launch();
         // The dispatching session's agent id, read synchronously: the cancel-signal entry records
         // it, so a cancel naming this id can prove ownership before the `jobs` row exists.
         let caller = crate::agent::CURRENT_TOOL_AGENT_ID
@@ -1132,17 +1214,11 @@ fn worker_report_text(result: &anyhow::Result<String>) -> String {
     }
 }
 
-/// Render a branch-report asset (`worker_report.md` / `worker_failure.md`): one `<worker-report>`
-/// envelope for both, with the folder it happened in and, for a named branch, its `branch`
-/// attribute.
-pub(crate) fn build_worker_envelope(
-    asset: &str,
-    folder: &str,
-    branch: Option<&str>,
-    message: &str,
-) -> String {
+/// Render a branch report: the `<worker-report>` envelope every worker answer uses, with the
+/// folder it happened in and, for a named branch, its `branch` attribute.
+pub(crate) fn build_worker_envelope(folder: &str, branch: Option<&str>, message: &str) -> String {
     crate::prompt::substitute(
-        &crate::prompt::load_prompt(asset),
+        &crate::prompt::load_prompt("worker_report.md"),
         &[
             (
                 "{{folder}}",
@@ -1718,7 +1794,7 @@ impl VideoJobLabels {
 /// Submit an OpenRouter async-video job (exactly one POST — no retry: each submission is billable
 /// and the endpoint has no idempotency key), poll to the 1-hour deadline, download the result and
 /// validate it is a real MP4. Returns the bytes; callers save the file and format the media marker.
-#[expect(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)] // one generation's whole lifecycle: submit, poll, download
 async fn fetch_async_video(
     api_base: &str,
     body: &serde_json::Value,
@@ -2297,6 +2373,19 @@ mod tests {
             )
             .is_none(),
             "another address is re-executed, never resolved to this core"
+        );
+        assert!(
+            SyncDurableCore::from_call(
+                "send",
+                &serde_json::json!({
+                    "message": "m",
+                    "addressee": "worker",
+                    "for": {"addressee": "worker_branch", "branch": "next"},
+                })
+            )
+            .is_none(),
+            "a chain call is never settled as an ordinary round — binding its first step would \
+             deliver an intermediate answer and drop the rest of the chain"
         );
     }
 

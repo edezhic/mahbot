@@ -382,6 +382,42 @@ pub(crate) async fn spawn_job(
     exec_dir: Option<&str>,
     custom_launch: Option<&crate::Launch>,
 ) -> Result<()> {
+    spawn_job_with_chain(
+        conn,
+        id,
+        task,
+        workspace_name,
+        user_name,
+        channel,
+        role,
+        agents,
+        child,
+        caller_agent_id,
+        exec_dir,
+        custom_launch,
+        None,
+    )
+    .await
+}
+
+/// [`spawn_job`] with a chain step's chain on the row, so a restart resumes the same chain
+/// instead of delivering the step's answer to the caller.
+#[expect(clippy::too_many_arguments)]
+pub(crate) async fn spawn_job_with_chain(
+    conn: &Connection,
+    id: &str,
+    task: &str,
+    workspace_name: &str,
+    user_name: &str,
+    channel: &str,
+    role: Role,
+    agents: &[NewAgent],
+    child: &SpawnChild,
+    caller_agent_id: Option<&str>,
+    exec_dir: Option<&str>,
+    custom_launch: Option<&crate::Launch>,
+    chain: Option<&crate::launch::Chain>,
+) -> Result<()> {
     let tx = conn.begin_tx().await?;
     insert_job_tx(
         &tx,
@@ -396,6 +432,7 @@ pub(crate) async fn spawn_job(
         caller_agent_id,
         exec_dir,
         custom_launch,
+        chain,
     )
     .await?;
     // Manual-cancel gate INSIDE the tx (after the INSERT, before the commit), scoped to the
@@ -433,6 +470,7 @@ async fn insert_job_tx(
     caller_agent_id: Option<&str>,
     exec_dir: Option<&str>,
     custom_launch: Option<&crate::Launch>,
+    chain: Option<&crate::launch::Chain>,
 ) -> Result<()> {
     let kind = child.kind_str();
     let ticket_id = child_ticket_id(child);
@@ -449,12 +487,18 @@ async fn insert_job_tx(
         .map(serde_json::to_string)
         .transpose()
         .context("serialize jobs.custom_launch")?;
+    // The chain this round is a step of, read back on resume so the answer is handed on instead
+    // of delivered to the caller.
+    let chain_json = chain
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serialize jobs.chain")?;
     let now = db::now();
     tx.execute(
         "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
          ticket_id, retry_count, created_at, updated_at, caller_agent_id, mode, exec_dir, \
-         custom_launch) \
-         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9, ?10, ?11, ?12, ?13)",
+         custom_launch, chain) \
+         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             id,
             kind,
@@ -469,6 +513,7 @@ async fn insert_job_tx(
             mode.as_str(),
             exec_dir,
             custom_launch_json,
+            chain_json,
         ],
     )
     .await
@@ -746,6 +791,7 @@ pub(crate) async fn transition_research_to_cleanup(
             task: cleanup_task.to_string(),
         }],
         &SpawnChild::ResearchCleanup,
+        None,
         None,
         None,
         None,
@@ -1049,6 +1095,10 @@ pub(crate) struct JobCaller {
     /// and for a NULL/unreadable value — a resume addresses the custom branch instead of a
     /// fabricated built-in address. Boxed to keep the resume-outcome enums small.
     pub custom_launch: Option<Box<crate::Launch>>,
+    /// The chain this round is a step of, `None` for an ordinary round — a resume hands the
+    /// answer on instead of delivering it to the caller. An unreadable value is its own state,
+    /// never "no chain": such a round is abandoned rather than delivered as an ordinary one.
+    pub chain: crate::launch::Stored,
 }
 
 /// Discriminated resume preamble: a sync caller never mistakes a gone job for a
@@ -1101,10 +1151,188 @@ pub(crate) fn parse_custom_launch(raw: Option<String>) -> Option<crate::Launch> 
     }
 }
 
+/// Whether any of `steps` still has its durable record — a worker round's `jobs` row, a queued
+/// launch envelope, or the conversation a role or worker-branch step runs in (it has no round of
+/// its own). `Some(false)` only when the read proved them gone, `None` when the read failed. The
+/// step ids are deterministic, so one call is both the hand-off's idempotency check (the next step
+/// alone) and a chain's liveness check (every step).
+pub(crate) async fn chain_has_records(
+    chain_id: &str,
+    steps: impl IntoIterator<Item = usize>,
+) -> Option<bool> {
+    let steps: Vec<usize> = steps.into_iter().collect();
+    if steps.is_empty() {
+        return Some(false);
+    }
+    let ids: Vec<Value> = steps
+        .iter()
+        .map(|step| Value::from(crate::launch::record_id(chain_id, *step)))
+        .collect();
+    let placeholders = db::sql_in_placeholders(ids.len());
+    // The same ids bind twice: a worker round's row and a queued envelope are both a step's record.
+    let mut bound = ids.clone();
+    bound.extend(ids);
+    let found = crate::session::store()
+        .conn
+        .query_optional(
+            &format!(
+                "SELECT 1 FROM jobs WHERE id IN ({placeholders}) \
+                 UNION ALL SELECT 1 FROM pending_jobs WHERE id IN ({placeholders}) LIMIT 1"
+            ),
+            bound,
+            |_| Ok::<(), anyhow::Error>(()),
+        )
+        .await;
+    match found {
+        Ok(Some(())) => return Some(true),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(chain = %chain_id, error = %e, "Failed to read a chain's records");
+            return None;
+        }
+    }
+    match chain_sessions(chain_id).await {
+        Ok(sessions) => Some(sessions.iter().any(|(_, at)| steps.contains(at))),
+        Err(e) => {
+            tracing::warn!(chain = %chain_id, error = %e, "Failed to read a chain's conversations");
+            None
+        }
+    }
+}
+
+/// The conversations a chain's steps are running in, with each one's step number.
+pub(crate) async fn chain_sessions(chain_id: &str) -> Result<Vec<(String, usize)>> {
+    let conn = &crate::session::store().conn;
+    let rows = conn
+        .query(
+            "SELECT agent_id, chain FROM session_metadata WHERE chain IS NOT NULL",
+            db::params![],
+        )
+        .await
+        .context("read the conversations of a chain")?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let agent_id = row.get::<String>(0).ok()?;
+            let chain = crate::launch::Stored::parse(row.get::<Option<String>>(1).ok().flatten());
+            match chain {
+                crate::launch::Stored::Step(chain) if chain.id == chain_id => {
+                    Some((agent_id, chain.step))
+                }
+                _ => None,
+            }
+        })
+        .collect())
+}
+
+/// Remove one step's durable record from whichever table holds it.
+pub(crate) async fn delete_chain_step(id: &str) -> Result<()> {
+    let conn = &crate::session::store().conn;
+    let tx = conn.begin_tx().await?;
+    tx.execute(
+        "DELETE FROM pending_jobs WHERE id = ?1",
+        params![id.to_string()],
+    )
+    .await?;
+    tx.execute("DELETE FROM jobs WHERE id = ?1", params![id.to_string()])
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Remove every durable record of one chain, so no step replays. The ids are exact — one per
+/// step — never a pattern, so another chain's step in the same conversation is untouched.
+pub(crate) async fn delete_chain_rows(chain_id: &str) -> Result<()> {
+    let ids: Vec<Value> = (1..=crate::launch::MAX_STEPS)
+        .map(|step| Value::from(crate::launch::record_id(chain_id, step)))
+        .collect();
+    let placeholders = db::sql_in_placeholders(ids.len());
+    let conn = &crate::session::store().conn;
+    let tx = conn.begin_tx().await?;
+    for table in ["pending_jobs", "jobs"] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE id IN ({placeholders})"),
+            ids.clone(),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Drop the chain pointer from the conversation of one step: the step is over, so a later turn
+/// there is an ordinary turn again. The next step's conversation is untouched.
+pub(crate) async fn clear_chain_step(chain_id: &str, step: usize) -> Result<()> {
+    for (agent_id, _) in chain_sessions(chain_id)
+        .await?
+        .into_iter()
+        .filter(|(_, at)| *at == step)
+    {
+        crate::session::store()
+            .set_chain(&agent_id, None)
+            .await
+            .context("clear a chain step's conversation mark")?;
+    }
+    Ok(())
+}
+
+/// The boot replay's repair of the one window between a step's message landing and its
+/// conversation recording the chain: the dedup path is the last write before the dead-session
+/// poller takes over, and the pointer is what tells it the step is in flight. The step's group is
+/// re-asserted here too, so a resumed chain is visible and stoppable before any dispatch runs.
+async fn repair_chain_step(row: &PendingJobRow, job: &AgentJob) {
+    let Some(chain) = job
+        .custom_role
+        .as_ref()
+        .and_then(|launch| launch.chain.as_deref())
+    else {
+        return;
+    };
+    if let Err(e) = record_chain_step(&row.target_agent_id, chain).await {
+        warn!(
+            pending_job = %row.id,
+            error = %e,
+            "Failed to record a chain step's conversation mark",
+        );
+    }
+    crate::tools::chain::keep_visible(chain);
+}
+
+/// Record on a conversation that it is a step of `chain`. The boot replay repairs the one window
+/// between a step's message landing and its conversation recording the chain, so a restart still
+/// knows the step is in flight instead of resuming it as an ordinary delegation.
+pub(crate) async fn record_chain_step(agent_id: &str, chain: &crate::launch::Chain) -> Result<()> {
+    crate::session::store()
+        .set_chain(agent_id, Some(chain))
+        .await
+        .context("record a chain step's conversation mark")
+}
+
+/// Retire every conversation of a chain: its dangling turn must never resume as an ordinary
+/// delegation, and nothing may hand its answer on. Called when the chain ends — failed or stopped.
+pub(crate) async fn retire_chain_sessions(chain_id: &str) -> Result<()> {
+    for (agent_id, _) in chain_sessions(chain_id).await? {
+        retire_chain_session(&agent_id).await?;
+    }
+    Ok(())
+}
+
+/// Retire ONE conversation from its chain step: the deliberate-stop mark keeps automatic recovery
+/// away from it, and the pointer goes so a later launch there is an ordinary branch again.
+pub(crate) async fn retire_chain_session(agent_id: &str) -> Result<()> {
+    crate::session::store()
+        .set_launch_stopped(agent_id, true)
+        .await?;
+    crate::session::store()
+        .set_chain(agent_id, None)
+        .await
+        .context("clear a retired chain step's conversation mark")
+}
+
 /// Load the task + caller identity of a job from the `jobs` row alone.
 async fn job_caller(conn: &Connection, job_id: &str) -> Result<Option<JobCaller>> {
     conn.query_optional(
-        "SELECT task, role, user_name, channel, custom_launch FROM jobs WHERE id = ?1",
+        "SELECT task, role, user_name, channel, custom_launch, chain FROM jobs WHERE id = ?1",
         params![job_id],
         |r| {
             Ok::<_, anyhow::Error>(JobCaller {
@@ -1113,6 +1341,7 @@ async fn job_caller(conn: &Connection, job_id: &str) -> Result<Option<JobCaller>
                 user_name: r.get::<String>(2)?,
                 channel: r.get::<String>(3)?,
                 custom_launch: parse_custom_launch(r.get::<Option<String>>(4)?).map(Box::new),
+                chain: crate::launch::Stored::parse(r.get::<Option<String>>(5)?),
             })
         },
     )
@@ -1510,6 +1739,7 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
             // The message already reached the session — dedup prevents a
             // duplicate append. The row is reclaimed here (delivery complete;
             // response recovery is the dead-session poller's domain).
+            repair_chain_step(row, &job).await;
             debug!(pending_job = %row.id, "Pending job already appended — skipping");
             if let Err(e) = delete_pending_job(conn, &row.id).await {
                 warn!(pending_job = %row.id, error = %e, "Failed to delete deduped pending job");
@@ -1926,6 +2156,95 @@ pub(crate) async fn purge_terminal_session_pins() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The boot replay repairs the one window between a step's message landing and its
+    /// conversation recording the chain, so a restart still knows the step is in flight instead of
+    /// resuming it as an ordinary delegation whose answer would reach the owner.
+    #[serial_test::serial(recover_from_restart)]
+    #[tokio::test]
+    async fn the_boot_replay_records_a_chain_step_on_its_conversation() {
+        crate::util::test::init_management_test_stores().await;
+        let agent_id = crate::session::worker_branch_agent_id("replayed");
+        let chain = crate::launch::Chain {
+            id: "replayed_step".to_string(),
+            task: "draft it".to_string(),
+            user: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "gui".to_string(),
+            workspace: "replayed_ws".to_string(),
+            current: crate::launch::Step {
+                addressee: crate::tools::send::Addressee::WorkerBranch,
+                place: None,
+                branch: Some("replayed".to_string()),
+                name: None,
+            },
+            step: 1,
+            next: Vec::new(),
+        };
+        let job = AgentJob {
+            content: "draft it".to_string(),
+            workspace_name: "replayed_ws".to_string(),
+            user_name: chain.user.clone(),
+            channel: chain.channel.clone(),
+            kind: MessageKind::UserMessage,
+            role: crate::Role::Worker,
+            reply_target: None,
+            pending_job_id: None,
+            originating_workspace: None,
+            custom_role: Some(crate::Launch {
+                role: crate::Role::Worker,
+                name: String::new(),
+                identifier: Some("replayed".to_string()),
+                prompt: String::new(),
+                tools: Vec::new(),
+                agent_id: agent_id.clone(),
+                reply_to: None,
+                chain: Some(Box::new(chain.clone())),
+            }),
+            reply_to_custom: None,
+            urgent: false,
+        };
+        let row = PendingJobRow {
+            id: crate::launch::record_id(&chain.id, 1),
+            target_agent_id: agent_id.clone(),
+            envelope: serde_json::to_string(&job).expect("encode the envelope"),
+            created_at: db::now(),
+        };
+        // The crash window: the step's message landed, its conversation never recorded the chain.
+        crate::util::test::seed_session_row(
+            &crate::session::store().conn,
+            &agent_id,
+            "user",
+            "draft it",
+        )
+        .await;
+
+        repair_chain_step(&row, &job).await;
+        repair_chain_step(&row, &job).await;
+
+        assert_eq!(
+            chain_sessions(&chain.id)
+                .await
+                .expect("read the chain's conversations"),
+            vec![(agent_id.clone(), 1)],
+            "the replay recorded the chain on the step's conversation, once"
+        );
+        // And the chain's Running Agents group is back before anything is dispatched again, so a
+        // chain resumed by the boot replay is visible and stoppable straight away.
+        assert!(
+            crate::agent::registry::NON_AGENT_CALLS
+                .list()
+                .iter()
+                .any(|call| call.parent_key
+                    == Some(crate::agent::registry::ParentKey::Chain(chain.id.clone()))),
+            "the resumed chain is one group in Running Agents"
+        );
+        crate::jobs::retire_chain_session(&agent_id)
+            .await
+            .expect("retire the test's conversation");
+        crate::tools::chain::stop(&chain.id)
+            .await
+            .expect("drop the test's chain group");
+    }
 
     /// A dispatch whose id is already cancelled commits no row: the cancel gate inside
     /// `spawn_job`'s transaction refuses it, roster included.

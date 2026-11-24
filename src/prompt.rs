@@ -329,6 +329,39 @@ pub(crate) fn substitute(template: &str, replacements: &[(&str, &str)]) -> Strin
 mod tests {
     use super::*;
 
+    /// Every prompt key the code names as a literal is embedded: `load_prompt` panics on a
+    /// missing asset, so a stale key or a deleted file would surface as a runtime panic in the
+    /// field. A dynamically built key (the per-addressee tool notes) is not matched here.
+    #[test]
+    fn every_named_prompt_key_is_embedded() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let key = Regex::new(r#"load_prompt(?:_sections)?\("([^"]+)"\)"#)
+            .expect("the prompt-key pattern compiles");
+        let mut missing = Vec::new();
+        for file in crate::util::test::rs_files_under(&manifest_dir.join("src")) {
+            let source = std::fs::read_to_string(&file).expect("read a source file");
+            // A comment may quote a key it deliberately does not load.
+            for line in source
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+            {
+                for capture in key.captures_iter(line) {
+                    let asset = &capture[1];
+                    if prompt_asset(asset).is_none() {
+                        missing.push(format!(
+                            "{}: {asset}",
+                            crate::util::test::rel_source_path(manifest_dir, &file)
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "prompt assets named by the code but not embedded: {missing:?}"
+        );
+    }
+
     /// One pass over the template with the replacements at hand: a key with no replacement is
     /// left as the literal `{{key}}`, and a template with no placeholders comes back unchanged.
     #[test]

@@ -862,6 +862,11 @@ pub struct Launch {
     /// [`crate::Launch`], and `#[serde(default)]` keeps older envelopes decodable.
     #[serde(default)]
     pub reply_to: Option<Box<crate::agent::message_router::Asker>>,
+    /// The chain this launch is a step of, when it is one: the remaining steps and the final
+    /// recipient, so a restart resumes the chain instead of delivering an intermediate answer.
+    /// `None` for every ordinary launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<Box<crate::launch::Chain>>,
 }
 
 impl Launch {

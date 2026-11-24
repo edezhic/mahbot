@@ -997,10 +997,10 @@ pub(crate) const FAMILIES: &[Family] = &[
     Family {
         word: "send",
         tool: "send",
-        // This build's own family: a product built before it answers the call as a
-        // failed operation, so it carries the current value and is refused as the
-        // environment's class instead.
-        protocol: crate::db::ipc::CALL_STORE,
+        // The chain argument `for` is this build's own: a product built before it would run
+        // step one and deliver its answer as the final one, so the frame carries a value of
+        // its own and an older instance refuses it as the environment's class instead.
+        protocol: crate::db::ipc::CALL_STORE_SEND,
         purpose: "Hand one message to an agent and finish — an answer arrives later in your \
                   assistant's conversation, and nothing does for the one-way 'guest' address",
         surface: Surface::Standalone(&[
@@ -1040,6 +1040,15 @@ pub(crate) const FAMILIES: &[Family] = &[
                 purpose: "The name the chosen address takes: for 'role', the custom role to \
                           start (it must exist); for 'guest', the account name of the guest whose \
                           own assistant receives the message",
+            },
+            Flag {
+                arg: "for",
+                kind: FlagKind::Value,
+                purpose: "Where this step's answer goes next, so one call runs a whole chain: a \
+                          JSON object with an 'addressee' ('worker', 'worker_branch' or 'role'), \
+                          that address's own 'place', 'branch' or 'name', and its own 'for' for \
+                          the step after it — at most ten steps including this call. Only the \
+                          final answer arrives; requires an explicit '--addressee'",
             },
         ]),
     },
@@ -3771,8 +3780,18 @@ mod tests {
             .collect();
         assert_eq!(
             current,
-            vec!["send", "document", "image", "rasterize"],
+            vec!["document", "image", "rasterize"],
             "the families the channel's second generation added"
+        );
+        let chained: Vec<&str> = FAMILIES
+            .iter()
+            .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE_SEND)
+            .map(|cli| cli.word)
+            .collect();
+        assert_eq!(
+            chained,
+            vec!["send"],
+            "the family whose surface gained the chain argument"
         );
         let changed: Vec<&str> = FAMILIES
             .iter()

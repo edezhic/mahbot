@@ -16,7 +16,8 @@
 //!
 //! The compatibility rule is why the operation rides the old frame: an operation frame carries a
 //! magic `store` value — the generation its family declares ([`CALL_STORE`] /
-//! [`CALL_STORE_BASE`] / [`CALL_STORE_VIDEO`] / [`CALL_STORE_PHOTO`] / [`CALL_STORE_SETTINGS`]),
+//! [`CALL_STORE_BASE`] / [`CALL_STORE_VIDEO`] / [`CALL_STORE_PHOTO`] / [`CALL_STORE_SETTINGS`] /
+//! [`CALL_STORE_SEND`]),
 //! never a store name — so a product that does not know it parses the frame as a diagnostic query
 //! and refuses it as an unknown store: an honest "this product does not serve that here" rather
 //! than a protocol complaint. A new frame type could be parsed as something else and answered
@@ -216,6 +217,11 @@ pub(crate) const CALL_STORE_PHOTO: &str = "cli4";
 /// `set_diagnostics` field — so the frame is refused as an unknown store: nothing ran, the
 /// environment's class.
 pub(crate) const CALL_STORE_SETTINGS: &str = "cli5";
+/// The value `send` carries since it gained the chain argument `for`: a product built before it
+/// would answer a chain call as an ordinary one — running only step one and delivering its answer
+/// as the final one — so the frame is refused as an unknown store: nothing ran, the environment's
+/// class. Every other family keeps its value; the listener still serves them all.
+pub(crate) const CALL_STORE_SEND: &str = "cli6";
 
 /// Every protocol value this build serves — one per generation of the command line's surface,
 /// including the ones only a frontend one build behind still sends.
@@ -225,6 +231,7 @@ pub(crate) const CALL_STORES: &[&str] = &[
     CALL_STORE_VIDEO,
     CALL_STORE_PHOTO,
     CALL_STORE_SETTINGS,
+    CALL_STORE_SEND,
 ];
 
 /// The store value a second launch's frame names: not a store, and nothing is queried — the frame

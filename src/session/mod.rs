@@ -244,6 +244,10 @@ pub(crate) struct SessionContext {
     /// ([`crate::Launch::reply_to`]). `None` for owner- or automation-started launches, and for
     /// rows predating the `reply_to` column.
     pub reply_to: Option<crate::agent::message_router::Asker>,
+    /// The chain this branch is a step of, when it is one: the recovered turn hands its answer on
+    /// exactly as the interrupted one would have. An unreadable record abandons the branch instead
+    /// of running it as an ordinary delegation.
+    pub chain: crate::launch::Stored,
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -570,6 +574,7 @@ enum MetadataColumn {
     CustomRole,
     CustomIdentifier,
     ReplyTo,
+    Chain,
     LaunchStopped,
     WorkspaceName,
     ContextBlockLen,
@@ -587,6 +592,7 @@ impl MetadataColumn {
             Self::CustomRole => "custom_role",
             Self::CustomIdentifier => "custom_identifier",
             Self::ReplyTo => "reply_to",
+            Self::Chain => "chain",
             Self::LaunchStopped => "launch_stopped",
             Self::WorkspaceName => "workspace_name",
             Self::ContextBlockLen => "context_block_len",
@@ -1062,6 +1068,10 @@ impl SessionStore {
     /// starts with any of the given prefixes (`"manager_"`, `"ticket_"`, …) via parameterised
     /// `NOT LIKE ?N` placeholders — no string interpolation into SQL.
     ///
+    /// A session that is a chain step is always listed: its conversation is the step's only durable
+    /// record, and a one-off role's transient `rolerun_` conversation would otherwise lose its chain
+    /// entirely.
+    ///
     /// Strict, unlike the plain list: the dead-session poller prunes its records against this list,
     /// so a failed read must not look like "no sessions".
     pub(crate) async fn list_sessions_with_metadata_excluding(
@@ -1072,7 +1082,7 @@ impl SessionStore {
             return self.list_sessions_with_metadata_checked().await;
         }
 
-        let where_clause = exclude_prefixes
+        let excluded = exclude_prefixes
             .iter()
             .enumerate()
             .map(|(i, _)| format!("sm.agent_id NOT LIKE ?{}", i + 1))
@@ -1086,7 +1096,7 @@ impl SessionStore {
 
         self.conn
             .query_map_strict(
-                &sessions_list_sql(&format!("WHERE {where_clause}")),
+                &sessions_list_sql(&format!("WHERE ({excluded}) OR sm.chain IS NOT NULL")),
                 params,
                 session_metadata_row,
             )
@@ -1122,7 +1132,7 @@ impl SessionStore {
             .conn
             .query(
                 "SELECT channel, user_name, workspace_name, role, custom_role, custom_identifier, \
-                 reply_to FROM session_metadata WHERE agent_id = ?1",
+                 reply_to, chain FROM session_metadata WHERE agent_id = ?1",
                 params![agent_id],
             )
             .await
@@ -1139,6 +1149,7 @@ impl SessionStore {
                 .ok()
                 .flatten()
                 .and_then(|json| serde_json::from_str(&json).ok());
+            let chain = crate::launch::Stored::parse(row.get::<Option<String>>(7).ok().flatten());
             Some(SessionContext {
                 channel: channel?,
                 user_name: user_name?,
@@ -1147,6 +1158,7 @@ impl SessionStore {
                 custom_role,
                 custom_identifier,
                 reply_to,
+                chain,
             })
         })
     }
@@ -1429,10 +1441,11 @@ impl SessionStore {
     }
 
     /// Record this session's branch kind and address — a custom role's name plus the named branch
-    /// it continues, or a worker branch's `None` role name plus its branch name — and the
-    /// conversation that asked for it, so the session can be resumed as the same branch without
-    /// parsing the agent ID. All three columns are written in ONE upsert on every appending turn of
-    /// a branch session, so a single failed write cannot leave the branch without a recorded role.
+    /// it continues, or a worker branch's `None` role name plus its branch name — the conversation
+    /// that asked for it, and the chain step it is running, so the session can be resumed as the
+    /// same branch without parsing the agent ID. All four columns are written in ONE upsert on every
+    /// appending turn of a branch session, so a single failed write cannot leave the branch without
+    /// a recorded role.
     ///
     /// `reply_to` is the asking conversation this launch's work reports back to
     /// ([`crate::Launch::reply_to`]); stored as JSON, `None` as NULL.
@@ -1442,27 +1455,42 @@ impl SessionStore {
         role_name: Option<&str>,
         identifier: Option<&str>,
         reply_to: Option<&crate::agent::message_router::Asker>,
+        chain: Option<&crate::launch::Chain>,
     ) -> Result<()> {
         let now = db::now();
         let created_at = now.clone();
         let role_col = MetadataColumn::CustomRole.as_str();
         let id_col = MetadataColumn::CustomIdentifier.as_str();
         let reply_col = MetadataColumn::ReplyTo.as_str();
+        let chain_col = MetadataColumn::Chain.as_str();
         let reply_json = reply_to
             .map(serde_json::to_string)
             .transpose()
             .context("Failed to encode the branch's reply-to")?;
+        let chain_json = chain
+            .map(serde_json::to_string)
+            .transpose()
+            .context("Failed to encode the branch's chain")?;
         self.conn
             .upsert_row(
                 &format!(
-                    "UPDATE session_metadata SET {role_col} = ?1, {id_col} = ?2, {reply_col} = ?3 \
-                     WHERE agent_id = ?4"
+                    "UPDATE session_metadata SET {role_col} = ?1, {id_col} = ?2, {reply_col} = ?3, \
+                     {chain_col} = ?4 WHERE agent_id = ?5"
                 ),
-                || params![role_name, identifier, reply_json.clone(), agent_id],
+                || {
+                    params![
+                        role_name,
+                        identifier,
+                        reply_json.clone(),
+                        chain_json.clone(),
+                        agent_id
+                    ]
+                },
                 &format!(
                     "INSERT INTO session_metadata \
-                     (agent_id, last_activity, {role_col}, {id_col}, {reply_col}, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     (agent_id, last_activity, {role_col}, {id_col}, {reply_col}, {chain_col}, \
+                     created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                      ON CONFLICT(agent_id) DO NOTHING"
                 ),
                 params![
@@ -1471,6 +1499,7 @@ impl SessionStore {
                     role_name,
                     identifier,
                     reply_json.clone(),
+                    chain_json.clone(),
                     created_at.as_str()
                 ],
             )
@@ -1488,6 +1517,37 @@ impl SessionStore {
             db::Value::Text(flag.into()),
         )
         .await
+    }
+
+    /// Record (or clear) the chain step a conversation is running. It is the step's durable record
+    /// when the step has no round of its own — a custom role's or a worker branch's — so a restart
+    /// resumes the step WITH its chain instead of delivering an intermediate answer as an ordinary
+    /// delegation. Stored as JSON, `None` as NULL.
+    pub(crate) async fn set_chain(
+        &self,
+        agent_id: &str,
+        chain: Option<&crate::launch::Chain>,
+    ) -> Result<()> {
+        let value = chain
+            .map(serde_json::to_string)
+            .transpose()
+            .context("Failed to encode a chain step")?
+            .map_or(db::Value::Null, db::Value::Text);
+        self.set_metadata_value(agent_id, MetadataColumn::Chain, value)
+            .await
+    }
+
+    /// Whether a conversation still exists: its session row is there. A launcher whose conversation
+    /// was purged (a one-off run after its TTL) has nowhere to receive a reply.
+    pub(crate) async fn session_exists(&self, agent_id: &str) -> bool {
+        self.read_optional_row(
+            "SELECT 1 FROM session_metadata WHERE agent_id = ?1",
+            agent_id,
+            "Failed to read whether a session still exists",
+            |row| row.get::<Option<i64>>(0),
+        )
+        .await
+        .is_some()
     }
 
     pub(crate) async fn get_launch_stopped(&self, agent_id: &str) -> bool {
@@ -2667,6 +2727,64 @@ mod tests {
                 "case-variant '{id}' should be excluded"
             );
         }
+    }
+
+    /// A chain step is the exception to the exclusion: its conversation is the step's only durable
+    /// record, so a one-off role's transient `rolerun_` session must still be listed while its chain
+    /// is in flight — and must not be, once it is no longer a step.
+    #[tokio::test]
+    async fn a_chain_step_is_a_recovery_candidate_whatever_its_prefix() {
+        let (store, _dir) = crate::open_test_store!(crate::session::SessionStore, "session");
+        let excluded_prefixes: Vec<&str> = reserved_agent_id_prefixes().collect();
+        let step_id = format!("{CUSTOM_ROLE_RUN_AGENT_ID_PREFIX}{}", unique_key());
+        store
+            .append_with_context(
+                &step_id,
+                &ChatMessage::user("msg"),
+                BatchMetadata::context("test_channel", "test_user", "test_ws", "custom"),
+            )
+            .await
+            .unwrap();
+        store
+            .set_chain(
+                &step_id,
+                Some(&crate::launch::Chain {
+                    id: unique_key(),
+                    task: "draft it".to_string(),
+                    user: "test_user".to_string(),
+                    channel: "test_channel".to_string(),
+                    workspace: "test_ws".to_string(),
+                    current: crate::launch::Step::worker(),
+                    step: 1,
+                    next: Vec::new(),
+                }),
+            )
+            .await
+            .unwrap();
+        let listed = |sessions: Vec<SessionMetadata>| {
+            sessions
+                .into_iter()
+                .any(|session| session.agent_id == step_id)
+        };
+        assert!(
+            listed(
+                store
+                    .list_sessions_with_metadata_excluding(&excluded_prefixes)
+                    .await
+                    .unwrap()
+            ),
+            "a chain step's conversation is a recovery candidate whatever its prefix"
+        );
+        store.set_chain(&step_id, None).await.unwrap();
+        assert!(
+            !listed(
+                store
+                    .list_sessions_with_metadata_excluding(&excluded_prefixes)
+                    .await
+                    .unwrap()
+            ),
+            "and a transient conversation that is no chain step stays excluded"
+        );
     }
 
     /// Empty messages are not appended by [`Session::init`].  Recovery retries

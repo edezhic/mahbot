@@ -485,7 +485,7 @@ pub(crate) fn dispatch_deep_analysis(ws: &Workspace, question: &str, caller_role
     let channel = crate::agent::tool_channel();
     // Read the caller's launch synchronously before the spawn (task-local contract): the
     // round's envelope and job row must carry the custom branch for a custom role.
-    let custom = crate::agent::tool_custom_launch();
+    let custom = crate::agent::tool_delegation_launch();
     let job_id = crate::generate_id();
     let ack = format!(
         "Deep analysis dispatched (job {job_id}). A compact answer will arrive when the run \

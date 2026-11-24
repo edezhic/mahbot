@@ -341,6 +341,7 @@ pub(crate) async fn run_analyze_with_job(
         spawn,
         caller_agent_id,
         fail_on_checkpoint_error,
+        ..
     } = args;
     let resume = spawn.is_none();
     let deadline = std::time::Instant::now() + round_timeout();
@@ -3410,6 +3411,7 @@ mod tests {
             tools: Vec::new(),
             agent_id: branch.to_string(),
             reply_to: None,
+            chain: None,
         };
         seed_round_row(&ws, branch_job, "branch-user", Role::Custom, Some(&launch)).await;
         let answer = run_as_caller(

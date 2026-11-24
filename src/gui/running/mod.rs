@@ -72,12 +72,13 @@ const MAX_GROUP_LABEL_CHARS: usize = 104;
 /// [`MAX_TOOL_TOOLTIP_WIDTH`], since it holds one short line.
 const MAX_METRIC_TOOLTIP_WIDTH: f32 = 360.0;
 
-/// What a Running-Agents stop action stops: a research run or one branch launch. Carried by
-/// the messages and the confirmation state; never rendered as text.
+/// What a Running-Agents stop action stops: a research run, one branch launch or one `send`
+/// chain. Carried by the messages and the confirmation state; never rendered as text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StopTarget {
     Research(String),
     Launch(String),
+    Chain(String),
 }
 
 /// Messages emitted by the Running Agents page. The page itself stays stateless — the
@@ -170,6 +171,7 @@ enum GroupKind {
     AnalyzeRound,
     Research,
     Launch,
+    Chain,
     Singleton,
     Unattributed,
 }
@@ -211,8 +213,9 @@ impl DisplayGroup {
             GroupKind::AnalyzeRound => 1,
             GroupKind::Research => 2,
             GroupKind::Launch => 3,
-            GroupKind::Singleton => 4,
-            GroupKind::Unattributed => 5,
+            GroupKind::Chain => 4,
+            GroupKind::Singleton => 5,
+            GroupKind::Unattributed => 6,
         };
         (order, self.key.clone())
     }
@@ -225,6 +228,7 @@ fn parent_group_kind(parent: &ParentKey) -> GroupKind {
         ParentKey::AnalyzeRound(_) => GroupKind::AnalyzeRound,
         ParentKey::Research(_) => GroupKind::Research,
         ParentKey::Launch(_) => GroupKind::Launch,
+        ParentKey::Chain(_) => GroupKind::Chain,
     }
 }
 
@@ -232,21 +236,24 @@ fn parent_group_kind(parent: &ParentKey) -> GroupKind {
 fn parent_group_key(parent: &ParentKey) -> &str {
     match parent {
         ParentKey::Ticket(id) => id,
-        ParentKey::AnalyzeRound(key) | ParentKey::Research(key) | ParentKey::Launch(key) => key,
+        ParentKey::AnalyzeRound(key)
+        | ParentKey::Research(key)
+        | ParentKey::Launch(key)
+        | ParentKey::Chain(key) => key,
     }
 }
 
 /// Group the running agents and non-agent calls by DIRECT PARENT INVOCATION: tickets, analyze
-/// rounds, research runs, branch launches, workspace singletons (agents with no parent key) and
-/// unattributed calls (non-agent calls with no parent key).
+/// rounds, research runs, branch launches, `send` chains, workspace singletons (agents with no
+/// parent key) and unattributed calls (non-agent calls with no parent key).
 ///
 /// Group identity is (kind, key) plus — for tickets/analyze rounds/singletons — the workspace:
 /// ticket ids embed the workspace name and analyze-round keys are scoped to one, so the extra
 /// component closes any cross-workspace collision (two concurrent sync analyze rounds drawing
 /// the same short NanoID suffix).
 ///
-/// Research and branch-launch groups are matched on (kind, key) alone, because a run/launch
-/// moves between workspaces: a research run's worker round executes in an EPHEMERAL per-run
+/// Research, branch-launch and chain groups are matched on (kind, key) alone, because a
+/// run/launch/chain moves between workspaces: a research run's worker round executes in an EPHEMERAL per-run
 /// workspace whose name IS the run key, while its analysts run in the real one; and a branch
 /// launch's folder is a property of the LAUNCH, not of the branch identity, so a branch pointed
 /// at a different folder keeps one group. The run key / launch agent id is durable and unique,
@@ -258,7 +265,8 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
     let find_group =
         |kind: GroupKind, key: &str, workspace: &str, groups: &mut Vec<DisplayGroup>| -> usize {
             let research = kind == GroupKind::Research;
-            let workspace_agnostic = research || kind == GroupKind::Launch;
+            let workspace_agnostic =
+                research || matches!(kind, GroupKind::Launch | GroupKind::Chain);
             if let Some(idx) = groups.iter().position(|g| {
                 g.kind == kind && g.key == key && (workspace_agnostic || g.workspace == workspace)
             }) {
@@ -422,6 +430,13 @@ fn group_title(group: &DisplayGroup) -> (String, Option<String>) {
                 .map_or_else(|| "Launch".to_string(), str::to_string),
             None,
         ),
+        GroupKind::Chain => (
+            group.label.as_deref().map_or_else(
+                || "Send chain".to_string(),
+                |l| truncate_at_boundary(l, MAX_GROUP_LABEL_CHARS),
+            ),
+            None,
+        ),
         GroupKind::Singleton => ("Standalone".to_string(), None),
         GroupKind::Unattributed => ("Other LLM work".to_string(), None),
     }
@@ -460,11 +475,14 @@ fn render_group(
         );
     }
     // Manual stop: danger-styled button on RESEARCH-run group headers ("Cancel run" — the run
-    // is removed permanently) and on BRANCH launch headers ("Stop launch" — the branch is
-    // marked stopped, not erased). The group key is carried by the message, never rendered.
+    // is removed permanently), on BRANCH launch headers ("Stop launch" — the branch is marked
+    // stopped, not erased) and on a CHAIN's header ("Stop chain" — that chain delivers nothing
+    // further, and another chain's step in the same conversation still runs). The group key is
+    // carried by the message, never rendered.
     let stop = match group.kind {
         GroupKind::Research => Some(("Cancel run", StopTarget::Research(group.key.clone()))),
         GroupKind::Launch => Some(("Stop launch", StopTarget::Launch(group.key.clone()))),
+        GroupKind::Chain => Some(("Stop chain", StopTarget::Chain(group.key.clone()))),
         _ => None,
     };
     if let Some((label, target)) = stop {
@@ -521,6 +539,20 @@ fn stop_confirm_dialog(target: &StopTarget) -> Element<'static, RunningMessage> 
             ],
             "Keep run",
             "Cancel run",
+        ),
+        StopTarget::Chain(_) => (
+            "Stop this chain?",
+            &[
+                "Confirming will:",
+                "• stop the step running now — an in-flight tool or LLM call \
+                 may finish, but nothing further is delivered;\n\
+                 • drop the chain's remaining steps — no step's answer is \
+                 delivered, and no step is replayed;\n\
+                 • leave other chains untouched — a step another chain queued in \
+                 the same conversation still runs.",
+            ],
+            "Keep chain",
+            "Stop chain",
         ),
         StopTarget::Launch(_) => (
             "Stop this launch?",
@@ -1071,7 +1103,7 @@ mod tests {
     use crate::gui::session_view::build_ledger;
 
     /// A parent key from its spec: `""` for none, otherwise `t:<id>`, `a:<key>`,
-    /// `r:<key>` or `l:<id>`.
+    /// `r:<key>`, `l:<id>` or `c:<id>`.
     fn parent(spec: &str) -> Option<ParentKey> {
         let (kind, key) = spec.split_once(':')?;
         let key = key.to_string();
@@ -1079,6 +1111,7 @@ mod tests {
             "t" => ParentKey::Ticket(key),
             "a" => ParentKey::AnalyzeRound(key),
             "r" => ParentKey::Research(key),
+            "c" => ParentKey::Chain(key),
             _ => ParentKey::Launch(key),
         })
     }
@@ -1203,6 +1236,20 @@ mod tests {
                 &[
                     (GroupKind::Research, "run1", 2, Some("ws1"), false),
                     (GroupKind::Research, "run2", 2, Some("ws1"), false),
+                ],
+            ),
+            case(
+                "every step of one chain is one group, whatever folder it runs in",
+                &[
+                    ("s1", "worker", "ws1", "c:chain1"),
+                    ("s2", "custom", "ws2", "c:chain1"),
+                    ("o1", "worker", "ws1", "c:chain2"),
+                ],
+                &[],
+                2,
+                &[
+                    (GroupKind::Chain, "chain1", 2, Some("ws1"), false),
+                    (GroupKind::Chain, "chain2", 1, Some("ws1"), false),
                 ],
             ),
             case(

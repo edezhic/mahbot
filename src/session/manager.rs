@@ -366,6 +366,7 @@ impl Session {
                         (launch.role == Role::Custom).then_some(launch.name.as_str()),
                         launch.identifier.as_deref(),
                         launch.reply_to.as_deref(),
+                        launch.chain.as_deref(),
                     )
                     .await
             {
@@ -2122,6 +2123,7 @@ mod tests {
             tools: vec!["read".to_string()],
             agent_id: "role_briefer:week2".to_string(),
             reply_to: None,
+            chain: None,
         };
         let (messages, _) = Session::build_context_messages(
             &ws,
@@ -2166,6 +2168,7 @@ mod tests {
             tools: vec!["custom:role_prompt_probe".to_string()],
             agent_id: "role_briefer".to_string(),
             reply_to: None,
+            chain: None,
         };
         let (messages, _) = Session::build_context_messages(
             &ws,
@@ -2260,6 +2263,7 @@ mod tests {
             tools: Vec::new(),
             agent_id: agent_id.clone(),
             reply_to: None,
+            chain: None,
         };
         let block_b = block_len(&ws_b, &launch).await;
         let mut session = Session {
