@@ -97,16 +97,19 @@ pub enum Addressee {
 
 /// What the command line shows for its `--addressee` flag. It lives beside the vocabulary
 /// it describes so the two cannot drift: `the_address_help_is_the_vocabulary_it_describes`
-/// checks every spelling and REQUIRED argument against the table below.
+/// checks every spelling and REQUIRED argument against the table below, and
+/// `the_address_help_says_where_a_chain_step_works` checks the folder rule.
 pub(crate) const ADDRESSEE_FLAG_HELP: &str = "Who receives it: 'assistant' (your own \
      assistant — the same as naming none), 'worker' (one scoped worker run in the folder \
-     `--place` names, your own workspace when it names none), 'worker_branch' (a \
-     continuable worker conversation, needs `--branch`), 'manager' (the Manager of the \
-     project `--place` names — what a script aiming at a project should use), 'role' \
-     (a custom role, needs `--name`), or 'guest' (another account's own assistant, \
-     one-way — nothing comes back, needs `--name` with that account's name). An address \
-     takes only its own flags: a flag the address does not take is refused rather than \
-     ignored — `--branch` with 'worker', or `--place` with 'assistant', fails the call";
+     `--place` names), 'worker_branch' (a continuable worker conversation, needs \
+     `--branch`), 'manager' (the Manager of the project `--place` names — what a script \
+     aiming at a project should use), 'role' (a custom role, needs `--name`), or 'guest' \
+     (another account's own assistant, one-way — nothing comes back, needs `--name` with \
+     that account's name). A step that names no `--place` works in the folder the nearest \
+     earlier step named; with none named anywhere before it, it keeps its default — your \
+     own workspace. An address takes only its own flags: a flag the address does not take \
+     is refused rather than ignored — `--branch` with 'worker', or `--place` with \
+     'assistant', fails the call";
 
 impl Addressee {
     pub const ARG: &'static str = "addressee";
@@ -564,18 +567,19 @@ impl SendTool {
             name: self.optional(args, Argument::Name)?.map(str::to_string),
             extract: extract.cloned(),
         };
-        // Everything knowable now is checked now: an unknown role, an invalid branch, an unusable
-        // place or a malformed value refuses the whole call, so no step runs.
-        super::chain::precheck(&current).await?;
-        for step in &next {
-            super::chain::precheck(step).await?;
-        }
+        // Everything knowable now is checked now, in step order: an unknown role, an invalid
+        // branch, an unusable place or a folder a step would inherit and cannot work in refuses the
+        // whole call, so no step runs.
+        super::chain::precheck(&current, &next).await?;
         Ok(Some(crate::launch::Chain {
             id: super::chain::id_of(task, &current, &next),
             task: task.to_string(),
             user: crate::agent::tool_user_name(),
             channel: crate::agent::tool_channel(),
             workspace: ws.name.clone(),
+            // Step one has no earlier step to inherit a folder from: its own `place` is its folder,
+            // and the hand-off carries it to the steps after it.
+            inherited: None,
             current,
             step: 1,
             next,
@@ -611,13 +615,16 @@ impl SendTool {
                 None => grouped.push((vec![addressee.as_str()], requirement)),
             }
         }
-        Some(
-            grouped
-                .iter()
-                .map(|(labels, requirement)| labelled(labels, requirement.note))
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
+        let mut parts: Vec<String> = grouped
+            .iter()
+            .map(|(labels, requirement)| labelled(labels, requirement.note))
+            .collect();
+        // A folder named on a step is the folder the chain's later steps work in: only the holder of
+        // `for` can name one that moves a chain, so only its `place` says so.
+        if arg == Argument::Place && self.owner_surface() {
+            parts.push(load_prompt("tool/send_place_chain.md").trim().to_string());
+        }
+        Some(parts.join("; "))
     }
 }
 
@@ -2522,6 +2529,21 @@ mod tests {
         }
     }
 
+    /// The command line's `--addressee` help says where a chain step that names no folder works:
+    /// inside a chain that is the nearest earlier step's folder, never the caller's own.
+    #[test]
+    fn the_address_help_says_where_a_chain_step_works() {
+        let help = ADDRESSEE_FLAG_HELP;
+        assert!(
+            help.contains("works in the folder the nearest earlier step named"),
+            "the help must say where a chain step that names no folder works: {help}"
+        );
+        assert!(
+            !help.contains("your own workspace when it names none"),
+            "and must not promise the caller's folder inside a chain: {help}"
+        );
+    }
+
     /// How a refused address call is made.
     enum RefusalCall {
         /// An agent session's call: the holder and its arguments.
@@ -2966,6 +2988,29 @@ mod tests {
                 );
             }
         }
+        // Where a chain step that names no folder works is the same holder's rule: only a `send`
+        // that takes `for` says it.
+        let place = |tool: &SendTool| {
+            tool.parameters_schema()["properties"]["place"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(
+            place(&admin).contains("the chain's later steps work in"),
+            "the admin's `place` says a folder named there moves the chain: {}",
+            place(&admin)
+        );
+        for other in [
+            SendTool::engineer(),
+            SendTool::granted(&[Addressee::Worker]),
+        ] {
+            assert!(
+                !place(&other).contains("chain"),
+                "a holder without `for` is told nothing of a chain: {}",
+                place(&other)
+            );
+        }
     }
 
     /// An address spells the same in a stored chain or launch as in a call: one wire spelling,
@@ -3295,6 +3340,132 @@ mod tests {
             .to_string();
             assert!(err.contains("extract"), "{bad}: {err}");
         }
+        assert_eq!(before, pending().await, "nothing was dispatched or queued");
+    }
+
+    /// A fresh chain records no inherited folder, whatever its first step names: the call is step
+    /// one, its own `place` is its folder, and the hand-off carries it to the steps after it.
+    #[tokio::test]
+    async fn a_fresh_chain_records_no_inherited_folder() {
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("send_chain_folder")
+                .to_string_lossy(),
+            "send_chain_folder_ws",
+        )
+        .await;
+        let scratch = tempfile::tempdir().unwrap();
+        let folder = crate::stored_workspace_path(scratch.path())
+            .to_string_lossy()
+            .into_owned();
+        let send = SendTool::admin(Role::Assistant);
+
+        // The call that starts a chain is its first step, and it names a folder like any other.
+        let chain = send
+            .chain(
+                &json!({"place": &folder, "for": {"addressee": "worker"}}),
+                &ws,
+                Addressee::Worker,
+                "draft it",
+                None,
+            )
+            .await
+            .expect("the chain is usable")
+            .expect("a chain");
+        assert_eq!(
+            chain.current.place.as_deref(),
+            Some(folder.as_str()),
+            "step one's own `place` is its folder"
+        );
+        assert_eq!(
+            chain.inherited, None,
+            "nothing earlier has named a folder for step one to inherit"
+        );
+        assert_eq!(
+            chain.workspace, ws.name,
+            "the chain's own workspace is the caller's and never moves"
+        );
+
+        // With no step naming a folder, nothing changes.
+        let bare = send
+            .chain(
+                &json!({"for": {"addressee": "worker"}}),
+                &ws,
+                Addressee::Worker,
+                "draft it",
+                None,
+            )
+            .await
+            .expect("the chain is usable")
+            .expect("a chain");
+        assert_eq!(bare.inherited, None);
+    }
+
+    /// A chain whose step would inherit a folder it cannot work in at all is refused whole, naming
+    /// the step and the folder, before anything is dispatched or queued.
+    #[tokio::test]
+    #[serial_test::serial(drain)]
+    async fn a_step_that_would_inherit_a_folder_it_cannot_work_in_refuses_the_call() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("send_chain_refused")
+                .to_string_lossy(),
+            "send_chain_refused_ws",
+        )
+        .await;
+        let managed_dir = crate::util::test::test_root().join("send_chain_refused_project");
+        std::fs::create_dir_all(&managed_dir).unwrap();
+        let managed = crate::util::test::create_test_workspace(
+            &crate::stored_workspace_path(&managed_dir).to_string_lossy(),
+            "send_chain_refused_project",
+        )
+        .await;
+        crate::custom_role::create(
+            "folder_role",
+            "you write",
+            &[],
+            crate::custom_role::CustomRoleBehavior::Continuous,
+        )
+        .await
+        .unwrap();
+        let conn = &crate::session::store().conn;
+        let pending = || async {
+            let mut ids: Vec<String> = crate::jobs::list_pending_jobs(conn)
+                .await
+                .expect("list pending")
+                .into_iter()
+                .map(|row| row.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        let before = pending().await;
+
+        // A role may be pointed at a managed workspace; the worker step after it cannot work there.
+        let err = dispatch(
+            &SendTool::admin(Role::Assistant),
+            &ws,
+            json!({
+                "message": "write it, then polish it",
+                "addressee": "role",
+                "name": "folder_role",
+                "place": &managed.name,
+                "for": {"addressee": "worker"},
+            }),
+        )
+        .await
+        .expect_err("a worker cannot inherit a managed workspace")
+        .to_string();
+        assert!(err.starts_with("usage:"), "{err}");
+        assert!(err.contains("step 2 of 2"), "the step is named: {err}");
+        assert!(
+            err.contains(&managed.name),
+            "the folder it would inherit is named: {err}"
+        );
+        assert!(err.contains("hint:"), "{err}");
         assert_eq!(before, pending().await, "nothing was dispatched or queued");
     }
 

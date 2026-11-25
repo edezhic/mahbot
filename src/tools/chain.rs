@@ -12,6 +12,12 @@
 //! survive a restart: the boot replay reclaims its queued envelope as already appended, and its
 //! conversation is what still says it is a chain step.
 //!
+//! A step that names no `place` works in the folder the nearest earlier step that named one moved
+//! the chain to — the outer call included. That folder is handed on in the form the next step
+//! resolves (a managed workspace's name, a `personal:<user>` key or a canonical path), so a step is
+//! never refused over how an earlier step spelled it; a step that cannot work there at all refuses
+//! the whole chain before anything runs.
+//!
 //! The hand-off is the durability boundary, and it is one rule: a step that has not answered
 //! continues from where it was (its conversation resumed, its launch rebuilt from its row), and a
 //! step that answered but whose hand-off did not commit is replayed. Every step's durable record is
@@ -34,6 +40,7 @@ use crate::agent::message_router::AnsweredFor;
 use crate::agent::registry::ParentKey;
 use crate::launch::{BusyFolder, Chain, MAX_STEPS, Step, Stored, record_id};
 use crate::send_outcome::Shape;
+use crate::tools::delegation::Provenance;
 use crate::tools::send::{Addressee, Argument, FOR_ARG};
 use crate::util::UnwrapPoison as _;
 
@@ -225,10 +232,51 @@ fn step_from(object: &serde_json::Map<String, serde_json::Value>) -> Result<Step
     Ok(step)
 }
 
-/// Refuse a step that cannot run, before anything starts: an unknown role, an invalid branch, an
-/// unusable place. What only becomes false later — a role deleted, a folder gone — ends the chain
-/// at that step instead (see [`dispatch`]).
-pub(crate) async fn precheck(step: &Step) -> Result<()> {
+/// Refuse a chain that cannot run, before anything starts: an unknown role, an invalid branch, an
+/// unusable place, or a folder a step would inherit and cannot work in. What only becomes false
+/// later — a role deleted, a folder gone — ends the chain at that step instead (see [`dispatch`]).
+pub(crate) async fn precheck(outer: &Step, next: &[Step]) -> Result<()> {
+    let total = next.len() + 1;
+    let mut inherited = None;
+    for (index, step) in std::iter::once(outer).chain(next).enumerate() {
+        check(step, index + 1, total, inherited.as_deref()).await?;
+        inherited = inherited_after(step, inherited);
+    }
+    Ok(())
+}
+
+/// The folder a step names, when it names one: a blank value is no value, exactly as it is for the
+/// same delegation outside a chain.
+fn named_place(step: &Step) -> Option<&str> {
+    step.place
+        .as_deref()
+        .map(str::trim)
+        .filter(|place| !place.is_empty())
+}
+
+/// The folder the steps after `step` inherit: the one it named, else the one it already had.
+fn inherited_after(step: &Step, inherited: Option<String>) -> Option<String> {
+    named_place(step).map_or(inherited, |place| Some(address_of(place)))
+}
+
+/// A named folder in the durable form every later step resolves: a managed workspace's name or a
+/// `personal:<user>` key as it was written, and any other folder as its canonical path — the same
+/// address [`crate::launch::launch_workspace`] stores for it, and what
+/// [`crate::users::resolve_workspace`] resolves back.
+fn address_of(place: &str) -> String {
+    let place = place.trim();
+    let expanded = crate::util::expand_tilde(place);
+    if expanded.is_absolute() {
+        crate::stored_workspace_path(&expanded)
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        place.to_string()
+    }
+}
+
+/// One step's own checks, before anything runs.
+async fn check(step: &Step, index: usize, total: usize, inherited: Option<&str>) -> Result<()> {
     match step.addressee {
         Addressee::Worker => {}
         Addressee::WorkerBranch => {
@@ -246,29 +294,61 @@ pub(crate) async fn precheck(step: &Step) -> Result<()> {
         }
         other => bail!("usage: `{}` cannot be a chain step", other.as_str()),
     }
-    place_of(step).await?;
+    place_of(
+        step,
+        inherited,
+        Provenance::Inherited {
+            at: (index, total),
+            runs: runs_as(step),
+        },
+    )
+    .await?;
     Ok(())
 }
 
-/// The folder a step runs in, resolved exactly as the same delegation resolves it today: a worker's
-/// `place` by the worker rule, a role's by the launch rule. `None` for a worker step that names no
-/// place — it runs in the chain's own workspace.
-async fn place_of(step: &Step) -> Result<Option<Workspace>> {
+/// The folder a step works in: the one it names, the one the chain was moved to when it names none,
+/// and — for a worker with neither — `None`, the chain's own workspace. A role always resolves one,
+/// the administrator's personal workspace being its own default.
+///
+/// `provenance` voices the refusal a folder the step inherits gets; a caller that never shows it
+/// passes [`Provenance::Named`].
+async fn place_of(
+    step: &Step,
+    inherited: Option<&str>,
+    provenance: Provenance<'_>,
+) -> Result<Option<Workspace>> {
     match step.addressee {
-        Addressee::Worker | Addressee::WorkerBranch => match step.place.as_deref() {
-            None => Ok(None),
-            Some(raw) => {
+        Addressee::Worker | Addressee::WorkerBranch => match (named_place(step), inherited) {
+            (Some(raw), _) => {
                 crate::tools::delegation::resolve(
                     crate::tools::delegation::DelegationKind::Worker,
                     &serde_json::json!({ "place": raw }),
                 )
                 .await
             }
+            (None, Some(address)) => {
+                crate::tools::delegation::resolve_inherited(address, provenance)
+                    .await
+                    .map(Some)
+            }
+            (None, None) => Ok(None),
         },
-        Addressee::Role => crate::launch::launch_workspace(step.place.as_deref())
+        Addressee::Role => crate::launch::launch_workspace(named_place(step).or(inherited))
             .await
             .map(Some),
         other => bail!("usage: `{}` cannot be a chain step", other.as_str()),
+    }
+}
+
+/// What a step runs as, for a refusal that says why a folder does not suit it.
+fn runs_as(step: &Step) -> &'static str {
+    match step.addressee {
+        Addressee::Assistant => "your own assistant",
+        Addressee::Worker => "a worker",
+        Addressee::WorkerBranch => "a worker branch",
+        Addressee::Manager => "a manager",
+        Addressee::Role => "a role",
+        Addressee::Guest => "a guest's assistant",
     }
 }
 
@@ -384,7 +464,15 @@ pub(crate) async fn dispatch(
     // restart and while a step waits in a conversation's queue.
     keep_visible(chain);
     let step = &chain.current;
-    let place = place_of(step).await?;
+    let place = place_of(
+        step,
+        chain.inherited.as_deref(),
+        Provenance::Inherited {
+            at: (chain.step, chain.total()),
+            runs: runs_as(step),
+        },
+    )
+    .await?;
     match step.addressee {
         Addressee::Worker => {
             // A single worker run in an occupied folder fails the chain: two agents in one folder
@@ -413,9 +501,9 @@ pub(crate) async fn dispatch(
             .map(|_| ())
         }
         Addressee::Role => {
-            // `place_of` always resolves a role's folder (`launch_workspace` answers the owner's
-            // personal folder when the step names none), so the chain's own workspace is never
-            // reached here.
+            // `place_of` always resolves a role's folder — the step's own, the one the chain was
+            // moved to, or the owner's personal folder when nothing named one — so the chain's own
+            // workspace is never reached here.
             let workspace = place.as_ref().unwrap_or(origin);
             // The launch owns the folder rule: only it knows which conversation the address names,
             // so only it can tell the step's own turn from another agent's.
@@ -476,6 +564,9 @@ async fn hand_on(chain: &Chain, answer: &str, shape: Shape) {
     next_chain.current = next.clone();
     next_chain.step += 1;
     next_chain.next = chain.next[1..].to_vec();
+    // The step after this one works in the folder this one named, or — when it named none — in the
+    // folder the chain already had.
+    next_chain.inherited = inherited_after(&chain.current, chain.inherited.clone());
     let message = later_message(&next_chain, &producer, answer);
     let origin = match origin(&next_chain).await {
         Ok(origin) => origin,
@@ -560,25 +651,31 @@ async fn consume(chain: &Chain) {
 /// a `<worker-report>` for a worker or a branch, a `<custom-role-message>` for a role. A step that
 /// never ran names the folder it would have worked in.
 async fn deliver(chain: &Chain, message: &str) {
-    let (folder, root) = match origin(chain).await {
-        Ok(origin) => step_place(&chain.current, Some(&origin)).await,
-        // The chain's own folder is gone: name the durable address rather than nothing.
-        Err(_) => (chain.workspace.clone(), chain.workspace.clone()),
-    };
+    // The chain's own workspace is where a step that named no folder ran; when it no longer
+    // resolves, its durable address is the same answer in the form the envelope takes.
+    let origin = origin(chain).await.unwrap_or_else(|_| Workspace {
+        name: chain.workspace.clone(),
+        path: chain.workspace.clone(),
+        ..Workspace::default()
+    });
+    let (folder, root) = step_place(&chain.current, Some(chain), &origin).await;
     crate::agent::message_router::deliver_chain_message(&chain.current, message, &folder, &root)
         .await;
 }
 
 /// The folder an envelope for `step` names and the workspace it belongs to: the step's own `place`
-/// when it names one, else `origin` — the chain's own workspace, where the same delegation from the
-/// owner's Assistant runs. A folder that no longer resolves names the durable address instead.
-async fn step_place(step: &Step, origin: Option<&Workspace>) -> (String, String) {
-    match place_of(step).await.ok().flatten() {
-        Some(ws) => (ws.path, ws.name),
-        None => origin.map_or_else(
-            || (String::new(), String::new()),
-            |ws| (ws.path.clone(), ws.name.clone()),
-        ),
+/// when it names one, the folder the chain was moved to when it inherits one, else `origin` — the
+/// chain's own workspace, where the same delegation from the owner's Assistant runs. A folder that
+/// no longer resolves is named by its durable address instead.
+async fn step_place(step: &Step, chain: Option<&Chain>, origin: &Workspace) -> (String, String) {
+    let inherited = chain.and_then(|chain| chain.inherited.as_deref());
+    // Its refusal is never shown — the durable address below is the answer — so the voice is moot.
+    match place_of(step, inherited, Provenance::Named).await {
+        Ok(Some(ws)) => (ws.path, ws.name),
+        _ => match inherited_after(step, inherited.map(str::to_string)) {
+            Some(address) => (address.clone(), address),
+            None => (origin.path.clone(), origin.name.clone()),
+        },
     }
 }
 
@@ -640,7 +737,7 @@ pub(crate) async fn abandon_unreadable(
         .ok()
         .flatten()
     {
-        Some(origin) => step_place(step, Some(&origin)).await,
+        Some(origin) => step_place(step, None, &origin).await,
         None => (workspace.to_string(), workspace.to_string()),
     };
     crate::agent::message_router::deliver_chain_message(step, &message, &folder, &root).await;
@@ -788,6 +885,12 @@ mod tests {
         }
     }
 
+    /// The step, moved to the folder it names.
+    fn named(mut step: Step, place: &str) -> Step {
+        step.place = Some(place.to_string());
+        step
+    }
+
     fn chain(
         id: &str,
         workspace: &str,
@@ -807,6 +910,7 @@ mod tests {
             user: crate::users::ADMIN_USER_NAME.to_string(),
             channel: "gui".to_string(),
             workspace: workspace.to_string(),
+            inherited: None,
             current,
             step,
             next,
@@ -2043,6 +2147,335 @@ mod tests {
             "and its rows are gone"
         );
         assert!(!visible(&chain), "nor does its Running Agents group linger");
+        crate::agent::message_router::unregister_agent(&admin);
+    }
+
+    /// A managed workspace over a real directory, stored the way production rows are: its
+    /// canonical path, named.
+    async fn managed_workspace(dir: &str, name: &str) -> crate::Workspace {
+        let path = crate::util::test::test_root().join(dir);
+        std::fs::create_dir_all(&path).unwrap();
+        let canonical = crate::stored_workspace_path(&path)
+            .to_string_lossy()
+            .into_owned();
+        crate::util::test::create_test_workspace(&canonical, name).await
+    }
+
+    /// The folder the step running now works in, resolved the way [`dispatch`] resolves it.
+    async fn worked_in(chain: &Chain) -> Option<Workspace> {
+        place_of(
+            &chain.current,
+            chain.inherited.as_deref(),
+            Provenance::Named,
+        )
+        .await
+        .expect("the step's folder resolves")
+    }
+
+    /// A chain stays in the folder it was moved to: a step that names none works in the folder the
+    /// nearest earlier step named, and the folder is handed on in the form that step takes.
+    #[tokio::test]
+    #[serial_test::serial(drain)]
+    async fn a_step_that_names_no_folder_works_in_the_one_the_nearest_earlier_step_named() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let managed = managed_workspace("chain_folder", "chain_folder_ws").await;
+        let scratch = tempfile::tempdir().unwrap();
+        let scratch_path = crate::stored_workspace_path(scratch.path())
+            .to_string_lossy()
+            .into_owned();
+
+        // A worker takes the directory.
+        let mut moved = chain(
+            "folder_worker",
+            "personal:admin",
+            2,
+            3,
+            worker(),
+            vec![worker()],
+        );
+        moved.inherited = Some(scratch_path.clone());
+        let ws = worked_in(&moved)
+            .await
+            .expect("a worker inherits the folder");
+        assert!(ws.name.starts_with("dir-"), "got {}", ws.name);
+        assert_eq!(ws.path, scratch_path);
+
+        // A role takes the workspace it is, identity and stored context kept.
+        let mut moved = chain(
+            "folder_role",
+            "personal:admin",
+            2,
+            3,
+            role("writer"),
+            vec![worker()],
+        );
+        moved.inherited = Some(managed.name.clone());
+        let ws = worked_in(&moved).await.expect("a role inherits the folder");
+        assert_eq!(ws.name, managed.name);
+        assert_eq!(ws.path, managed.path);
+    }
+
+    /// A step that names its own folder becomes the nearest named folder for the steps after it —
+    /// not the first folder named anywhere in the chain.
+    #[test]
+    fn the_nearest_named_folder_is_the_one_the_steps_after_it_work_in() {
+        let outer = named(worker(), "ws_first_named");
+        let mut inherited = inherited_after(&outer, None);
+        assert_eq!(
+            inherited.as_deref(),
+            Some("ws_first_named"),
+            "the call that starts a chain is its first step, and it names a folder like any other"
+        );
+        inherited = inherited_after(&worker(), inherited);
+        assert_eq!(
+            inherited.as_deref(),
+            Some("ws_first_named"),
+            "a step that names none keeps the folder it was moved to"
+        );
+        inherited = inherited_after(&named(worker(), "   "), inherited);
+        assert_eq!(
+            inherited.as_deref(),
+            Some("ws_first_named"),
+            "a blank place is no place"
+        );
+        inherited = inherited_after(&named(role("writer"), "ws_second_named"), inherited);
+        assert_eq!(
+            inherited.as_deref(),
+            Some("ws_second_named"),
+            "a step that names its own moves the rest of the chain with it"
+        );
+
+        // A directory is handed on as its canonical path, so a later step resolves the same folder.
+        let scratch = tempfile::tempdir().unwrap();
+        let path = crate::stored_workspace_path(scratch.path())
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            inherited_after(&named(worker(), &path), inherited).as_deref(),
+            Some(path.as_str())
+        );
+    }
+
+    /// With no step naming a folder nothing changes, for any addressee: a worker keeps the chain's
+    /// own workspace and a role the administrator's personal one.
+    #[tokio::test]
+    #[serial_test::serial(drain)]
+    async fn a_chain_that_names_no_folder_keeps_todays_folders() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        precheck(&worker(), &[worker(), worker()])
+            .await
+            .expect("a chain that names no folder is fine");
+
+        let bare = chain("bare", "personal:admin", 1, 2, worker(), vec![worker()]);
+        assert!(
+            worked_in(&bare).await.is_none(),
+            "a worker runs in the chain's own workspace"
+        );
+
+        let role_step = chain(
+            "bare_role",
+            "personal:admin",
+            1,
+            1,
+            role("writer"),
+            Vec::new(),
+        );
+        let ws = worked_in(&role_step)
+            .await
+            .expect("a role always resolves a folder");
+        assert_eq!(
+            ws.name,
+            crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
+            "the role default is deliberate and stays"
+        );
+    }
+
+    /// A chain whose step would inherit a folder it cannot work in at all is refused whole, before
+    /// anything runs, naming the step, the folder and why that step cannot work there.
+    #[tokio::test]
+    #[serial_test::serial(drain)]
+    async fn an_inherited_folder_a_step_cannot_work_in_refuses_the_chain_whole() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let managed = managed_workspace("chain_refused", "chain_refused_ws").await;
+        crate::custom_role::create(
+            "folder_writer",
+            "you write",
+            &[],
+            crate::custom_role::CustomRoleBehavior::Continuous,
+        )
+        .await
+        .unwrap();
+
+        let outer = named(role("folder_writer"), &managed.name);
+        let next = vec![worker()];
+        let err = precheck(&outer, &next)
+            .await
+            .expect_err("a worker cannot inherit a managed workspace")
+            .to_string();
+        assert!(err.starts_with("usage:"), "{err}");
+        assert!(err.contains("step 2 of 2"), "the step is named: {err}");
+        assert!(err.contains("a worker"), "what it runs as is named: {err}");
+        assert!(
+            err.contains(&managed.name),
+            "the folder it would inherit is named: {err}"
+        );
+        assert!(err.contains("hint:"), "{err}");
+        assert!(err.contains("do not chain it"), "{err}");
+        assert_eq!(
+            crate::jobs::chain_has_records(&id_of("draft it", &outer, &next), 1..=2).await,
+            Some(false),
+            "nothing ran"
+        );
+    }
+
+    /// A chain recorded before a step could hand its folder on still reads, and keeps today's
+    /// folders for the steps it has left: the folder it never recorded is not invented.
+    #[tokio::test]
+    #[serial_test::serial(drain)]
+    async fn a_chain_recorded_before_a_step_handed_its_folder_on_keeps_todays_folders() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let stored = Stored::parse(Some(
+            json!({
+                "id": "old_chain",
+                "task": "draft it",
+                "user": crate::users::ADMIN_USER_NAME,
+                "channel": "gui",
+                "workspace": "personal:admin",
+                "current": {"addressee": "worker"},
+                "step": 2,
+                "next": [],
+            })
+            .to_string(),
+        ));
+        let chain = stored
+            .step()
+            .expect("an older record still reads as a chain step");
+        assert_eq!(
+            chain.inherited, None,
+            "a folder it never recorded is not invented"
+        );
+        assert!(
+            worked_in(chain).await.is_none(),
+            "a worker keeps the chain's own workspace"
+        );
+    }
+
+    /// The folder a chain was moved to is no part of its identity: the record's id is the call, and
+    /// a record read back recomputes it, inherited folder and all.
+    #[test]
+    fn the_inherited_folder_is_no_part_of_the_chains_identity() {
+        let outer = named(worker(), "/tmp/somewhere");
+        let next = vec![worker()];
+        let id = id_of("draft it", &outer, &next);
+        let mut chain = chain(&id, "personal:admin", 1, 2, outer, next);
+        chain.inherited = Some("/tmp/somewhere".to_string());
+
+        let read: Chain =
+            serde_json::from_str(&serde_json::to_string(&chain).expect("a chain serialises"))
+                .expect("a chain reads back");
+        assert_eq!(read.inherited, chain.inherited);
+        assert_eq!(
+            read.id,
+            id_of(&read.task, &read.current, &read.next),
+            "the same chain asked twice is still the same chain"
+        );
+    }
+
+    /// A step's report and its failure both name the folder the step actually worked in, not the
+    /// caller's.
+    #[tokio::test]
+    #[serial_test::serial(drain, send_outcome)]
+    async fn a_report_and_a_failure_name_the_folder_the_step_worked_in() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("chain_report")
+                .to_string_lossy(),
+            "chain_report_ws",
+        )
+        .await;
+        let scratch = tempfile::tempdir().unwrap();
+        let folder = crate::stored_workspace_path(scratch.path())
+            .to_string_lossy()
+            .into_owned();
+        let mut moved = chain("report", "chain_report_ws", 2, 2, worker(), Vec::new());
+        moved.inherited = Some(folder.clone());
+        seed_step(&moved, &ws).await;
+        let mut failed = chain(
+            "report_failure",
+            "chain_report_ws",
+            2,
+            2,
+            worker(),
+            Vec::new(),
+        );
+        failed.inherited = Some(folder.clone());
+        seed_step(&failed, &ws).await;
+
+        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let mut admin_rx = crate::agent::message_router::register_agent(&admin);
+
+        hand_on(&moved, "the final text", Shape::None).await;
+        let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
+            .await
+            .expect("the final answer is delivered")
+            .expect("the final envelope");
+        assert!(
+            job.content.contains(&folder),
+            "the report names the folder it worked in: {}",
+            job.content
+        );
+        assert!(
+            !job.content.contains(&ws.path),
+            "not the caller's: {}",
+            job.content
+        );
+
+        fail(&failed, "it broke").await;
+        let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
+            .await
+            .expect("the failure is delivered")
+            .expect("the failure envelope");
+        assert!(
+            job.content.contains(&folder),
+            "the failure names the folder it worked in: {}",
+            job.content
+        );
+        assert!(
+            !job.content.contains(&ws.path),
+            "not the caller's: {}",
+            job.content
+        );
+
+        // The inherited folder is gone by the time the step ends: its durable address is named
+        // instead — the step worked there, and the chain still knows it after the folder is gone.
+        let gone =
+            crate::stored_workspace_path(&crate::util::test::test_root().join("vanished_folder"))
+                .to_string_lossy()
+                .into_owned();
+        let mut vanished = chain("report_gone", "chain_report_ws", 2, 2, worker(), Vec::new());
+        vanished.inherited = Some(gone.clone());
+        seed_step(&vanished, &ws).await;
+        hand_on(&vanished, "the final text", Shape::None).await;
+        let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
+            .await
+            .expect("the final answer is delivered")
+            .expect("the final envelope");
+        assert!(
+            job.content.contains(&gone),
+            "a folder that is gone is named by its durable address: {}",
+            job.content
+        );
+        assert!(
+            !job.content.contains(&ws.path),
+            "not the caller's: {}",
+            job.content
+        );
         crate::agent::message_router::unregister_agent(&admin);
     }
 

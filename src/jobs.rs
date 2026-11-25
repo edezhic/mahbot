@@ -2295,6 +2295,7 @@ mod tests {
             user: crate::users::ADMIN_USER_NAME.to_string(),
             channel: "gui".to_string(),
             workspace: "replayed_ws".to_string(),
+            inherited: None,
             current: crate::launch::Step {
                 addressee: crate::tools::send::Addressee::WorkerBranch,
                 place: None,

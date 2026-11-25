@@ -443,8 +443,9 @@ mod tests {
     }
 
     /// The owner's argument detail reaches only a holder whose `send` takes those arguments: the
-    /// shared `send` reference documents neither `extract` nor `for`, so a holder without them
-    /// reads everything it can reach and learns nothing of either.
+    /// shared `send` reference documents neither `extract` nor `for` — nor where a chain step that
+    /// names no folder works — so a holder without them reads everything it can reach and learns
+    /// nothing of any of it.
     #[tokio::test]
     async fn the_argument_detail_reaches_only_a_holder_that_can_use_it() {
         let ws = crate::workspace::test_ws("reference");
@@ -452,7 +453,7 @@ mod tests {
             .execute(&ws, serde_json::json!({"tool": "send"}))
             .await
             .expect("a held tool's reference arrives");
-        for absent in ["extract", "`for`"] {
+        for absent in ["extract", "`for`", "chain"] {
             assert!(
                 !plain.contains(absent),
                 "a holder without the argument never reads {absent}: {plain}"
@@ -475,6 +476,10 @@ mod tests {
         assert!(
             full.contains("`for`"),
             "the holder of `for` is actually handed its entry: {full}"
+        );
+        assert!(
+            full.contains("the folder the nearest earlier step named"),
+            "and the folder a chain step that names none works in: {full}"
         );
     }
 }

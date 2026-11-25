@@ -749,6 +749,7 @@ mod tests {
             user: crate::users::ADMIN_USER_NAME.to_string(),
             channel: "gui".to_string(),
             workspace: ws.name.clone(),
+            inherited: None,
             current: crate::launch::Step {
                 addressee: crate::tools::send::Addressee::Role,
                 place: None,
@@ -812,6 +813,7 @@ mod tests {
             user: crate::users::ADMIN_USER_NAME.to_string(),
             channel: "gui".to_string(),
             workspace: workspace.clone(),
+            inherited: None,
             current: crate::launch::Step {
                 addressee: crate::tools::send::Addressee::Role,
                 place: None,
@@ -926,6 +928,7 @@ mod tests {
             user: crate::users::ADMIN_USER_NAME.to_string(),
             channel: "gui".to_string(),
             workspace: workspace.clone(),
+            inherited: None,
             current: crate::launch::Step {
                 addressee: crate::tools::send::Addressee::WorkerBranch,
                 place: None,
@@ -1036,6 +1039,7 @@ mod tests {
             user: crate::users::ADMIN_USER_NAME.to_string(),
             channel: "gui".to_string(),
             workspace: workspace.clone(),
+            inherited: None,
             current: crate::launch::Step {
                 addressee: crate::tools::send::Addressee::WorkerBranch,
                 place: None,

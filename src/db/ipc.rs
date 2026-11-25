@@ -17,16 +17,16 @@
 //! The compatibility rule is why the operation rides the old frame: an operation frame carries a
 //! magic `store` value — the generation its family declares ([`CALL_STORE`] /
 //! [`CALL_STORE_BASE`] / [`CALL_STORE_VIDEO`] / [`CALL_STORE_PHOTO`] / [`CALL_STORE_SETTINGS`] /
-//! [`CALL_STORE_SEND_OUTCOME`] / [`CALL_STORE_OUTCOME`], and the retired
-//! [`CALL_STORE_SEND_CHAIN`] / [`CALL_STORE_SEND`]) — never a store name, so a product that does
-//! not know it parses the frame as a diagnostic query and refuses it as an unknown store: an
-//! honest "this product does not serve that here" rather than a protocol complaint. A new frame
-//! type could be parsed as something else and answered misleadingly; a superset of the old frame
-//! is the only shape that degrades honestly. The value belongs to the FAMILY, so a family whose
-//! surface has not changed keeps working one build behind; a family added since — or one whose
-//! surface gained arguments a product built before it would ignore — carries a value that product
-//! does not know, so the call is refused instead of misanswered. This build serves every
-//! generation ([`CALL_STORES`]); its frontend sends the one its family declares.
+//! [`CALL_STORE_SEND_FOLDER`] / [`CALL_STORE_OUTCOME`], and the retired
+//! [`CALL_STORE_SEND_OUTCOME`] / [`CALL_STORE_SEND_CHAIN`] / [`CALL_STORE_SEND`]) — never a store
+//! name, so a product that does not know it parses the frame as a diagnostic query and refuses it
+//! as an unknown store: an honest "this product does not serve that here" rather than a protocol
+//! complaint. A new frame type could be parsed as something else and answered misleadingly; a
+//! superset of the old frame is the only shape that degrades honestly. The value belongs to the
+//! FAMILY, so a family whose surface has not changed keeps working one build behind; a family added
+//! since — or one whose surface gained arguments a product built before it would ignore — carries a
+//! value that product does not know, so the call is refused instead of misanswered. This build
+//! serves every generation ([`CALL_STORES`]); its frontend sends the one its family declares.
 //! The call channel is same-user-only, like the diagnostic one, and FAIL-CLOSED: when the socket
 //! could not be restricted to the instance's own user, queries keep working and operations are
 //! refused.
@@ -238,6 +238,12 @@ pub(crate) const CALL_STORE_OUTCOME: &str = "cli8";
 /// keeps its value; the listener still serves them all.
 pub(crate) const CALL_STORE_SEND_OUTCOME: &str = "cli9";
 
+/// The value `send` carries since a chain step that names no folder works in the one the nearest
+/// earlier step named: a product built before it would run such a step in the caller's folder
+/// instead, silently — and can refuse it outright over a folder it was never given. The frame is
+/// refused as an unknown store, so nothing ran and the environment's class is what the caller sees.
+pub(crate) const CALL_STORE_SEND_FOLDER: &str = "cli10";
+
 /// Every protocol value this build serves — one per generation of the command line's surface,
 /// including the ones only a frontend one build behind still sends.
 pub(crate) const CALL_STORES: &[&str] = &[
@@ -250,6 +256,7 @@ pub(crate) const CALL_STORES: &[&str] = &[
     CALL_STORE_SEND_CHAIN,
     CALL_STORE_OUTCOME,
     CALL_STORE_SEND_OUTCOME,
+    CALL_STORE_SEND_FOLDER,
 ];
 
 /// The store value a second launch's frame names: not a store, and nothing is queried — the frame

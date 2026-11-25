@@ -1018,11 +1018,12 @@ pub(crate) const FAMILIES: &[Family] = &[
     Family {
         word: "send",
         tool: "send",
-        // The chain argument `for`, the schema argument `extract` and the id the acknowledgement
-        // names are this build's own: a product built before them would run step one as the final
-        // one, drop the schema and deliver prose, or answer without an id — so the frame carries a
-        // value of its own and an older instance refuses it as the environment's class instead.
-        protocol: crate::db::ipc::CALL_STORE_SEND_OUTCOME,
+        // The chain argument `for`, the schema argument `extract`, the id the acknowledgement names
+        // and the folder a chain step inherits are this build's own: a product built before them
+        // would run step one as the final one, drop the schema, deliver prose, answer without an id,
+        // or run an inheriting step in the caller's folder — so the frame carries a value of its own
+        // and an older instance refuses it as the environment's class instead.
+        protocol: crate::db::ipc::CALL_STORE_SEND_FOLDER,
         purpose: "Hand one message to an agent and finish — the answer arrives later in your \
                   assistant's conversation, and the acknowledgement names the id 'mahbot \
                   outcome' reports on; nothing comes back from the one-way 'guest' address",
@@ -1047,8 +1048,10 @@ pub(crate) const FAMILIES: &[Family] = &[
                           workspace to message, by its managed name or its own folder; for \
                           'role', a managed workspace, a folder path, or 'personal:<user>'; a \
                           worker or a worker branch works in a directory outside the managed \
-                          workspaces (one inside is refused), and in your own workspace when it \
-                          names none",
+                          workspaces (one inside is refused). A step that names no 'place' works \
+                          in the folder the nearest earlier step named — with none named \
+                          anywhere before it, in your own workspace — and a folder named here is \
+                          the one the chain's later steps work in when they name none",
             },
             Flag {
                 arg: "branch",
@@ -1070,8 +1073,9 @@ pub(crate) const FAMILIES: &[Family] = &[
                 purpose: "Where this step's answer goes next, so one call runs a whole chain: a \
                           JSON object with an 'addressee' ('worker', 'worker_branch' or 'role'), \
                           that address's own 'place', 'branch' or 'name', and its own 'for' for \
-                          the step after it — at most ten steps including this call. Only the \
-                          final answer arrives; requires an explicit '--addressee'",
+                          the step after it — at most ten steps including this call. A step that \
+                          names no 'place' works in the folder the nearest earlier step named. \
+                          Only the final answer arrives; requires an explicit '--addressee'",
             },
             Flag {
                 arg: "extract",
@@ -3868,14 +3872,14 @@ mod tests {
         );
         let named: Vec<&str> = FAMILIES
             .iter()
-            .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE_SEND_OUTCOME)
+            .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE_SEND_FOLDER)
             .map(|cli| cli.word)
             .collect();
         assert_eq!(
             named,
             vec!["send"],
-            "the family whose surface gained the chain argument, the answer's schema and then the \
-             id its acknowledgement names"
+            "the family whose surface gained the chain argument, the answer's schema, the id its \
+             acknowledgement names and the folder a chain step inherits"
         );
         let changed: Vec<&str> = FAMILIES
             .iter()
@@ -3925,6 +3929,7 @@ mod tests {
             crate::db::ipc::CALL_STORE_BASE,
             crate::db::ipc::CALL_STORE_SEND_CHAIN,
             crate::db::ipc::CALL_STORE_SEND,
+            crate::db::ipc::CALL_STORE_SEND_OUTCOME,
         ] {
             assert!(
                 crate::db::ipc::CALL_STORES.contains(&retired),

@@ -14,6 +14,10 @@
 //! A worker round additionally refuses a managed workspace, anything inside one, the filesystem
 //! root and the product's own data directory: a ticket-less worker must never write into a tree
 //! whose workspace pipeline owns it. Guardrails, not a security boundary — the shell is unchanged.
+//!
+//! A chain step that names no folder of its own inherits the one the nearest earlier step named,
+//! and [`resolve_inherited`] is the same rule with the refusals addressed to that step — the folder
+//! was never written there, so it is never refused over how the earlier step spelled it.
 
 use crate::Workspace;
 use anyhow::{Context as _, Result, bail};
@@ -35,6 +39,61 @@ fn managed_at(managed: &[Workspace], dir: &Path) -> Option<Workspace> {
     managed.iter().find(|ws| dir == ws.as_path()).cloned()
 }
 
+/// Who addressed a folder to the resolver: the caller in its own `place`, or a chain step that
+/// names none and inherits the earlier step's folder. The checks are the same; only the refusal
+/// differs, because an inherited folder was never written on that step.
+#[derive(Clone, Copy)]
+pub(crate) enum Provenance<'a> {
+    /// The caller named it in its own `place`.
+    Named,
+    /// A chain step inherits it: where the step stands in its chain (`at`) and what it runs as
+    /// (`runs`), so the refusal can say which step and how to make it start.
+    Inherited { at: (usize, usize), runs: &'a str },
+}
+
+impl Provenance<'_> {
+    /// The refusal an inherited folder gets, when this is one: the step, the folder and why that
+    /// step cannot work there, ending in the way out.
+    fn inherited(self, folder: &str, why: &str) -> Option<anyhow::Error> {
+        let Self::Inherited {
+            at: (index, total),
+            runs,
+        } = self
+        else {
+            return None;
+        };
+        Some(anyhow::anyhow!(
+            "usage: step {index} of {total} runs as {runs}, and the folder it would inherit \
+             \"{folder}\" {why} — hint: name a folder on that step that {runs} can work in, or do \
+             not chain it"
+        ))
+    }
+}
+
+/// One refused place: the folder, the caller's own subject for it, why, and the caller's way out.
+/// Written once so the caller's voice and an inherited folder's cannot drift apart.
+struct Refusal<'a> {
+    /// The folder as the caller wrote it, which the inherited voice names.
+    folder: &'a str,
+    /// What the caller's own refusal names as its subject — `place "<raw>"` or `place path "<raw>"`.
+    subject: String,
+    /// The reason, as it reads after the subject or after the folder: `is the filesystem root`.
+    why: String,
+    /// The way out for a caller that named the place itself; an inherited folder's way out is the
+    /// chain's own ([`Provenance::inherited`]).
+    hint: &'static str,
+}
+
+impl Refusal<'_> {
+    /// The refusal in the voice of whoever addressed the folder.
+    fn say(self, provenance: Provenance<'_>) -> anyhow::Error {
+        if let Some(refusal) = provenance.inherited(self.folder, &self.why) {
+            return refusal;
+        }
+        anyhow::anyhow!("usage: {} {} — hint: {}", self.subject, self.why, self.hint)
+    }
+}
+
 /// Resolve a `place` that must address a managed workspace — by its exact name, or the directory
 /// that is it.
 pub(crate) async fn resolve_managed_workspace(raw: &str) -> Result<Workspace> {
@@ -42,7 +101,7 @@ pub(crate) async fn resolve_managed_workspace(raw: &str) -> Result<Workspace> {
     if !raw.is_empty() {
         let expanded = crate::util::expand_tilde(raw);
         if expanded.is_absolute() {
-            let dir = canonical_dir(raw, &expanded)?;
+            let dir = canonical_dir(raw, &expanded, Provenance::Named)?;
             if let Some(ws) = managed_at(&stored_workspaces().await?, &dir) {
                 return Ok(ws);
             }
@@ -66,7 +125,29 @@ pub(crate) async fn resolve(kind: DelegationKind, args: &Value) -> Result<Option
     let Some(raw) = raw.filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
+    resolve_place(kind, raw, Provenance::Named).await.map(Some)
+}
 
+/// Resolve the folder a chain step inherits, by the rule a worker's own `place` gets, with every
+/// refusal naming the step instead of a `place` it never wrote. A folder handed on by name becomes
+/// the directory it names first, so one folder spelled either way gets one answer.
+pub(crate) async fn resolve_inherited(
+    address: &str,
+    provenance: Provenance<'_>,
+) -> Result<Workspace> {
+    let Some(workspace) = crate::users::resolve_workspace(address).await? else {
+        return Err(refuse_missing(address).say(provenance));
+    };
+    resolve_place(DelegationKind::Worker, &workspace.path, provenance).await
+}
+
+/// Resolve one `place` value — a caller's own, or a folder a chain step inherited — into the
+/// workspace the round runs in.
+async fn resolve_place(
+    kind: DelegationKind,
+    raw: &str,
+    provenance: Provenance<'_>,
+) -> Result<Workspace> {
     // A value that is not an absolute path can only be a managed workspace name.
     let expanded = crate::util::expand_tilde(raw);
     if !expanded.is_absolute() {
@@ -74,33 +155,33 @@ pub(crate) async fn resolve(kind: DelegationKind, args: &Value) -> Result<Option
             return Err(refuse_unresolvable(kind, raw));
         };
         if kind == DelegationKind::Worker {
-            return Err(refuse_managed_workspace(raw, &ws.name));
+            return Err(refuse_managed_workspace(raw, &ws.name).say(provenance));
         }
-        return Ok(Some(ws));
+        return Ok(ws);
     }
 
-    let dir = canonical_dir(raw, &expanded)?;
+    let dir = canonical_dir(raw, &expanded, provenance)?;
     let managed = stored_workspaces().await?;
     let exact = managed_at(&managed, &dir);
     if kind == DelegationKind::Worker {
         if let Some(ws) = exact {
-            return Err(refuse_managed_workspace(raw, &ws.name));
+            return Err(refuse_managed_workspace(raw, &ws.name).say(provenance));
         }
         if let Some(ws) = managed
             .iter()
             .find(|ws| crate::util::is_within(&dir, ws.as_path()))
         {
-            return Err(refuse_inside(raw, &ws.name));
+            return Err(refuse_inside(raw, &ws.name).say(provenance));
         }
         if let Some(root) = data_dir(&dir) {
-            return Err(refuse_data_dir(raw, &root));
+            return Err(refuse_data_dir(raw, &root).say(provenance));
         }
-        return Ok(Some(dir_workspace(&dir)));
+        return Ok(dir_workspace(&dir));
     }
     // The analyst may be pointed at a managed workspace: it then carries that workspace's context.
     match exact {
-        Some(ws) => Ok(Some(ws)),
-        None => Ok(Some(dir_workspace(&dir))),
+        Some(ws) => Ok(ws),
+        None => Ok(dir_workspace(&dir)),
     }
 }
 
@@ -127,17 +208,17 @@ async fn stored_workspaces() -> Result<Vec<Workspace>> {
 }
 
 /// Canonicalize an existing directory place, refusing the filesystem root.
-fn canonical_dir(raw: &str, expanded: &Path) -> Result<PathBuf> {
+fn canonical_dir(raw: &str, expanded: &Path, provenance: Provenance<'_>) -> Result<PathBuf> {
     let (exists, is_dir) = path_state(expanded);
     if !exists {
-        return Err(refuse_missing(raw));
+        return Err(refuse_missing(raw).say(provenance));
     }
     if !is_dir {
-        return Err(refuse_not_a_directory(raw));
+        return Err(refuse_not_a_directory(raw).say(provenance));
     }
     let canonical = crate::stored_workspace_path(expanded);
     if canonical.parent().is_none() {
-        return Err(refuse_root(raw));
+        return Err(refuse_root(raw).say(provenance));
     }
     Ok(canonical)
 }
@@ -147,24 +228,31 @@ fn path_state(path: &Path) -> (bool, bool) {
     crate::util::with_block_in_place(|| (path.exists(), path.is_dir()))
 }
 
-fn refuse_missing(raw: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "usage: place path \"{raw}\" does not exist — hint: pass an absolute path to an \
-         existing directory"
-    )
+fn refuse_missing(raw: &str) -> Refusal<'_> {
+    Refusal {
+        folder: raw,
+        subject: format!("place path \"{raw}\""),
+        why: "does not exist".to_string(),
+        hint: "pass an absolute path to an existing directory",
+    }
 }
 
-fn refuse_not_a_directory(raw: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "usage: place path \"{raw}\" is a file, not a directory — hint: pass an absolute \
-         path to a directory"
-    )
+fn refuse_not_a_directory(raw: &str) -> Refusal<'_> {
+    Refusal {
+        folder: raw,
+        subject: format!("place path \"{raw}\""),
+        why: "is a file, not a directory".to_string(),
+        hint: "pass an absolute path to a directory",
+    }
 }
 
-fn refuse_root(raw: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "usage: place \"{raw}\" is the filesystem root — hint: pass a project directory instead"
-    )
+fn refuse_root(raw: &str) -> Refusal<'_> {
+    Refusal {
+        folder: raw,
+        subject: format!("place \"{raw}\""),
+        why: "is the filesystem root".to_string(),
+        hint: "pass a project directory instead",
+    }
 }
 
 /// The product's own data directory when `dir` lies inside it OUTSIDE the personal workspaces —
@@ -252,28 +340,36 @@ fn refuse_unresolvable(kind: DelegationKind, raw: &str) -> anyhow::Error {
     }
 }
 
-fn refuse_managed_workspace(raw: &str, workspace: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "usage: place \"{raw}\" is the managed workspace \"{workspace}\" — hint: work in a \
-         managed workspace goes through that workspace's board and its Manager, never through \
-         this tool; pass an absolute path to a directory outside the managed workspaces"
-    )
+/// The way out shared by the two managed-workspace refusals.
+const THROUGH_THE_BOARD: &str = "work in a managed workspace goes through that workspace's board \
+     and its Manager, never through this tool; pass an absolute path to a directory outside the \
+     managed workspaces";
+
+fn refuse_managed_workspace<'a>(raw: &'a str, workspace: &str) -> Refusal<'a> {
+    Refusal {
+        folder: raw,
+        subject: format!("place \"{raw}\""),
+        why: format!("is the managed workspace \"{workspace}\""),
+        hint: THROUGH_THE_BOARD,
+    }
 }
 
-fn refuse_inside(raw: &str, workspace: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "usage: place path \"{raw}\" is inside the managed workspace \"{workspace}\" — hint: \
-         work in a managed workspace goes through that workspace's board and its Manager, never \
-         through this tool; pass an absolute path to a directory outside the managed workspaces"
-    )
+fn refuse_inside<'a>(raw: &'a str, workspace: &str) -> Refusal<'a> {
+    Refusal {
+        folder: raw,
+        subject: format!("place path \"{raw}\""),
+        why: format!("is inside the managed workspace \"{workspace}\""),
+        hint: THROUGH_THE_BOARD,
+    }
 }
 
-fn refuse_data_dir(raw: &str, root: &Path) -> anyhow::Error {
-    anyhow::anyhow!(
-        "usage: place path \"{raw}\" is inside MahBot's own data directory ({}) — hint: pass a \
-         project directory instead; a personal workspace directory is allowed",
-        root.display()
-    )
+fn refuse_data_dir<'a>(raw: &'a str, root: &Path) -> Refusal<'a> {
+    Refusal {
+        folder: raw,
+        subject: format!("place path \"{raw}\""),
+        why: format!("is inside MahBot's own data directory ({})", root.display()),
+        hint: "pass a project directory instead; a personal workspace directory is allowed",
+    }
 }
 
 #[cfg(test)]
@@ -488,8 +584,15 @@ mod tests {
         .await
         .expect_err("missing absolute path")
         .to_string();
-        assert!(missing.starts_with("usage:"), "{missing}");
-        assert!(missing.contains("does not exist"), "{missing}");
+        assert_eq!(
+            missing,
+            format!(
+                "usage: place path \"{}\" does not exist — hint: pass an absolute path to an \
+                 existing directory",
+                missing_path.display()
+            ),
+            "the caller's own refusal names the folder once"
+        );
 
         let file = canonical.join("a-file.txt");
         std::fs::write(&file, "x").unwrap();
@@ -500,8 +603,15 @@ mod tests {
         .await
         .expect_err("a file place")
         .to_string();
-        assert!(file_err.starts_with("usage:"), "{file_err}");
-        assert!(file_err.contains("not a directory"), "{file_err}");
+        assert_eq!(
+            file_err,
+            format!(
+                "usage: place path \"{}\" is a file, not a directory — hint: pass an absolute path \
+                 to a directory",
+                file.display()
+            ),
+            "and neither does this one"
+        );
 
         let non_string = resolve(DelegationKind::Analyze, &json!({ "place": 5 }))
             .await
@@ -551,5 +661,115 @@ mod tests {
         .expect("a personal workspace directory is allowed")
         .expect("a target is present");
         assert!(ws.name.starts_with("dir-"), "got {}", ws.name);
+    }
+
+    /// The provenance an inherited folder's refusal carries in these tests.
+    fn inherited() -> Provenance<'static> {
+        Provenance::Inherited {
+            at: (2, 3),
+            runs: "a worker",
+        }
+    }
+
+    /// A folder a chain step inherits is judged by what it is, never by how the step that named it
+    /// spelled it: the same folder written as a name and as a directory gets one answer. Every
+    /// refusal names the step and the folder, and ends in the way out.
+    #[tokio::test]
+    async fn an_inherited_folder_is_judged_by_what_it_is_not_how_it_was_spelled() {
+        init_management_test_stores().await;
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = canon(dir.path());
+        add_managed_workspace(&canonical, "ws_inherited_alpha").await;
+        let plain = canonical.to_str().unwrap();
+
+        // A worker cannot be handed a managed workspace, whichever way the earlier step wrote it.
+        for address in ["ws_inherited_alpha", plain] {
+            let err = resolve_inherited(address, inherited())
+                .await
+                .expect_err("a worker refuses a managed workspace")
+                .to_string();
+            assert!(err.starts_with("usage:"), "{err}");
+            assert!(err.contains("step 2 of 3"), "the step is named: {err}");
+            assert!(err.contains("a worker"), "what it runs as is named: {err}");
+            assert!(
+                err.contains("ws_inherited_alpha"),
+                "the folder it would inherit is named: {err}"
+            );
+            assert!(err.contains("hint:"), "{err}");
+            assert!(err.contains("do not chain it"), "{err}");
+        }
+        assert_eq!(
+            resolve_inherited("ws_inherited_alpha", inherited())
+                .await
+                .expect_err("refused")
+                .to_string(),
+            resolve_inherited(plain, inherited())
+                .await
+                .expect_err("refused")
+                .to_string(),
+            "one folder, one answer, however it was spelled"
+        );
+
+        // A plain directory is the folder a worker takes.
+        let scratch = tempfile::tempdir().unwrap();
+        let scratch_canonical = canon(scratch.path());
+        let ws = resolve_inherited(scratch_canonical.to_str().unwrap(), inherited())
+            .await
+            .expect("a plain directory is a worker's folder");
+        assert!(ws.name.starts_with("dir-"), "got {}", ws.name);
+        assert_eq!(ws.path, scratch_canonical.to_string_lossy());
+
+        // A `personal:` key becomes the directory it names: a worker may work there.
+        let personal = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
+        let ws = resolve_inherited(&personal, inherited())
+            .await
+            .expect("a personal workspace is a folder a worker may work in");
+        assert_eq!(
+            ws.path,
+            crate::stored_workspace_path(&crate::users::personal_workspace_path(
+                crate::users::ADMIN_USER_NAME
+            ))
+            .to_string_lossy()
+        );
+    }
+
+    /// A folder that is gone, the root, the product's own data directory or a tree inside a managed
+    /// workspace is refused for a step that would inherit it, exactly as for a caller that named it.
+    #[tokio::test]
+    async fn an_inherited_folder_a_worker_cannot_work_in_is_refused() {
+        init_management_test_stores().await;
+        let probe = test_root().join("inherited-probe");
+        std::fs::create_dir_all(&probe).unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let canonical = canon(project.path());
+        add_managed_workspace(&canonical, "ws_inherited_nested").await;
+        let nested = canonical.join("inner");
+        std::fs::create_dir(&nested).unwrap();
+        for (address, needle) in [
+            (
+                tempfile::tempdir()
+                    .unwrap()
+                    .path()
+                    .join("gone")
+                    .to_string_lossy()
+                    .into_owned(),
+                "does not exist",
+            ),
+            ("/".to_string(), "filesystem root"),
+            (probe.to_string_lossy().into_owned(), "data directory"),
+            (
+                nested.to_string_lossy().into_owned(),
+                "inside the managed workspace \"ws_inherited_nested\"",
+            ),
+        ] {
+            let err = resolve_inherited(&address, inherited())
+                .await
+                .expect_err("a worker cannot work there")
+                .to_string();
+            assert!(err.starts_with("usage:"), "{err}");
+            assert!(err.contains(needle), "{address}: {err}");
+            assert!(err.contains("step 2 of 3"), "{err}");
+            assert!(err.contains("hint:"), "{err}");
+        }
     }
 }

@@ -107,9 +107,17 @@ pub struct Chain {
     /// The user the chain answers to (the owner) and the channel it started on.
     pub user: String,
     pub channel: String,
-    /// The workspace a step that names no `place` runs in — the one the same delegation from the
-    /// owner's Assistant runs in today.
+    /// The workspace a step that names no `place` runs in when no step named one — the one the same
+    /// delegation from the owner's Assistant runs in today — and the chain's own group. It never
+    /// moves: a folder a step names rides on [`Self::inherited`].
     pub workspace: String,
+    /// The folder a step that names none works in: the one the nearest earlier step that named one
+    /// moved the chain to, in the form every later step resolves — a managed workspace's name, a
+    /// `personal:<user>` key, or a canonical path. `None` until a step names a folder, and `None` on
+    /// a chain recorded before this build, which then keeps today's behaviour for the steps it has
+    /// left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited: Option<String>,
     /// The address of the step running now, and its 1-based position.
     pub current: Step,
     pub step: usize,

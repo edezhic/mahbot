@@ -2773,6 +2773,7 @@ mod tests {
                     user: "test_user".to_string(),
                     channel: "test_channel".to_string(),
                     workspace: "test_ws".to_string(),
+                    inherited: None,
                     current: crate::launch::Step::worker(),
                     step: 1,
                     next: Vec::new(),
