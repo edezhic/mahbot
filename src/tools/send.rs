@@ -653,8 +653,9 @@ impl Tool for SendTool {
         if self.dispatch_mode.is_async() {
             parts.push(load_prompt("tool/send_async.md"));
         }
-        // `for` is the owner's Assistant's own argument: one clause here, its shape in the
-        // argument's own schema description, and nothing on any other holder's description.
+        // `for` is the owner's Assistant's own argument: one clause here, its shape and its step
+        // rule in the schema description and the on-demand reference only a holder of it reaches,
+        // and nothing on any other holder's description.
         if self.owner_surface() {
             parts.push(labelled(&[FOR_ARG], load_prompt("tool/send_for.md").trim()));
         }

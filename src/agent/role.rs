@@ -482,10 +482,14 @@ impl Role {
         // role's set is per record, so [`Self::custom_role_tools`] adds its own.
         if self != Role::Custom {
             // Only the admin Assistant's toolset holds the owner's `send`, so only its reference
-            // carries the detail; a guest's holds no `send` at all. The rule itself lives on
-            // [`Role::is_owner_assistant`], so the argument and its detail cannot diverge.
-            let shaped = is_admin && self.is_owner_assistant();
-            tools.push(Box::new(ReferenceTool::new(Self::holders(&tools), shaped)));
+            // carries the detail of `extract` and `for`; a guest's holds no `send` at all. The rule
+            // itself lives on [`Role::is_owner_assistant`], so the arguments and their detail
+            // cannot diverge.
+            let owner_arguments = is_admin && self.is_owner_assistant();
+            tools.push(Box::new(ReferenceTool::new(
+                Self::holders(&tools),
+                owner_arguments,
+            )));
         }
 
         tools
@@ -557,7 +561,7 @@ impl Role {
         // The shared reference entry point is not a grant: every set has it, so a custom role's
         // short descriptions can point at the same route the built-in roles use. It is added once
         // the whole set is assembled, so it serves exactly the tools this record granted, and no
-        // granted `send` takes `extract` — only the owner's own does.
+        // granted `send` takes `extract` or `for` — only the owner's own does.
         tools.push(Box::new(ReferenceTool::new(Self::holders(&tools), false)));
         tools
     }
