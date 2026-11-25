@@ -11,7 +11,7 @@
 - `planning` — paused, awaiting a decision whether to proceed or cancel.
 - `queued` — send it to the engineer's queue for implementation.
 - `cancelled` — abandon it. Work already done in the workspace stays, so the workspace can be left dirty.
-- `failed` — mark the attempt unsuccessful. A failed ticket blocks its dependents and stays visible for triage.
+- `failed` — mark the attempt unsuccessful. A failed ticket parks the workspace: while a ticket here sits in `failed`, nothing here is picked up for development. It also blocks its dependents and stays visible for triage. Do not move a failed ticket back to `backlog`, `planning` or `queued` — a failed ticket is replaced by a supersede, or cancelled.
 - `done` — mark it complete and successful; irreversible.
 
 ## Pipeline-managed phases
@@ -20,7 +20,7 @@ Never set `analysis`, `in_development`, `verification` or `in_sanitation` yourse
 
 ## Finished tickets
 
-A `done` ticket's phase is frozen: every move is refused and it cannot be superseded. Only the phase is frozen — the ticket can still be read, commented on and archived. To revisit finished work, create a new standalone ticket.
+A `done` ticket's phase is frozen: every move is refused and it cannot be superseded. Only the phase is frozen — the ticket can still be read and commented on. To revisit finished work, create a new standalone ticket.
 
 ## Result
 

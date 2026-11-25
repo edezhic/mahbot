@@ -685,8 +685,9 @@ async fn every_second_bounce_notifies_manager() {
         .expect("the failed transition notifies the Manager");
     assert_has_header(&job.content, &failed.id, "Bounce", "failed");
     assert!(
-        job.content.contains("the rework budget was exhausted"),
-        "a breaker failure names the exhausted budget:\n{}",
+        job.content.contains("The rework budget was exhausted")
+            && job.content.contains(&super::pause_status_sentence(false)),
+        "a breaker failure names the exhausted budget and keeps the workspace state:\n{}",
         job.content,
     );
     crate::agent::message_router::unregister_agent(&crate::session::manager_agent_id(&ws.name));

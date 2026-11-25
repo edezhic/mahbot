@@ -7,7 +7,7 @@ A new ticket starts in `backlog`, where analysts validate its scope before it is
 - `title` — a short summary, the line the board shows.
 - `description` — the full statement of the work: what to change and why.
 - `prerequisites` — optional ticket IDs that must finish (`done`, archived or `cancelled`) before this ticket can be claimed. A `failed` prerequisite keeps blocking.
-- `supersede` — optional ticket ID this ticket replaces. The old ticket is cancelled, this one is created as its replacement, and every dependent's prerequisite is rewired to the new ID. A `done` ticket cannot be superseded: its phase is immutable, so file the follow-up as a standalone ticket.
+- `supersede` — optional ticket ID this ticket replaces. The old ticket is cancelled and archived, this one is created as its replacement linked as its successor, and every dependent's prerequisite is rewired to the new ID. Superseding a `failed` ticket is how a parked workspace is resumed: the park lifts only once nothing here is left in `failed`. A `done` ticket cannot be superseded: its phase is immutable, so file the follow-up as a standalone ticket.
 - `label` — the Manager's own argument, required: `feat` adds a capability, `fix` repairs a problem, `maint` is everything else. It is fixed at creation and cannot change; the pipeline prefixes every commit it makes for the ticket with it. A replacement states its own label — nothing is inherited.
 - `priority` — the Manager's own argument, optional: 0 is the highest urgency, 1 the default, higher numbers lower. Omitted while superseding, it is inherited from the superseded ticket; otherwise the role default applies.
 

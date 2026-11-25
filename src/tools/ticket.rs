@@ -152,7 +152,7 @@ impl Tool for CreateTicketTool {
             "supersede".into(),
             json!({
                 "type": "string",
-                "description": "Optional ticket ID to replace; a `done` ticket cannot be superseded"
+                "description": "Optional ticket ID this one replaces; a `done` ticket cannot be superseded"
             }),
         );
 
@@ -286,7 +286,8 @@ impl Tool for UpdateTicketTool {
                 },
                 "phase": {
                     "type": "string",
-                    "description": "New phase: `backlog`, `planning`, `queued`, `cancelled`, `failed` or `done` (irreversible)."
+                    "description": "New phase: `backlog`, `planning`, `queued`, `cancelled`, \
+                                    `failed` (parks the workspace) or `done` (irreversible)."
                 }
             }),
             &["ticket_id", "phase"],
@@ -334,7 +335,8 @@ impl Tool for ListTicketsTool {
             &json!({
                 "phase": {
                     "type": "string",
-                    "description": "Optional phase filter; omitted, `done` and `cancelled` are excluded. `archived` is not a phase."
+                    "description": "Optional phase filter; omitted, finished tickets are \
+                                    excluded. `failed` tickets come back."
                 }
             }),
             &[],
@@ -514,7 +516,8 @@ impl Tool for AddCommentTool {
 /// Refuses a ticket in a pipeline-occupied phase. Used by create-ticket (when
 /// superseding) and update-ticket to keep in-flight tickets unmodified during
 /// automated processing. `add_comment` deliberately bypasses it — comments are
-/// allowed mid-pipeline and reach running agents as soft deferred messages.
+/// allowed mid-pipeline and reach running agents as soft deferred messages. The
+/// remedy is a prompt asset: both readers are agents with no GUI to fall back on.
 async fn guard_not_pipeline_occupied(
     store: &crate::pipeline::board::BoardStore,
     ticket_id: &str,
@@ -523,9 +526,9 @@ async fn guard_not_pipeline_occupied(
         && current_phase.is_pipeline_occupied()
     {
         anyhow::bail!(
-            "Ticket {ticket_id} is currently in phase '{current_phase}' — \
-                 in-flight tickets cannot be modified through automated tools. \
-                 Use the GUI to cancel or manage this ticket manually.",
+            "Ticket {ticket_id} is in phase '{current_phase}' — an in-flight ticket cannot be \
+             superseded, cancelled or moved. {}",
+            crate::prompt::load_prompt("tool/ticket_in_flight.md").trim(),
         );
     }
     Ok(())

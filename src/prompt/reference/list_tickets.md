@@ -2,13 +2,15 @@
 
 ## Arguments
 
-- `phase` — optional phase filter. Without it only active tickets are returned: `done` and `cancelled` are excluded. Name a phase explicitly to include them (`phase: "done"`, `phase: "cancelled"`).
+- `phase` — optional filter; the phases are listed below.
 
 ## Phases
 
 `backlog`, `analysis`, `planning`, `queued`, `in_development`, `verification`, `in_sanitation`, `done`, `cancelled`, `failed`.
 
-`archived` is not a phase: a `phase: "archived"` request is refused, and the archive is searched with `search_archived_tickets` instead.
+`done` and `cancelled` are finished: they get archived, and `search_archived_tickets` is how finished work is reached — naming their phase here returns only one that has not been archived yet. A `failed` ticket is not finished — it stays live and does come back.
+
+`archived` is not a phase: a `phase: "archived"` request is refused.
 
 ## Result
 

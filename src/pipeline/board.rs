@@ -1287,11 +1287,12 @@ impl BoardStore {
 
     /// The one refusal for a phase write on a finished ticket: names the ticket, the attempted
     /// action and what still works, so no caller mistakes it for "not found" or a silent no-op.
+    /// It never offers archiving — the readers are agents, and archiving is the user's board.
     fn finished_ticket_error(ticket_id: &str, action: &str) -> anyhow::Error {
         anyhow::anyhow!(
             "Ticket {ticket_id} is finished (phase 'done') — a finished ticket's phase is \
-             immutable, so it cannot be {action}. Only archiving remains; the ticket can \
-             still be read and commented on.",
+             immutable, so it cannot be {action}. The ticket can still be read and commented \
+             on; anything further is a new ticket.",
         )
     }
 

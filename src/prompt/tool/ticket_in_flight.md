@@ -1,0 +1,1 @@
+Wait until it reaches `done` or `failed`. A comment is the one thing that still reaches it: the Manager can comment to clarify the ticket's scope, and the running agent reads it as a deferred note at its next round without being interrupted. Once it fails, replace it by superseding it; once it is done, file a new ticket.

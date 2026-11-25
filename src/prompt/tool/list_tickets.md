@@ -1,1 +1,1 @@
-List the board's tickets, optionally filtered by `phase`. Without a filter only active tickets come back — `done` and `cancelled` are excluded; name a phase to see them. Survey the board before acting; the archive is `search_archived_tickets`. Returns one line per ticket.
+List the board's live tickets, optionally filtered by `phase` — `failed` ones included; without a filter, finished tickets are excluded. Survey the board before acting; the archive is `search_archived_tickets`. Returns one line per ticket.

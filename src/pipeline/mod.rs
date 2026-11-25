@@ -864,13 +864,15 @@ fn paused_workspace_sentence() -> &'static str {
     "all in-flight work stops and no pipeline stage advances until the workspace is resumed"
 }
 
-/// The `{{workspace_status}}` fragment of a failure notification: whether the
-/// failure paused the workspace and what that means for queued tickets.
+/// The `{{workspace_status}}` fragment of the failure, engineer-pause and sanitation-stop
+/// notices: whether the workspace is paused. Shared by all three, so the park a failed ticket
+/// puts on the queue is stated by the failure notice itself instead — the other two carry no
+/// failed ticket.
 fn pause_status_sentence(paused: bool) -> String {
     if paused {
         format!("The workspace is paused — {}.", paused_workspace_sentence())
     } else {
-        "The workspace was not paused — remaining queued tickets may still be claimed.".to_string()
+        "The workspace was not paused.".to_string()
     }
 }
 
@@ -1091,15 +1093,15 @@ async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
 
     if ctx.target == TicketPhase::Failed {
         let failure_details = last_comment_as_failure_details(&ticket.id).await;
-        // The rework budget is described only in the Manager's own instructions,
-        // so a failure it stopped says so here.
-        let workspace_status = if ctx.breaker_trip {
-            "Beware that the rework budget was exhausted, so all the other tickets \
-             were moved back from Queued to Planning."
-                .to_string()
-        } else {
-            pause_status_sentence(ws.paused)
-        };
+        // The rework budget is described only in the Manager's own instructions, so a failure
+        // it stopped says so here; the pause state is appended, never replaced.
+        let mut workspace_status = pause_status_sentence(ws.paused);
+        if ctx.breaker_trip {
+            workspace_status = format!(
+                "The rework budget was exhausted, so all the other tickets were moved back \
+                 from Queued to Planning. {workspace_status}"
+            );
+        }
 
         blocks.push(substitute(
             &load_prompt("pipeline/failure_notification.md"),
