@@ -194,10 +194,11 @@ pub(crate) async fn wait_for_service() -> ServiceGate {
 /// without the target: a word or flag nobody has, a flag with no value, a token
 /// that is no flag, an argument that is not text — and, for a frontend that opens
 /// files itself, the filesystem's verdict on the paths it was handed. Everything
-/// the TARGET judges is a failed operation instead. A frontend that only CARRIES
-/// the operation (this one) holds no copy of the target's rules, so it never
-/// guesses a class; `mahbot audio`, which RUNS its target, may judge that target's
-/// published vocabulary as misuse. Each family's help says what its classes mean.
+/// the TARGET judges is a failed operation instead — bar the one family whose own
+/// refusal is the environment's ([`Refusal`]). A frontend that only CARRIES the
+/// operation (this one) holds no copy of the target's rules, so it never guesses a
+/// class; `mahbot audio`, which RUNS its target, may judge that target's published
+/// vocabulary as misuse. Each family's help says what its classes mean.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Exit {
     Ok = 0,
@@ -208,8 +209,8 @@ pub(crate) enum Exit {
     /// component the operation's input needs — could not take the operation on. The
     /// environment, not the operation.
     Environment = 2,
-    /// The caller's own mistake: an invocation that cannot mean what it asks, and —
-    /// for a frontend that opens the files itself — the paths it was handed.
+    /// The caller's own mistake: what this command rejects before the product is asked,
+    /// never the product's own judgement (the split is stated on this enum).
     Usage = 3,
 }
 
@@ -2320,17 +2321,17 @@ fn list_entries_from_file(flag: &Flag, file: &str) -> Result<Vec<serde_json::Val
 }
 
 /// The exit classes a family's help states: one skeleton, so no two can word it differently, and
-/// one pair of sentences per refusal class — see [`Refusal`].
+/// one set of sentences per refusal class — see [`Refusal`] and the split on [`Exit`].
 fn exit_class_help(refusal: Refusal) -> String {
     let (failed, environment, closing) = match refusal {
         Refusal::Operation => (
-            "the operation failed — the product refused it, carried it out only in part, or the \
-             exchange was severed after the call went out (an operation that may be under way is \
-             never the environment's class)",
-            "the environment — nothing ran: the product is not up, its channel was not reachable, \
-             or it could not take the operation on",
-            "a refusal still prints the product's own answer on stdout, so only the code says \
-             whether the operation happened.",
+            "the product took the call and it did not go through — it refused the call, carried it \
+             out only in part, or the exchange was severed after it went out (an operation that may \
+             be under way is never the environment's class)",
+            "the environment — nothing ran: the product is not up, its channel was not reachable, or \
+             it was in no state to take the call on",
+            "a call the product judged prints its own words on stdout — a refusal often beginning \
+             \"usage:\" — so the code says whether the operation was carried out, not how far it got.",
         ),
         // A read that failed answered nothing, so its wording is this command's diagnostic rather
         // than the product's answer on stdout.
@@ -2344,7 +2345,8 @@ fn exit_class_help(refusal: Refusal) -> String {
     };
     format!(
         "\nExit codes:\n  0  the operation was carried out\n  1  {failed}\n  2  {environment}\n  \
-         3  this command was misused\nA script reads the exit code, not the text: {closing}\n"
+         3  this command rejected the call itself, before the product was asked\nA script reads the \
+         exit code, not the text: {closing}\n"
     )
 }
 
@@ -2953,8 +2955,8 @@ struct Verdict {
 /// decision can be read — and tested — with no socket near it.
 ///
 /// An answer the product gave goes to stdout whatever its outcome: the exit code,
-/// not the text, says whether the operation happened, and a partial run adds one
-/// short diagnostic, so the caller need not read the product's wording for a
+/// not the text, says whether the operation was carried out, and a partial run adds
+/// one short diagnostic, so the caller need not read the product's wording for a
 /// verdict. A refusal is the family's own class ([`Refusal`]): an operation's
 /// refusal is still the product's answer on stdout with the failed class, while the
 /// one family that only READS a durable record treats a refusal as this command's
@@ -3949,8 +3951,9 @@ mod tests {
     }
 
     /// A help states the contract its operation really has and the exit classes: the running
-    /// product for one carried to it, this command's own answer for a static text.
-    fn assert_help_contract(help: &str, is_static: bool) {
+    /// product for one carried to it, this command's own answer for a static text — and the classes
+    /// split by who judged the call (see [`Exit`]).
+    fn assert_help_contract(help: &str, is_static: bool, refusal: Refusal) {
         assert!(
             !help.contains("{{"),
             "a help placeholder was not expanded:\n{help}"
@@ -3958,13 +3961,39 @@ mod tests {
         for required in [
             "Exit codes:",
             "0  the operation was carried out",
-            "3  this command was misused",
+            "3  this command rejected the call itself, before the product was asked",
             "Output:",
         ] {
             assert!(
                 help.contains(required),
                 "'{required}' is missing from:\n{help}"
             );
+        }
+        // Class 1 is a call the product took on and judged, class 2 one it was in no state to take
+        // on, and a refusal's own words — often beginning "usage:" — are on stdout, so the code
+        // says whether the operation was carried out, not how far it got.
+        match refusal {
+            Refusal::Operation => {
+                for required in [
+                    "the product took the call and it did not go through",
+                    "it refused the call",
+                    "it was in no state to take the call on",
+                    "a refusal often beginning \"usage:\"",
+                    "whether the operation was carried out, not how far it got",
+                ] {
+                    assert!(
+                        help.contains(required),
+                        "'{required}' is missing from:\n{help}"
+                    );
+                }
+            }
+            // The one family whose refusal is the environment's must not claim the product judged
+            // the call; its own class is guarded by
+            // `the_outcome_help_states_the_class_its_refusal_takes`.
+            Refusal::Environment => assert!(
+                !help.contains("the product took the call"),
+                "a refusal that is the environment's must not claim the product judged it:\n{help}"
+            ),
         }
         // A static text is printed here and must not claim a running product.
         if is_static {
@@ -4021,7 +4050,7 @@ mod tests {
                 }
             };
             for (is_static, help) in &helps {
-                assert_help_contract(help, *is_static);
+                assert_help_contract(help, *is_static, family.refusal);
             }
             // The family help states the exception in the sentence that claims the instance: a
             // claim with a static text in the list, contradicted a paragraph later, is false.
@@ -5249,10 +5278,10 @@ mod tests {
                 .expect("the outcome family"),
         );
         assert!(help.contains("the record could not be read"), "{help}");
-        assert!(!help.contains("a refusal still prints"), "{help}");
+        assert!(!help.contains("prints its own words on stdout"), "{help}");
         for other in FAMILIES.iter().filter(|family| family.word != "outcome") {
             let help = family_help(other);
-            assert!(help.contains("a refusal still prints"), "{help}");
+            assert!(help.contains("prints its own words on stdout"), "{help}");
             assert!(!help.contains("the record could not be read"), "{help}");
         }
     }
