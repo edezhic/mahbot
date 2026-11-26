@@ -308,7 +308,13 @@ impl Tool for UpdateTicketTool {
             .transition_to(&ticket_id, None, parsed_phase, Role::Manager.as_str())
             .await?;
 
-        Ok(format!("Ticket {ticket_id} phase updated to '{new_phase}'"))
+        let mut reply = format!("Ticket {ticket_id} phase updated to '{new_phase}'");
+        if parsed_phase == TicketPhase::Queued
+            && let Some(warning) = queue_park_warning(store, &self.ws_name, &ticket_id).await
+        {
+            let _ = write!(reply, ". {warning}");
+        }
+        Ok(reply)
     }
 }
 
@@ -528,10 +534,35 @@ async fn guard_not_pipeline_occupied(
         anyhow::bail!(
             "Ticket {ticket_id} is in phase '{current_phase}' — an in-flight ticket cannot be \
              superseded, cancelled or moved. {}",
-            crate::prompt::load_prompt("tool/ticket_in_flight.md").trim(),
+            crate::prompt::load_prompt("ticket_in_flight.md").trim(),
         );
     }
     Ok(())
+}
+
+/// The warning a move to `queued` carries when the workspace holds a failed ticket: the claim is
+/// refused until every failed ticket leaves `failed`, so the reply names them instead of reading
+/// like a move that will be picked up. `None` when nothing is failed. The move is already written,
+/// so a failed lookup costs only the warning — it never turns the answer into an error.
+async fn queue_park_warning(
+    store: &crate::pipeline::board::BoardStore,
+    workspace_name: &str,
+    ticket_id: &str,
+) -> Option<String> {
+    let failed = store
+        .failed_siblings(workspace_name, ticket_id)
+        .await
+        .inspect_err(|e| {
+            tracing::warn!(ticket = %ticket_id, error = %e, "queue-park warning lookup failed");
+        })
+        .unwrap_or_default();
+    if failed.is_empty() {
+        return None;
+    }
+    Some(crate::prompt::substitute(
+        crate::prompt::load_prompt("queue_park_warning.md").trim(),
+        &[("{{failed_tickets}}", &failed.join(", "))],
+    ))
 }
 
 #[cfg(test)]
@@ -637,6 +668,96 @@ mod tests {
             .expect("get_ticket")
             .expect("ticket exists");
         assert_eq!(ticket.phase, TicketPhase::Verification);
+    }
+
+    /// Run a phase move through the tool — the Manager's own route to the board.
+    async fn move_ticket(ws: &crate::Workspace, ticket_id: &str, phase: &str) -> String {
+        UpdateTicketTool::new(ws)
+            .execute(ws, json!({"ticket_id": ticket_id, "phase": phase}))
+            .await
+            .expect("the move succeeds")
+    }
+
+    /// The reply to a move to `queued`: unchanged when nothing in the workspace is failed, and
+    /// otherwise the same confirmation followed by the warning that names the failed ticket. Only
+    /// a move to `queued` carries it.
+    #[tokio::test]
+    async fn queued_move_warns_about_a_failed_ticket() {
+        crate::util::test::init_test_stores().await;
+        let store = board_store();
+
+        // Each scenario gets a workspace of its own: the board is shared by the whole test binary.
+        let clean = crate::workspace::test_ws_named("/tmp/queue_park_clean", "queue_park_clean");
+        let moved = make_ticket(store, &clean, "Clean", TicketPhase::Backlog).await;
+        assert_eq!(
+            move_ticket(&clean, &moved, "queued").await,
+            format!("Ticket {moved} phase updated to 'queued'"),
+            "without a failed ticket the confirmation is the whole answer"
+        );
+
+        let parked = crate::workspace::test_ws_named("/tmp/queue_park_one", "queue_park_one");
+        let failed = make_ticket(store, &parked, "Failure", TicketPhase::Failed).await;
+        let moved = make_ticket(store, &parked, "Moved", TicketPhase::Backlog).await;
+        assert_eq!(
+            move_ticket(&parked, &moved, "queued").await,
+            format!(
+                "Ticket {moved} phase updated to 'queued'. It will not be picked up while this \
+                 workspace holds {failed} in 'failed': the queue stays parked until every failed \
+                 ticket has left 'failed' — by being superseded or cancelled."
+            ),
+            "the confirmation keeps its own sentence and the warning names the failed ticket"
+        );
+        assert_eq!(
+            expect_ticket(store, &moved).await.phase,
+            TicketPhase::Queued,
+            "the warning never refuses the move"
+        );
+
+        let other = make_ticket(store, &parked, "Other", TicketPhase::Backlog).await;
+        assert_eq!(
+            move_ticket(&parked, &other, "cancelled").await,
+            format!("Ticket {other} phase updated to 'cancelled'"),
+            "a move to any other phase stays unwarned"
+        );
+    }
+
+    /// The warning names exactly the workspace's failed tickets: a ticket in another workspace,
+    /// in another phase, or archived parks no queue.
+    #[tokio::test]
+    async fn queued_move_names_only_the_tickets_that_park_the_queue() {
+        crate::util::test::init_test_stores().await;
+        let store = board_store();
+        let parked = crate::workspace::test_ws_named("/tmp/queue_park_many", "queue_park_many");
+        let first = make_ticket(store, &parked, "First failure", TicketPhase::Failed).await;
+        let second = make_ticket(store, &parked, "Second failure", TicketPhase::Failed).await;
+        make_ticket(store, &parked, "Cancelled", TicketPhase::Cancelled).await;
+        let archived = make_ticket(store, &parked, "Archived failure", TicketPhase::Failed).await;
+        store.set_archived(&archived).await.expect("archive");
+        let elsewhere =
+            crate::workspace::test_ws_named("/tmp/queue_park_elsewhere", "queue_park_elsewhere");
+        make_ticket(store, &elsewhere, "Failure", TicketPhase::Failed).await;
+        let moved = make_ticket(store, &parked, "Moved", TicketPhase::Backlog).await;
+
+        let reply = move_ticket(&parked, &moved, "queued").await;
+        assert!(
+            reply.contains(&format!("holds {first}, {second} in 'failed'")),
+            "exactly the workspace's failed tickets are named, oldest first: {reply}"
+        );
+    }
+
+    /// A failed ticket moved back to `queued` is not warned about itself — the exclusion mirrors
+    /// the claim gate, which never counts the candidate as its own blocker.
+    #[tokio::test]
+    async fn failed_ticket_moved_to_queued_does_not_warn_about_itself() {
+        crate::util::test::init_test_stores().await;
+        let store = board_store();
+        let ws = crate::workspace::test_ws_named("/tmp/queue_park_self", "queue_park_self");
+        let id = make_ticket(store, &ws, "Failed", TicketPhase::Failed).await;
+        assert_eq!(
+            move_ticket(&ws, &id, "queued").await,
+            format!("Ticket {id} phase updated to 'queued'"),
+            "a ticket never parks its own claim"
+        );
     }
 
     #[tokio::test]

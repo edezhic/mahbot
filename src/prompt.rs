@@ -5,7 +5,9 @@
 //! Two directories carry tool text: `tool/{name}.md` is a tool's standing description — how to
 //! use it, why, and one clause about what it returns — and `reference/{name}.md` is the detail
 //! behind it, fetched on demand by the `reference` tool
-//! ([`crate::tools::tool_reference`]).
+//! ([`crate::tools::tool_reference`]). A sentence a tool returns as part of its answer is reply
+//! text, not description: it lives at the top level beside its siblings (`ticket_in_flight.md`,
+//! `queue_park_warning.md`, `worker_failure.md`).
 //!
 //! Not the prompts themselves — those are the `.md` files, loaded by asset key — and not a
 //! template engine: substitution is one pass and never cascades.

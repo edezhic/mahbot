@@ -24,4 +24,4 @@ A `done` ticket's phase is frozen: every move is refused and it cannot be supers
 
 ## Result
 
-The answer is a one-line confirmation naming the ticket and its new phase.
+The answer confirms the ticket and its new phase. A move to `queued` adds a sentence when the workspace holds a failed ticket other than the one being moved: it names them and says the queued one will not be picked up until every one of them has left `failed` — by being superseded or cancelled.

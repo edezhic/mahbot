@@ -172,12 +172,8 @@ fn claim_candidate_where(base: usize, source: TicketPhase) -> String {
         // [`PIPELINE_OCCUPIED_PHASES`], so the gate lives here, on the start decision itself,
         // where the read-only probe inherits it through this shared builder.
         parts.push(format!(
-            "NOT EXISTS (SELECT 1 FROM tickets t2 \
-                WHERE t2.workspace_name = t1.workspace_name \
-                AND t2.phase = '{}' \
-                AND t2.is_archived = 0 \
-                AND t2.id != t1.id)",
-            TicketPhase::Failed.as_ref(),
+            "NOT EXISTS (SELECT 1 FROM tickets t2 WHERE {})",
+            failed_sibling_rows_where("t1.workspace_name", "t1.id"),
         ));
     }
     parts.push(format!(
@@ -189,6 +185,19 @@ fn claim_candidate_where(base: usize, source: TicketPhase) -> String {
         phase_list_sql_fragment(UNBLOCKING_PHASES),
     ));
     parts.join(" AND ")
+}
+
+/// The rows that park a workspace's queue: the non-archived `failed` tickets in `workspace`'s
+/// workspace other than `candidate`. One builder feeds both the claim's `NOT EXISTS` gate and the
+/// advisory that tells a caller why a queued ticket will not start, so the two cannot drift.
+fn failed_sibling_rows_where(workspace: &str, candidate: &str) -> String {
+    format!(
+        "workspace_name = {workspace} \
+         AND phase = '{}' \
+         AND is_archived = 0 \
+         AND id != {candidate}",
+        TicketPhase::Failed.as_ref(),
+    )
 }
 
 fn parse_prereqs(raw: &str) -> Result<Vec<String>> {
@@ -1656,6 +1665,27 @@ impl BoardStore {
             )
             .await
             .map_err(Into::into)
+    }
+
+    /// The non-archived [`TicketPhase::Failed`] tickets that park a workspace's queue, oldest
+    /// first — the same predicate as the claim's failed-sibling gate, so a caller's advisory names
+    /// the tickets that really refuse the claim. `ticket_id` is excluded as the gate does: a
+    /// ticket never parks its own claim.
+    pub(crate) async fn failed_siblings(
+        &self,
+        workspace_name: &str,
+        ticket_id: &str,
+    ) -> Result<Vec<String>> {
+        self.conn
+            .query_map_strict(
+                &format!(
+                    "SELECT id FROM tickets WHERE {} ORDER BY created_at ASC",
+                    failed_sibling_rows_where("?1", "?2"),
+                ),
+                db::params![workspace_name, ticket_id],
+                |row| row.get::<String>(0),
+            )
+            .await
     }
 
     /// Archive a single ticket by ID: sets `is_archived = 1`, erroring if the ticket does not
