@@ -351,6 +351,47 @@ impl ParallelVerdict {
     }
 }
 
+/// One round member's result, as the round reports it: its verdict, whether it stopped rather
+/// than failed, and the provider facts a failure carried. `paused` and `cut_short` drive the
+/// round's own freeze and the death predicate ([`super::notice::Participant::of`]) — a
+/// cancellation, a freeze or a phase-gate bail is never a stage death. `class` and `attempts` are
+/// what a death notice says about the failure.
+#[derive(Clone)]
+pub(crate) struct MemberOutcome {
+    pub verdict: ParallelVerdict,
+    /// The member stopped at a pause boundary: the round freezes instead of failing.
+    pub paused: bool,
+    /// The member was cut short rather than failing: a phase-gate bail, a cancellation, a
+    /// shutdown or a drain.
+    pub cut_short: bool,
+    /// The provider class the failure carried, when the product classified it.
+    pub class: Option<crate::retry::FailureClass>,
+    /// The attempts the failing call made before giving up, when the product knows them.
+    pub attempts: Option<usize>,
+}
+
+impl MemberOutcome {
+    /// A member that ended with this verdict and no failure facts of its own: it produced the
+    /// verdict, or its task died (already logged) — either way there is nothing more to say about
+    /// it here.
+    #[must_use]
+    pub(crate) fn of_verdict(verdict: ParallelVerdict) -> Self {
+        Self {
+            verdict,
+            paused: false,
+            cut_short: false,
+            class: None,
+            attempts: None,
+        }
+    }
+
+    /// The members' verdicts, for a round whose deaths stop nothing (analysis).
+    #[must_use]
+    pub(crate) fn verdicts(members: Vec<Self>) -> Vec<ParallelVerdict> {
+        members.into_iter().map(|member| member.verdict).collect()
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum ExtractionMode {
     ScoreVerdict,

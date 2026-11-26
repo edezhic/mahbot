@@ -199,10 +199,9 @@ tokio::task_local! {
 /// Value last intentionally reviewed: 2026-07-11
 const MAX_TOOL_ROUNDS: usize = 1000;
 
-/// Retry-exhaustion marker shared by `llm_call`/`summarize` and the
-/// `engineer_failure_notice` match; drift is cosmetic (classification uses the
-/// typed `RetryExhausted`).
-pub(crate) const RETRY_EXHAUSTION_MARKER: &str = "exhausted retry budget";
+/// Retry-exhaustion marker carried by the context of an exhausted `llm_call`/`summarize`, so a
+/// log reader can spot one; classification itself uses the typed `RetryExhausted`.
+const RETRY_EXHAUSTION_MARKER: &str = "exhausted retry budget";
 
 /// Attempts for the summarization call when the model answers with a tool call
 /// instead of a summary — re-sent verbatim, so attempts stay byte-identical
@@ -582,6 +581,7 @@ impl Agent {
             first_call_notify: None,
             failure: None,
             failure_class: None,
+            failure_attempts: None,
             run_failure: None,
             sleep_ended: false,
             turn_recorded: false,
@@ -698,6 +698,13 @@ impl Agent {
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancel_token.is_cancelled()
+    }
+
+    /// The run was cut short rather than failing: a cancellation, a shutdown or a drain. Such
+    /// an ending is never reported as a stage failure.
+    #[must_use]
+    pub fn cut_short(&self) -> bool {
+        self.is_cancelled() || crate::shutdown::aborting()
     }
 
     #[must_use]
@@ -2730,6 +2737,7 @@ pub(crate) async fn run_agent(
             // a generic placeholder.
             agent.failure = Some(format!("{e:#}"));
             agent.failure_class = failure_class_from_error(&e);
+            agent.failure_attempts = failure_attempts_from_error(&e);
             // A refusal class fails the same way over the same bytes: remember the durable history
             // tail so the dead-session poller can tell "the history changed, one restart is worth
             // it" from "restarting would re-send exactly what was just refused".
@@ -2813,16 +2821,26 @@ pub(crate) async fn run_default_agent(
     .await
 }
 
-/// The typed provider failure class from an error chain, when it carries a
-/// [`RetryExhausted`]. `None` means the error is not provider-classified (runtime
-/// errors, panics, plain I/O) — callers treat that as a genuine non-provider failure.
-pub(crate) fn failure_class_from_error(
-    error: &anyhow::Error,
-) -> Option<crate::retry::FailureClass> {
+/// The [`crate::retry::RetryExhausted`] carried by an error chain, when the error is
+/// provider-classified.
+fn retry_exhausted(error: &anyhow::Error) -> Option<&crate::retry::RetryExhausted> {
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<crate::retry::RetryExhausted>())
-        .map(|exhausted| exhausted.final_class)
+}
+
+/// The attempts the failing call made before giving up, `None` when the error is not
+/// provider-classified.
+pub(crate) fn failure_attempts_from_error(error: &anyhow::Error) -> Option<usize> {
+    retry_exhausted(error).map(|exhausted| exhausted.failures.len())
+}
+
+/// The typed provider failure class, `None` when the error is not provider-classified (runtime
+/// errors, panics, plain I/O).
+pub(crate) fn failure_class_from_error(
+    error: &anyhow::Error,
+) -> Option<crate::retry::FailureClass> {
+    retry_exhausted(error).map(|exhausted| exhausted.final_class)
 }
 
 /// Labels meaning the run stopped cooperatively rather than failing technically.
@@ -2980,6 +2998,7 @@ mod tests {
             first_call_notify: None,
             failure: None,
             failure_class: None,
+            failure_attempts: None,
             run_failure: None,
             sleep_ended: false,
             turn_recorded: false,
@@ -3321,6 +3340,7 @@ mod tests {
                 role,
                 reply_target: None,
                 pending_job_id: None,
+                pause_notice_id: None,
                 originating_workspace: None,
                 custom_role: None,
                 reply_to_custom: None,

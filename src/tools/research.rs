@@ -537,6 +537,7 @@ pub(crate) fn dispatch_deep_analysis(ws: &Workspace, question: &str, caller_role
                     role: caller_role.for_launch(custom.as_ref()),
                     reply_target: None,
                     pending_job_id: Some(job_id),
+                    pause_notice_id: None,
                     originating_workspace: None,
                     custom_role: custom,
                     reply_to_custom: None,

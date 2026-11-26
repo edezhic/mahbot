@@ -300,6 +300,7 @@ mod tests {
                         role: crate::Role::Assistant,
                         reply_target: None,
                         pending_job_id: None,
+                        pause_notice_id: None,
                         originating_workspace: None,
                         custom_role: None,
                         reply_to_custom: None,

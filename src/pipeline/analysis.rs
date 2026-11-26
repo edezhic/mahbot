@@ -7,11 +7,12 @@ use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::{Role, Workspace};
 
 use super::{
-    AgentSlot, BoardStore, ExtractionMode, FinalizeOutcome, JointRound, ParallelVerdict,
-    TicketPhase, TransitionCtx, Write, agent_slot_from_roster_row, build_agent_slots,
-    build_round_grouping, debug, deserialize_verdict_outcome, guard_job_phase, info,
-    insert_round_slots, issue_grade, pause_freezing, rearm_resumed_slots, render_joint_comment,
-    reset_phase_attempt, run_parallel_agents, warn, with_comment_and_transition,
+    AgentSlot, BoardStore, ExtractionMode, FinalizeOutcome, JointRound, MemberOutcome,
+    ParallelVerdict, TicketPhase, TransitionCtx, Write, agent_slot_from_roster_row,
+    build_agent_slots, build_round_grouping, debug, deserialize_verdict_outcome, guard_job_phase,
+    info, insert_round_slots, issue_grade, pause_freezing, rearm_resumed_slots,
+    render_joint_comment, reset_phase_attempt, run_parallel_agents, warn,
+    with_comment_and_transition,
 };
 
 const BASE_ANALYST_COUNT: usize = 2;
@@ -478,7 +479,7 @@ async fn run_blocker_verification(
     let extraction_prompt = load_prompt("extraction/blocker_verification.md");
     let blockers_arc =
         Arc::<[String]>::from(entries.iter().map(|e| e.text.clone()).collect::<Vec<_>>());
-    run_parallel_agents(
+    let (outcomes, paused) = run_parallel_agents(
         ticket,
         ws,
         Role::Analyst,
@@ -491,7 +492,9 @@ async fn run_blocker_verification(
         TicketPhase::Analysis,
         resume,
     )
-    .await
+    .await;
+    // Analysis deaths never stop the workspace, so only the verdicts are of interest here.
+    (MemberOutcome::verdicts(outcomes), paused)
 }
 
 /// Run an analysis round: the base analyst cohort researches a backlog ticket
@@ -665,7 +668,7 @@ async fn run_analysis_round(
     resume: bool,
 ) {
     let extraction_prompt = load_prompt("extraction/analyst.md");
-    let (base_results, base_paused) = run_parallel_agents(
+    let (base_outcomes, base_paused) = run_parallel_agents(
         ticket,
         ws,
         Role::Analyst,
@@ -681,6 +684,7 @@ async fn run_analysis_round(
         pause_freezing(ticket, job_id).await;
         return;
     }
+    let base_results = MemberOutcome::verdicts(base_outcomes);
     let base_count = base_results.len();
     let (round, outcome) = build_round_grouping(
         STAGE,
@@ -772,7 +776,7 @@ async fn reset_analysis_round(ticket: &Ticket, job_id: &str) {
         ticket = %ticket.id,
         "Backlog analysis produced no usable output — resetting for a fresh attempt",
     );
-    reset_phase_attempt(ticket, TicketPhase::Analysis, job_id, "analysis failure").await;
+    reset_phase_attempt(ticket, TicketPhase::Analysis, job_id, None).await;
 }
 
 /// Process the analyst verdicts and transition the ticket to Planning (fail-open — the ticket

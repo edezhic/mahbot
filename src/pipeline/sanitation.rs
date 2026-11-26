@@ -9,9 +9,8 @@ use crate::{Agent, Role, Workspace};
 use super::{
     BoardStore, FinalizeOutcome, StageRunKind, TicketPhase, TransitionCtx, board,
     bounce_to_development, clear_implementation_roster, error, guard_job_phase, guard_stage, info,
-    list_new_or_untracked_files, notify_manager_system, pause_freezing, pause_status_sentence,
-    reset_phase_attempt, run_git_status, run_stage_agent, sync_phase_job_task, warn,
-    with_comment_and_transition,
+    list_new_or_untracked_files, notice, pause_freezing, reset_phase_attempt, run_git_status,
+    run_stage_agent, sync_phase_job_task, warn, with_comment_and_transition,
 };
 
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
@@ -112,49 +111,51 @@ async fn finalize_sanitation_ticket(
 /// phase job behind for the puller to re-drive.
 async fn finish_or_stop(ticket: &Ticket, ws: &Workspace, job_id: &str) {
     if let Err(cause) = finalize_sanitation_ticket(ticket, ws, job_id).await {
-        stop_sanitation_round(ticket, ws, job_id, &cause).await;
+        stop_sanitation_round(ticket, job_id, &cause).await;
     }
 }
 
 /// Stop a sanitation round that could not finish: the full cause in the log and in the Manager
 /// notice, the workspace frozen, the phase job deleted. The ticket stays in `InSanitation` and
-/// the round replays from scratch on unpause.
-async fn stop_sanitation_round(ticket: &Ticket, ws: &Workspace, job_id: &str, cause: &str) {
+/// the round re-drives on unpause — in the same session, so it may go back to development
+/// instead of straight to the commit. This death has its own notice and gains no second one.
+async fn stop_sanitation_round(ticket: &Ticket, job_id: &str, cause: &str) {
     error!(
         ticket = %ticket.id,
         error = %cause,
         "Sanitation round could not finish — stopping the round and freezing the workspace"
     );
-    let detail = crate::util::failure_detail(cause, "sanitation failure");
 
-    // Read before the freeze lands: `reset_phase_attempt` reports whether THIS stop paused the
-    // workspace, so an already-set flag means the freeze is not this failure's and still has to
-    // be described in the notice. The notice itself is never suppressed.
-    let was_frozen = matches!(
-        crate::workspace::store().get_by_name(&ws.name).await,
-        Ok(Some(live)) if live.paused
-    );
-
-    let pause_occurred = reset_phase_attempt(
+    reset_phase_attempt(
         ticket,
         TicketPhase::InSanitation,
         job_id,
-        "sanitation failure",
+        Some(notice::Cause::SanitationStop {
+            terms: notice::Terms::plain(crate::util::failure_detail(cause, "sanitation failure")),
+        }),
     )
     .await;
+}
 
-    let content = substitute(
-        &load_prompt("pipeline/sanitation_stop_notification.md"),
-        &[
-            ("{{ticket_id}}", &ticket.id),
-            ("{{failure_details}}", &detail),
-            (
-                "{{workspace_status}}",
-                &pause_status_sentence(pause_occurred || was_frozen),
-            ),
-        ],
-    );
-    notify_manager_system(&ws.name, content);
+/// A sanitation round that died without a usable verdict: the agent never answered, or its verdict
+/// could not be read. The cut-short flag is read BEFORE the reset — the reset's own cancellation of
+/// this round must not turn a failure into the cancellation it looks like afterwards — and only a
+/// genuine death is reported.
+async fn reset_sanitation_attempt(
+    ticket: &Ticket,
+    agent: &Agent,
+    job_id: &str,
+    produced: notice::Produced,
+    terms: notice::Terms,
+) {
+    let death = (!agent.cut_short()).then(|| {
+        notice::Cause::Participants(vec![notice::Participant {
+            label: "sanitation agent".to_string(),
+            produced,
+            terms,
+        }])
+    });
+    reset_phase_attempt(ticket, TicketPhase::InSanitation, job_id, death).await;
 }
 
 /// After a successful `git commit`, persist the metadata and transition the ticket to Done
@@ -233,13 +234,16 @@ pub(crate) async fn finalize_sanitation_stage(
             agent_id = %agent.agent_id,
             "Sanitation agent returned no output — resetting for a fresh attempt"
         );
-        reset_phase_attempt(
-            ticket,
-            TicketPhase::InSanitation,
-            job_id,
-            "sanitation failure",
-        )
-        .await;
+        let error = agent
+            .failure
+            .as_deref()
+            .unwrap_or("the sanitation agent produced no output");
+        let terms = notice::Terms::new(
+            agent.failure_class,
+            agent.failure_attempts,
+            crate::util::failure_detail(error, "sanitation agent failure"),
+        );
+        reset_sanitation_attempt(ticket, agent, job_id, notice::Produced::NoAnswer, terms).await;
         return;
     }
 
@@ -258,11 +262,12 @@ pub(crate) async fn finalize_sanitation_stage(
                 error = %failure,
                 "Failed to extract sanitation verdict — resetting for a fresh attempt"
             );
-            reset_phase_attempt(
+            reset_sanitation_attempt(
                 ticket,
-                TicketPhase::InSanitation,
+                agent,
                 job_id,
-                "sanitation failure",
+                notice::Produced::UnreadableVerdict,
+                notice::Terms::of_extraction(&failure),
             )
             .await;
         }
@@ -282,7 +287,7 @@ async fn dispatch_sanitation(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
             let Some(reason) = missing_repo_reason(&ws).await else {
                 // A genuine repository-state read failure: stop the round rather than let the
                 // agent inspect a placeholder list and commit the tree uninspected.
-                stop_sanitation_round(&ticket, &ws, job_id, &format!("{e:#}")).await;
+                stop_sanitation_round(&ticket, job_id, &format!("{e:#}")).await;
                 return;
             };
             // No usable repository: the agent round proceeds without a file list and the

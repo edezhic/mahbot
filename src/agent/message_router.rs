@@ -97,6 +97,11 @@ pub struct AgentJob {
     /// returns — the at-least-once delivery boundary.
     #[serde(default)]
     pub pending_job_id: Option<String>,
+    /// The `pause_notices` row this job delivers (see [`crate::pipeline::notice`]). Such a
+    /// delivery is confirmed only by a turn that ran to completion, so a failed turn leaves the
+    /// row for the delivery loop to retry; every other job carries `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_notice_id: Option<String>,
     /// For relayed jobs, the workspace the relayed content originated in, so its media
     /// markers resolve and deliver from where they were produced.
     #[serde(default)]
@@ -323,6 +328,7 @@ fn user_message_job(
         role,
         reply_target,
         pending_job_id: None,
+        pause_notice_id: None,
         originating_workspace: None,
         custom_role: None,
         reply_to_custom: None,
@@ -493,6 +499,7 @@ fn agent_message_job(
         role: Role::Manager,
         reply_target: None,
         pending_job_id: None,
+        pause_notice_id: None,
         originating_workspace: None,
         custom_role: None,
         reply_to_custom: asker,
@@ -538,6 +545,7 @@ pub(crate) async fn route_guest_message(
         role: Role::Assistant,
         reply_target: None,
         pending_job_id: None,
+        pause_notice_id: None,
         // No root of the sender's rides along: relative markers in the guest's
         // answer resolve in the guest's own workspace.
         originating_workspace: None,
@@ -1217,6 +1225,7 @@ async fn consumer_loop(
             // abandoned — the handover failed rather than finished.
             if agent.sleep_ended {
                 finish_turn_outcomes(&job, &queued, "", crate::send_outcome::Shape::None).await;
+                confirm_pause_notices(&job, &queued).await;
             } else {
                 fail_turn_outcomes(&job, &queued, "the turn was cut short before it answered")
                     .await;
@@ -1247,6 +1256,7 @@ async fn consumer_loop(
         // The answer is final and unwrapped here, so the record and the conversation carry the same
         // text — the conversation gets it wrapped in an envelope for the non-`assistant` addresses.
         finish_turn_outcomes(&job, &queued, &response, shape).await;
+        confirm_pause_notices(&job, &queued).await;
 
         // Manager: a durable `<manager-message>` into the admin's Assistant, or back into the
         // asking branch. Custom role: `<custom-role-message>`. Worker branch: `<worker-report>`
@@ -1361,6 +1371,18 @@ fn worker_branch_launch(job: &AgentJob) -> Option<&crate::Launch> {
     job.custom_role
         .as_ref()
         .filter(|launch| launch.role == Role::Worker)
+}
+
+// A workspace-stop notice is consumed ONLY by a turn that ran to completion — whether or not the
+// Manager said anything in it. A turn that failed, was cancelled or was cut short leaves the row
+// for the delivery loop to retry, so a notice is never lost to the same outage that stopped the
+// workspace. Every job of the turn is confirmed: a batched turn answers each of its messages.
+async fn confirm_pause_notices(job: &AgentJob, queued: &[AgentJob]) {
+    for item in queued.iter().chain(std::iter::once(job)) {
+        if let Some(id) = item.pause_notice_id.as_deref() {
+            crate::pipeline::notice::confirm_delivered(id).await;
+        }
+    }
 }
 
 // Consumer-confirmed delivery: delete the durable pending_jobs row after the agent ran
@@ -1597,6 +1619,7 @@ fn admin_assistant_job(
         role: Role::Assistant,
         reply_target: None,
         pending_job_id: None,
+        pause_notice_id: None,
         originating_workspace: originating_workspace.map(str::to_string),
         custom_role: None,
         reply_to_custom: None,
@@ -1655,6 +1678,7 @@ fn branch_job(
         role: Role::Custom,
         reply_target: None,
         pending_job_id: None,
+        pause_notice_id: None,
         originating_workspace: originating_workspace.map(str::to_string),
         custom_role: Some(asker.launch.clone()),
         reply_to_custom: None,
@@ -2314,12 +2338,60 @@ mod tests {
             role,
             reply_target: None,
             pending_job_id: None,
+            pause_notice_id: None,
             originating_workspace: None,
             custom_role: None,
             reply_to_custom: None,
             urgent: false,
             extract: None,
         }
+    }
+
+    /// A workspace-stop notice is consumed by a turn that ran to completion — every notice the
+    /// batch carried, whether or not the Manager said anything — and never by a turn that failed.
+    #[serial_test::serial(pause_notice)]
+    #[tokio::test]
+    async fn a_completed_turn_consumes_every_notice_of_its_batch() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let cause = crate::pipeline::notice::Cause::Panic("provider down".to_string());
+        let still_there = |id: &'static str| async move {
+            crate::session::store()
+                .conn
+                .query_optional(
+                    "SELECT 1 FROM pause_notices WHERE id = ?1",
+                    crate::db::params![id.to_string()],
+                    |_| Ok::<_, std::convert::Infallible>(()),
+                )
+                .await
+                .expect("read the notice")
+                .is_some()
+        };
+        for id in ["consumed_turn", "consumed_queued", "kept_after_failure"] {
+            crate::pipeline::notice::record_for_test(id, "notice_ws", &format!("job_{id}"), &cause)
+                .await;
+        }
+        let mut job = make_job(Role::Manager, "notice_ws", "system", "");
+        job.pause_notice_id = Some("consumed_turn".to_string());
+        let mut carried = make_job(Role::Manager, "notice_ws", "system", "");
+        carried.pause_notice_id = Some("consumed_queued".to_string());
+        let mut failed = make_job(Role::Manager, "notice_ws", "system", "");
+        failed.pause_notice_id = Some("kept_after_failure".to_string());
+
+        confirm_pause_notices(&job, std::slice::from_ref(&carried)).await;
+
+        assert!(
+            !still_there("consumed_turn").await,
+            "the turn's own notice is consumed"
+        );
+        assert!(
+            !still_there("consumed_queued").await,
+            "a carried notice is consumed too"
+        );
+        assert!(
+            still_there("kept_after_failure").await,
+            "a turn that failed never consumes a notice"
+        );
     }
 
     /// One turn answers every message of its batch, so every command-line handover it carried is
@@ -2644,6 +2716,7 @@ mod tests {
             role: Role::Assistant,
             reply_target: None,
             pending_job_id: None,
+            pause_notice_id: None,
             originating_workspace: None,
             custom_role: None,
             reply_to_custom: None,
@@ -3197,6 +3270,7 @@ mod tests {
             role: Role::Assistant,
             reply_target: Some("chat_123".to_string()),
             pending_job_id: None,
+            pause_notice_id: None,
             originating_workspace: None,
             custom_role: None,
             reply_to_custom: None,

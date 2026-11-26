@@ -997,9 +997,10 @@ impl WorkspaceStore {
     /// personal workspace.
     ///
     /// The workspace's research runs are cancelled and swept first (releasing run
-    /// folders + archives), and the remaining job rows are deleted IN the
-    /// workspace-row transaction so the jobs/workspace deletion commits
-    /// atomically. The associated search engine is removed from the in-memory registry.
+    /// folders + archives), and the remaining job rows and undelivered
+    /// workspace-stop notices are deleted IN the workspace-row transaction so they
+    /// commit atomically. The associated search engine is removed from the in-memory
+    /// registry.
     ///
     /// Returns the admin's active project after the deletion (`None` = the
     /// personal workspace) — read back through the same transaction, so the
@@ -1052,6 +1053,13 @@ impl WorkspaceStore {
                 db::params![name],
             )
             .await?;
+        // Undelivered workspace-stop notices go with the workspace: a notice naming a
+        // workspace that no longer exists can never be delivered.
+        tx.execute(
+            "DELETE FROM pause_notices WHERE workspace_name = ?1",
+            db::params![name],
+        )
+        .await?;
         tx.commit().await?;
         if swept > 0 || remaining > 0 {
             tracing::info!(
@@ -1152,28 +1160,74 @@ impl WorkspaceStore {
     /// Set or clear the pipeline pause toggle for a workspace. A name with no row is an error
     /// rather than a silent no-op: every caller reports the toggle as applied, so a pause that
     /// wrote nothing would be reported as one.
+    ///
+    /// Pausing is [`Self::pause_with_record`] with nothing to record, so there is one pause
+    /// write; resuming is the plain update below.
     pub async fn set_paused(&self, name: &str, paused: bool) -> Result<()> {
-        let val: i64 = i64::from(paused);
+        if paused {
+            let stopped = self.pause_with_record(name, async |_, _| Ok(())).await?;
+            anyhow::ensure!(
+                stopped.is_some(),
+                "No managed workspace exists under the name '{name}'."
+            );
+            return Ok(());
+        }
         let affected = self
-            .exec_update_with_updated_at("paused = ?", vec![Value::from(val)], name)
+            .exec_update_with_updated_at("paused = ?", vec![Value::from(0)], name)
             .await?;
         anyhow::ensure!(
             affected > 0,
             "No managed workspace exists under the name '{name}'."
         );
-        if paused {
-            // The user/operator/failure pause — the one pause set through this method. The
-            // discovery analysis-pause writes `paused` via DIRECT SQL, so it does not trigger this
-            // cancel. Every pause entry point funnels through here, so the cancel is guaranteed.
-            crate::agent::registry::AGENT_REGISTRY.cancel_by_workspace_pause(name);
-            tracing::info!(workspace = name, "Workspace pipeline paused");
-        } else {
-            // Clear the cooperative pause-stop flags left on in-flight agents so a resumed
-            // workspace does not freeze them at their next LLM round boundary.
-            crate::agent::registry::AGENT_REGISTRY.clear_workspace_pause(name);
-            tracing::info!(workspace = name, "Workspace pipeline resumed");
-        }
+        // Clear the cooperative pause-stop flags left on in-flight agents so a resumed
+        // workspace does not freeze them at their next LLM round boundary.
+        crate::agent::registry::AGENT_REGISTRY.clear_workspace_pause(name);
+        tracing::info!(workspace = name, "Workspace pipeline resumed");
         Ok(())
+    }
+
+    /// The one pause write: pause the workspace and run `record` in the SAME transaction, so a
+    /// pause is never committed without the write that explains it — a stage death's notice.
+    /// `record` is handed whether this call performed the pause. Returns that same flag, or `None`
+    /// when no such workspace exists (nothing was written).
+    ///
+    /// A workspace already paused by something else is not paused again, but the cooperative
+    /// freeze is signalled for it too: its in-flight agents must stop at their next round
+    /// boundary either way.
+    pub(crate) async fn pause_with_record(
+        &self,
+        name: &str,
+        record: impl AsyncFnOnce(&db::TxGuard<'_>, bool) -> Result<()>,
+    ) -> Result<Option<bool>> {
+        let tx = self.conn.begin_tx().await?;
+        let paused = tx
+            .query_map_strict(
+                "SELECT paused FROM workspaces WHERE name = ?1",
+                db::params![name.to_string()],
+                |row| row.get::<i64>(0),
+            )
+            .await?
+            .into_iter()
+            .next();
+        let Some(paused) = paused else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let stopped = paused == 0;
+        if stopped {
+            tx.execute(
+                "UPDATE workspaces SET paused = 1, updated_at = ?1 WHERE name = ?2",
+                db::params![db::now(), name.to_string()],
+            )
+            .await?;
+        }
+        record(&tx, stopped).await?;
+        tx.commit().await?;
+        crate::agent::registry::AGENT_REGISTRY.cancel_by_workspace_pause(name);
+        if stopped {
+            tracing::info!(workspace = name, "Workspace pipeline paused");
+        }
+        Ok(Some(stopped))
     }
 
     /// Pause every managed workspace — the `mahbot paused` startup mode. Each row goes

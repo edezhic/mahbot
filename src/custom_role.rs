@@ -546,6 +546,7 @@ mod tests {
             role: crate::Role::Custom,
             reply_target: None,
             pending_job_id: None,
+            pause_notice_id: None,
             originating_workspace: None,
             custom_role: Some(crate::Launch {
                 role: crate::Role::Custom,

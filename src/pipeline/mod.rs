@@ -24,11 +24,17 @@
 //! manager/maintainer/auxiliary agents are not gated by it. A workspace holding a
 //! failed ticket awaiting Manager triage skips the `Queued -> InDevelopment` claim
 //! (enforced inside the claim predicate, not here); every other puller step still runs.
+//!
+//! A stage whose death STOPS the workspace — development, verification, sanitation — records a
+//! [`notice`] for the workspace's Manager. The row is the death, not its text: the delivery loop
+//! renders it against the pause state of the moment it is delivered, and a notice is consumed
+//! only by a Manager turn that ran to completion.
 
 pub mod analysis;
 pub mod board;
 pub mod chronicle;
 pub mod development;
+pub mod notice;
 pub mod sanitation;
 #[cfg(test)]
 mod tests;
@@ -45,7 +51,7 @@ use tracing::{Instrument, debug, error, info, warn};
 
 use crate::agent::message_router;
 use crate::agent::role::SYSTEM_ROLE;
-use crate::agent::{RETRY_EXHAUSTION_MARKER, run_agent};
+use crate::agent::run_agent;
 use crate::db::TxGuard;
 use crate::git::commands::{list_new_or_untracked_files, run_git_status};
 use crate::pipeline::board::{BoardStore, PIPELINE_ACTOR, Ticket, TicketPhase};
@@ -55,7 +61,7 @@ use crate::util::UnwrapPoison;
 use crate::{Agent, Role, Workspace, WorkspaceStatus};
 
 pub(crate) use verdict::{
-    AgentSlot, ExtractionMode, JointRound, ParallelVerdict, build_round_grouping,
+    AgentSlot, ExtractionMode, JointRound, MemberOutcome, ParallelVerdict, build_round_grouping,
     deserialize_verdict_outcome, issue_grade, render_joint_comment, round_member_failed,
     serialize_verdict_outcome, validate_blocker_verification, validate_verdict_score,
 };
@@ -496,19 +502,30 @@ fn spawn_phase_body(phase: TicketPhase, ticket: Arc<Ticket>, ws: Workspace, job_
                     return;
                 }
             };
-            if futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run))
-                .await
-                .is_ok()
+            if let Err(payload) =
+                futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(run)).await
             {
-                return;
+                let message = crate::util::panic_message(&*payload);
+                error!(
+                    ticket = %panic_ticket.id,
+                    phase = %phase,
+                    job = %log_job_id,
+                    panic = %message,
+                    "Phase body panicked — resetting for a fresh attempt",
+                );
+                // A body that recorded its death before crashing keeps that one notice: one
+                // attempt records one notice. An analysis panic stops nothing and reports nothing.
+                reset_phase_attempt(
+                    &panic_ticket,
+                    phase,
+                    &log_job_id,
+                    Some(notice::Cause::Panic(crate::util::failure_detail(
+                        &message,
+                        "stage crash",
+                    ))),
+                )
+                .await;
             }
-            error!(
-                ticket = %panic_ticket.id,
-                phase = %phase,
-                job = %log_job_id,
-                "Phase body panicked — resetting for a fresh attempt",
-            );
-            reset_phase_attempt(&panic_ticket, phase, &log_job_id, "pipeline phase panic").await;
         }
         .instrument(span),
     );
@@ -864,43 +881,16 @@ fn paused_workspace_sentence() -> &'static str {
     "all in-flight work stops and no pipeline stage advances until the workspace is resumed"
 }
 
-/// The `{{workspace_status}}` fragment of the failure, engineer-pause and sanitation-stop
-/// notices: whether the workspace is paused. Shared by all three, so the park a failed ticket
-/// puts on the queue is stated by the failure notice itself instead — the other two carry no
-/// failed ticket.
+/// The `{{workspace_status}}` fragment of the failed-ticket notice: whether the workspace is
+/// paused. The three workspace-stop notices state their pause facts of their own
+/// ([`notice`]): they report two independent facts — whether the failure stopped the workspace
+/// and whether it is paused now — where this one only appends the current state.
 fn pause_status_sentence(paused: bool) -> String {
     if paused {
         format!("The workspace is paused — {}.", paused_workspace_sentence())
     } else {
         "The workspace was not paused.".to_string()
     }
-}
-
-/// Route a notice to a workspace's Manager agent on the system channel — the
-/// path of the notices that report a failure WITHOUT a ticket phase change
-/// (the engineer hard failure and the sanitation round stop). The Manager
-/// cannot resume the workspace itself, so the notice exists to be passed on to
-/// the user.
-fn notify_manager_system(ws_name: &str, content: String) {
-    let agent_id = manager_agent_id(ws_name);
-    message_router::route(
-        &agent_id,
-        message_router::AgentJob {
-            content,
-            workspace_name: ws_name.to_string(),
-            user_name: "system".to_string(),
-            channel: String::new(),
-            kind: message_router::MessageKind::UserMessage,
-            role: Role::Manager,
-            reply_target: None,
-            pending_job_id: None,
-            originating_workspace: None,
-            custom_role: None,
-            reply_to_custom: None,
-            urgent: false,
-            extract: None,
-        },
-    );
 }
 
 /// Pause the workspace after a technical/agent failure so queued development
@@ -952,23 +942,33 @@ pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) ->
 
 /// Hard technical failure at a phase: destroy the CURRENT attempt (its phase
 /// job) so the puller creates a FRESH one from scratch. Cancels any orphaned
-/// ticket agents, pauses the workspace only for the implementation phases, and
-/// deletes the phase job. Leaves no ticket comment — ticket history carries
-/// stage conclusions only. Consumes no bounce budget. Returns whether THIS call
-/// paused the workspace: `false` for a phase that does not pause (a
-/// non-pipeline-occupied one) and when this call did not perform the pause — it
-/// was already paused, or the pause was skipped (a shutdown, or a workspace
-/// that could not be resolved).
+/// ticket agents, stops the workspace for the death, and deletes the phase job.
+/// Leaves no ticket comment — ticket history carries stage conclusions only.
+/// Consumes no bounce budget.
+///
+/// `death` is the stage death to report, or `None` when the round is not one — an
+/// analysis attempt (whose death stops nothing) or a round cut short by a
+/// cancellation, a shutdown or a drain. A death's notice and the pause it explains
+/// commit together ([`notice::stop_workspace`]), so a crash between them cannot
+/// leave a frozen workspace with nobody told. A round that failed with no
+/// reportable death still stops an implementation phase, silently: a cut-short
+/// round is not a stage death.
 async fn reset_phase_attempt(
     ticket: &Ticket,
     phase: TicketPhase,
     job_id: &str,
-    reason: &str,
-) -> bool {
+    death: Option<notice::Cause>,
+) {
     crate::agent::registry::AGENT_REGISTRY.cancel_by_ticket_id(&ticket.id);
-    let paused = phase.is_pipeline_occupied() && pause_workspace_on_failure(ticket, reason).await;
+    match (death, notice::Stage::of_phase(phase)) {
+        (Some(cause), Some(stage)) => notice::stop_workspace(ticket, stage, cause, job_id).await,
+        _ if phase.is_pipeline_occupied() => {
+            pause_workspace_on_failure(ticket, "a stage round failed without a reportable death")
+                .await;
+        }
+        _ => {}
+    }
     let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
-    paused
 }
 
 /// Discard a parallel round member's per-attempt session when its run died on
@@ -1150,6 +1150,7 @@ async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
             role: crate::Role::Manager,
             reply_target: None,
             pending_job_id: None,
+            pause_notice_id: None,
             originating_workspace: None,
             custom_role: None,
             reply_to_custom: None,
@@ -1331,16 +1332,16 @@ async fn checkpoint_parallel_outcomes(
     ticket_id: &str,
     job_id: &str,
     launched: &[&AgentSlot],
-    run_results: &[ParallelVerdict],
-) -> std::collections::HashMap<String, ParallelVerdict> {
+    run_results: &[MemberOutcome],
+) -> std::collections::HashMap<String, MemberOutcome> {
     let conn = &crate::session::store().conn;
     let mut by_agent = std::collections::HashMap::with_capacity(launched.len());
     for (slot, result) in launched.iter().zip(run_results) {
-        let outcome = serialize_verdict_outcome(result);
+        let outcome = serialize_verdict_outcome(&result.verdict);
         // A ParseFailed member must be treated as not-Done (re-run on a resume)
         // — it did produce a response but the extraction failed, so its stored
         // outcome is only a diagnostic dump, not a completed verdict.
-        let status = if result.is_technical_failure() {
+        let status = if result.verdict.is_technical_failure() {
             crate::jobs::RowStatus::Failed
         } else {
             crate::jobs::RowStatus::Done
@@ -1364,14 +1365,14 @@ async fn checkpoint_parallel_outcomes(
 
 fn assemble_parallel_results(
     slots: &[AgentSlot],
-    by_agent: &std::collections::HashMap<String, ParallelVerdict>,
-) -> Vec<ParallelVerdict> {
+    by_agent: &std::collections::HashMap<String, MemberOutcome>,
+) -> Vec<MemberOutcome> {
     let mut results = Vec::with_capacity(slots.len());
     for slot in slots {
         if slot.status == crate::jobs::RowStatus::Done {
-            results.push(deserialize_verdict_outcome(
+            results.push(MemberOutcome::of_verdict(deserialize_verdict_outcome(
                 slot.outcome.as_deref().unwrap_or(""),
-            ));
+            )));
         } else if let Some(r) = by_agent.get(slot.agent_id.as_str()) {
             results.push(r.clone());
         } else {
@@ -1383,7 +1384,9 @@ fn assemble_parallel_results(
 
 /// Run the given agent slots in parallel, then extract structured verdicts from
 /// their responses. Returns `(results, paused)` — `paused` is a typed signal
-/// that any member stopped at its pause boundary.
+/// that any member stopped at its pause boundary. Each result carries whether its
+/// member was cut short rather than failing, so a cancellation or a phase-gate
+/// bail is never reported as a stage death.
 ///
 /// `resume` marks a slot-resume round: not-Done slots are re-run with
 /// session-continuation semantics (their stored tasks were already seeded), so
@@ -1402,7 +1405,7 @@ async fn run_parallel_agents(
     slots: &[AgentSlot],
     expected_phase: TicketPhase,
     resume: bool,
-) -> (Vec<ParallelVerdict>, bool) {
+) -> (Vec<MemberOutcome>, bool) {
     let launched: Vec<&AgentSlot> = slots
         .iter()
         .filter(|s| s.status != crate::jobs::RowStatus::Done)
@@ -1429,10 +1432,14 @@ async fn run_parallel_agents(
                             notify.notify_one();
                         }
                         message_router::unregister_agent(&agent_id);
-                        return (
-                            ParallelVerdict::NoResponse(PHASE_GATE_BAIL_REASON.to_string()),
-                            false,
-                        );
+                        // A bail, not a death: the ticket moved on, so the round is superseded.
+                        return MemberOutcome {
+                            verdict: ParallelVerdict::NoResponse(PHASE_GATE_BAIL_REASON.to_string()),
+                            paused: false,
+                            cut_short: true,
+                            class: None,
+                            attempts: None,
+                        };
                     }
                     // Session-non-emptiness discriminator: a resumed slot whose
                     // session already holds the task continues with an empty
@@ -1467,14 +1474,24 @@ async fn run_parallel_agents(
                         // agent stopped rather than failing. It is not a
                         // technical failure.
                         if agent.is_paused_frozen() {
-                            (
-                                ParallelVerdict::NoResponse("agent paused".to_string()),
-                                true,
-                            )
+                            MemberOutcome {
+                                verdict: ParallelVerdict::NoResponse("agent paused".to_string()),
+                                paused: true,
+                                cut_short: true,
+                                class: None,
+                                attempts: None,
+                            }
                         } else {
                             let reason = agent.failure_reason("agent produced no response");
+                            let cut_short = agent.cut_short();
                             discard_failed_first_request_session(&ticket.id, &agent).await;
-                            (ParallelVerdict::NoResponse(reason), false)
+                            MemberOutcome {
+                                verdict: ParallelVerdict::NoResponse(reason),
+                                paused: false,
+                                cut_short,
+                                class: agent.failure_class,
+                                attempts: agent.failure_attempts,
+                            }
                         }
                     } else {
                         let verdict = match &extract_mode {
@@ -1510,7 +1527,7 @@ async fn run_parallel_agents(
                             }
                         };
                         match verdict {
-                            Ok(v) => (v, false),
+                            Ok(v) => MemberOutcome::of_verdict(v),
                             Err(e) => {
                                 warn!(
                                     ticket = %ticket.id,
@@ -1521,7 +1538,15 @@ async fn run_parallel_agents(
                                     ),
                                     "Round member produced a response but its verdict could not be extracted",
                                 );
-                                (ParallelVerdict::ParseFailed(e), false)
+                                MemberOutcome {
+                                    verdict: ParallelVerdict::ParseFailed(e),
+                                    paused: false,
+                                    // An extraction cut short by a cancellation is not a death:
+                                    // the same exclusion every other member applies.
+                                    cut_short: agent.cut_short(),
+                                    class: None,
+                                    attempts: None,
+                                }
                             }
                         }
                     }
@@ -1529,15 +1554,19 @@ async fn run_parallel_agents(
             })
             .collect();
         let handles = crate::agent::spawn_staggered_round(members, resume).await;
-        let mut run_results: Vec<ParallelVerdict> = Vec::with_capacity(handles.len());
+        let mut run_results: Vec<MemberOutcome> = Vec::with_capacity(handles.len());
         let mut paused = false;
         for handle in handles {
             match handle.await {
-                Ok((v, p)) => {
-                    paused |= p;
-                    run_results.push(v);
+                Ok(outcome) => {
+                    paused |= outcome.paused;
+                    run_results.push(outcome);
                 }
-                Err(e) => run_results.push(round_member_failed(&ticket.id, e)),
+                Err(e) => {
+                    run_results.push(MemberOutcome::of_verdict(round_member_failed(
+                        &ticket.id, e,
+                    )));
+                }
             }
         }
 
@@ -1711,8 +1740,7 @@ async fn run_stage_agent(
 
     match kind {
         StageRunKind::Engineer => {
-            finalize_engineer_stage(ticket, &mut agent, response.as_deref(), job_id, ws, paused)
-                .await;
+            finalize_engineer_stage(ticket, &mut agent, response.as_deref(), job_id, paused).await;
         }
         StageRunKind::Sanitation => {
             finalize_sanitation_stage(ticket, &mut agent, response.as_deref(), job_id, ws, paused)

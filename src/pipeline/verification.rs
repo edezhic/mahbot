@@ -25,11 +25,11 @@ use crate::util::excerpt::failure_excerpt;
 use crate::{DiagnosticsCommands, Role, Workspace};
 
 use super::{
-    AgentSlot, ExtractionMode, FinalizeOutcome, ParallelVerdict, TicketPhase, TransitionCtx,
-    agent_slot_from_roster_row, bounce_to_development, build_agent_slots, build_round_grouping,
-    comment_and_transition, debug, guard_job_phase, info, insert_round_slots, pause_freezing,
-    read_roster_or_bail, rearm_resumed_slots, render_joint_comment, reset_phase_attempt,
-    run_parallel_agents, sync_phase_job_task, warn,
+    AgentSlot, ExtractionMode, FinalizeOutcome, MemberOutcome, ParallelVerdict, TicketPhase,
+    TransitionCtx, agent_slot_from_roster_row, bounce_to_development, build_agent_slots,
+    build_round_grouping, comment_and_transition, debug, guard_job_phase, info, insert_round_slots,
+    notice, pause_freezing, read_roster_or_bail, rearm_resumed_slots, render_joint_comment,
+    reset_phase_attempt, run_parallel_agents, sync_phase_job_task, warn,
 };
 
 /// The stage's own name: the role the consolidated round comment is authored under, and the
@@ -55,12 +55,12 @@ const SKIPPED_REVIEW_NOTE: &str = "\
 last handed on this ticket (same commit, same working tree, no changes since), \
 so they were not dispatched again. The functional check still ran.\n\n";
 
-/// Static metadata for one participant kind of a verification round. The code reviewers and
-/// the tester differ only here: the role (which selects the system prompt, tools and shell
-/// mode), the roster kind their slots are stored under, the work prompt, the angle supplements
-/// and the extraction prompt.
+/// Static metadata for one participant cohort of a verification round — the code reviewers or the
+/// functional tester. A cohort differs from the other only here: the role (which selects the
+/// system prompt, tools and shell mode), the roster kind its slots are stored under, the work
+/// prompt, the angle supplements and the extraction prompt.
 #[derive(Copy, Clone)]
-struct Participant {
+struct Cohort {
     role: Role,
     kind: crate::jobs::AgentKind,
     prompt_template: &'static str,
@@ -69,7 +69,7 @@ struct Participant {
 }
 
 /// Read-only code reviewers; the cohort size is calibrated per round.
-const REVIEWER: Participant = Participant {
+const REVIEWER: Cohort = Cohort {
     role: Role::Reviewer,
     kind: crate::jobs::AgentKind::Reviewer,
     prompt_template: "review.md",
@@ -78,7 +78,7 @@ const REVIEWER: Participant = Participant {
 };
 
 /// The functional tester — the participant that may run the product.
-const TESTER: Participant = Participant {
+const TESTER: Cohort = Cohort {
     role: Role::Qa,
     kind: crate::jobs::AgentKind::Tester,
     prompt_template: "qa.md",
@@ -86,7 +86,7 @@ const TESTER: Participant = Participant {
     extraction_prompt_path: "extraction/qa.md",
 };
 
-impl Participant {
+impl Cohort {
     /// The round's work prompt with the engineer's response and the project-commands brief
     /// baked in.
     fn prompt(self, ticket: &Ticket, commands_brief: &str) -> String {
@@ -105,6 +105,15 @@ impl Participant {
 
     fn extraction_prompt(self) -> String {
         load_prompt(self.extraction_prompt_path)
+    }
+
+    /// This participant's name in the round: the tester is its only member, the reviewers are
+    /// numbered by their slot.
+    fn label(self, slot: &AgentSlot) -> String {
+        match self.kind {
+            crate::jobs::AgentKind::Tester => "functional tester".to_string(),
+            _ => format!("code reviewer {}", slot.idx + 1),
+        }
     }
 }
 
@@ -140,7 +149,12 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
                 &ticket,
                 ACTIVE_PHASE,
                 &job_id,
-                "project commands load failure",
+                Some(notice::Cause::ProjectCommands {
+                    terms: notice::Terms::plain(crate::util::failure_detail(
+                        &format!("{e:#}"),
+                        "project commands load failure",
+                    )),
+                }),
             )
             .await;
             return;
@@ -494,45 +508,56 @@ async fn execute_round(
     .await;
 }
 
-/// Dispatch one participant cohort on the shared phase job. A cohort with no slot (a skipped
-/// code review) loads nothing and dispatches nothing.
+/// One participant's outcome in the round, named as the round reports it — the identity a stage
+/// death notice needs, which the merged verdict list does not carry.
+type Labelled = (String, MemberOutcome);
+
+/// Dispatch one participant cohort on the shared phase job, named per slot. A cohort with no slot
+/// (a skipped code review) loads nothing and dispatches nothing.
 async fn dispatch_cohort(
     ticket: &Arc<Ticket>,
     ws: &Workspace,
-    participant: Participant,
+    cohort: Cohort,
     slots: &[AgentSlot],
     job_id: &str,
     resume: bool,
-) -> (Vec<ParallelVerdict>, bool) {
+) -> (Vec<Labelled>, bool) {
     if slots.is_empty() {
         return (Vec::new(), false);
     }
-    run_parallel_agents(
+    let (outcomes, paused) = run_parallel_agents(
         ticket,
         ws,
-        participant.role,
-        &participant.extraction_prompt(),
+        cohort.role,
+        &cohort.extraction_prompt(),
         ExtractionMode::ScoreVerdict,
         job_id,
         slots,
         ACTIVE_PHASE,
         resume,
     )
-    .await
+    .await;
+    // The results come back in slot order, so a label and its outcome stay paired.
+    let named = slots
+        .iter()
+        .zip(outcomes)
+        .map(|(slot, outcome)| (cohort.label(slot), outcome))
+        .collect();
+    (named, paused)
 }
 
 #[expect(clippy::too_many_arguments)]
 async fn finalize_round(
     ws: &Workspace,
     ticket: &Ticket,
-    reviewer_results: &[ParallelVerdict],
-    tester_results: &[ParallelVerdict],
+    reviewer_results: &[Labelled],
+    tester_results: &[Labelled],
     base: Option<ReviewBase>,
     review_skipped: bool,
     job_id: &str,
     commands: &ProjectCommands,
 ) {
-    let results: Vec<ParallelVerdict> = reviewer_results
+    let results: Vec<Labelled> = reviewer_results
         .iter()
         .chain(tester_results)
         .cloned()
@@ -552,7 +577,7 @@ async fn finalize_round(
 async fn process_round_verdicts(
     ws: &Workspace,
     ticket: &Ticket,
-    results: &[ParallelVerdict],
+    results: &[Labelled],
     review_skipped: bool,
     job_id: &str,
     commands: &ProjectCommands,
@@ -561,13 +586,15 @@ async fn process_round_verdicts(
     // HARD TECHNICAL failure — reset the attempt (delete job + pause; no bounce budget). One
     // that completed but found issues is a rework verdict — bounce to development, consuming
     // bounce budget.
-    let technical_failure = results.iter().any(ParallelVerdict::is_technical_failure);
+    let technical_failure = results
+        .iter()
+        .any(|(_, outcome)| outcome.verdict.is_technical_failure());
     // The rework condition is the participants' verdicts OR the project commands.
     let rework_failure = !technical_failure
         && (!commands.passed
-            || results
-                .iter()
-                .any(|r| matches!(r, ParallelVerdict::Verdict(v) if !verdict_passes(v))));
+            || results.iter().any(
+                |(_, outcome)| matches!(&outcome.verdict, ParallelVerdict::Verdict(v) if !verdict_passes(v)),
+            ));
 
     if crate::shutdown::aborting() {
         info!(
@@ -585,15 +612,27 @@ async fn process_round_verdicts(
             stage = STAGE,
             "Verification round hit a technical participant failure — resetting for a fresh attempt",
         );
-        reset_phase_attempt(ticket, ACTIVE_PHASE, job_id, "verification failure").await;
+        // One notice per stage death, naming every participant that failed. A round whose only
+        // failures were cancellations or bails reports nothing: those are not deaths.
+        let failed: Vec<notice::Participant> = results
+            .iter()
+            .filter_map(|(label, outcome)| notice::Participant::of(label, outcome))
+            .collect();
+        let death = (!failed.is_empty()).then_some(notice::Cause::Participants(failed));
+        reset_phase_attempt(ticket, ACTIVE_PHASE, job_id, death).await;
         return false;
     }
+
+    let verdicts: Vec<ParallelVerdict> = results
+        .iter()
+        .map(|(_, outcome)| outcome.verdict.clone())
+        .collect();
 
     // The round's one artifact: the consolidated joint comment, carrying the
     // skipped-code-review note when the reviewers were not dispatched.
     let (round, outcome) = build_round_grouping(
         STAGE,
-        results,
+        &verdicts,
         // `stage_role(STAGE)` resolves the comment to the tester's badge and icon, so the
         // grouping pass runs and is labelled under the same role.
         Role::Qa,

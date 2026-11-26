@@ -560,6 +560,17 @@ fn spawn_background_tasks(log_store: Arc<mahbot::logs::LogStore>) {
         mahbot::pipeline::run_management(),
     );
 
+    // The workspace-stop notices a stage's technical death records: rendered per attempt with
+    // the workspace's pause state read then, and retried until a Manager turn completes with
+    // them. Runs alongside the pipeline because the pause it reports is exactly what stops the
+    // pipeline in that workspace.
+    spawn_cancellable(
+        &mut tasks,
+        &shutdown_token,
+        "workspace-stop-notices",
+        mahbot::pipeline::notice::run_delivery_loop(),
+    );
+
     // The two-request drain protocol's listener is spawned by the boot itself
     // (`spawn_stop_listener`), before the first store is opened, so a stop during boot is a drain
     // too.
@@ -1327,6 +1338,7 @@ async fn deliver_clear_reply(
             role: effective_role,
             reply_target: Some(msg.reply_target.clone()),
             pending_job_id: None,
+            pause_notice_id: None,
             originating_workspace: None,
             custom_role: None,
             reply_to_custom: None,

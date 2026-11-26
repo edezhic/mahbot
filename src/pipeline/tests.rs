@@ -934,7 +934,7 @@ async fn reset_phase_attempt_destroys_attempt_and_pauses() {
         &expect_ticket(store, &id).await,
         TicketPhase::InDevelopment,
         &job_id,
-        "test hard failure",
+        None,
     )
     .await;
 
@@ -1003,7 +1003,7 @@ async fn reset_phase_attempt_analysis_does_not_pause() {
         &expect_ticket(store, &id).await,
         TicketPhase::Analysis,
         &job_id,
-        "analysis failure",
+        None,
     )
     .await;
 
@@ -1100,8 +1100,14 @@ async fn first_request_failure_discards_only_empty_round_sessions() {
     assert!(
         results
             .iter()
-            .all(super::ParallelVerdict::is_technical_failure),
+            .all(|outcome| outcome.verdict.is_technical_failure()),
         "both members must report a technical failure",
+    );
+    assert!(
+        results
+            .iter()
+            .all(|outcome| outcome.class.is_some() && !outcome.cut_short),
+        "a provider failure carries its class and is not a cut-short round",
     );
     assert!(!paused, "a provider failure is not a cooperative pause");
 
@@ -1133,6 +1139,32 @@ async fn first_request_failure_discards_only_empty_round_sessions() {
     );
 }
 
+/// The workspace-stop notices recorded for a workspace: `(stage, cause, stopped_workspace)`, in
+/// the order they were recorded. The death sites only record; the delivery loop renders and
+/// routes, so a phase body driven directly here never reaches a Manager.
+/// The stage, the recorded death and whether it stopped the workspace, per notice.
+async fn recorded_notices(ws_name: &str) -> Vec<(String, crate::pipeline::notice::Cause, bool)> {
+    crate::session::store()
+        .conn
+        .query(
+            "SELECT stage, cause, stopped_workspace FROM pause_notices \
+             WHERE workspace_name = ?1 ORDER BY created_at",
+            crate::db::params![ws_name.to_string()],
+        )
+        .await
+        .expect("read the recorded workspace-stop notices")
+        .into_iter()
+        .map(|row| {
+            let cause = row.get::<String>(1).expect("cause");
+            (
+                row.get::<String>(0).expect("stage"),
+                serde_json::from_str(&cause).expect("a recorded cause this build can read"),
+                row.get::<i64>(2).expect("stopped_workspace") != 0,
+            )
+        })
+        .collect()
+}
+
 /// An engineer provider failure pauses the workspace and leaves no ticket comment, while its
 /// reusable session pin keeps the accumulated session for the next attempt.
 #[serial_test::serial(provider, drain)]
@@ -1150,11 +1182,6 @@ async fn engineer_provider_failure_leaves_no_comment_and_keeps_the_session() {
         .set_paused(&ws.name, false)
         .await
         .unwrap();
-    // Registered up front so the pause notice lands in a local inbox instead of spawning a real
-    // Manager turn.
-    let mut manager_inbox =
-        crate::agent::message_router::register_agent(&crate::session::manager_agent_id(&ws.name));
-
     let id = make_ticket(store, &ws, "EngineerFailure", TicketPhase::InDevelopment).await;
     let job_id = crate::generate_id();
     spawn_phase_job(
@@ -1205,13 +1232,24 @@ async fn engineer_provider_failure_leaves_no_comment_and_keeps_the_session() {
         crate::session::store().has_content(&pin).await,
         "the engineer session pin must keep its session for the next attempt",
     );
-    let notice = manager_inbox
-        .try_recv()
-        .expect("the pause must notify the Manager");
+    let notices = recorded_notices(&ws.name).await;
+    assert_eq!(
+        notices.len(),
+        1,
+        "the engineer's hard failure records exactly one notice"
+    );
+    assert_eq!(notices[0].0, "development");
+    let crate::pipeline::notice::Cause::Engineer { terms } = &notices[0].1 else {
+        panic!("the engineer's death reports its own cause");
+    };
     assert!(
-        notice.content.contains("provider balance exhausted"),
-        "the Manager notice must carry the real cause:\n{}",
-        notice.content,
+        terms.error.contains("provider balance exhausted"),
+        "the notice must carry the real cause: {}",
+        terms.error,
+    );
+    assert!(
+        notices[0].2,
+        "this failure is the one that stopped the workspace"
     );
 }
 
@@ -2776,7 +2814,7 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
         &expect_ticket(store, &eid).await,
         TicketPhase::InDevelopment,
         &ejob,
-        "test hard failure",
+        None,
     )
     .await;
     assert_eq!(
@@ -2883,6 +2921,40 @@ async fn verification_provider_failure_leaves_no_comment_and_resets() {
     assert!(
         comments.is_empty(),
         "a technical participant failure must leave no ticket comment",
+    );
+
+    // One stage death, one notice — naming every participant that failed, with the product's own
+    // terms for the failure and the pause it caused.
+    let notices = recorded_notices(&ws.name).await;
+    assert_eq!(notices.len(), 1, "one death is one notice");
+    assert_eq!(notices[0].0, "verification");
+    let crate::pipeline::notice::Cause::Participants(participants) = &notices[0].1 else {
+        panic!("a technical participant failure names the participants");
+    };
+    let labels: Vec<&str> = participants
+        .iter()
+        .map(|participant| participant.label.as_str())
+        .collect();
+    assert_eq!(
+        labels,
+        ["code reviewer 1", "functional tester"],
+        "the notice must name every failed participant",
+    );
+    for participant in participants {
+        assert!(
+            participant
+                .terms
+                .error
+                .contains("provider balance exhausted"),
+            "the notice must carry the real cause: {}",
+            participant.terms.error,
+        );
+        assert_eq!(participant.terms.class.as_deref(), Some("invalid_request"));
+        assert_eq!(participant.terms.attempts, Some(1));
+    }
+    assert!(
+        notices[0].2,
+        "this failure is the one that stopped the workspace"
     );
 
     drop(repo_dir);
@@ -3333,6 +3405,86 @@ async fn stage_re_drive_completes_dangling_calls_before_model_round() {
     );
 }
 
+/// A sanitation agent that produces no output at all is a stage death with no result behind it:
+/// the attempt is reset, the workspace frozen, and the Manager told which participant failed and
+/// how.
+#[serial_test::serial(provider, drain)]
+#[tokio::test]
+async fn a_sanitation_agent_with_no_output_records_a_stage_death() {
+    let _guard = STORE_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let (repo_dir, repo_path) = crate::util::test::init_temp_repo();
+    let ws = create_test_workspace(repo_path.to_str().unwrap(), "sanitation_no_output_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "SanitationNoOutput", TicketPhase::InSanitation).await;
+    // The round must reach the agent: an empty untracked list skips it and commits straight to Done.
+    std::fs::write(repo_path.join("unexpected.txt"), b"x\n").unwrap();
+
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::InSanitation,
+        crate::Role::Sanitation,
+        "sanitation",
+    )
+    .await;
+    {
+        let mut fake = crate::util::test::FakeProvider::new();
+        for _ in 0..20 {
+            fake = fake.err(
+                crate::retry::FailureClass::InvalidRequest,
+                "provider balance exhausted",
+            );
+        }
+        let _seam = crate::util::test::install_retry_seam(fake);
+        super::sanitation::run(
+            std::sync::Arc::new(expect_ticket(store, &id).await),
+            ws.clone(),
+            job_id,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::InSanitation,
+        "a death of the sanitation agent must not move the ticket",
+    );
+    assert_workspace_paused(&ws, true).await;
+    let notices = recorded_notices(&ws.name).await;
+    assert_eq!(notices.len(), 1, "one death is one notice");
+    assert_eq!(notices[0].0, "sanitation");
+    let crate::pipeline::notice::Cause::Participants(participants) = &notices[0].1 else {
+        panic!("a sanitation agent's death names the participant");
+    };
+    assert_eq!(participants.len(), 1);
+    assert_eq!(participants[0].label, "sanitation agent");
+    assert!(matches!(
+        participants[0].produced,
+        crate::pipeline::notice::Produced::NoAnswer
+    ));
+    assert!(
+        participants[0]
+            .terms
+            .error
+            .contains("provider balance exhausted"),
+        "the notice must carry the real cause: {}",
+        participants[0].terms.error,
+    );
+    assert!(
+        notices[0].2,
+        "this failure is the one that stopped the workspace"
+    );
+
+    drop(repo_dir);
+}
+
 /// A persistent commit failure (a rejecting hook, a broken index, a missing git identity, an
 /// unreadable repository) must STOP the sanitation round instead of leaving its job behind for the
 /// puller to re-drive every poll tick: the full cause reaches the Manager notice and the log, the
@@ -3353,10 +3505,6 @@ async fn sanitation_commit_failure_stops_round_and_freezes_workspace() {
         .set_status(&ws.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    // Registered up front so the stop's Manager notice lands in a local inbox instead of spawning a
-    // real Manager turn.
-    let mut manager_inbox =
-        crate::agent::message_router::register_agent(&crate::session::manager_agent_id(&ws.name));
     let id = make_ticket(store, &ws, "SanitationStop", TicketPhase::InSanitation).await;
 
     let hook = repo_path.join(".git").join("hooks").join("pre-commit");
@@ -3395,17 +3543,20 @@ async fn sanitation_commit_failure_stops_round_and_freezes_workspace() {
         )
         .await;
 
-        let notice = manager_inbox
-            .try_recv()
-            .expect("the stop must notify the Manager");
-        assert!(
-            notice.content.contains(&id) && notice.content.contains("rejected by test hook"),
-            "the Manager notice must carry the ticket and the real cause:\n{}",
-            notice.content,
+        let notices = recorded_notices(&ws.name).await;
+        assert_eq!(
+            notices.len(),
+            1,
+            "the stop records exactly one notice for the Manager"
         );
+        assert_eq!(notices[0].0, "sanitation");
+        let crate::pipeline::notice::Cause::SanitationStop { terms } = &notices[0].1 else {
+            panic!("a stopped sanitation round reports its own cause");
+        };
         assert!(
-            manager_inbox.try_recv().is_err(),
-            "the stop notifies the Manager exactly once",
+            terms.error.contains("rejected by test hook"),
+            "the notice must carry the real cause: {}",
+            terms.error,
         );
     }
 

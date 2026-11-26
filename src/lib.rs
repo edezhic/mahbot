@@ -28,7 +28,8 @@ pub(crate) mod extract;
 
 // Where parallel participants' answers are merged into one verdict.
 pub(crate) mod consensus;
-// Tickets from backlog to done: claim, dispatch, bounce handling, pause.
+// Tickets from backlog to done: claim, dispatch, bounce handling, pause, and the notice that tells
+// a workspace's Manager why a stage's technical death stopped it.
 pub mod pipeline;
 
 // Git wrappers and diff parsing for the worktree checks, the dashboard and nightly runs, plus the
@@ -1030,6 +1031,10 @@ pub struct Agent {
     /// errors, cancellations and successes. Workspace discovery reads it to tell
     /// provider-class failures (workspace returns to Pending) from genuine ones (Failed).
     pub(crate) failure_class: Option<crate::retry::FailureClass>,
+    /// The attempts the failing call made before giving up, set alongside
+    /// [`Self::failure_class`] when the error chain carries a
+    /// [`crate::retry::RetryExhausted`]; `None` when the product cannot say.
+    pub(crate) failure_attempts: Option<usize>,
     /// The classification captured at failure time (not re-derived), so a later
     /// process-global stop cannot reclassify the run; `None` on success.
     pub(crate) run_failure: Option<RunFailure>,

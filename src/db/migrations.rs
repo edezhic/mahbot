@@ -27,7 +27,7 @@
 //! if it can still be pending on a database that has run a 0.10.x build. The
 //! two halves select different entries, and confusing them is how a column,
 //! table or default disappears from an installation that has not yet reached
-//! the newest release. The catalog holds eleven entries:
+//! the newest release. The catalog holds twelve entries:
 //!
 //! - `24` / `26` — the core and logs baselines. They always stay: they are what
 //!   a fresh install is built from, and the upgrade half alone would retire
@@ -63,6 +63,8 @@
 //! - `86` — the `send_outcomes` table the command line's `outcome` lookup reads (see
 //!   [`SEND_OUTCOMES_TABLE`]). It arrives with this release, so every existing store
 //!   is still pending on it.
+//! - `87` — the `pause_notices` table the workspace-stop notice is delivered from (see
+//!   [`PAUSE_NOTICES_TABLE`]), arriving with the same release.
 //!
 //! # The id → release record, and the retired ids
 //!
@@ -76,7 +78,8 @@
 //! - `84` — the `send` chain's columns; no shipped build records it.
 //! - `85` — the `send` schema's columns; no shipped build records it.
 //! - `86` — the `send_outcomes` table; no shipped build records it.
-//! - Next id: `87`.
+//! - `87` — the `pause_notices` table; no shipped build records it.
+//! - Next id: `88`.
 //!
 //! Retired, and never to be reused:
 //!
@@ -499,6 +502,19 @@ CREATE TABLE IF NOT EXISTS send_outcomes (
     created_at TEXT NOT NULL,
     finished_at TEXT
 );
+CREATE TABLE IF NOT EXISTS pause_notices (
+    id                TEXT PRIMARY KEY,
+    workspace_name    TEXT NOT NULL,
+    ticket_id         TEXT NOT NULL,
+    ticket_title      TEXT NOT NULL,
+    stage             TEXT NOT NULL,
+    cause             TEXT NOT NULL,
+    stopped_workspace INTEGER NOT NULL,
+    job_id            TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    attempted_at      TEXT,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS custom_roles (
     name       TEXT PRIMARY KEY,
     prompt     TEXT NOT NULL,
@@ -523,7 +539,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_phase_ticket ON jobs(kind, ticket_id)
 CREATE INDEX IF NOT EXISTS idx_ticket_chronicle_ws_id ON ticket_chronicle(workspace_name, id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ticket_chronicle_dedup ON ticket_chronicle(ticket_id, workspace_name, source_phase, target_phase, at);
 CREATE INDEX IF NOT EXISTS idx_automations_due ON automations(status, next_fire_at);
-CREATE INDEX IF NOT EXISTS idx_tickets_workspace_phase ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);";
+CREATE INDEX IF NOT EXISTS idx_tickets_workspace_phase ON tickets (workspace_name, phase, is_archived, priority ASC, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pause_notices_job ON pause_notices(job_id);";
 
 /// Entry `26`: the full current-shape logs schema — `logs`, `tool_calls`,
 /// `llm_requests`, `llm_failures` and `grep_telemetry` with only the indexes a
@@ -688,11 +705,34 @@ const SEND_OUTCOMES_TABLE: &str = "CREATE TABLE IF NOT EXISTS send_outcomes (
     finished_at TEXT
 );";
 
+/// Entry `87` (existing installs): the `pause_notices` table behind the workspace-stop notice a
+/// stage's technical death sends to the workspace's Manager (see [`crate::pipeline::notice`]).
+/// One row per death holds the DEATH — the stage, the ticket it happened on and what failed — not
+/// its text: the notice states the workspace's pause state as it is when the notice is delivered,
+/// so the row is rendered per delivery attempt and deleted once a Manager turn completes with it.
+/// `job_id` is the dying attempt's phase job, unique so one attempt records one notice however
+/// many times its body reports the death. The baseline (`24`) already declares both, so on a fresh
+/// install this is an `IF NOT EXISTS` no-op.
+const PAUSE_NOTICES_TABLE: &str = "CREATE TABLE IF NOT EXISTS pause_notices (
+    id                TEXT PRIMARY KEY,
+    workspace_name    TEXT NOT NULL,
+    ticket_id         TEXT NOT NULL,
+    ticket_title      TEXT NOT NULL,
+    stage             TEXT NOT NULL,
+    cause             TEXT NOT NULL,
+    stopped_workspace INTEGER NOT NULL,
+    job_id            TEXT NOT NULL,
+    created_at        TEXT NOT NULL,
+    attempted_at      TEXT,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pause_notices_job ON pause_notices(job_id);";
+
 /// The complete, strictly-linear catalog. **Order is application order.**
 ///
-/// Eleven entries, split by the module header's rule: the fresh-install half is
+/// Twelve entries, split by the module header's rule: the fresh-install half is
 /// `24`, `26` and `69`; the upgrade half is `79`, `80`, `81`, `82`, `83`, `84`,
-/// `85` and `86` — the entries that can still be pending on a store that has run
+/// `85`, `86` and `87` — the entries that can still be pending on a store that has run
 /// a 0.10.x build. The header also carries the id → release record and the
 /// retired ids.
 ///
@@ -718,6 +758,7 @@ const SEND_OUTCOMES_TABLE: &str = "CREATE TABLE IF NOT EXISTS send_outcomes (
 ///   schema rides on (see [`run_add_extract_columns`]).
 /// - `86` creates `send_outcomes` on an existing core store (see
 ///   [`SEND_OUTCOMES_TABLE`]).
+/// - `87` creates `pause_notices` on an existing core store (see [`PAUSE_NOTICES_TABLE`]).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -773,6 +814,11 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         id: "86",
         target: TargetDb::Core,
         body: MigrationBody::Sql(SEND_OUTCOMES_TABLE),
+    },
+    Migration {
+        id: "87",
+        target: TargetDb::Core,
+        body: MigrationBody::Sql(PAUSE_NOTICES_TABLE),
     },
 ];
 
@@ -1205,6 +1251,22 @@ mod tests {
             ],
         ),
         (
+            "pause_notices",
+            &[
+                "id",
+                "workspace_name",
+                "ticket_id",
+                "ticket_title",
+                "stage",
+                "cause",
+                "stopped_workspace",
+                "job_id",
+                "created_at",
+                "attempted_at",
+                "delivery_attempts",
+            ],
+        ),
+        (
             "pending_jobs",
             &["id", "target_agent_id", "envelope", "created_at"],
         ),
@@ -1384,6 +1446,7 @@ mod tests {
         "idx_ticket_chronicle_dedup",
         "idx_automations_due",
         "idx_tickets_workspace_phase",
+        "idx_pause_notices_job",
     ];
 
     const EXPECTED_LOGS_TABLE_COLUMNS: &[(&str, &[&str])] = &[
@@ -1573,8 +1636,11 @@ mod tests {
         applied.sort();
         assert_eq!(
             applied,
-            ["24", "69", "79", "80", "81", "82", "83", "84", "85", "86"].map(String::from),
-            "fresh core applies the baseline, the 69 seed and the eight upgrade entries exactly"
+            [
+                "24", "69", "79", "80", "81", "82", "83", "84", "85", "86", "87"
+            ]
+            .map(String::from),
+            "fresh core applies the baseline, the 69 seed and the nine upgrade entries exactly"
         );
     }
 

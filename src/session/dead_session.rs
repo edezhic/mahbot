@@ -511,6 +511,7 @@ async fn attempt_recovery(agent_id: &str, ctx: &SessionContext, role: Role) -> b
         // Telegram users. An accepted limitation.
         reply_target: None,
         pending_job_id: None,
+        pause_notice_id: None,
         originating_workspace: None,
         custom_role: launch,
         // A recovered worker branch's asker travels on its launch above (`Launch::reply_to`), read

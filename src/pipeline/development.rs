@@ -8,10 +8,8 @@ use crate::prompt::{load_prompt, substitute};
 use crate::{Agent, Role, Workspace};
 
 use super::{
-    RETRY_EXHAUSTION_MARKER, StageRunKind, TicketPhase, TransitionCtx,
-    comment_and_transition_or_bail, guard_job_phase, guard_stage, info, notify_manager_system,
-    pause_freezing, pause_status_sentence, pause_workspace_on_failure, run_stage_agent,
-    sync_phase_job_task, warn,
+    StageRunKind, TicketPhase, TransitionCtx, comment_and_transition_or_bail, guard_job_phase,
+    guard_stage, info, notice, pause_freezing, run_stage_agent, sync_phase_job_task, warn,
 };
 
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
@@ -115,35 +113,6 @@ async fn engineer_comment_text(agent: &mut Agent, raw: &str) -> String {
     crate::util::failure_detail(&out, "engineer summary comment")
 }
 
-fn engineer_failure_notice(shutdown: bool, error: Option<&str>) -> String {
-    if shutdown {
-        return "Engineer failed: service shutting down — the run was interrupted \
-                by process shutdown."
-            .to_string();
-    }
-    let Some(detail) = error else {
-        return load_prompt("pipeline/engineer_failed.md");
-    };
-    let detail = crate::util::failure_detail(detail, "engineer failure");
-    if detail.contains(RETRY_EXHAUSTION_MARKER) {
-        format!("Engineer failed: LLM provider retry exhaustion.\n\n{detail}")
-    } else {
-        format!("Engineer failed.\n\n{detail}")
-    }
-}
-
-fn notify_engineer_pause(ticket_id: &str, ws: &Workspace, failure_details: &str, paused: bool) {
-    let content = substitute(
-        &load_prompt("pipeline/engineer_pause_notification.md"),
-        &[
-            ("{{ticket_id}}", ticket_id),
-            ("{{failure_details}}", failure_details),
-            ("{{workspace_status}}", &pause_status_sentence(paused)),
-        ],
-    );
-    notify_manager_system(&ws.name, content);
-}
-
 /// Shared engineer post-run tail: phase/drain guards, failure handling, pause,
 /// transition, and job terminalization.
 pub(crate) async fn finalize_engineer_stage(
@@ -151,7 +120,6 @@ pub(crate) async fn finalize_engineer_stage(
     agent: &mut Agent,
     response: Option<&str>,
     job_id: &str,
-    ws: &Workspace,
     paused: bool,
 ) {
     if guard_stage(
@@ -188,16 +156,10 @@ pub(crate) async fn finalize_engineer_stage(
 
     // Past the guards above, response None here is a real failure — classify,
     // pause, and freeze/fail.
-    handle_engineer_failure(ticket, agent, job_id, ws, paused).await;
+    handle_engineer_failure(ticket, agent, job_id, paused).await;
 }
 
-async fn handle_engineer_failure(
-    ticket: &Ticket,
-    agent: &Agent,
-    job_id: &str,
-    ws: &Workspace,
-    paused: bool,
-) {
+async fn handle_engineer_failure(ticket: &Ticket, agent: &Agent, job_id: &str, paused: bool) {
     // A workspace-pause (strict freeze) is NOT a failure — leave the job for the unpause
     // re-drive. Uses the immutable bail-time snapshot, so it survives an unpause race.
     if paused {
@@ -212,7 +174,24 @@ async fn handle_engineer_failure(
         return;
     }
 
-    let pause_occurred = pause_workspace_on_failure(ticket, "engineer agent failure").await;
+    // Hard failure: the pause and its notice are one commit. The ticket itself gets no comment —
+    // ticket history carries stage conclusions only. This death has its own notice, so it gains
+    // no second one.
+    let terms = match agent.failure.clone() {
+        Some(error) => notice::Terms::new(
+            agent.failure_class,
+            agent.failure_attempts,
+            crate::util::failure_detail(&error, "engineer failure"),
+        ),
+        None => notice::Terms::plain("the engineer produced no output"),
+    };
+    notice::stop_workspace(
+        ticket,
+        notice::Stage::Development,
+        notice::Cause::Engineer { terms },
+        job_id,
+    )
+    .await;
 
     if crate::shutdown::aborting() {
         info!(
@@ -222,19 +201,9 @@ async fn handle_engineer_failure(
         return;
     }
 
-    let failure_notice = engineer_failure_notice(
-        crate::shutdown::shutdown_token().is_cancelled(),
-        agent.failure.as_deref(),
-    );
-    let conn = &crate::session::store().conn;
-
-    // Hard failure: the pause is already committed. The ticket itself gets no comment —
-    // ticket history carries stage conclusions only.
-    let workspace_paused = ws.paused || pause_occurred;
-    notify_engineer_pause(&ticket.id, ws, &failure_notice, workspace_paused);
     info!(
         ticket = %ticket.id,
         "Engineer hard failure — workspace paused, ticket reset for a fresh development attempt"
     );
-    let _ = crate::jobs::terminalize_job(conn, job_id).await;
+    let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
 }

@@ -235,6 +235,7 @@ fn launch_job(
         role: launch.role,
         reply_target: None,
         pending_job_id: None,
+        pause_notice_id: None,
         originating_workspace: None,
         custom_role: Some(launch),
         reply_to_custom: None,

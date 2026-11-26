@@ -1311,6 +1311,7 @@ impl SyncDurableCore {
                         role,
                         reply_target: None,
                         pending_job_id: Some(job_id.clone()),
+                        pause_notice_id: None,
                         originating_workspace: None,
                         custom_role: custom,
                         reply_to_custom: None,
