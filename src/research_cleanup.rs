@@ -418,17 +418,6 @@ pub(crate) async fn dispatch_cleanup_for_pending_envelope(
     }
 }
 
-/// The cleanup Sanitation agent id for a run. Single builder — the
-/// transient-prefix invariant test in session/mod.rs asserts against it, so a
-/// format change is caught by tests instead of silently leaking sessions.
-/// Shared by ALL transient `cleanup_` Sanitation agents: the research-run
-/// cleanup AND the periodic temp cleaner (`crate::temp`), so the
-/// transient-prefix invariant test covers both.
-#[must_use]
-pub(crate) fn cleanup_agent_id(job_id: &str) -> String {
-    format!("cleanup_{job_id}")
-}
-
 /// Create the durable `research_cleanup` jobs row for a run (dedup marker +
 /// folder-hold). Shared by the fresh terminalization dispatch, the
 /// boot-replay crash-window hook, and tests. Returns `Ok(Some(prompt))` when
@@ -469,7 +458,7 @@ async fn create_cleanup_job_row(job_id: &str, ws: &Workspace) -> Result<Option<S
         "",
         crate::Role::Sanitation,
         &[crate::jobs::NewAgent {
-            agent_id: cleanup_agent_id(job_id),
+            agent_id: crate::address::AgentAddress::cleanup(job_id).id(),
             kind: crate::jobs::AgentKind::Sanitation,
             idx: None,
             task: prompt.clone(),
@@ -540,7 +529,7 @@ pub(crate) async fn dispatch_research_cleanup(
 pub(crate) fn spawn_cleanup_agent(job_id: &str, question: &str, ws: &Workspace, prompt: &str) {
     let ws = ws.clone();
     let job_id_log = job_id.to_string();
-    let agent_id = cleanup_agent_id(job_id);
+    let agent_id = crate::address::AgentAddress::cleanup(job_id).id();
     let agent_id_log = agent_id.clone();
     let job_id = job_id.to_string();
     let question = question.to_string();
@@ -566,7 +555,7 @@ async fn run_cleanup_agent_and_finish(
     ws: &Workspace,
     prompt: &str,
 ) {
-    let agent_id = cleanup_agent_id(job_id);
+    let agent_id = crate::address::AgentAddress::cleanup(job_id).id();
     let (agent, response) = crate::agent::run_default_agent(
         &agent_id,
         crate::Role::Sanitation,
@@ -574,10 +563,12 @@ async fn run_cleanup_agent_and_finish(
         prompt,
         false,
         None,
-        Some(crate::agent::registry::ParentKey::Research(
-            job_id.to_string(),
-        )),
-        question.map(str::to_string),
+        crate::work_unit::WorkUnit::of_parent(
+            Some(crate::agent::registry::ParentKey::Research(
+                job_id.to_string(),
+            )),
+            question.map(str::to_string),
+        ),
     )
     .await;
     // The cleaner's final response is logged for observability (no archive

@@ -58,9 +58,9 @@ async fn dispatch_engineer(ticket: Arc<Ticket>, ws: Workspace, job_id: &str) {
 
 async fn engineer_comment_text(agent: &mut Agent, raw: &str) -> String {
     let ticket_id = agent
-        .ticket
-        .as_ref()
-        .map_or_else(|| "?".to_string(), |t| t.id.clone());
+        .work
+        .ticket_id()
+        .map_or_else(|| "?".to_string(), str::to_string);
     let policy = crate::retry::RetryPolicy::comment();
     let extraction_prompt = load_prompt("extraction/engineer.md");
     let summary = match agent
@@ -169,7 +169,7 @@ async fn handle_engineer_failure(ticket: &Ticket, agent: &Agent, job_id: &str, p
 
     // A code-driven cancellation — re-dispatch, replacement, supersede, or the GUI cancel —
     // leaves the ticket for the replacement run.
-    if agent.is_cancelled() && !crate::shutdown::aborting() {
+    if agent.stop() == Some(crate::stop::StopReason::Cancelled) {
         info!(ticket = %ticket.id, "Engineer run interrupted by a code-driven cancellation — leaving the ticket for the replacement run");
         return;
     }

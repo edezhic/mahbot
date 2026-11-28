@@ -362,8 +362,9 @@ async fn validate_automation_target(
 /// could never see or cancel).
 #[must_use]
 pub(crate) fn owner_automation_session(agent_id: &str, user_name: &str) -> String {
-    if crate::session::is_custom_role_agent_id(agent_id) {
-        crate::session::assistant_agent_id(user_name)
+    if crate::address::AgentAddress::parse(agent_id).is_some_and(|address| address.is_custom_role())
+    {
+        crate::address::AgentAddress::assistant(user_name.to_owned()).id()
     } else {
         agent_id.to_string()
     }
@@ -663,30 +664,41 @@ async fn fire_custom_role_automation(automation: &Automation) -> Result<()> {
         ("the custom role no longer exists".to_string(), true)
     } else {
         // The launch runs in the folder the automation was armed for; one that no longer
-        // resolves is a launch failure like any other.
-        let launched = async {
-            let workspace =
-                crate::launch::launch_workspace(automation.workspace.as_deref()).await?;
-            crate::launch::custom_role(
-                role,
-                &automation.text,
-                automation.identifier.as_deref(),
-                &workspace,
-                None,
-                // An automation fires on its own schedule: it has no caller to answer with a
-                // refusal, and refusing it would disarm the automation over a busy folder.
-                crate::launch::BusyFolder::Ignore,
-                None,
-                crate::agent::message_router::AnsweredFor::Nobody,
-            )
-            .await
-        }
-        .await;
+        // resolves is a launch failure like any other. A frozen workspace and a held folder are
+        // typed refusals, handled below as a wait rather than a failure.
+        let launched = match crate::launch::launch_workspace(automation.workspace.as_deref()).await
+        {
+            Ok(workspace) => {
+                crate::launch::custom_role(
+                    role,
+                    &automation.text,
+                    automation.identifier.as_deref(),
+                    &workspace,
+                    None,
+                    crate::launch::BusyFolder::Refuse,
+                    None,
+                    crate::agent::message_router::AnsweredFor::Nobody,
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
         match launched {
             Ok(_) => {
                 // The launch is already persisted durably before it is routed (see
                 // `launch::custom_role`), so the state advance runs after, as on the plain path.
                 advance_automation_state(automation, &db::now()).await?;
+                return Ok(());
+            }
+            Err(e) if crate::launch::waits_for_later(&e) => {
+                // A freeze or another writer's hold: no caller to refuse, so the fire waits and the
+                // next sweep retries — a one-shot automation stays armed. Expected on every sweep
+                // while the condition lasts, so it is not an info line.
+                tracing::debug!(
+                    automation = %automation.id,
+                    role = %role,
+                    "Automation's workspace is paused or its folder held — waiting for the next sweep"
+                );
                 return Ok(());
             }
             Err(e) if crate::db::is_store_error(&e) => {
@@ -2327,7 +2339,7 @@ mod tests {
         .await
         .unwrap();
         let automation = add_automation(
-            &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
+            &crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME.to_owned()).id(),
             crate::users::ADMIN_USER_NAME,
             "run the runner",
             Some("2099-01-01T00:00:00Z"),
@@ -2338,7 +2350,7 @@ mod tests {
         .await
         .unwrap();
 
-        let branch = crate::session::custom_role_agent_id("automation_runner", None);
+        let branch = crate::address::AgentAddress::custom_role("automation_runner", None).id();
         let mut rx = crate::agent::message_router::register_agent(&branch);
         fire_automation(&automation).await.unwrap();
         let job = rx
@@ -2368,7 +2380,7 @@ mod tests {
         .await
         .unwrap();
         let automation = add_automation(
-            &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
+            &crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME.to_owned()).id(),
             crate::users::ADMIN_USER_NAME,
             "wake the role",
             Some("2099-01-01T00:00:00Z"),
@@ -2421,7 +2433,7 @@ mod tests {
         .await
         .unwrap();
         let automation = add_automation(
-            &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
+            &crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME.to_owned()).id(),
             crate::users::ADMIN_USER_NAME,
             "one",
             Some("2099-01-01T00:00:00Z"),

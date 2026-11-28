@@ -13,6 +13,7 @@ use tracing::Instrument;
 
 use crate::providers::reasoning::assistant_replay_payload;
 use crate::session::Session;
+use crate::stop::StopReason;
 use crate::tools::{
     ImagePayload, ToolExecutionOutcome, find_tool, format_tool_failure_feedback,
     normalize_tool_call,
@@ -66,6 +67,21 @@ pub(crate) fn current_agent_id() -> Option<String> {
         .ok()
         .flatten()
         .filter(|agent_id| !agent_id.is_empty())
+}
+
+/// The calling agent's group — the identity its own run occupies its workspace folder with, so a
+/// launch it hands that folder is not a second writer. `None` outside an agent run (the command
+/// line has no session).
+pub(crate) fn tool_group() -> Option<String> {
+    let agent_id = current_agent_id()?;
+    let parent = CURRENT_TOOL_PARENT_KEY
+        .try_with(Option::clone)
+        .ok()
+        .flatten();
+    Some(crate::agent::registry::group_key(
+        parent.as_ref(),
+        &agent_id,
+    ))
 }
 
 /// The scope a tool-call row states; the ticket is empty when the run has none.
@@ -474,24 +490,21 @@ impl Agent {
     /// Create an agent (tools from [`crate::Role::tools`]) and register it with
     /// [`crate::agent::registry::AGENT_REGISTRY`]; deregistered on [`Drop`].
     ///
-    /// `parent_key` is its DIRECT PARENT INVOCATION grouping key for the Running Agents
-    /// view — `None` means a workspace singleton, ticket agents get [`ParentKey::Ticket`]
-    /// implicitly; `parent_label` is that invocation's presentational label.
+    /// `work` is what this invocation works for — the one descriptor every dispatch path builds;
+    /// the registry card's grouping key and label are read from it.
     ///
     /// `launch` is the launch this agent runs under; it is attached to the session so
     /// the system prompt is assembled from it.
     #[must_use]
     #[expect(clippy::too_many_arguments)] // one positional arg per construction field; callers use literals
-    pub fn new(
+    pub(crate) fn new(
         agent_id: String,
         role: crate::Role,
         ws: &crate::Workspace,
-        ticket: Option<crate::pipeline::board::Ticket>,
+        work: crate::work_unit::WorkUnit,
         user_name: String,
         channel: String,
         is_admin: bool,
-        parent_key: Option<crate::agent::registry::ParentKey>,
-        parent_label: Option<String>,
         launch: Option<crate::Launch>,
     ) -> Self {
         let chrome_sessions = crate::tools::chrome::ChromeRunSessions::for_run(&agent_id);
@@ -503,22 +516,9 @@ impl Agent {
             launch.as_ref(),
         );
 
-        let cancel_token = tokio_util::sync::CancellationToken::new();
-        let pause_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // Ticket agents group by ticket; an explicit parent key takes precedence.
-        let parent_key = parent_key.or_else(|| {
-            ticket
-                .as_ref()
-                .map(|t| crate::agent::registry::ParentKey::Ticket(t.id.clone()))
-        });
-        // The group header label: an explicit one wins, a ticket-parented agent falls
-        // back to the ticket title. Presentational only.
-        let parent_label = parent_label.or_else(|| match parent_key {
-            Some(crate::agent::registry::ParentKey::Ticket(_)) => {
-                ticket.as_ref().map(|t| t.title.clone())
-            }
-            _ => None,
-        });
+        let stop = Arc::new(crate::stop::Stop::default());
+        let parent_key = work.parent();
+        let parent_label = work.label().map(str::to_string);
         // Registration-time manual-cancel check: a sub-agent of a research run or
         // analyze round whose cancel signal already fired must never run a round —
         // even when it registers AFTER the registry's cancel sweep (the
@@ -528,21 +528,18 @@ impl Agent {
             crate::agent::registry::ParentKey::Research(run_id)
             | crate::agent::registry::ParentKey::AnalyzeRound(run_id),
         ) = &parent_key
-            && crate::round_cancel::is_cancelled(run_id)
+            && crate::stop::cancelled(run_id)
         {
-            cancel_token.cancel();
+            stop.fire(StopReason::Cancelled);
         }
-        let interrupt_token = tokio_util::sync::CancellationToken::new();
         let generation = crate::agent::registry::AGENT_REGISTRY.register(
             agent_id.clone(),
             role.to_string(),
-            ticket.as_ref().map(|t| t.id.clone()),
+            work.ticket_id().map(str::to_string),
             ws,
-            cancel_token.clone(),
-            interrupt_token.clone(),
-            parent_key.clone(),
-            parent_label.clone(),
-            pause_stop.clone(),
+            Arc::clone(&stop),
+            parent_key,
+            parent_label,
         );
 
         // A fresh live-transcript snapshot holder for this run, so the Running
@@ -564,17 +561,13 @@ impl Agent {
             workspace: Arc::new(ws.clone()),
             tools,
             tool_specs,
-            cancel_token,
-            pause_stop,
-            paused_frozen: std::sync::atomic::AtomicBool::new(false),
-            ticket,
+            stop,
+            work,
             generation,
             tool_stats: std::sync::Mutex::new(Vec::new()),
             user_name,
             channel,
             is_admin,
-            parent_key,
-            parent_label,
             incoming_rx: None,
             provider: crate::providers::selection::ProviderSelection::default(),
             round_ts: None,
@@ -590,7 +583,6 @@ impl Agent {
                 crate::tools::shell::BackgroundSessions::default(),
             ),
             chrome_sessions,
-            interrupt_token,
         }
     }
 }
@@ -613,6 +605,10 @@ impl Drop for Agent {
 fn format_comment_message(user_name: &str, content: &str) -> String {
     format!("[Comment from {user_name} on ticket]: {content}")
 }
+
+/// What a run records when a workspace pause cut it short — one sentence for every record that
+/// answers "why did this stop": a turn's failure reason and a chain step's settled row.
+pub(crate) const PAUSED_REASON: &str = "the workspace was paused before this run answered";
 
 impl Agent {
     /// Hand the tool stats to the telemetry queue, then persist the final assistant
@@ -639,20 +635,20 @@ impl Agent {
         // Cancelled (stop or shutdown): no assistant message is expected, so skip
         // finalization. Tool results are durable; a dropped tail loses nothing
         // (comments stay in the board DB).
-        if self.cancel_token.is_cancelled() || crate::shutdown::shutdown_token().is_cancelled() {
+        if self.is_cancelled() || crate::shutdown::shutdown_token().is_cancelled() {
             tracing::debug!(
                 agent_id = %self.agent_id,
                 role = %self.role,
                 workspace = %self.workspace.name,
-                ticket = self.ticket.as_ref().map(|t| t.id.as_str()),
+                ticket = self.work.ticket_id(),
                 "Session finalize skipped (agent cancelled or shutdown)"
             );
             return Ok(());
         }
 
         match self.session.finalize(&self.agent_id).await? {
-            crate::session::FinalizeOutcome::Flushed => {}
-            crate::session::FinalizeOutcome::NoUnpersistedTail => {
+            crate::session::SessionFlush::Flushed => {}
+            crate::session::SessionFlush::NoUnpersistedTail => {
                 if crate::shutdown::is_draining() {
                     // Drain cut the turn right after the last commit: expected and
                     // lossless — committed frames are durable, ticket rounds resume at
@@ -661,7 +657,7 @@ impl Agent {
                         agent_id = %self.agent_id,
                         role = %self.role,
                         workspace = %self.workspace.name,
-                        ticket = self.ticket.as_ref().map(|t| t.id.as_str()),
+                        ticket = self.work.ticket_id(),
                         "Session finalize no-op: turn cut by graceful drain — \
                          committed frames are durable; resumes at boot or on the next user message"
                     );
@@ -672,7 +668,7 @@ impl Agent {
                         agent_id = %self.agent_id,
                         role = %self.role,
                         workspace = %self.workspace.name,
-                        ticket = self.ticket.as_ref().map(|t| t.id.as_str()),
+                        ticket = self.work.ticket_id(),
                         "Session finalize no-op: turn ended via sleep — waiting for new input"
                     );
                 } else {
@@ -682,7 +678,7 @@ impl Agent {
                         agent_id = %self.agent_id,
                         role = %self.role,
                         workspace = %self.workspace.name,
-                        ticket = self.ticket.as_ref().map(|t| t.id.as_str()),
+                        ticket = self.work.ticket_id(),
                         "finalize called but no new assistant message in history"
                     );
                 }
@@ -697,39 +693,50 @@ impl Agent {
 
     #[must_use]
     pub fn is_cancelled(&self) -> bool {
-        self.cancel_token.is_cancelled()
+        self.stop.is_fired(StopReason::Cancelled)
     }
 
-    /// The run was cut short rather than failing: a cancellation, a shutdown or a drain. Such
-    /// an ending is never reported as a stage failure.
+    /// The run was cut short rather than failing: a cancellation, a shutdown or a drain, or a
+    /// cooperative workspace-pause freeze. Such an ending is never reported as a failure.
     #[must_use]
     pub fn cut_short(&self) -> bool {
-        self.is_cancelled() || crate::shutdown::aborting()
+        self.stop().is_some_and(StopReason::is_aborting)
     }
 
+    /// The run's stop reason, read from [`crate::stop::Stop`] — the one precedence order, with the
+    /// pause read from its immutable record so a resumed workspace cannot reclassify a run that
+    /// already obeyed the stop, and the process-wide drain and shutdown checked first because a
+    /// force-cancel fires the token mid-drain and the drain is the one that names the stop then.
     #[must_use]
-    fn is_cancelled_by_pause(&self) -> bool {
-        self.pause_stop.load(std::sync::atomic::Ordering::SeqCst)
+    pub(crate) fn stop(&self) -> Option<StopReason> {
+        self.stop.reason()
     }
 
-    /// IMMUTABLE bail-time snapshot of a cooperative workspace-pause freeze: set once at
-    /// the LLM-round boundary and never cleared, so a finalizer can tell a frozen run from
-    /// a technical failure after the workspace is resumed.
+    /// IMMUTABLE bail-time record of a cooperative workspace-pause freeze: set once at the
+    /// LLM-round boundary and never cleared, so a finalizer can tell a frozen run from a technical
+    /// failure after the workspace is resumed.
     #[must_use]
     pub(crate) fn is_paused_frozen(&self) -> bool {
-        self.paused_frozen.load(std::sync::atomic::Ordering::SeqCst)
+        self.stop.is_fired(StopReason::Paused)
     }
 
-    /// Failure reason, global-token-first like [`failure_classification`]: shutdown
-    /// cancels every per-agent token, so it is checked before an internal cancel.
+    /// Record the freeze without running a round — a test that needs a run which already bailed
+    /// at the pause boundary, where the field is otherwise written only by [`Self::llm_loop`].
+    #[cfg(test)]
+    pub(crate) fn mark_paused_frozen(&self) {
+        self.stop.obey_pause();
+    }
+
+    /// Failure reason, read from [`Self::stop`] so it can never disagree with the classifier.
     #[must_use]
     pub(crate) fn failure_reason(&self, fallback: &str) -> String {
-        if crate::shutdown::shutdown_token().is_cancelled() {
-            "service shutting down".to_string()
-        } else if self.is_cancelled() {
-            "agent cancelled".to_string()
-        } else {
-            self.failure.clone().unwrap_or_else(|| fallback.to_string())
+        match self.stop() {
+            Some(StopReason::Shutdown | StopReason::Drain) => "service shutting down".to_string(),
+            Some(StopReason::Cancelled) => "agent cancelled".to_string(),
+            Some(StopReason::Paused) => PAUSED_REASON.to_string(),
+            Some(StopReason::Interrupted) | None => {
+                self.failure.clone().unwrap_or_else(|| fallback.to_string())
+            }
         }
     }
 
@@ -776,12 +783,37 @@ impl Agent {
             agent_id = %self.agent_id,
             role = %self.role,
             workspace = %self.workspace.name,
-            ticket = self.ticket.as_ref().map(|ticket| ticket.id.as_str())
+            ticket = self.work.ticket_id()
         );
         self.run_turn(messages, resume).instrument(span).await
     }
 
     async fn run_turn(&mut self, messages: &[&str], resume: bool) -> anyhow::Result<String> {
+        // The freeze, read live at the one point every writer passes: a pause that landed after
+        // this run was decided — the registry's sweep cannot have reached it, and the agent being
+        // registered is no guarantee either — stops it here, before it writes anything. Reading and
+        // the Manager's triage are not writers, so a discovery pass or a separately launched
+        // analysis runs on, and the notice that explains the pause stays deliverable. A pause that
+        // cannot be read is no pause at all: nothing would lift it, so it is the fault it is.
+        let writes =
+            crate::work_unit::writes_folder(self.work.parent().as_ref(), self.role.as_str());
+        if writes {
+            match crate::workspace::paused_now(&self.workspace.name).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    // The immutable record, so every finalizer classifies this as obeying the pause
+                    // rather than as a technical failure — an unpause cannot erase it.
+                    self.stop.obey_pause();
+                    return Err(anyhow::Error::new(crate::launch::WorkspacePaused {
+                        workspace: self.workspace.name.clone(),
+                    }));
+                }
+                // Not a pause: nothing would ever lift it, so the turn fails as the fault it is.
+                Err(e) => {
+                    return Err(e.context("could not read the workspace's pause before the run"));
+                }
+            }
+        }
         // Whether the turn's message lands decides whether it may advance a personal
         // folder's change baseline; cleared first, so no early return carries the old one.
         self.turn_recorded = false;
@@ -850,7 +882,7 @@ impl Agent {
                     messages,
                     &self.workspace,
                     &self.role,
-                    self.ticket.as_ref(),
+                    &self.work,
                     &self.channel,
                     &self.user_name,
                     self.round_ts.as_deref(),
@@ -866,7 +898,7 @@ impl Agent {
         Self::bail_on_shutdown()?;
         // Pre-maybe_summarize cancel check, same rule: an agent stopped before its first
         // model call must not spend a summarization call on itself.
-        if self.cancel_token.is_cancelled() {
+        if self.is_cancelled() {
             anyhow::bail!("Agent cancelled");
         }
 
@@ -1123,19 +1155,20 @@ impl Agent {
     async fn llm_loop(&mut self) -> anyhow::Result<String> {
         let mut tool_rounds = 0usize;
         loop {
-            if self.cancel_token.is_cancelled() {
+            if self.is_cancelled() {
                 anyhow::bail!("Agent cancelled");
             }
             // Cooperative workspace-pause (strict freeze): the round ends here, no new LLM
             // call starts. The pause does NOT fire the cancel token, so an in-flight round
             // completes and commits first; the finalizer treats the agent as a no-op (the
             // job stays for the unpause re-drive).
-            if self.is_cancelled_by_pause() {
-                // Record the freeze IMMUTABLY, so a later unpause (which clears the
-                // live pause_stop) cannot turn it into a misclassified hard failure.
-                self.paused_frozen
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                anyhow::bail!("Agent frozen by workspace pause — resumes at unpause");
+            if self.stop.pause_requested() {
+                // Record the freeze IMMUTABLY, so a later unpause (which clears the live
+                // request) cannot turn it into a misclassified hard failure.
+                self.stop.obey_pause();
+                return Err(anyhow::Error::new(crate::launch::WorkspacePaused {
+                    workspace: self.workspace.name.clone(),
+                }));
             }
             // Shutdown/drain: checked at round top, after the previous group's commit, so
             // the current group completes and no new LLM call starts. The round resumes at
@@ -1144,7 +1177,7 @@ impl Agent {
             // Urgent-message interrupt: not a cancellation — the turn ends here, every
             // result already committed, with the phrase as its only session entry. Checked
             // after shutdown/drain (their priority is unchanged) and before another model call.
-            if self.interrupt_token.is_cancelled() {
+            if self.stop.is_fired(StopReason::Interrupted) {
                 return Ok(self.end_interrupted_turn());
             }
             if tool_rounds >= MAX_TOOL_ROUNDS {
@@ -1163,7 +1196,7 @@ impl Agent {
             // fire-before-wait race. Raced against the urgent interrupt: cutting a
             // request means dropping it (nothing recorded), which is what makes the
             // cut immediate. The signal is skipped on that path.
-            let interrupt = self.interrupt_token.clone();
+            let interrupt = self.stop.interrupt_token();
             let llm_result = tokio::select! {
                 biased;
                 () = interrupt.cancelled() => return Ok(self.end_interrupted_turn()),
@@ -1261,7 +1294,7 @@ impl Agent {
             // The cut round's results are committed, so the interruption ends the turn here
             // instead of another round. A successful sleep returned above: that round
             // concluded inside its only call, so nothing was cut.
-            if cut || self.interrupt_token.is_cancelled() {
+            if cut || self.stop.is_fired(StopReason::Interrupted) {
                 return Ok(self.end_interrupted_turn());
             }
 
@@ -1344,10 +1377,10 @@ impl Agent {
     where
         F: std::future::Future<Output = ToolExecutionOutcome>,
     {
-        if self.interrupt_token.is_cancelled() {
+        if self.stop.is_fired(StopReason::Interrupted) {
             return None;
         }
-        let interrupt = self.interrupt_token.clone();
+        let interrupt = self.stop.interrupt_token();
         tokio::select! {
             biased;
             outcome = call => Some(outcome),
@@ -1415,16 +1448,16 @@ impl Agent {
     async fn in_tool_context<T>(&self, fut: impl std::future::Future<Output = T>) -> T {
         let user_name = self.user_name.clone();
         let channel = self.channel.clone();
-        let parent_key = self.parent_key.clone();
-        let parent_label = self.parent_label.clone();
+        let parent_key = self.work.parent();
+        let parent_label = self.work.label().map(str::to_string);
         let background_sessions = Some(self.background_sessions.clone());
         let agent_id = Some(self.agent_id.clone());
         let agent_tracking = Some(crate::agent::registry::AgentTracking {
             role: self.role.as_str().to_string(),
             ticket: self
-                .ticket
-                .as_ref()
-                .map(|ticket| ticket.id.clone())
+                .work
+                .ticket_id()
+                .map(str::to_string)
                 .unwrap_or_default(),
         });
         let launch = self.session.launch.clone();
@@ -1522,7 +1555,7 @@ impl Agent {
         // Pre-flight cancellation check: a call dispatched before llm_loop's round-top
         // check can still reach here, and a side-effecting tool (shell, file edits,
         // sub-agents) must not run after a Stop.
-        if self.cancel_token.is_cancelled() {
+        if self.is_cancelled() {
             let reason = "Agent cancelled — tool execution skipped";
             tracing::debug!(
                 tool = %call_name,
@@ -1849,7 +1882,7 @@ impl Agent {
                 ));
                 break;
             }
-            if self.cancel_token.is_cancelled() {
+            if self.is_cancelled() {
                 break;
             }
 
@@ -2113,7 +2146,9 @@ impl Agent {
             return;
         }
 
-        let Some(ticket_id) = self.ticket.as_ref().map(|t| t.id.clone()) else {
+        // Only a round that holds the board row re-reads the board: a round dispatched inside a
+        // ticket has the id but not the row, so it takes its comments from the live channel.
+        let Some(ticket_id) = self.work.ticket().map(|t| t.id.clone()) else {
             return;
         };
 
@@ -2203,7 +2238,7 @@ impl Agent {
             agent_id: self.agent_id.clone(),
             role: self.role.as_str().to_string(),
             workspace: self.workspace.name.clone(),
-            ticket_id: self.ticket.as_ref().map(|t| t.id.clone()),
+            ticket_id: self.work.ticket_id().map(str::to_string),
         });
         request
     }
@@ -2346,7 +2381,7 @@ impl Agent {
                         &summary,
                         &self.workspace,
                         &self.role,
-                        self.ticket.as_ref(),
+                        &self.work,
                         self.is_admin,
                         &self.user_name,
                         turn_start,
@@ -2659,15 +2694,15 @@ impl Drop for RunEndCleanup {
 /// a cancelled run's result is handled.
 ///
 /// `user_name` and `channel` identify the message's origin, so tools route sub-agent
-/// results to the right user. `launch` is the launch this run executes — `Some` for a
-/// branch role, `None` for built-ins. `messages` arrives in arrival order (see
-/// [`Agent::work`]).
+/// results to the right user. `work` is what this run works for. `launch` is the launch this
+/// run executes — `Some` for a branch role, `None` for built-ins. `messages` arrives in
+/// arrival order (see [`Agent::work`]).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn run_agent(
     agent_id: String,
     role: crate::Role,
     ws: &crate::Workspace,
-    ticket: Option<&crate::pipeline::board::Ticket>,
+    work: crate::work_unit::WorkUnit,
     messages: &[&str],
     user_name: String,
     channel: String,
@@ -2677,8 +2712,6 @@ pub(crate) async fn run_agent(
     >,
     resume: bool,
     round: Option<RoundOpts>,
-    parent_key: Option<crate::agent::registry::ParentKey>,
-    parent_label: Option<String>,
     launch: Option<crate::Launch>,
 ) -> (Agent, Option<String>) {
     // Unregister from the message router on EVERY exit path, a mid-work panic
@@ -2695,16 +2728,7 @@ pub(crate) async fn run_agent(
         .is_some()
         .then(|| UnregisterOnDrop(agent_id.clone()));
     let mut agent = Agent::new(
-        agent_id,
-        role,
-        ws,
-        ticket.cloned(),
-        user_name,
-        channel,
-        is_admin,
-        parent_key,
-        parent_label,
-        launch,
+        agent_id, role, ws, work, user_name, channel, is_admin, launch,
     );
     agent.incoming_rx = incoming_rx;
     if let Some(round) = round {
@@ -2751,7 +2775,11 @@ pub(crate) async fn run_agent(
                 );
             }
             let classification = failure_classification(&agent, Some(&e));
-            agent.run_failure = Some(if is_cooperative_stop(classification) {
+            // Only a stop that ABORTS the run is cooperative. An urgent interrupt ends the turn
+            // and leaves the run to carry on, so a turn that errored after one failed like any
+            // other — classifying it a cooperative stop would hide a real failure.
+            let stopped = agent.stop().is_some_and(StopReason::is_aborting);
+            agent.run_failure = Some(if stopped {
                 crate::RunFailure::CooperativeStop
             } else {
                 crate::RunFailure::Technical
@@ -2761,12 +2789,12 @@ pub(crate) async fn run_agent(
             let error_chain = crate::util::failure_detail(&format!("{e:#}"), "agent failure log");
             // Cooperative ends and a deliberate cancel get the same treatment; the
             // classification above decides which log fires.
-            if is_cooperative_stop(classification) {
+            if stopped {
                 tracing::debug!(
                     agent_id = %agent.agent_id,
                     workspace = %ws.name,
                     role = %role,
-                    ticket = ticket.map(|t| t.id.as_str()),
+                    ticket = agent.work.ticket_id(),
                     classification,
                     error_chain,
                     "Agent stopped by a non-failure cancellation"
@@ -2776,7 +2804,7 @@ pub(crate) async fn run_agent(
                     agent_id = %agent.agent_id,
                     workspace = %ws.name,
                     role = %role,
-                    ticket = ticket.map(|t| t.id.as_str()),
+                    ticket = agent.work.ticket_id(),
                     classification,
                     error_chain,
                     "Agent failed"
@@ -2787,11 +2815,10 @@ pub(crate) async fn run_agent(
     }
 }
 
-/// Default dispatch: no ticket, empty user/channel, no inbox. `resume` selects the
-/// slot-resume primitive (empty committed-tail continuation, summarization skipped),
-/// `false` for fresh dispatches. `parent_key`/`parent_label` are the Running Agents
-/// grouping key and its presentational label; `None` for workspace singletons.
-#[expect(clippy::too_many_arguments)]
+/// Default dispatch: empty user/channel, no inbox. `resume` selects the slot-resume primitive
+/// (empty committed-tail continuation, summarization skipped), `false` for fresh dispatches.
+/// `work` is what the run works for — [`WorkUnit::Turn`](crate::work_unit::WorkUnit::Turn) for a
+/// workspace singleton.
 pub(crate) async fn run_default_agent(
     agent_id: &str,
     role: crate::Role,
@@ -2799,14 +2826,13 @@ pub(crate) async fn run_default_agent(
     message: &str,
     resume: bool,
     round: Option<RoundOpts>,
-    parent_key: Option<crate::agent::registry::ParentKey>,
-    parent_label: Option<String>,
+    work: crate::work_unit::WorkUnit,
 ) -> (Agent, Option<String>) {
     run_agent(
         agent_id.to_string(),
         role,
         ws,
-        None,
+        work,
         &[message],
         String::new(),
         String::new(),
@@ -2814,8 +2840,6 @@ pub(crate) async fn run_default_agent(
         None,
         resume,
         round,
-        parent_key,
-        parent_label,
         None,
     )
     .await
@@ -2843,37 +2867,20 @@ pub(crate) fn failure_class_from_error(
     retry_exhausted(error).map(|exhausted| exhausted.final_class)
 }
 
-/// Labels meaning the run stopped cooperatively rather than failing technically.
-const COOPERATIVE_STOP_CLASSES: [&str; 4] = ["drain", "shutdown", "pause", "internal_cancel"];
-
-fn is_cooperative_stop(classification: &str) -> bool {
-    COOPERATIVE_STOP_CLASSES.contains(&classification)
-}
-
 /// Stable failure classification for the agent-failure log.
 ///
-/// Order matters: the global shutdown token fires on any stop request (SIGTERM/SIGINT,
-/// the dashboard's quit, a console or session-end, a self-update) and on a completed
-/// drain, so it is checked first — shutdown must never be mislabeled an internal
-/// cancel. `error` is the raw source when present (`run_agent`'s `Err` arm), `None`
-/// only in tests. A [`RetryExhausted`] carries the granular
-/// [`crate::retry::FailureClass`]; everything else falls back to `runtime`. The
-/// cooperative labels live in [`COOPERATIVE_STOP_CLASSES`], consumed by both the exit
-/// log and [`Agent::failed_technically`].
+/// The stop reason comes from [`Agent::stop`] — one derivation, one precedence — and only a run
+/// nothing stopped is classified by its error. That order matters: the global shutdown token
+/// fires on any stop request (SIGTERM/SIGINT, the dashboard's quit, a console or session-end, a
+/// self-update) and on a completed drain, so it must never be mislabeled an internal cancel.
+/// `error` is the raw source when present (`run_agent`'s `Err` arm), `None` only in tests. A
+/// [`RetryExhausted`] carries the granular [`crate::retry::FailureClass`]; everything else falls
+/// back to `runtime`. Whether the run counts as a technical failure is [`Agent::stop`]'s answer,
+/// never a label comparison — and only a stop that ABORTS the run names the ending: an interrupt
+/// ended a turn, not the run, so a turn that then failed is classified by its own error.
 fn failure_classification(agent: &Agent, error: Option<&anyhow::Error>) -> &'static str {
-    if crate::shutdown::is_draining() {
-        // The drain cut the round short — not a failure. Checked before the token, so
-        // a drained agent is never mislabeled cancelled/shutdown (no failure emoji,
-        // no exit rollback).
-        "drain"
-    } else if crate::shutdown::shutdown_token().is_cancelled() {
-        "shutdown"
-    } else if agent.is_paused_frozen() {
-        // A strictly-frozen run — not a failure. The immutable bail-time snapshot is
-        // authoritative, not the live pause_stop an unpause can clear.
-        "pause"
-    } else if agent.is_cancelled() {
-        "internal_cancel"
+    if let Some(stop) = agent.stop().filter(|stop| stop.is_aborting()) {
+        stop.label()
     } else if let Some(class) = error.and_then(failure_class_from_error) {
         class.label()
     } else {
@@ -2888,7 +2895,6 @@ mod tests {
     use crate::tools::chrome_release;
     use crate::util::test::{FakeProvider, install_fake_provider, install_test_retry_policy};
     use async_trait::async_trait;
-    use tokio_util::sync::CancellationToken;
 
     struct TestTool {
         output: String,
@@ -2922,7 +2928,7 @@ mod tests {
             identifier: None,
             prompt: "write it".to_string(),
             tools: Vec::new(),
-            agent_id: crate::session::custom_role_agent_id("copywriter", None),
+            agent_id: crate::address::AgentAddress::custom_role("copywriter", None).id(),
             reply_to: None,
             chain: Some(Box::new(chain)),
             extract: Some(
@@ -2981,17 +2987,13 @@ mod tests {
             workspace: std::sync::Arc::new(crate::Workspace::default()),
             tools,
             tool_specs,
-            cancel_token: CancellationToken::new(),
-            pause_stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            paused_frozen: std::sync::atomic::AtomicBool::new(false),
-            ticket: None,
+            stop: std::sync::Arc::new(crate::stop::Stop::default()),
+            work: crate::work_unit::WorkUnit::Turn,
             generation: 0,
             tool_stats: std::sync::Mutex::new(Vec::new()),
             user_name: String::new(),
             channel: String::new(),
             is_admin: false,
-            parent_key: None,
-            parent_label: None,
             incoming_rx: None,
             provider: crate::providers::selection::ProviderSelection::default(),
             round_ts: None,
@@ -3007,7 +3009,6 @@ mod tests {
                 crate::tools::shell::BackgroundSessions::default(),
             ),
             chrome_sessions: std::sync::Arc::new(crate::tools::chrome::ChromeRunSessions::default()),
-            interrupt_token: CancellationToken::new(),
         }
     }
 
@@ -3017,6 +3018,55 @@ mod tests {
         agent.agent_id = agent_id.to_string();
         agent.workspace = std::sync::Arc::new(ws);
         agent
+    }
+
+    /// A workspace-pause freeze is a deliberate stop, not a failure: nothing may report it as one.
+    #[test]
+    fn a_pause_frozen_run_is_cut_short_and_not_a_failure() {
+        let agent = make_agent(Vec::new());
+        agent.mark_paused_frozen();
+        assert!(agent.cut_short(), "a freeze is a deliberate stop");
+        assert!(!agent.failed_technically(), "and never a technical failure");
+    }
+
+    /// The stop reason has one precedence: the pause's immutable record outranks a cancel that
+    /// landed after the bail, so a resumed workspace cannot reclassify a run that already obeyed
+    /// the stop as a deliberate cancel.
+    #[test]
+    #[serial_test::serial(drain)] // the drain flag is process-global
+    fn the_obeyed_pause_outranks_a_later_cancel() {
+        crate::shutdown::drain_clear();
+        let agent = make_agent(Vec::new());
+        assert_eq!(agent.stop(), None, "a fresh run was stopped by nothing");
+
+        agent.stop.obey_pause();
+        agent.stop.fire(StopReason::Cancelled);
+        assert_eq!(
+            agent.stop(),
+            Some(StopReason::Paused),
+            "the obeyed pause wins over a cancel that arrived after it"
+        );
+        assert!(agent.cut_short(), "and it is a stop, not a failure");
+    }
+
+    /// A drain is what names a stop even when the token has also fired — the case a force-cancel
+    /// creates mid-drain.
+    #[test]
+    #[serial_test::serial(drain)] // the drain flag is process-global
+    fn a_drain_names_the_stop_even_with_the_token_fired() {
+        crate::shutdown::drain_clear();
+        let agent = make_agent(Vec::new());
+        agent.stop.fire(StopReason::Cancelled);
+        assert_eq!(agent.stop(), Some(StopReason::Cancelled));
+
+        crate::shutdown::drain_begin();
+        let stop = agent.stop();
+        crate::shutdown::drain_clear();
+        assert_eq!(
+            stop,
+            Some(StopReason::Drain),
+            "the drain outranks a cancel too, and would outrank a fired token"
+        );
     }
 
     #[test]
@@ -3051,7 +3101,7 @@ mod tests {
         // An internal cancellation fires the generic token and must classify as an
         // internal cancel — every non-shutdown/non-pause stop is one.
         let internally_cancelled = make_agent(vec![]);
-        internally_cancelled.cancel_token.cancel();
+        internally_cancelled.stop.fire(StopReason::Cancelled);
         assert_eq!(
             failure_classification(&internally_cancelled, Some(&runtime_err)),
             "internal_cancel"
@@ -3059,6 +3109,31 @@ mod tests {
         assert_eq!(
             failure_classification(&internally_cancelled, None),
             "internal_cancel"
+        );
+    }
+
+    /// An urgent interrupt ends the TURN, not the run: a turn that errored after one is a
+    /// failure, classified by its own error — never "interrupted", never a cooperative stop.
+    #[test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    fn an_interrupted_turn_that_then_failed_is_a_failure() {
+        crate::shutdown::drain_clear();
+        let agent = make_agent(vec![]);
+        agent.stop.fire(StopReason::Interrupted);
+        let err = anyhow::anyhow!("tool panicked");
+        assert_eq!(
+            failure_classification(&agent, Some(&err)),
+            "runtime",
+            "the turn was cut, then the run failed: the error names the ending"
+        );
+        assert_eq!(
+            agent.stop(),
+            Some(StopReason::Interrupted),
+            "the cut is still the turn's own record"
+        );
+        assert!(
+            !agent.cut_short(),
+            "an interrupt ends a turn and leaves the run to carry on"
         );
     }
 
@@ -3079,7 +3154,7 @@ mod tests {
             "a drained agent must classify as drain, never failure",
         );
         // A per-agent cancel during drain still classifies as drain (checked first).
-        agent.cancel_token.cancel();
+        agent.stop.fire(StopReason::Cancelled);
         assert_eq!(failure_classification(&agent, None), "drain");
         // Restore isolation: the drain flag is process-global, and the token must never
         // be fired from a test — it would cancel every parallel retry loop.
@@ -3213,7 +3288,7 @@ mod tests {
     #[tokio::test]
     async fn finalize_session_skipped_when_cancelled() {
         let mut agent = make_agent(vec![]);
-        agent.cancel_token.cancel();
+        agent.stop.fire(StopReason::Cancelled);
         let result = agent.finalize_session().await;
         assert!(
             result.is_ok(),
@@ -3229,7 +3304,7 @@ mod tests {
         });
         let name = tool.name();
         let agent = make_agent(vec![tool]);
-        agent.cancel_token.cancel();
+        agent.stop.fire(StopReason::Cancelled);
         let out = agent.execute_tool(name, serde_json::json!({})).await;
 
         assert!(!out.success, "cancelled agent should not execute tool");
@@ -3398,7 +3473,7 @@ mod tests {
         let mut agent = make_agent_with_role(vec![], role);
         agent.agent_id = agent_id.to_string();
         agent.session.init(agent_id).await.unwrap();
-        agent.ticket = Some(ticket);
+        agent.work = crate::work_unit::WorkUnit::of_ticket(std::sync::Arc::new(ticket));
         agent
     }
 
@@ -3628,7 +3703,7 @@ mod tests {
             "leader_fail_agent".to_string(),
             crate::Role::Analyst,
             &ws,
-            None,
+            crate::work_unit::WorkUnit::Turn,
             &["task"],
             String::new(),
             String::new(),
@@ -3639,8 +3714,6 @@ mod tests {
                 round_ts: crate::session::render_timestamp(),
                 first_call_notify: Some(notify.clone()),
             }),
-            None,
-            None,
             None,
         )
         .await;
@@ -3677,15 +3750,13 @@ mod tests {
             agent_id.clone(),
             crate::Role::Assistant,
             &ws,
-            None,
+            crate::work_unit::WorkUnit::Turn,
             &["hello"],
             "sleep_user".to_string(),
             "gui".to_string(),
             false,
             None,
             false,
-            None,
-            None,
             None,
             None,
         )
@@ -3723,15 +3794,13 @@ mod tests {
             agent_id.clone(),
             crate::Role::Assistant,
             &ws,
-            None,
+            crate::work_unit::WorkUnit::Turn,
             &["wake up"],
             "sleep_user".to_string(),
             "gui".to_string(),
             false,
             None,
             false,
-            None,
-            None,
             None,
             None,
         )
@@ -3767,15 +3836,13 @@ mod tests {
             agent_id.clone(),
             crate::Role::Assistant,
             &ws,
-            None,
+            crate::work_unit::WorkUnit::Turn,
             &["hello"],
             "sleep_text_user".to_string(),
             "gui".to_string(),
             false,
             None,
             false,
-            None,
-            None,
             None,
             None,
         )
@@ -3848,15 +3915,13 @@ mod tests {
             agent_id.clone(),
             crate::Role::Assistant,
             &ws,
-            None,
+            crate::work_unit::WorkUnit::Turn,
             &["hello"],
             "sleep_bundle_user".to_string(),
             "gui".to_string(),
             false,
             None,
             false,
-            None,
-            None,
             None,
             None,
         )
@@ -4505,7 +4570,7 @@ mod tests {
 
         // A cancelled run never spends a summarization call on itself.
         let mut cancelled = over_threshold(crate::Role::Assistant);
-        cancelled.cancel_token.cancel();
+        cancelled.stop.fire(StopReason::Cancelled);
         cancelled.maybe_summarize_after_delivery().await;
 
         // Going down: no destructive compaction during the drain window.
@@ -5790,7 +5855,7 @@ mod tests {
                 conn,
                 &job_id,
                 &row.agent_id,
-                crate::jobs::RowStatus::Done,
+                crate::outcome::Outcome::Done,
                 Some(outcome),
             )
             .await
@@ -5944,7 +6009,7 @@ mod tests {
                 conn,
                 job_id,
                 &analyst_id,
-                crate::jobs::RowStatus::Done,
+                crate::outcome::Outcome::Done,
                 Some(outcome),
             )
             .await
@@ -6159,7 +6224,7 @@ mod tests {
             conn,
             "stale_frame_job",
             "stale_frame_job_worker",
-            crate::jobs::RowStatus::Done,
+            crate::outcome::Outcome::Done,
             Some("STALE_RESULT"),
         )
         .await
@@ -6372,7 +6437,7 @@ mod tests {
             crate::Role::Engineer,
         );
         agent.agent_id = "e2e_urgent_interrupt".to_string();
-        let interrupt = agent.interrupt_token.clone();
+        let interrupt = agent.stop.interrupt_token();
         let turn = tokio::spawn(async move {
             let answer = agent.work(&["do two things"], false).await;
             (agent, answer)
@@ -6392,10 +6457,7 @@ mod tests {
             agent.turn_state.interrupted,
             "the router must skip delivery for this turn"
         );
-        assert!(
-            !agent.cancel_token.is_cancelled(),
-            "the interrupt is not a cancellation"
-        );
+        assert!(!agent.is_cancelled(), "the interrupt is not a cancellation");
 
         let history = agent.session.history().to_vec();
         let results: Vec<String> = history

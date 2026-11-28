@@ -602,8 +602,9 @@ async fn every_second_bounce_notifies_manager() {
         .unwrap();
     // Registered up front so the notifications land in a local inbox instead of spawning real
     // Manager turns.
-    let mut manager_inbox =
-        crate::agent::message_router::register_agent(&crate::session::manager_agent_id(&ws.name));
+    let mut manager_inbox = crate::agent::message_router::register_agent(
+        &crate::address::AgentAddress::manager(&ws.name).id(),
+    );
 
     let interval = i64::try_from(super::BOUNCE_NOTICE_INTERVAL).unwrap();
     let budget = i64::try_from(super::MAX_BOUNCES).unwrap();
@@ -669,7 +670,7 @@ async fn every_second_bounce_notifies_manager() {
                 async |_tx| Ok(()),
             )
             .await,
-            super::FinalizeOutcome::Applied,
+            super::Outcome::Done,
         ),
         "the done transition must be applied",
     );
@@ -690,7 +691,9 @@ async fn every_second_bounce_notifies_manager() {
         "a breaker failure names the exhausted budget and keeps the workspace state:\n{}",
         job.content,
     );
-    crate::agent::message_router::unregister_agent(&crate::session::manager_agent_id(&ws.name));
+    crate::agent::message_router::unregister_agent(
+        &crate::address::AgentAddress::manager(&ws.name).id(),
+    );
 }
 
 /// Assert the notification opens with the ticket header for `ticket_id`, `title` and `phase` — the
@@ -1057,14 +1060,14 @@ async fn first_request_failure_discards_only_empty_round_sessions() {
             idx: 0,
             agent_id: fresh_id.clone(),
             task: "analyse the ticket".to_string(),
-            status: crate::jobs::RowStatus::Launched,
+            status: crate::outcome::Outcome::Running,
             outcome: None,
         },
         super::AgentSlot {
             idx: 1,
             agent_id: resumed_id.clone(),
             task: "analyse the ticket".to_string(),
-            status: crate::jobs::RowStatus::Launched,
+            status: crate::outcome::Outcome::Running,
             outcome: None,
         },
     ];
@@ -1448,8 +1451,9 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
     age_ticket_past_grace(store, &id).await;
     // Registered up front so the notifications, including the Done one, land in a local inbox
     // instead of spawning real Manager turns.
-    let mut manager_inbox =
-        crate::agent::message_router::register_agent(&crate::session::manager_agent_id(&ws.name));
+    let mut manager_inbox = crate::agent::message_router::register_agent(
+        &crate::address::AgentAddress::manager(&ws.name).id(),
+    );
 
     super::run_claim_pipeline(&ws).await;
     assert_eq!(
@@ -1651,7 +1655,9 @@ async fn full_pipeline_lifecycle_backlog_to_done_with_skip_review_and_dirty_comm
     }
     assert!(done_notified, "the Done transition must notify the Manager");
 
-    crate::agent::message_router::unregister_agent(&crate::session::manager_agent_id(&ws.name));
+    crate::agent::message_router::unregister_agent(
+        &crate::address::AgentAddress::manager(&ws.name).id(),
+    );
     drop(repo_dir);
 }
 
@@ -2133,12 +2139,12 @@ async fn analysis_resume_reconstructs_done_slots_and_reruns_not_done() {
     let seeds = [
         (
             0_i64,
-            crate::jobs::RowStatus::Done,
+            crate::outcome::Outcome::Done,
             Some(done_outcome.as_str()),
         ),
         (
             1_i64,
-            crate::jobs::RowStatus::Failed,
+            crate::outcome::Outcome::Failed,
             Some(fail_outcome.as_str()),
         ),
     ];
@@ -2270,28 +2276,28 @@ async fn analysis_resume_across_escalation_reuses_done_and_reruns_not_done() {
         (
             0_i64,
             crate::jobs::AgentKind::Analyst,
-            crate::jobs::RowStatus::Done,
+            crate::outcome::Outcome::Done,
             Some(blocker_verdict.as_str()),
             base_task,
         ),
         (
             1_i64,
             crate::jobs::AgentKind::Analyst,
-            crate::jobs::RowStatus::Done,
+            crate::outcome::Outcome::Done,
             Some(clean_verdict.as_str()),
             base_task,
         ),
         (
             2_i64,
             crate::jobs::AgentKind::BlockerVerifier,
-            crate::jobs::RowStatus::Done,
+            crate::outcome::Outcome::Done,
             Some(grade_outcome.as_str()),
             escalation_task,
         ),
         (
             3_i64,
             crate::jobs::AgentKind::BlockerVerifier,
-            crate::jobs::RowStatus::Failed,
+            crate::outcome::Outcome::Failed,
             Some(fail_outcome.as_str()),
             escalation_task,
         ),
@@ -2402,7 +2408,7 @@ async fn legacy_wider_analysis_roster_is_never_resumed() {
             conn,
             &job_id,
             &agent_id,
-            crate::jobs::RowStatus::Done,
+            crate::outcome::Outcome::Done,
             Some(clean_verdict.as_str()),
         )
         .await
@@ -2805,7 +2811,7 @@ async fn reset_round_cleanup_puller_recreates_job_and_engineer_session_stable() 
         &crate::session::store().conn,
         &eid,
         "implement",
-        crate::jobs::RowStatus::Launched,
+        crate::outcome::Outcome::Running,
         crate::Role::Engineer,
     )
     .await
@@ -3167,7 +3173,7 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
         assert!(
             roster
                 .iter()
-                .all(|r| r.status != crate::jobs::RowStatus::Launched.as_str()),
+                .all(|r| r.status != crate::outcome::Outcome::Running.as_str()),
             "no paused participant may remain marked launched",
         );
     }
@@ -3196,13 +3202,12 @@ async fn pause_and_resume_keeps_job_and_does_not_re_pause() {
     assert_workspace_paused(&ws, false).await;
 }
 
-/// A failure freeze that lands while the workspace is ALREADY paused — the discovery's own analysis
-/// pause owns the flag, and it is written by direct SQL, so nothing signalled the registry — still
-/// freezes in-flight ticket agents. Only the write in `set_paused` would otherwise reach them, so
-/// `pause_workspace_on_failure` signals the freeze itself.
+/// A round dispatched onto an already-paused workspace stops before its first model call and keeps
+/// its phase job for the unpause re-drive: the freeze is read live at the round's own start, so it
+/// reaches a writer the registry's sweep never saw, and the round is never classified as a death.
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
-async fn failure_freeze_while_paused_stops_in_flight_ticket_agent() {
+async fn a_round_dispatched_onto_a_paused_workspace_stops_before_it_runs() {
     let _guard = STORE_LOCK.lock().await;
     init_management_test_stores().await;
     let store = crate::pipeline::board::store();
@@ -3211,8 +3216,8 @@ async fn failure_freeze_while_paused_stops_in_flight_ticket_agent() {
         .set_status(&ws.name, &WorkspaceStatus::Ready)
         .await
         .unwrap();
-    // Paused before the round is dispatched, so no agent of this round has been signalled yet — the
-    // registry only sees the pause through the failure call.
+    // Paused before the round is dispatched, so no agent of this round has been signalled by the
+    // registry's sweep — only the live read at the round's own start can reach it.
     crate::workspace::store()
         .set_paused(&ws.name, true)
         .await
@@ -3230,34 +3235,36 @@ async fn failure_freeze_while_paused_stops_in_flight_ticket_agent() {
     .await;
 
     {
-        // Holding script: tool calls keep the round's participants in flight until the freeze
-        // lands.
-        let mut fake = crate::util::test::FakeProvider::new().ok_tool_call("read");
-        for _ in 0..39 {
-            fake = fake.ok_tool_call("read");
-        }
-        let _seam = crate::util::test::install_retry_seam(fake);
+        // A plain answer: the round must stop before its first model call, so a fake that reaches
+        // one would show up as an assertion failure rather than hold the round open.
+        let _seam = crate::util::test::install_retry_seam(
+            crate::util::test::FakeProvider::new().ok("never reached"),
+        );
 
         let ticket = expect_ticket(store, &id).await;
-        let handle = tokio::spawn(super::verification::run(
+        super::verification::run(
             std::sync::Arc::new(ticket.clone()),
             ws.clone(),
             job_id.clone(),
-        ));
-        wait_for_agent_registered(&id, std::time::Duration::from_secs(2)).await;
+        )
+        .await;
 
         assert!(
             !super::pause_workspace_on_failure(&ticket, "test freeze while paused").await,
             "the workspace was already paused, so this call does not pause it",
         );
-        handle.await.unwrap();
-
         assert!(
             expect_phase_job(store, &id, TicketPhase::Verification)
                 .await
                 .is_some(),
             "the frozen round must keep its phase job for the unpause re-drive",
         );
+        assert_eq!(
+            expect_ticket_phase(store, &id).await,
+            TicketPhase::Verification,
+            "a freeze is not a stage death: the ticket keeps its stage",
+        );
+        assert_workspace_paused(&ws, true).await;
     }
 }
 
@@ -3336,7 +3343,7 @@ async fn stage_re_drive_completes_dangling_calls_before_model_round() {
         conn,
         analyze_job,
         &analyst_id,
-        crate::jobs::RowStatus::Done,
+        crate::outcome::Outcome::Done,
         Some("STAGE_RESULT"),
     )
     .await
@@ -3604,16 +3611,68 @@ async fn sanitation_commit_failure_stops_round_and_freezes_workspace() {
         "a frozen workspace must not re-drive the stopped sanitation round",
     );
 
-    crate::agent::message_router::unregister_agent(&crate::session::manager_agent_id(&ws.name));
+    crate::agent::message_router::unregister_agent(
+        &crate::address::AgentAddress::manager(&ws.name).id(),
+    );
     drop(repo_dir);
 }
 
-/// The ticket pipeline runs only for a workspace that is BOTH unpaused and ready: a freeze holds at
-/// every status, and a workspace that is not ready — awaiting its first analysis, re-analysing
-/// (with or without a freeze), or failed — takes no ticket work either. No claims, no phase jobs.
+/// A pending workspace the owner froze is still claimed into its first discovery: reading is
+/// outside the freeze, so a re-analysis that returned the row to `pending` restarts itself under a
+/// pause, and a row that has never been analysed is analysed. The pause stays in force and holds
+/// the ticket pipeline once the discovery is done.
+#[serial_test::serial(provider, config_persist)]
+#[tokio::test]
+async fn a_paused_pending_workspace_is_still_picked_up_for_its_first_discovery() {
+    let _guard = STORE_LOCK.lock().await;
+    init_management_test_stores().await;
+    let snapshot = crate::config::CONFIG.snapshot();
+    crate::config::CONFIG.swap(crate::config::ConfigData {
+        provider_key: Some("sk-test".to_string()),
+        ..crate::config::ConfigData::STRUCT_FIELDS_DEFAULT
+    });
+    let live = || async {
+        crate::workspace::store()
+            .get_by_name("paused_pickup_ws")
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    create_test_workspace("/tmp/paused_pickup_ws", "paused_pickup_ws").await;
+    crate::workspace::store()
+        .set_paused("paused_pickup_ws", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        live().await.status,
+        WorkspaceStatus::Pending,
+        "a workspace waits in pending for its first discovery",
+    );
+
+    // The freeze does not reach discovery: a paused pending workspace is claimed and analysed.
+    assert!(
+        super::pickup_claim(&live().await).await.is_some(),
+        "a paused pending workspace is claimed into its first discovery — reading is outside the freeze",
+    );
+    assert_eq!(
+        live().await.status,
+        WorkspaceStatus::Analyzing,
+        "the claim takes the workspace into its analysis",
+    );
+    assert!(
+        live().await.paused,
+        "and the owner's pause stays in force for the pipeline",
+    );
+    crate::config::CONFIG.swap(snapshot);
+}
+
+/// The ticket pipeline runs only for a workspace that is unpaused and past its first discovery: a
+/// freeze holds at every status, and a workspace whose discovery has not run or has failed takes no
+/// ticket work either — no claims, no phase jobs. A workspace being re-analysed is NOT held out:
+/// reading is outside the hold, so a pass over the folder and the pipeline run side by side.
 ///
-/// The pending pickup stays exempt (it starts the discovery itself), and no provider is configured
-/// in tests, so a `Pending` row is never claimed into a discovery here and keeps its status.
+/// The pending pickup runs ahead of that gate (it starts the discovery itself), and no provider is
+/// configured in tests, so a `Pending` row here keeps its status.
 #[serial_test::serial(provider, drain)]
 #[tokio::test]
 async fn unsettled_or_frozen_workspace_skips_claims_and_dispatch() {
@@ -3622,10 +3681,9 @@ async fn unsettled_or_frozen_workspace_skips_claims_and_dispatch() {
     let store = crate::pipeline::board::store();
 
     for (idx, status, paused) in [
-        (0, WorkspaceStatus::Analyzing, true),  // frozen mid Re-analyse
-        (1, WorkspaceStatus::Analyzing, false), // resumed mid Re-analyse
-        (2, WorkspaceStatus::Pending, false),   // awaiting the first analysis
-        (3, WorkspaceStatus::Failed, false),    // discovery failed
+        (0, WorkspaceStatus::Analyzing, true), // frozen mid Re-analyse
+        (1, WorkspaceStatus::Pending, false),  // awaiting the first analysis
+        (2, WorkspaceStatus::Failed, false),   // discovery failed
     ] {
         let name = format!("unsettled_ws_{idx}");
         let ws = create_test_workspace(&format!("/tmp/{name}"), &name).await;
@@ -3664,54 +3722,59 @@ async fn unsettled_or_frozen_workspace_skips_claims_and_dispatch() {
         );
     }
 
-    // Positive control: the same poll step does claim for a ready, unpaused workspace. The
-    // pre-created job carries a launched roster row, so the dispatch arm skips it instead of
-    // spawning a real phase body.
-    let ws = create_test_workspace("/tmp/settled_ws", "settled_ws").await;
-    crate::workspace::store()
-        .set_status(&ws.name, &WorkspaceStatus::Ready)
-        .await
-        .unwrap();
-    crate::workspace::store()
-        .set_paused(&ws.name, false)
-        .await
-        .unwrap();
-    let id = make_ticket(store, &ws, "Settled backlog", TicketPhase::Backlog).await;
-    age_ticket_past_grace(store, &id).await;
-    let job_id = crate::generate_id();
-    spawn_phase_job(
-        &job_id,
-        &ws,
-        &id,
-        TicketPhase::Analysis,
-        crate::Role::Analyst,
-        "analysis",
-    )
-    .await;
-    crate::jobs::upsert_job_agent(
-        &crate::session::store().conn,
-        &job_id,
-        "settled_ws_analyst_roster",
-        crate::jobs::AgentKind::Analyst,
-        crate::jobs::RowStatus::Launched,
-    )
-    .await
-    .unwrap();
-
-    super::process_single_workspace(
+    // Positive control: the same poll step does claim for a ready, unpaused workspace, and for one
+    // being re-analysed — a pass over the folder holds nothing. The pre-created job carries a
+    // launched roster row, so the dispatch arm skips it instead of spawning a real phase body.
+    for (name, status) in [
+        ("settled_ws", WorkspaceStatus::Ready),
+        ("reanalysing_ws", WorkspaceStatus::Analyzing),
+    ] {
+        let ws = create_test_workspace(&format!("/tmp/{name}"), name).await;
         crate::workspace::store()
-            .get_by_name(&ws.name)
+            .set_status(&ws.name, &status)
             .await
-            .unwrap()
-            .unwrap(),
-    )
-    .await;
+            .unwrap();
+        crate::workspace::store()
+            .set_paused(&ws.name, false)
+            .await
+            .unwrap();
+        let id = make_ticket(store, &ws, "Settled backlog", TicketPhase::Backlog).await;
+        age_ticket_past_grace(store, &id).await;
+        let job_id = crate::generate_id();
+        spawn_phase_job(
+            &job_id,
+            &ws,
+            &id,
+            TicketPhase::Analysis,
+            crate::Role::Analyst,
+            "analysis",
+        )
+        .await;
+        crate::jobs::upsert_job_agent(
+            &crate::session::store().conn,
+            &job_id,
+            &format!("{name}_analyst_roster"),
+            crate::jobs::AgentKind::Analyst,
+            crate::outcome::Outcome::Running,
+        )
+        .await
+        .unwrap();
 
-    assert_eq!(
-        expect_ticket_phase(store, &id).await,
-        TicketPhase::Analysis,
-        "a ready, unpaused workspace must claim its aged backlog ticket",
-    );
+        super::process_single_workspace(
+            crate::workspace::store()
+                .get_by_name(&ws.name)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(
+            expect_ticket_phase(store, &id).await,
+            TicketPhase::Analysis,
+            "{status}: a settled workspace must claim its aged backlog ticket",
+        );
+    }
 }
 
 /// A model control token must not survive into the board: the ticket description and every comment
@@ -3827,5 +3890,237 @@ async fn board_comments_mask_model_control_tokens_on_read() {
         !ticket.description.contains("<|"),
         "description masked: {}",
         ticket.description
+    );
+}
+
+/// Poll one workspace the way the management loop does.
+async fn poll_once(name: &str) {
+    let live = crate::workspace::store()
+        .get_by_name(name)
+        .await
+        .unwrap()
+        .unwrap();
+    super::process_single_workspace(live).await;
+}
+
+/// A workspace waits instead of looking idle: an unconfirmed profile stops the claim, and the
+/// workspace says why.
+#[tokio::test]
+async fn an_unconfirmed_profile_waits_before_claiming() {
+    let _guard = STORE_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/profile_wait_ws", "profile_wait_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "Waiting work", TicketPhase::Backlog).await;
+    age_ticket_past_grace(store, &id).await;
+
+    crate::util::test::unconfirm_test_workspace(&ws.name).await;
+    poll_once(&ws.name).await;
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::Backlog,
+        "an unconfirmed profile must not claim"
+    );
+    let live = crate::workspace::store()
+        .get_by_name(&ws.name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::workspace::status_reason(&live, &crate::workspace_profile::read(&live))
+            .is_some_and(|reason| reason.contains("profile")),
+        "the workspace says it is waiting for its profile"
+    );
+
+    // Confirmed: the claim goes through. The pre-created job with a launched roster row keeps the
+    // dispatch arm from spawning a real phase body.
+    crate::workspace::store()
+        .confirm_profile(&ws.name)
+        .await
+        .unwrap();
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::Analysis,
+        crate::Role::Analyst,
+        "analysis",
+    )
+    .await;
+    crate::jobs::upsert_job_agent(
+        &crate::session::store().conn,
+        &job_id,
+        "profile_wait_ws_analyst_roster",
+        crate::jobs::AgentKind::Analyst,
+        crate::outcome::Outcome::Running,
+    )
+    .await
+    .unwrap();
+    poll_once(&ws.name).await;
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::Analysis,
+        "a confirmed profile claims"
+    );
+}
+
+/// The folder's single-writer hold reaches the pipeline: a folder another group holds is not
+/// claimed, the ticket stays where it is, and the state says the workspace is waiting.
+#[tokio::test]
+async fn a_folder_held_by_another_writer_waits_before_claiming() {
+    let _guard = STORE_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/held_folder_ws", "held_folder_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    let id = make_ticket(store, &ws, "Held work", TicketPhase::Backlog).await;
+    age_ticket_past_grace(store, &id).await;
+
+    let branch = format!("branch_{}", crate::generate_suffix());
+    let generation = crate::agent::registry::AGENT_REGISTRY.register(
+        branch.clone(),
+        crate::Role::Custom.as_str().to_string(),
+        None,
+        &ws,
+        std::sync::Arc::new(crate::stop::Stop::default()),
+        Some(crate::agent::registry::ParentKey::Launch(branch.clone())),
+        None,
+    );
+    poll_once(&ws.name).await;
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::Backlog,
+        "a held folder must not claim"
+    );
+    let live = crate::workspace::store()
+        .get_by_name(&ws.name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::workspace::status_reason(&live, &crate::workspace_profile::read(&live))
+            .is_some_and(|reason| reason.contains("waiting for a custom role to finish")),
+        "the workspace says it is waiting for the other writer"
+    );
+
+    // Free again: the claim goes through.
+    crate::agent::registry::AGENT_REGISTRY.deregister(&branch, generation);
+    let job_id = crate::generate_id();
+    spawn_phase_job(
+        &job_id,
+        &ws,
+        &id,
+        TicketPhase::Analysis,
+        crate::Role::Analyst,
+        "analysis",
+    )
+    .await;
+    crate::jobs::upsert_job_agent(
+        &crate::session::store().conn,
+        &job_id,
+        "held_folder_ws_analyst_roster",
+        crate::jobs::AgentKind::Analyst,
+        crate::outcome::Outcome::Running,
+    )
+    .await
+    .unwrap();
+    poll_once(&ws.name).await;
+    assert_eq!(
+        expect_ticket_phase(store, &id).await,
+        TicketPhase::Analysis,
+        "a free folder claims again"
+    );
+}
+
+/// The workspace's own stage work holds the folder without making the workspace look idle: the
+/// owner-facing answer stays silent (the workspace is working), while the pipeline's own gate
+/// still refuses to start anything else.
+#[tokio::test]
+async fn the_workspaces_own_stage_work_is_not_reported_as_waiting() {
+    let _guard = STORE_LOCK.lock().await;
+    init_management_test_stores().await;
+    let ws = create_test_workspace("/tmp/own_work_ws", "own_work_ws").await;
+
+    let branch = format!("branch_{}", crate::generate_suffix());
+    let generation = crate::agent::registry::AGENT_REGISTRY.register(
+        branch.clone(),
+        crate::Role::Engineer.as_str().to_string(),
+        None,
+        &ws,
+        std::sync::Arc::new(crate::stop::Stop::default()),
+        Some(crate::agent::registry::ParentKey::Ticket(
+            "own_work_ticket".to_string(),
+        )),
+        None,
+    );
+    let live = crate::workspace::store()
+        .get_by_name(&ws.name)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        crate::workspace::status_reason(&live, &crate::workspace_profile::read(&live)).is_none(),
+        "the workspace's own stage work is the workspace working, not waiting: {:?}",
+        crate::workspace::status_reason(&live, &crate::workspace_profile::read(&live))
+    );
+    assert!(
+        crate::workspace::pipeline_gate(&live, &crate::workspace_profile::read(&live)).is_some(),
+        "the pipeline starts nothing else while its own stage holds the folder"
+    );
+
+    crate::agent::registry::AGENT_REGISTRY.deregister(&branch, generation);
+}
+
+/// A ticket-transition notification is durable: it rides the one outbox before it is routed, so a
+/// restart between the transition and the Manager's turn cannot lose it.
+#[tokio::test]
+async fn a_manager_notification_rides_the_durable_outbox() {
+    let _guard = STORE_LOCK.lock().await;
+    init_management_test_stores().await;
+    let store = crate::pipeline::board::store();
+    let ws = create_test_workspace("/tmp/notify_outbox_ws", "notify_outbox_ws").await;
+    crate::workspace::store()
+        .set_status(&ws.name, &WorkspaceStatus::Ready)
+        .await
+        .unwrap();
+    // A local inbox keeps the notification from spawning a real Manager turn.
+    let _inbox = crate::agent::message_router::register_agent(
+        &crate::address::AgentAddress::manager(&ws.name).id(),
+    );
+    let id = make_ticket(store, &ws, "Notify durably", TicketPhase::Planning).await;
+    let ticket = expect_ticket(store, &id).await;
+    super::notify_ticket(&super::TransitionCtx::notifying(
+        &ticket,
+        TicketPhase::Analysis,
+        TicketPhase::Planning,
+        "Analyst",
+        crate::Role::Analyst.as_str(),
+    ))
+    .await;
+    let pending: i64 = crate::session::store()
+        .conn
+        .query(
+            "SELECT COUNT(*) FROM pending_jobs WHERE target_agent_id = ?1",
+            crate::db::params![crate::address::AgentAddress::manager(&ws.name).id()],
+        )
+        .await
+        .unwrap()
+        .first()
+        .and_then(|row| row.get::<i64>(0).ok())
+        .unwrap_or(0);
+    assert!(
+        pending > 0,
+        "the Manager notification must be in the durable outbox"
+    );
+    crate::agent::message_router::unregister_agent(
+        &crate::address::AgentAddress::manager(&ws.name).id(),
     );
 }

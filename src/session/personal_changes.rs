@@ -4,7 +4,7 @@
 //! included — so it never answers from stale knowledge.
 //!
 //! The observed state is a row of its own, `session_personal_changes`, a child of the
-//! Assistant's `session_metadata` row ([`crate::session::assistant_agent_id`]), written
+//! Assistant's `session_metadata` row ([`crate::address::AgentAddress::Assistant`]), written
 //! only when it changes and deleted with that row — never inside the watched folder,
 //! which stays the user's alone. [`refresh_after_turn`] rewrites it at the end of the
 //! Assistant's own turn, so it absorbs everything that moved during that turn, the
@@ -791,7 +791,7 @@ pub(crate) async fn prepend_changes(msg: &str, workspace: &Workspace, role: &Rol
     if ESTABLISHING.lock().unwrap_poison().contains_key(&user_name) {
         return msg.to_string();
     }
-    let agent_id = crate::session::assistant_agent_id(&user_name);
+    let agent_id = crate::address::AgentAddress::assistant(&user_name).id();
     // `None` (no session row, no baseline recorded yet, or a read error) means
     // there is nothing to compare against — never fabricate a report from one.
     let Some(Some(stored)) = crate::session::store()
@@ -870,7 +870,7 @@ async fn refresh(user_name: &str) {
     if request_another_walk(user_name) {
         return;
     }
-    let agent_id = crate::session::assistant_agent_id(user_name);
+    let agent_id = crate::address::AgentAddress::assistant(user_name).id();
     // `None` is no session row at all: the baseline could never be recorded.
     let Some(stored) = crate::session::store()
         .personal_changes_baseline(&agent_id)
@@ -1139,7 +1139,7 @@ mod tests {
     /// refresh returns and the block stays silent until it closes. A walk a forced stop
     /// abandoned leaves no baseline, and the next turn re-drives the refresh.
     async fn wait_for_baseline(user: &str) -> Option<String> {
-        let agent_id = crate::session::assistant_agent_id(user);
+        let agent_id = crate::address::AgentAddress::assistant(user).id();
         for _ in 0..200 {
             // Waiting is all this may do while the observation is in flight: a refresh here
             // would ask it for another walk and perturb the state under test.
@@ -1647,7 +1647,7 @@ mod tests {
     async fn refresh_and_prepend_round_trip() {
         crate::util::test::init_test_stores().await;
         let user = "pc_e2e_user";
-        let agent_id = crate::session::assistant_agent_id(user);
+        let agent_id = crate::address::AgentAddress::assistant(user).id();
         let conn = &crate::session::store().conn;
         conn.execute(
             "DELETE FROM session_metadata WHERE agent_id = ?1",
@@ -1829,7 +1829,7 @@ mod tests {
 
         // Only a turn that ran in the folder advances its baseline, and the write lands on that
         // folder's account.
-        let agent_id = crate::session::assistant_agent_id("pc_gate_user");
+        let agent_id = crate::address::AgentAddress::assistant("pc_gate_user").id();
         crate::session::store()
             .conn
             .execute(

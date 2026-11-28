@@ -821,8 +821,8 @@ impl Dashboard {
         !matches!(page, Page::Editor | Page::Shell) || self.resolved_workspace().is_some()
     }
 
-    /// Whether the selected workspace's pipeline is paused (a strict freeze: no
-    /// in-flight work and no stage advance until resume).
+    /// Whether the selected workspace's pipeline is paused (a strict freeze: every writer stops
+    /// and no stage advances until resume; reading runs on).
     fn paused(&self) -> bool {
         self.selected_workspace_info().is_some_and(|w| w.paused)
     }
@@ -1076,6 +1076,10 @@ impl Dashboard {
     fn sync_settings_workspaces_from_map(&mut self) {
         let mut list: Vec<Workspace> = self.workspaces.values().cloned().collect();
         list.sort_by(|a, b| a.name.cmp(&b.name));
+        self.settings_state.workspaces_state.profile_states = list
+            .iter()
+            .map(|ws| (ws.name.clone(), crate::workspace_profile::state(ws)))
+            .collect();
         self.settings_state.workspaces_state.workspaces = list;
     }
 

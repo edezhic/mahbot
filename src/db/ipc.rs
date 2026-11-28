@@ -17,16 +17,17 @@
 //! The compatibility rule is why the operation rides the old frame: an operation frame carries a
 //! magic `store` value — the generation its family declares ([`CALL_STORE`] /
 //! [`CALL_STORE_BASE`] / [`CALL_STORE_VIDEO`] / [`CALL_STORE_PHOTO`] / [`CALL_STORE_SETTINGS`] /
-//! [`CALL_STORE_SEND_FOLDER`] / [`CALL_STORE_OUTCOME`], and the retired
-//! [`CALL_STORE_SEND_OUTCOME`] / [`CALL_STORE_SEND_CHAIN`] / [`CALL_STORE_SEND`]) — never a store
-//! name, so a product that does not know it parses the frame as a diagnostic query and refuses it
-//! as an unknown store: an honest "this product does not serve that here" rather than a protocol
-//! complaint. A new frame type could be parsed as something else and answered misleadingly; a
-//! superset of the old frame is the only shape that degrades honestly. The value belongs to the
-//! FAMILY, so a family whose surface has not changed keeps working one build behind; a family added
-//! since — or one whose surface gained arguments a product built before it would ignore — carries a
-//! value that product does not know, so the call is refused instead of misanswered. This build
-//! serves every generation ([`CALL_STORES`]); its frontend sends the one its family declares.
+//! [`CALL_STORE_SEND_FOLDER`] / [`CALL_STORE_WORKSPACE_PROFILE`], and the retired
+//! [`CALL_STORE_SEND_CHAIN`] / [`CALL_STORE_SEND`]) —
+//! never a store name, so a product that does not know it parses the frame as a diagnostic query
+//! and refuses it as an unknown store: an honest "this product does not serve that here" rather
+//! than a protocol complaint. A new frame type could be parsed as something else and answered
+//! misleadingly; a superset of the old frame is the only shape that degrades honestly. The value
+//! belongs to the FAMILY, so a family whose surface has not changed keeps working one build behind;
+//! a family added since — or one whose surface gained arguments a product built before it would
+//! ignore — carries a value that product does not know, so the call is refused instead of
+//! misanswered. This build serves every generation ([`CALL_STORES`]); its frontend sends the one
+//! its family declares.
 //! The call channel is same-user-only, like the diagnostic one, and FAIL-CLOSED: when the socket
 //! could not be restricted to the instance's own user, queries keep working and operations are
 //! refused.
@@ -210,12 +211,15 @@ pub(crate) const CALL_STORE_VIDEO: &str = "cli3";
 /// generation: a product built before it refuses the frame as an unknown store.
 pub(crate) const CALL_STORE_PHOTO: &str = "cli4";
 
-/// The value the two families whose surface this build widened carry: `config` gained the
-/// settings actions (`reference` / `get` / `list` / `set` and the account ones), and `workspace`
-/// gained its own settings and project actions. A product built before them knows neither those
-/// actions nor the arguments they carry — it would answer a `set` as an unknown action and drop a
-/// `set_diagnostics` field — so the frame is refused as an unknown store: nothing ran, the
-/// environment's class.
+/// The value `config` and `workspace` carried when this build widened their surfaces: `config`
+/// gained the settings actions (`reference` / `get` / `list` / `set` and the account ones), and
+/// `workspace` gained its own settings and project actions. A product built before them knows
+/// neither those actions nor the arguments they carry — it would answer a `set` as an unknown
+/// action and drop a `set_diagnostics` field — so the frame is refused as an unknown store:
+/// nothing ran, the environment's class.
+///
+/// No family of this build carries it any more — `config` moved on with the profile actions — but
+/// the listener keeps serving it, so a frontend one build behind still reaches the product.
 pub(crate) const CALL_STORE_SETTINGS: &str = "cli5";
 /// The value `send` carried since it gained the schema argument `extract`. No family of this build
 /// carries it any more, but the listener keeps serving it, so a frontend one build behind still
@@ -227,22 +231,16 @@ pub(crate) const CALL_STORE_SEND: &str = "cli7";
 /// reaches the product instead of losing `send` to an unknown store.
 pub(crate) const CALL_STORE_SEND_CHAIN: &str = "cli6";
 
-/// The value the `outcome` family carries, added after the channel had served every earlier
-/// generation: a product built before it serves no such tool, so the frame is refused as an
-/// unknown store — nothing ran, the environment's class.
-pub(crate) const CALL_STORE_OUTCOME: &str = "cli8";
-
-/// The value `send` carries since its acknowledgement names the record its id answers: a product
-/// built before it answers a handover without an id, leaving a script nothing to ask about, so the
-/// frame is refused as an unknown store — nothing ran, the environment's class. Every other family
-/// keeps its value; the listener still serves them all.
-pub(crate) const CALL_STORE_SEND_OUTCOME: &str = "cli9";
-
 /// The value `send` carries since a chain step that names no folder works in the one the nearest
 /// earlier step named: a product built before it would run such a step in the caller's folder
 /// instead, silently — and can refuse it outright over a folder it was never given. The frame is
 /// refused as an unknown store, so nothing ran and the environment's class is what the caller sees.
 pub(crate) const CALL_STORE_SEND_FOLDER: &str = "cli10";
+
+/// The value the `workspace` and `config` families carry since their surfaces gained the profile
+/// actions: a product built before them would answer `profile` as an unknown action, so the frame
+/// is refused as an unknown store — nothing ran, the environment's class.
+pub(crate) const CALL_STORE_WORKSPACE_PROFILE: &str = "cli11";
 
 /// Every protocol value this build serves — one per generation of the command line's surface,
 /// including the ones only a frontend one build behind still sends.
@@ -254,9 +252,8 @@ pub(crate) const CALL_STORES: &[&str] = &[
     CALL_STORE_SETTINGS,
     CALL_STORE_SEND,
     CALL_STORE_SEND_CHAIN,
-    CALL_STORE_OUTCOME,
-    CALL_STORE_SEND_OUTCOME,
     CALL_STORE_SEND_FOLDER,
+    CALL_STORE_WORKSPACE_PROFILE,
 ];
 
 /// The store value a second launch's frame names: not a store, and nothing is queried — the frame
@@ -722,7 +719,7 @@ fn not_attempted(undelivered: Option<&str>, spent: anyhow::Error, socket: &Path)
 
 /// What a finished attempt means to the retry loop: one classification for both clients, so they
 /// cannot drift on which failures are sent again or on what a failure says.
-enum Outcome {
+enum AttemptOutcome {
     Answer(QueryResponse),
     /// The instance never took it: send the next attempt after the backoff. The transport's error
     /// is carried along, for the case where the budget runs out before another attempt can be made.
@@ -734,30 +731,34 @@ enum Outcome {
 /// Classify one attempt for the retry loop that made it, framing everything but the limit's own
 /// failure with [`channel_unreachable`]: a bare OS text would read as "the store is gone" instead
 /// of "an instance is running and its store was deliberately left alone".
-fn classify(attempt: Attempt, read: crate::db::read_limit::Read<'_>, socket: &Path) -> Outcome {
+fn classify(
+    attempt: Attempt,
+    read: crate::db::read_limit::Read<'_>,
+    socket: &Path,
+) -> AttemptOutcome {
     match attempt {
         // An answer the budget was spent on is not an answer, however well the
         // exchange itself went.
         Attempt::Answered(resp) => {
             if read.remaining().is_zero() {
-                Outcome::Report(read.timeout())
+                AttemptOutcome::Report(read.timeout())
             } else {
-                Outcome::Answer(resp)
+                AttemptOutcome::Answer(resp)
             }
         }
         // A delivery that never happened is retryable only while there is
         // budget left to send it again.
         Attempt::NotDelivered(e) => {
             if read.remaining().is_zero() {
-                Outcome::Report(unreachable(socket, &e))
+                AttemptOutcome::Report(unreachable(socket, &e))
             } else {
-                Outcome::Resend(e)
+                AttemptOutcome::Resend(e)
             }
         }
         // The frame went out: the instance took the query, so it is never sent
         // again — this is the limit's own failure, not an unreachable channel.
-        Attempt::NoAnswer => Outcome::Report(read.timeout()),
-        Attempt::Broken(e) => Outcome::Report(unreachable(socket, &e)),
+        Attempt::NoAnswer => AttemptOutcome::Report(read.timeout()),
+        Attempt::Broken(e) => AttemptOutcome::Report(unreachable(socket, &e)),
     }
 }
 
@@ -788,15 +789,15 @@ pub(crate) async fn ipc_query_with_wait(
             return Err(not_attempted(undelivered.as_deref(), spent, &socket));
         }
         match classify(ipc_query_once(storage_root, req, read).await, read, &socket) {
-            Outcome::Answer(resp) => return Ok(resp),
-            Outcome::Resend(e) => {
+            AttemptOutcome::Answer(resp) => return Ok(resp),
+            AttemptOutcome::Resend(e) => {
                 undelivered = Some(e);
                 // Never sleep past the budget: the next attempt's own check
                 // ends the read at the limit, not somewhere after it.
                 tokio::time::sleep(retry_backoff(attempt).min(read.remaining())).await;
                 attempt += 1;
             }
-            Outcome::Report(e) => return Err(e),
+            AttemptOutcome::Report(e) => return Err(e),
         }
     }
 }
@@ -824,14 +825,14 @@ pub(crate) fn ipc_query_sync(
             return Err(not_attempted(undelivered.as_deref(), spent, &socket));
         }
         match classify(ipc_query_sync_once(storage_root, req, read), read, &socket) {
-            Outcome::Answer(resp) => return Ok(resp),
-            Outcome::Resend(e) => {
+            AttemptOutcome::Answer(resp) => return Ok(resp),
+            AttemptOutcome::Resend(e) => {
                 undelivered = Some(e);
                 // Never sleep past the budget (see the async client).
                 std::thread::sleep(retry_backoff(attempt).min(read.remaining()));
                 attempt += 1;
             }
-            Outcome::Report(e) => return Err(e),
+            AttemptOutcome::Report(e) => return Err(e),
         }
     }
 }
@@ -1659,7 +1660,7 @@ mod tests {
         });
 
         // Consume the routed envelope so the real agent run never starts.
-        let assistant = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let assistant = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut rx = crate::agent::message_router::register_agent(&assistant);
 
         // The durable rows outstanding before this call: the store is shared with

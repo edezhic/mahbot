@@ -10,8 +10,9 @@ use crate::agent::role::DIAGNOSTICS_ROLE;
 use crate::agent::run_default_agent;
 use crate::config_db::ConfigStore;
 use crate::db::{self, Value};
-use crate::session::discovery_agent_id;
+use crate::outcome::Outcome;
 use crate::util::UnwrapPoison;
+use crate::workspace_profile::{ProfileRead, ProfileState};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Timelike, Utc};
 use futures_util::future::join_all;
@@ -45,6 +46,8 @@ crate::columns! {
         DIAGNOSTICS           => "diagnostics",
         NOTES                  => "notes",
         LAST_ANALYZED_COMMIT   => "last_analyzed_commit",
+        PROFILE_CONFIRMED      => "profile_confirmed",
+        PROFILE                => "profile",
     }
 }
 
@@ -157,7 +160,7 @@ async fn run_discovery_task(
 
     tracing::info!(workspace_name = ws.name, role = %label, "Starting workspace discovery");
 
-    let agent_id = discovery_agent_id(&ws.name, label);
+    let agent_id = crate::address::AgentAddress::discovery(&ws.name, label).id();
     let (agent, response) = run_default_agent(
         &agent_id,
         Role::Discovery,
@@ -165,8 +168,7 @@ async fn run_discovery_task(
         &prompt,
         false,
         None,
-        None,
-        None,
+        crate::work_unit::WorkUnit::Turn,
     )
     .await;
     let Some(response) = response else {
@@ -223,7 +225,7 @@ async fn run_workspace_diagnostics(
 
     tracing::info!(workspace_name = ws.name, "Starting diagnostics discovery");
 
-    let agent_id = discovery_agent_id(&ws.name, DIAGNOSTICS_ROLE);
+    let agent_id = crate::address::AgentAddress::discovery(&ws.name, DIAGNOSTICS_ROLE).id();
 
     // Load the diagnostics discovery prompt directly (not a role-specific discovery prompt).
     let prompt = crate::prompt::load_prompt("discovery/diagnostics.md");
@@ -235,8 +237,7 @@ async fn run_workspace_diagnostics(
         &prompt,
         false,
         None,
-        None,
-        None,
+        crate::work_unit::WorkUnit::Turn,
     )
     .await;
     if response.is_none() {
@@ -283,29 +284,25 @@ async fn run_workspace_diagnostics(
     Ok(())
 }
 
-/// Apply the final status and pause state after a discovery run completes, once all role
-/// discoveries and diagnostics have finished. Separate so tests can check the
-/// paused-behaviour invariants without running real agents.
+/// Apply the final status after a discovery run completes, once all role discoveries and
+/// diagnostics have finished. Separate so tests can check the status invariants without running
+/// real agents.
 ///
-/// `AllOk` sets `ready` and unpauses — rediscovery is the documented unpause path, and
-/// the poll step holds every claim while the workspace is not ready, so queued work is
-/// picked up on the next cycle. `Fatal` sets `failed` (terminal, manual Re-analyze as
-/// before) and leaves `paused`; `Transient` sets `pending` and arms the pickup cooldown,
-/// leaving the analysis pause armed. Panics never reach here — they abort the spawned
-/// task and boot reclassification recovers the row (see [`spawn_panic_guarded`]). Every
-/// write is skipped when a newer [`WorkspaceStore::rediscover`] bumped the generation
-/// while discovery was in flight.
-///
-/// Known limitation: the unpause does not check who set the pause, so a failure or
-/// operator pause that landed mid-discovery is cleared with it — the stopped round
-/// replays once, fails again and freezes the workspace on its own `set_paused`. Bounded,
-/// not a loop, and the nightly loop skips paused workspaces.
+/// `Done` sets `ready`, and the poll step holds every claim while the workspace is `pending` or
+/// `failed`, so queued work is picked up on the next cycle. `Failed` sets `failed` (terminal,
+/// manual Re-analyze as before); `Deferred` sets `pending` and arms the pickup cooldown. None of
+/// them touches `paused`: that column means the owner (or a stage death) stopped the workspace, so
+/// a freeze that landed while discovery ran is left in force, and an unpause is the owner's own
+/// action.
+/// Panics never reach here — they abort the spawned task and boot reclassification recovers the
+/// row (see [`spawn_panic_guarded`]). Every write is skipped when a newer
+/// [`WorkspaceStore::rediscover`] bumped the generation while discovery was in flight.
 async fn finalize_discovery(
     storage: &WorkspaceStore,
     ws_name: &str,
     ws_path: &str,
     discovery_generation: i64,
-    outcome: DiscoveryOutcome,
+    outcome: Outcome,
     errors: &[String],
 ) {
     // Final guard: if a newer rediscover was triggered while this task ran,
@@ -324,7 +321,7 @@ async fn finalize_discovery(
     }
 
     match outcome {
-        DiscoveryOutcome::AllOk => {
+        Outcome::Done => {
             // Success — any prior provider-failure cooldown is obsolete.
             clear_pending_pickup_cooldown(ws_name);
 
@@ -337,7 +334,7 @@ async fn finalize_discovery(
 
             if let Err(e) = storage
                 .exec_update_with_updated_at(
-                    "status = ?, paused = 0, last_analyzed_commit = ?",
+                    "status = ?, last_analyzed_commit = ?",
                     vec![
                         Value::from(WorkspaceStatus::Ready.to_string()),
                         Value::from(commit_hash.as_deref()),
@@ -353,13 +350,12 @@ async fn finalize_discovery(
                 );
             }
 
-            tracing::info!(workspace = ws_name, "Workspace pipeline resumed");
             tracing::info!(
                 workspace_name = ws_name,
                 "Workspace analysis complete — all roles ready"
             );
         }
-        DiscoveryOutcome::Fatal => {
+        Outcome::Failed => {
             let msg = errors.join("; ");
             // Terminal — the workspace leaves the pending-pickup cycle; drop any
             // cooldown armed by an earlier provider-class failure.
@@ -375,7 +371,7 @@ async fn finalize_discovery(
             }
             tracing::warn!(workspace_name = ws_name, error = %msg, "Workspace analysis failed");
         }
-        DiscoveryOutcome::Transient => {
+        Outcome::Deferred => {
             // Every failure was provider-class: return to pending and let the pickup
             // step retry after the cooldown. The cooldown is armed BEFORE the status
             // write: while the row is still `analyzing` nothing can claim it, so no poll
@@ -396,6 +392,8 @@ async fn finalize_discovery(
                 "Workspace analysis stalled on provider failure — pending pickup retry after cooldown"
             );
         }
+        // Discovery only ever produces the three values [`fold_discovery_result`] writes.
+        Outcome::Running | Outcome::Empty | Outcome::Stopped | Outcome::Superseded => {}
     }
 }
 
@@ -480,10 +478,7 @@ fn classify_discovery_failure(
     agent: &crate::Agent,
     error: Option<&anyhow::Error>,
 ) -> DiscoveryFailureKind {
-    if crate::shutdown::is_draining()
-        || crate::shutdown::shutdown_token().is_cancelled()
-        || agent.is_cancelled()
-    {
+    if agent.cut_short() {
         return DiscoveryFailureKind::Transient;
     }
     let class = agent
@@ -513,24 +508,12 @@ fn classify_discovery_failure(
     }
 }
 
-/// Aggregate outcome of a discovery run — encodes the success/fatal/transient
-/// trichotomy structurally (a success implies no fatal failure), replacing a
-/// pair of bools that could express invalid combinations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiscoveryOutcome {
-    /// Every sub-run succeeded.
-    AllOk,
-    /// At least one fatal (non-provider) failure — terminal `Failed`.
-    Fatal,
-    /// Only provider-class (transient) failures — return to `Pending`.
-    Transient,
-}
-
-/// Fold one discovery sub-run result into the aggregate outcome shared by the role,
-/// general and diagnostics sites: any error degrades `AllOk`, any fatal forces `Fatal`,
-/// and the error string is recorded (with `prefix`) for the finalize message.
+/// Fold one discovery sub-run result into the aggregate [`Outcome`] shared by the role, general and
+/// diagnostics sites: any error degrades [`Outcome::Done`], any fatal forces [`Outcome::Failed`],
+/// and the error string is recorded (with `prefix`) for the finalize message. Only those three
+/// values are reachable here.
 fn fold_discovery_result(
-    outcome: &mut DiscoveryOutcome,
+    outcome: &mut Outcome,
     errors: &mut Vec<String>,
     result: Result<(), DiscoveryRunError>,
     prefix: &str,
@@ -538,9 +521,9 @@ fn fold_discovery_result(
     if let Err(e) = result {
         errors.push(format!("{prefix}{e}"));
         if e.kind == DiscoveryFailureKind::Fatal {
-            *outcome = DiscoveryOutcome::Fatal;
-        } else if *outcome == DiscoveryOutcome::AllOk {
-            *outcome = DiscoveryOutcome::Transient;
+            *outcome = Outcome::Failed;
+        } else if *outcome == Outcome::Done {
+            *outcome = Outcome::Deferred;
         }
     }
 }
@@ -705,7 +688,7 @@ pub fn spawn_workspace_discovery(
                 (roles, general, Ok(()))
             };
 
-            let mut outcome = DiscoveryOutcome::AllOk;
+            let mut outcome = Outcome::Done;
             let mut errors: Vec<String> = Vec::new();
 
             for result in role_results {
@@ -862,7 +845,156 @@ fn workspace_from_row(row: &db::Row) -> anyhow::Result<Workspace> {
         diagnostics: row.get::<Option<String>>(COL_WS_DIAGNOSTICS)?,
         notes: row.get::<String>(COL_WS_NOTES)?,
         last_analyzed_commit: row.get::<Option<String>>(COL_WS_LAST_ANALYZED_COMMIT)?,
+        profile_confirmed: row.get::<bool>(COL_WS_PROFILE_CONFIRMED)?,
+        profile: row.get::<Option<String>>(COL_WS_PROFILE)?,
     })
+}
+
+/// The workspace's status as the owner is shown it in one listing line: an unconfirmed profile, a
+/// confirmed profile this build cannot read, or another writer holding the folder. A workspace
+/// whose own stage or maintainer holds the folder is working, not waiting, so that hold is not
+/// reported — a second writer beside it still is. Reading never holds anything, so a pass over the
+/// folder is never a wait. The invalid-profile report is a report, not a wait: it never stops the
+/// pipeline, which is why the name says status rather than why.
+#[must_use]
+pub(crate) fn status_reason(ws: &Workspace, read: &ProfileRead) -> Option<String> {
+    wait_reason(ws, read, false)
+}
+
+/// Whether the workspace is paused as it stands now — the live read every writer takes at the
+/// moment it starts, so a pause landing between a decision and the work stops it. `false` for a
+/// name with no managed row: a personal workspace cannot be paused. The read is retried once; a
+/// pause that still cannot be read is an `Err`, which is neither a pause — nothing would ever lift
+/// that — nor permission to write.
+pub(crate) async fn paused_now(name: &str) -> anyhow::Result<bool> {
+    let Some(store) = WORKSPACES.get() else {
+        return Ok(false);
+    };
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match store
+            .conn
+            .query_optional(
+                "SELECT paused FROM workspaces WHERE name = ?1",
+                db::params![name],
+                |row| row.get::<i64>(0),
+            )
+            .await
+        {
+            Ok(paused) => return Ok(paused == Some(1)),
+            Err(e) if attempt == 1 => {
+                tracing::debug!(
+                    workspace = name,
+                    error = %e,
+                    "Retrying the workspace's pause read",
+                );
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("reading the pause of workspace '{name}'"));
+            }
+        }
+    }
+}
+
+/// The pipeline's own gate: the same wait conditions, with the folder's hold counted even when the
+/// holder is this workspace's own work — which is exactly when no further work may start — and
+/// with an invalid profile reported nowhere, because it never stops the workspace.
+#[must_use]
+pub(crate) fn pipeline_gate(ws: &Workspace, read: &ProfileRead) -> Option<String> {
+    wait_reason(ws, read, true)
+}
+
+/// Why the pipeline would not claim this workspace now, in report order: the profile first, then
+/// the folder's hold. `gate` is the pipeline's own view, and it differs in exactly two arms — the
+/// workspace's own stage and its maintainer count as writers there, because that is when no
+/// further work may start, where the owner-facing listing calls that work IS the workspace working;
+/// and an invalid profile is reported only to the owner, because it never stops the workspace.
+fn wait_reason(ws: &Workspace, read: &ProfileRead, gate: bool) -> Option<String> {
+    match read.state {
+        // One short phrase, because a listing line carries it — the fuller status, including how to
+        // confirm, is what `workspace profile` prints.
+        ProfileState::Unconfirmed => {
+            return Some("waiting for its profile to be confirmed".to_string());
+        }
+        // A report, not a wait: the workspace runs on the default, which the owner has to be told —
+        // the parse error stays in `show` and `workspace profile`, a listing line only says what
+        // state it is, and nothing is logged from a read.
+        ProfileState::Invalid(_) if !gate => {
+            return Some("its confirmed profile is invalid — running on the default".to_string());
+        }
+        ProfileState::Invalid(_) | ProfileState::Confirmed => {}
+    }
+    let agents = crate::agent::registry::AGENT_REGISTRY.list();
+    let own_work = if gate {
+        Vec::new()
+    } else {
+        own_work_groups(&agents, ws)
+    };
+    let excluded: Vec<&str> = own_work.iter().map(String::as_str).collect();
+    let holder =
+        crate::agent::registry::AgentRegistry::holder_among(agents, ws.as_path(), &excluded)?;
+    Some(format!(
+        "waiting for {} to finish",
+        holder_name(&holder.role)
+    ))
+}
+
+/// The workspace's own work holds its folder under its own group keys — excluded by GROUP, not by
+/// holder: the workspace's own work is a group, whichever agent of it happens to hold the folder —
+/// so the remaining holder is any writer outside those groups, not merely the first one that is
+/// not.
+fn own_work_groups(agents: &[crate::agent::registry::AgentHandle], ws: &Workspace) -> Vec<String> {
+    agents
+        .iter()
+        .filter(|agent| Path::new(&agent.workspace_path) == ws.as_path())
+        .filter(|agent| is_own_work(agent))
+        .map(crate::agent::registry::AgentHandle::group)
+        .collect()
+}
+
+/// Whether a run belongs to the workspace's own work: a ticket's phase round, or the workspace's
+/// own maintainer, which registers as a workspace singleton ([`crate::work_unit::WorkUnit::Turn`],
+/// no parent). A parentless run of any other role is another writer that happens to carry no parent
+/// key — a router-dispatched worker round is the common case — so it is a holder and must be named.
+/// A launch and a chain are separate writers too. The caller has already restricted the holder to
+/// this workspace.
+fn is_own_work(agent: &crate::agent::registry::AgentHandle) -> bool {
+    match agent.parent_key.as_ref() {
+        None => matches!(agent.role.parse::<Role>(), Ok(Role::Maintainer)),
+        Some(crate::agent::registry::ParentKey::Ticket(_)) => true,
+        Some(_) => false,
+    }
+}
+
+/// What a paused workspace does to a writer: one clause, so the pipeline's gate, a launch and an
+/// agent's own run — before it starts and when the freeze stops it — say the same thing. Reading
+/// (a discovery pass, a separately launched analysis) is outside it: it runs in a paused workspace.
+/// The caller names the workspace, so this must not name it again.
+pub(crate) const PAUSED_REFUSAL: &str = "is paused — no writer starts here until it is resumed";
+
+/// How a folder's holder reads in a sentence, by the role it runs as. The one mapping both voices
+/// use — a launch refusal and a workspace's wait name the same writer the same way.
+#[must_use]
+pub(crate) fn holder_name(role: &str) -> String {
+    match role.parse::<Role>() {
+        Ok(Role::Worker) => "a worker".to_string(),
+        Ok(Role::Custom) => "a custom role".to_string(),
+        Ok(Role::Qa) => "the functional tester".to_string(),
+        // Only a pipeline stage's analyst holds the folder — a separately launched analysis reads —
+        // so the holder is named by the work, as the `send` reference names it.
+        Ok(Role::Analyst) => "the pipeline's analysis stage".to_string(),
+        Ok(Role::Reviewer) => "a code reviewer".to_string(),
+        Ok(Role::Discovery) => "discovery".to_string(),
+        Ok(Role::Maintainer) => "the maintainer".to_string(),
+        Ok(Role::Engineer) => "the engineer".to_string(),
+        Ok(Role::Sanitation) => "the sanitation step".to_string(),
+        Ok(Role::Assistant) => "the assistant".to_string(),
+        Ok(Role::Manager) => "the manager".to_string(),
+        // A role string comes from `Role::to_string()`, so this is unreachable — but a holder is
+        // never misnamed as nothing.
+        Err(_) => format!("the {role}"),
+    }
 }
 
 /// Max length of workspace notes in chars (char-level truncation — never
@@ -894,10 +1026,11 @@ impl WorkspaceStore {
         Ok(self.conn.execute(&sql, params).await?)
     }
 
-    /// Insert a new workspace with status `pending` (paused=1); the discovery spawn is
-    /// deferred to the management poll's pickup step, so a first-run "workspace added
-    /// before the key" no longer flips to Failed seconds later. Manual Re-analyze and
-    /// the nightly rediscovery path are unaffected.
+    /// Insert a new workspace with status `pending`; the discovery spawn is deferred to the
+    /// management poll's pickup step, so a first-run "workspace added before the key" no longer
+    /// flips to Failed seconds later. The new row is not paused: its `pending` status — not a pause
+    /// — is what keeps the ticket pipeline out until the first discovery runs, so a freeze set
+    /// while it does stays in force.
     pub async fn add(&self, name: &str, path: &str) -> Result<Workspace> {
         validate_name(name)?;
 
@@ -926,7 +1059,7 @@ impl WorkspaceStore {
                     "INSERT INTO workspaces (name, path, status, created_at, updated_at, paused) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING {WORKSPACE_COLUMNS}"
                 ),
-                db::params![name, path, pending, now.clone(), now.clone(), 1],
+                db::params![name, path, pending, now.clone(), now.clone(), 0],
                 workspace_from_row,
             )
             .await?;
@@ -1081,14 +1214,15 @@ impl WorkspaceStore {
     }
 
     /// Atomically claim a pending workspace for its first discovery: `pending` →
-    /// `analyzing` (with the analysis pause), returning the row's live
-    /// `discovery_generation` captured in the same statement so a concurrent `rediscover`
-    /// cannot race the read. `Ok(None)` when the row was no longer pending — a concurrent
-    /// pickup, GUI Re-analyze or delete won the race, and the caller must not spawn.
+    /// `analyzing`, returning the row's live `discovery_generation` captured in the same
+    /// statement so a concurrent `rediscover` cannot race the read. The claim does not pause, and a
+    /// pause does not stop it: discovery reads the folder, so it is outside the freeze. `Ok(None)`
+    /// when the row was no longer pending — a concurrent pickup, GUI Re-analyze or delete won the
+    /// race, and the caller must not spawn.
     pub(crate) async fn claim_pending_for_discovery(&self, name: &str) -> Result<Option<i64>> {
         self.conn
             .execute_optional(
-                "UPDATE workspaces SET status = ?, paused = 1, updated_at = ? \
+                "UPDATE workspaces SET status = ?, updated_at = ? \
                  WHERE name = ? AND status = ? RETURNING discovery_generation",
                 db::params![
                     WorkspaceStatus::Analyzing.to_string(),
@@ -1157,12 +1291,39 @@ impl WorkspaceStore {
         Ok(())
     }
 
+    /// Record that the owner accepted this workspace's profile: what is confirmed is the
+    /// workspace's settings as they stand, not a snapshot of the values (an unpinned field keeps
+    /// following the default).
+    pub async fn confirm_profile(&self, name: &str) -> Result<u64> {
+        let affected = self
+            .exec_update_with_updated_at("profile_confirmed = 1", Vec::new(), name)
+            .await?;
+        anyhow::ensure!(
+            affected > 0,
+            "No managed workspace exists under the name '{name}'."
+        );
+        Ok(affected)
+    }
+
+    /// Store the fields the owner customised; `None` returns every field to the default.
+    pub async fn set_profile(&self, name: &str, profile: Option<&str>) -> Result<u64> {
+        let affected = self
+            .exec_update_with_updated_at("profile = ?", vec![Value::from(profile)], name)
+            .await?;
+        anyhow::ensure!(
+            affected > 0,
+            "No managed workspace exists under the name '{name}'."
+        );
+        Ok(affected)
+    }
+
     /// Set or clear the pipeline pause toggle for a workspace. A name with no row is an error
     /// rather than a silent no-op: every caller reports the toggle as applied, so a pause that
     /// wrote nothing would be reported as one.
     ///
     /// Pausing is [`Self::pause_with_record`] with nothing to record, so there is one pause
-    /// write; resuming is the plain update below.
+    /// write; resuming is the plain update below, followed by the two re-drives a resume owes: the
+    /// turns the freeze kept and the rounds it stopped.
     pub async fn set_paused(&self, name: &str, paused: bool) -> Result<()> {
         if paused {
             let stopped = self.pause_with_record(name, async |_, _| Ok(())).await?;
@@ -1182,6 +1343,31 @@ impl WorkspaceStore {
         // Clear the cooperative pause-stop flags left on in-flight agents so a resumed
         // workspace does not freeze them at their next LLM round boundary.
         crate::agent::registry::AGENT_REGISTRY.clear_workspace_pause(name);
+        // The turns a pause kept are envelopes, not rounds: deliver them here, so resuming is all
+        // the owner has to do to be answered — no restart.
+        match crate::jobs::replay_pending_for_workspace(name).await {
+            Ok(0) => {}
+            Ok(delivered) => tracing::info!(
+                workspace = name,
+                delivered,
+                "Delivered the turns a pause kept",
+            ),
+            Err(e) => tracing::warn!(
+                workspace = name,
+                error = %e,
+                "Failed to deliver the turns a pause kept",
+            ),
+        }
+        // The freeze stopped rounds mid-flight; resuming re-drives exactly those, so a resumed
+        // workspace picks its work back up instead of waiting for the next restart.
+        match crate::jobs::resumable_for_workspace(name).await {
+            Ok(jobs) => crate::pipeline::resume_jobs(jobs).await,
+            Err(e) => tracing::warn!(
+                workspace = name,
+                error = %e,
+                "Failed to re-drive the rounds a resume should pick up",
+            ),
+        }
         tracing::info!(workspace = name, "Workspace pipeline resumed");
         Ok(())
     }
@@ -1375,7 +1561,9 @@ impl WorkspaceStore {
     /// preserved untouched, and diagnostics discovery runs only when none exist yet (a
     /// never-analyzed `Pending` workspace re-analyzed manually would otherwise reach
     /// Ready with none). Manual Re-analyze bypasses the pending-pickup cooldown by
-    /// design, so any in-memory cooldown is cleared here.
+    /// design, so any in-memory cooldown is cleared here. The pause column is left alone, and
+    /// nothing refuses a re-analysis: reading is outside both the freeze and the folder's hold, so
+    /// a workspace the owner stopped, or one another writer is working in, is still re-analysed.
     pub async fn rediscover(&self, name: &str) -> Result<()> {
         let ws = self
             .get_by_name(name)
@@ -1388,7 +1576,7 @@ impl WorkspaceStore {
         // NOTE: diagnostics is deliberately NOT cleared — user-managed
         // diagnostics survive re-analysis.
         self.exec_update_with_updated_at(
-            "discovery_generation = discovery_generation + 1, status = ?, paused = 1",
+            "discovery_generation = discovery_generation + 1, status = ?",
             vec![Value::from(WorkspaceStatus::Analyzing.to_string())],
             name,
         )
@@ -1399,7 +1587,6 @@ impl WorkspaceStore {
         // Clear stale per-role context entries so that old discovery tasks
         // that beat the generation check cannot leave partial data behind.
         self.clear_contexts(name).await?;
-
         let generation = self
             .get_generation(name, GenerationColumn::DISCOVERY)
             .await?;
@@ -1420,7 +1607,8 @@ impl WorkspaceStore {
     /// diagnostics-only discovery task.
     ///
     /// Unlike [`Self::rediscover`], this does **not** touch workspace status,
-    /// paused state, per-role contexts, or the discovery generation counter.
+    /// paused state, per-role contexts, or the discovery generation counter. Nothing refuses it
+    /// either: it is a read of the folder, so a freeze and another writer leave it alone.
     pub async fn rediscover_diagnostics(&self, name: &str) -> Result<()> {
         let ws = self
             .get_by_name(name)
@@ -1685,11 +1873,11 @@ fn has_new_commits(last_analyzed_commit: Option<&str>, current_hash: &str) -> bo
 /// days (see [`nightly_gate_should_run`]); missed windows do not accumulate.
 ///
 /// Workspaces are processed sequentially, so each discovery completes before the next is
-/// checked. Edge cases: an empty pass still counts (the timestamp is written first, so an
-/// unpause right after waits for the next eligible night — manual Re-analyze stays
-/// available); a non-git workspace or one whose path is gone is skipped with a warning,
-/// and since `last_analyzed_commit` stays NULL there is no re-discovery loop; a batch
-/// that starts before 3:00 is finished, as the window is checked once per wake cycle.
+/// checked. Edge cases: an empty pass still counts (the timestamp is written first, so the
+/// next pass waits for the next eligible night — manual Re-analyze stays available); a
+/// non-git workspace or one whose path is gone is skipped with a warning, and since
+/// `last_analyzed_commit` stays NULL there is no re-discovery loop; a batch that starts
+/// before 3:00 is finished, as the window is checked once per wake cycle.
 pub async fn run_nightly_check_loop() {
     let interval = Duration::from_mins(30);
     let shutdown = crate::shutdown::shutdown_token();
@@ -1732,10 +1920,9 @@ pub async fn run_nightly_check_loop() {
                 break;
             }
 
-            if ws.status != WorkspaceStatus::Ready || ws.paused {
-                // Paused workspaces are skipped: a pause (including an automatic
-                // technical-failure pause) is only lifted via the normal unpause
-                // path — nightly rediscovery must not silently resume it.
+            // A paused workspace is re-analysed like any other: a discovery pass reads the folder,
+            // so the pause neither refuses it nor is lifted by it.
+            if ws.status != WorkspaceStatus::Ready {
                 continue;
             }
 
@@ -1779,37 +1966,41 @@ pub async fn run_nightly_check_loop() {
                 continue;
             }
 
-            // Wait for discovery to complete before checking the next workspace.
-            // Poll status every 10 seconds with a generous timeout (4 hours).
-            let deadline = std::time::Instant::now() + Duration::from_hours(4);
-            loop {
-                if shutdown.is_cancelled() {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    tracing::warn!(
-                        workspace = %ws.name,
-                        "Nightly check: discovery timed out — proceeding to next workspace",
-                    );
-                    break;
-                }
+            await_discovery(&store, &ws.name, &shutdown).await;
+        }
+    }
+}
 
-                tokio::time::sleep(Duration::from_secs(10)).await;
-
-                match store.get_by_name(&ws.name).await {
-                    Ok(Some(current)) if current.status != WorkspaceStatus::Analyzing => {
-                        break;
-                    }
-                    Ok(_) => {} // Still analyzing — keep polling.
-                    Err(e) => {
-                        tracing::warn!(
-                            workspace = %ws.name,
-                            error = %e,
-                            "Nightly check: failed to poll workspace status",
-                        );
-                        break;
-                    }
-                }
+/// Wait for a discovery pass to finish before the nightly loop moves on: status polled every 10
+/// seconds, with a generous 4-hour deadline.
+async fn await_discovery(
+    store: &WorkspaceStore,
+    name: &str,
+    shutdown: &tokio_util::sync::CancellationToken,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_hours(4);
+    loop {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                workspace = %name,
+                "Nightly check: discovery timed out — proceeding to next workspace",
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        match store.get_by_name(name).await {
+            Ok(Some(current)) if current.status != WorkspaceStatus::Analyzing => return,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %name,
+                    error = %e,
+                    "Nightly check: failed to poll workspace status",
+                );
+                return;
             }
         }
     }
@@ -1864,8 +2055,8 @@ mod tests {
         store
             .conn
             .execute(
-                "INSERT INTO workspaces (name, path, created_at, updated_at, paused, maintenance, discovery_generation, diagnostics_generation) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO workspaces (name, path, created_at, updated_at, paused, maintenance, discovery_generation, diagnostics_generation, profile_confirmed) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1)",
                 crate::db::params![name, path, now.clone(), now.clone(), paused_int, maint_int, discovery_generation, diagnostics_generation],
             )
             .await
@@ -1880,6 +2071,8 @@ mod tests {
             diagnostics: None,
             notes: String::new(),
             last_analyzed_commit: None,
+            profile_confirmed: true,
+            profile: None,
         }
     }
 
@@ -2085,7 +2278,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_discovery_success_auto_unpauses() {
+    /// A finished discovery sets the status only: a pause that landed while the analysis ran is
+    /// the owner's (or a stage death's) and stays in force, so a freeze survives a re-analysis.
+    async fn a_finished_discovery_leaves_a_pause_in_force() {
         for (suffix, generation) in [("gen0", 0), ("gen1", 1)] {
             let (store, _tmp) = test_store().await;
             insert_direct(
@@ -2103,7 +2298,7 @@ mod tests {
                 suffix,
                 &format!("/tmp/{suffix}"),
                 generation,
-                DiscoveryOutcome::AllOk,
+                Outcome::Done,
                 &[],
             )
             .await;
@@ -2114,8 +2309,8 @@ mod tests {
                 .expect("fetch")
                 .expect("exists");
             assert!(
-                !ws.paused,
-                "Should auto-unpause after discovery OK (gen {generation})"
+                ws.paused,
+                "a pause set before the round finished must survive it (gen {generation})"
             );
             assert_eq!(
                 ws.status,
@@ -2138,7 +2333,7 @@ mod tests {
             "fail_gen0",
             "/tmp/fail_gen0",
             0,
-            DiscoveryOutcome::Fatal,
+            Outcome::Failed,
             &errors,
         )
         .await;
@@ -2172,7 +2367,7 @@ mod tests {
             "prov_gen0",
             "/tmp/prov_gen0",
             0,
-            DiscoveryOutcome::Transient,
+            Outcome::Deferred,
             &errors,
         )
         .await;
@@ -2182,7 +2377,10 @@ mod tests {
             .await
             .expect("fetch")
             .expect("exists");
-        assert!(ws.paused, "Should remain paused (analysis pause)");
+        assert!(
+            ws.paused,
+            "a pause is left in force by every outcome, this one included"
+        );
         assert_eq!(
             ws.status,
             WorkspaceStatus::Pending,
@@ -2193,15 +2391,7 @@ mod tests {
             "Provider-class failure must arm the in-memory pickup cooldown"
         );
         // A successful finalize clears the cooldown.
-        finalize_discovery(
-            &store,
-            "prov_gen0",
-            "/tmp/prov_gen0",
-            0,
-            DiscoveryOutcome::AllOk,
-            &[],
-        )
-        .await;
+        finalize_discovery(&store, "prov_gen0", "/tmp/prov_gen0", 0, Outcome::Done, &[]).await;
         assert!(
             !pending_pickup_cooldown_active("prov_gen0"),
             "Successful discovery must clear the pickup cooldown"
@@ -2220,15 +2410,7 @@ mod tests {
             .await
             .expect("bump generation");
 
-        finalize_discovery(
-            &store,
-            "stale",
-            "/tmp/stale",
-            0,
-            DiscoveryOutcome::AllOk,
-            &[],
-        )
-        .await;
+        finalize_discovery(&store, "stale", "/tmp/stale", 0, Outcome::Done, &[]).await;
 
         let ws = store
             .get_by_name("stale")
@@ -2248,8 +2430,10 @@ mod tests {
         );
     }
 
+    /// A re-analysis changes the status only: the pause column is the owner's, so a workspace that
+    /// was running stays unpaused and one the owner stopped stays stopped.
     #[tokio::test]
-    async fn rediscover_sets_paused() {
+    async fn a_reanalysis_leaves_the_pause_state_alone() {
         let (store, _tmp) = test_store().await;
         insert_direct(
             &store,
@@ -2289,8 +2473,13 @@ mod tests {
             .expect("fetch")
             .expect("exists");
         assert!(
-            ws.paused,
-            "rediscover() must set paused = true when transitioning to 'analyzing'"
+            !ws.paused,
+            "rediscover() must not pause a workspace that was running"
+        );
+        assert_eq!(
+            ws.status,
+            WorkspaceStatus::Analyzing,
+            "rediscover() still takes the workspace into 'analyzing'"
         );
     }
 
@@ -2316,8 +2505,9 @@ mod tests {
             .expect("add workspace");
 
         assert!(
-            ws.paused,
-            "add() must return a Workspace with paused = true"
+            !ws.paused,
+            "add() must return an unpaused Workspace: its status, not a pause, keeps the \
+             pipeline out until discovery completes"
         );
         assert_eq!(
             ws.status,
@@ -2357,8 +2547,8 @@ mod tests {
             .expect("fetch")
             .expect("exists");
         assert!(
-            fetched.paused,
-            "Persisted workspace must have paused = true"
+            !fetched.paused,
+            "Persisted workspace must not be born paused"
         );
         assert_eq!(
             fetched.status,
@@ -2464,7 +2654,7 @@ mod tests {
     #[tokio::test]
     async fn claim_pending_for_discovery_is_atomic_and_returns_live_generation() {
         let (store, _tmp) = test_store().await;
-        insert_direct(&store, "pickup", "/tmp/pickup", true, false, 3, 0).await;
+        insert_direct(&store, "pickup", "/tmp/pickup", false, false, 3, 0).await;
 
         let generation = store
             .claim_pending_for_discovery("pickup")
@@ -2483,7 +2673,10 @@ mod tests {
             WorkspaceStatus::Analyzing,
             "claim must transition pending → analyzing"
         );
-        assert!(ws.paused, "claim must set the analysis pause");
+        assert!(
+            !ws.paused,
+            "the claim does not pause: the analyzing status is what keeps the pipeline out"
+        );
 
         // A second claim on the same row is a no-op (atomicity guard).
         let second = store
@@ -2553,12 +2746,10 @@ mod tests {
             "classify-test".into(),
             crate::Role::Discovery,
             &ws,
-            None,
+            crate::work_unit::WorkUnit::Turn,
             String::new(),
             String::new(),
             false,
-            None,
-            None,
             None,
         );
         agent.failure_class = class;
@@ -2613,6 +2804,30 @@ mod tests {
             classify_with(None),
             DiscoveryFailureKind::Fatal,
             "unclassified runtime failures must be Fatal"
+        );
+    }
+
+    /// A workspace pause freezes a discovery in flight. That is a cooperative stop, so the
+    /// workspace returns to Pending for the unpause to re-drive rather than going terminally Failed.
+    #[test]
+    #[serial_test::serial(drain)] // serializes the process-global drain flag
+    fn a_frozen_discovery_is_a_cooperative_stop() {
+        let ws = test_ws("/tmp/frozen_discovery_ws");
+        let agent = crate::Agent::new(
+            "frozen-discovery-test".into(),
+            crate::Role::Discovery,
+            &ws,
+            crate::work_unit::WorkUnit::Turn,
+            String::new(),
+            String::new(),
+            false,
+            None,
+        );
+        agent.mark_paused_frozen();
+        assert_eq!(
+            classify_discovery_failure(&agent, None),
+            DiscoveryFailureKind::Transient,
+            "a freeze returns the workspace to Pending rather than Failed"
         );
     }
 
@@ -3028,5 +3243,207 @@ mod tests {
             .await
             .expect("query user workspace")
             .flatten()
+    }
+
+    /// A confirmed profile this build cannot read is a fact the owner is told — and never a reason
+    /// to stop the workspace, which runs on the default.
+    #[test]
+    fn an_invalid_confirmed_profile_is_reported_to_the_owner_but_never_gates_the_pipeline() {
+        let ws = Workspace {
+            profile: Some("not json".to_string()),
+            profile_confirmed: true,
+            ..test_ws_named("/tmp/ws_invalid_profile", "ws_invalid_profile")
+        };
+        let reported = status_reason(&ws, &crate::workspace_profile::read(&ws))
+            .expect("the owner is told the profile is invalid");
+        assert!(
+            reported.contains("confirmed profile is invalid") && reported.contains("default"),
+            "got: {reported}"
+        );
+        assert!(
+            pipeline_gate(&ws, &crate::workspace_profile::read(&ws)).is_none(),
+            "an invalid profile never stops the workspace"
+        );
+    }
+
+    /// A writer beside the workspace's own stage work is still another writer: the own work is what
+    /// the workspace is doing, and the listing must not read idle while the gate is blocking.
+    #[tokio::test]
+    async fn a_second_writer_beside_the_workspaces_own_stage_work_is_still_reported() {
+        use crate::agent::registry::{AGENT_REGISTRY, ParentKey};
+        let ws = Workspace {
+            profile_confirmed: true,
+            ..test_ws_named("/tmp/ws_second_writer", "ws_second_writer")
+        };
+        let own = format!("own_{}", crate::generate_suffix());
+        let own_generation = AGENT_REGISTRY.register(
+            own.clone(),
+            Role::Engineer.as_str().to_string(),
+            None,
+            &ws,
+            std::sync::Arc::new(crate::stop::Stop::default()),
+            Some(ParentKey::Ticket("second_writer_ticket".to_string())),
+            None,
+        );
+        let other = format!("other_{}", crate::generate_suffix());
+        let other_generation = AGENT_REGISTRY.register(
+            other.clone(),
+            Role::Worker.as_str().to_string(),
+            None,
+            &ws,
+            std::sync::Arc::new(crate::stop::Stop::default()),
+            Some(ParentKey::Launch(other.clone())),
+            None,
+        );
+
+        let reported = status_reason(&ws, &crate::workspace_profile::read(&ws))
+            .expect("the other writer is reported");
+        assert!(
+            reported.contains("waiting for a worker to finish"),
+            "the holder reads as a person, not as its role token: {reported}"
+        );
+        assert!(
+            pipeline_gate(&ws, &crate::workspace_profile::read(&ws)).is_some(),
+            "the gate blocks either way"
+        );
+
+        AGENT_REGISTRY.deregister(&other, other_generation);
+        AGENT_REGISTRY.deregister(&own, own_generation);
+    }
+
+    /// A parentless writer that is not the workspace's own background pass is still another
+    /// writer: a router-dispatched worker round carries no parent key, and the listing must name it
+    /// rather than report the workspace idle while the pipeline's gate blocks on it.
+    #[tokio::test]
+    async fn a_parentless_writer_beside_the_workspaces_own_work_is_reported() {
+        use crate::agent::registry::AGENT_REGISTRY;
+        let ws = Workspace {
+            profile_confirmed: true,
+            ..test_ws_named("/tmp/ws_parentless_writer", "ws_parentless_writer")
+        };
+        let round = format!("worker_{}", crate::generate_suffix());
+        let generation = AGENT_REGISTRY.register(
+            round.clone(),
+            Role::Worker.as_str().to_string(),
+            None,
+            &ws,
+            std::sync::Arc::new(crate::stop::Stop::default()),
+            None,
+            None,
+        );
+
+        let reported = status_reason(&ws, &crate::workspace_profile::read(&ws))
+            .expect("a parentless worker round is a writer, not the workspace working");
+        assert!(
+            reported.contains("waiting for a worker to finish"),
+            "the holder reads as a person, not as its role token: {reported}"
+        );
+
+        AGENT_REGISTRY.deregister(&round, generation);
+    }
+
+    /// Reading takes no hold and is not a writer, in either voice: a discovery pass, a separately
+    /// launched analysis and a research run leave the folder free — neither the owner-facing
+    /// listing nor the pipeline's gate sees a writer beside them — while a ticket's phase round and
+    /// a research run's cleanup step hold it. The line is the work, not the role: the pipeline's
+    /// analysis stage runs an analyst under a ticket and does hold.
+    #[test]
+    fn a_reading_pass_holds_nothing_for_either_voice() {
+        use crate::agent::registry::{AGENT_REGISTRY, ParentKey};
+        let ws = Workspace {
+            profile_confirmed: true,
+            ..test_ws_named("/tmp/ws_reading_holds_nothing", "ws_reading_holds_nothing")
+        };
+        let read = crate::workspace_profile::read(&ws);
+        let mut registered = Vec::new();
+        for (role, parent) in [
+            (Role::Discovery, None),
+            (
+                Role::Analyst,
+                Some(ParentKey::AnalyzeRound("reading_round".to_string())),
+            ),
+            (
+                Role::Worker,
+                Some(ParentKey::Research("reading_run".to_string())),
+            ),
+        ] {
+            let agent_id = format!("{}_{}", role.as_str(), crate::generate_suffix());
+            let generation = AGENT_REGISTRY.register(
+                agent_id.clone(),
+                role.as_str().to_string(),
+                None,
+                &ws,
+                std::sync::Arc::new(crate::stop::Stop::default()),
+                parent,
+                None,
+            );
+            registered.push((agent_id, generation));
+            assert!(
+                AGENT_REGISTRY.folder_holder(ws.as_path(), &[]).is_none(),
+                "{role} is reading: it holds nothing",
+            );
+            assert!(
+                status_reason(&ws, &read).is_none(),
+                "{role} is not another writer for the listing",
+            );
+            assert!(
+                pipeline_gate(&ws, &read).is_none(),
+                "and the gate starts work beside it",
+            );
+        }
+        for (agent_id, generation) in registered {
+            AGENT_REGISTRY.deregister(&agent_id, generation);
+        }
+
+        // A research run's cleanup deletes the run's folder: the one writer under that parent.
+        let cleanup = format!("cleanup_{}", crate::generate_suffix());
+        let cleanup_generation = AGENT_REGISTRY.register(
+            cleanup.clone(),
+            Role::Sanitation.as_str().to_string(),
+            None,
+            &ws,
+            std::sync::Arc::new(crate::stop::Stop::default()),
+            Some(ParentKey::Research("reading_run".to_string())),
+            None,
+        );
+        assert_eq!(
+            AGENT_REGISTRY
+                .folder_holder(ws.as_path(), &[])
+                .map(|holder| holder.agent_id),
+            Some(cleanup.clone()),
+            "a research run's cleanup writes the folder",
+        );
+        AGENT_REGISTRY.deregister(&cleanup, cleanup_generation);
+
+        let stage = format!("ticket_{}", crate::generate_suffix());
+        let stage_key = ParentKey::Ticket("reading_holds_ticket".to_string());
+        let stage_generation = AGENT_REGISTRY.register(
+            stage.clone(),
+            Role::Analyst.as_str().to_string(),
+            None,
+            &ws,
+            std::sync::Arc::new(crate::stop::Stop::default()),
+            Some(stage_key.clone()),
+            None,
+        );
+        let holder = AGENT_REGISTRY
+            .folder_holder(ws.as_path(), &[])
+            .expect("a ticket stage writes the folder");
+        assert_eq!(holder.agent_id, stage, "the stage is the writer");
+        assert!(
+            !own_work_groups(&AGENT_REGISTRY.list(), &ws).is_empty(),
+            "and the listing still calls the workspace's own stage its own work",
+        );
+
+        AGENT_REGISTRY.deregister(&stage, stage_generation);
+    }
+
+    /// The one holder naming both voices use: the launch roles by their own names, a pipeline role
+    /// as itself.
+    #[test]
+    fn a_holder_is_named_the_same_way_in_a_wait_and_in_a_refusal() {
+        assert_eq!(holder_name(Role::Worker.as_str()), "a worker");
+        assert_eq!(holder_name(Role::Custom.as_str()), "a custom role");
+        assert_eq!(holder_name(Role::Engineer.as_str()), "the engineer");
     }
 }

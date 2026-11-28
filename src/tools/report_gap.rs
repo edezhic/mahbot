@@ -141,7 +141,8 @@ mod tests {
 
     impl Spy {
         fn register() -> Self {
-            let agent_id = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+            let agent_id =
+                crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
             let rx = message_router::register_agent(&agent_id);
             Self { agent_id, rx }
         }
@@ -217,7 +218,7 @@ mod tests {
             .expect("the durable row exists");
         assert_eq!(
             row.target_agent_id,
-            crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
+            crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id(),
             "the durable target is the owner's Assistant"
         );
         reclaim(&job).await;

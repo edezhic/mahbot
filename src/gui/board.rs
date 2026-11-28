@@ -1540,8 +1540,9 @@ impl BoardState {
                      but no further work happens;\n\
                      • leave uncommitted changes in the working tree — not \
                      committed, not reverted;\n\
-                     • pause the workspace pipeline — all in-flight work stops \
-                     and no pipeline stage advances until you manually resume it.",
+                     • pause the workspace pipeline — every writer stops and no pipeline \
+                     stage advances until you manually resume it; a discovery pass or a \
+                     launched analysis keeps running.",
                 ]),
                 [
                     dialog::DialogAction::secondary("Keep ticket", BoardMessage::DismissCancel),

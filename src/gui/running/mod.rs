@@ -232,17 +232,6 @@ fn parent_group_kind(parent: &ParentKey) -> GroupKind {
     }
 }
 
-/// The group key payload for a parent key (ticket id / round key / run key / launch agent id).
-fn parent_group_key(parent: &ParentKey) -> &str {
-    match parent {
-        ParentKey::Ticket(id) => id,
-        ParentKey::AnalyzeRound(key)
-        | ParentKey::Research(key)
-        | ParentKey::Launch(key)
-        | ParentKey::Chain(key) => key,
-    }
-}
-
 /// Group the running agents and non-agent calls by DIRECT PARENT INVOCATION: tickets, analyze
 /// rounds, research runs, branch launches, `send` chains, workspace singletons (agents with no
 /// parent key) and unattributed calls (non-agent calls with no parent key).
@@ -301,7 +290,7 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
         if let Some(parent) = &agent.parent_key {
             let idx = find_group(
                 parent_group_kind(parent),
-                parent_group_key(parent),
+                parent.key(),
                 &workspace,
                 &mut groups,
             );
@@ -327,7 +316,7 @@ fn build_groups(agents: &[AgentHandle], calls: &[NonAgentCallHandle]) -> Vec<Dis
         if let Some(parent) = &call.parent_key {
             let idx = find_group(
                 parent_group_kind(parent),
-                parent_group_key(parent),
+                parent.key(),
                 &workspace,
                 &mut groups,
             );

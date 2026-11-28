@@ -14,9 +14,9 @@
 //! interrupted turn resumes ~two minutes after it was cut.
 //!
 //! The poller skips `manager_*` (Manager has its own lifecycle) plus every prefix in
-//! [`super::TRANSIENT_AGENT_ID_PREFIXES`] — the union returned by
-//! `super::non_user_facing_agent_id_prefixes`; a custom role's continuable `role_*` branch IS
-//! recovered. Only direct user-agent sessions (`{user}_{ws}_{role}`, or the deduped
+//! [`crate::address::TRANSIENT_AGENT_ID_PREFIXES`] — the union returned by
+//! [`crate::address::non_user_facing_agent_id_prefixes`]; a custom role's continuable `role_*`
+//! branch IS recovered. Only direct user-agent sessions (`{user}_{ws}_{role}`, or the deduped
 //! `{user}_personal:{role}`) and custom roles' continuable branches are eligible.
 //!
 //! Retry safety: every recovery attempt counts toward the per-session retry cap regardless of
@@ -227,11 +227,12 @@ fn history_signature(role: ChatRole, content: &str) -> u64 {
     hasher.finish()
 }
 
-/// Whether the poller's SQL filter excludes this id: `manager_` plus every transient prefix,
-/// matched case-insensitively for ASCII the way Turso's `LIKE 'prefix_%'` does.
+/// Whether the poller's SQL filter excludes this id: a workspace Manager, or any transient kind —
+/// asked of the one addressing type. The SQL filter above is the case-insensitive `LIKE` match;
+/// this is the same question of the exact spelling every stored id has.
 fn is_non_user_facing(agent_id: &str) -> bool {
-    crate::session::non_user_facing_agent_id_prefixes()
-        .any(|prefix| super::starts_with_ignore_ascii_case(agent_id, prefix))
+    crate::address::AgentAddress::parse(agent_id)
+        .is_some_and(|address| address.is_non_user_facing())
 }
 
 /// Run the dead-session recovery poller loop: once a minute for the first `STARTUP_WINDOW`, then
@@ -280,14 +281,14 @@ fn is_recovery_candidate(last_role: ChatRole, last_content: &str) -> bool {
 async fn recover_dead_sessions() -> anyhow::Result<()> {
     let now = Utc::now();
 
-    // SQL-side filtering keeps excluded sessions (manager_ and every TRANSIENT_AGENT_ID_PREFIXES
+    // SQL-side filtering keeps excluded sessions (manager_ and every transient prefix
     // prefix) from being loaded; the per-session `get_last_message_tail` reads below are
     // lightweight (indexed `ORDER BY id DESC LIMIT 1`) and run only for eligible sessions. A custom
     // role's continuable `role_` branch is deliberately not excluded, and a chain step is always
     // listed — a one-off role's `rolerun_` conversation is its step's whole durable record.
     let sessions = crate::session::store()
         .list_sessions_with_metadata_excluding(
-            &crate::session::non_user_facing_agent_id_prefixes().collect::<Vec<&str>>(),
+            &crate::address::non_user_facing_agent_id_prefixes().collect::<Vec<&str>>(),
         )
         .await?;
 
@@ -326,10 +327,6 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
             continue;
         }
         DEAD_SESSION_TRACKER.forget_deterministic_failure(agent_id);
-        // An Assistant tail is a candidate only via the dangling-frame path —
-        // remember that for the pause guard below.
-        let needs_pause_guard = last_role == ChatRole::Assistant;
-
         if AGENT_REGISTRY.contains(agent_id) {
             // Agent is still running (or was just spawned).
             continue;
@@ -395,8 +392,10 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
             continue;
         };
 
-        // Pause guard (dangling-frame resumption only)
-        if needs_pause_guard && paused_workspace_blocks(agent_id, &ctx, role).await {
+        // The freeze reaches every writer in the workspace: a paused workspace's recovery waits for
+        // the unpause, which is what re-drives the work. The Manager's own triage is the one
+        // exemption — its notice is what explains the pause.
+        if role != Role::Manager && paused_workspace_blocks(&ctx).await {
             continue;
         }
 
@@ -423,20 +422,14 @@ async fn recover_dead_sessions() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The dangling-frame pause guard: a paused workspace is a strict freeze, so auto-resuming
-/// interrupted work the owner explicitly paused must not happen (unpausing re-drives via the
-/// puller / the next user prompt). User/Tool tails stay exempt — answering a pending user prompt
-/// matches normal direct-chat behavior, which a workspace pause does not freeze — and so does a
-/// continuable branch (a custom role's or a worker branch's), since a workspace pause freezes only
-/// launches tied to a ticket. A failed workspace lookup skips the cycle.
-async fn paused_workspace_blocks(agent_id: &str, ctx: &SessionContext, role: Role) -> bool {
-    if is_continuable_branch(role, agent_id) {
-        return false;
-    }
+/// The pause guard: a paused workspace is a strict freeze, so auto-resuming interrupted work the
+/// owner explicitly paused must not happen (unpausing re-drives via the puller / the next user
+/// prompt). Every writer in the workspace is covered — a ticket-less custom-role or worker branch
+/// included — and the caller exempts only the Manager. A failed workspace lookup skips the cycle.
+async fn paused_workspace_blocks(ctx: &SessionContext) -> bool {
     match crate::workspace::get_by_name(&ctx.workspace_name).await {
         Ok(Some(ws)) if ws.paused => {
             tracing::debug!(
-                agent_id = %agent_id,
                 workspace = %ctx.workspace_name,
                 "Dead session recovery: workspace paused — skipping"
             );
@@ -445,7 +438,7 @@ async fn paused_workspace_blocks(agent_id: &str, ctx: &SessionContext, role: Rol
         Ok(_) => false,
         Err(e) => {
             tracing::warn!(
-                agent_id = %agent_id,
+                workspace = %ctx.workspace_name,
                 error = %e,
                 "Dead session recovery: workspace lookup failed — skipping this cycle"
             );
@@ -596,13 +589,13 @@ async fn recovered_launch(
             }
         };
     }
-    if role == Role::Worker && crate::session::is_worker_branch_agent_id(agent_id) {
+    if role == Role::Worker && is_worker_branch(agent_id) {
         // The branch name is the recorded identifier, or — when that write failed — the agent id's
         // own suffix, which is the same name.
-        let branch = ctx
-            .custom_identifier
-            .clone()
-            .or_else(|| crate::session::worker_branch_name(agent_id).map(str::to_string));
+        let branch = ctx.custom_identifier.clone().or_else(|| {
+            crate::address::AgentAddress::parse(agent_id)
+                .and_then(|address| address.branch_name().map(str::to_string))
+        });
         return RecoveredLaunch::Launch(Some(crate::Launch {
             role: Role::Worker,
             name: String::new(),
@@ -682,15 +675,10 @@ async fn retire_chain_step(agent_id: &str) {
     }
 }
 
-/// Whether a dead session is a continuable branch (a custom role's or a worker branch's). Such a
-/// session is exempt from the workspace-pause guard: a pause freezes only launches tied to a
-/// ticket.
-fn is_continuable_branch(role: Role, agent_id: &str) -> bool {
-    match role {
-        Role::Custom => true,
-        Role::Worker => crate::session::is_worker_branch_agent_id(agent_id),
-        _ => false,
-    }
+/// Whether an agent id is a worker branch's — asked of the one addressing type.
+fn is_worker_branch(agent_id: &str) -> bool {
+    crate::address::AgentAddress::parse(agent_id)
+        .is_some_and(|address| address.branch_name().is_some())
 }
 
 #[cfg(test)]
@@ -772,7 +760,8 @@ mod tests {
             chain: crate::launch::Stored::Step(Box::new(chain.clone())),
             extract: None,
         };
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin =
+            crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME.to_owned()).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
         assert!(
@@ -825,7 +814,7 @@ mod tests {
             step: 1,
             next: Vec::new(),
         };
-        let conversation = crate::session::custom_role_run_agent_id("oneoff_editor");
+        let conversation = crate::address::AgentAddress::custom_role_run("oneoff_editor").id();
         let ctx = SessionContext {
             channel: "gui".to_string(),
             user_name: crate::users::ADMIN_USER_NAME.to_string(),
@@ -866,7 +855,7 @@ mod tests {
     #[tokio::test]
     async fn attempt_recovery_rebuilds_a_worker_branch_with_its_asker() {
         crate::util::test::init_management_test_stores().await;
-        let branch = crate::session::worker_branch_agent_id("night");
+        let branch = crate::address::AgentAddress::worker_branch("night".to_owned()).id();
         let asker_folder = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
         let ctx = SessionContext {
             channel: "gui".to_string(),
@@ -882,7 +871,8 @@ mod tests {
                     identifier: Some("hourly".to_string()),
                     prompt: "you brief".to_string(),
                     tools: Vec::new(),
-                    agent_id: crate::session::custom_role_agent_id("briefer", Some("hourly")),
+                    agent_id: crate::address::AgentAddress::custom_role("briefer", Some("hourly"))
+                        .id(),
                     reply_to: None,
                     chain: None,
                     extract: None,
@@ -921,7 +911,7 @@ mod tests {
     #[tokio::test]
     async fn a_branch_step_survives_a_restart_on_its_conversation_alone() {
         crate::util::test::init_management_test_stores().await;
-        let branch = crate::session::worker_branch_agent_id("editor");
+        let branch = crate::address::AgentAddress::worker_branch("editor".to_owned()).id();
         let workspace = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
         let chain = crate::launch::Chain {
             id: "recovered".to_string(),
@@ -988,7 +978,7 @@ mod tests {
     #[tokio::test]
     async fn an_ordinary_send_recovers_with_its_schema() {
         crate::util::test::init_management_test_stores().await;
-        let branch = crate::session::worker_branch_agent_id("shaped");
+        let branch = crate::address::AgentAddress::worker_branch("shaped".to_owned()).id();
         let workspace = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
         let extract = crate::extract::Extract::from_text(
             r#"{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"]}"#,
@@ -1032,7 +1022,7 @@ mod tests {
     #[serial_test::serial(drain)]
     async fn a_stopped_chain_step_is_never_resumed() {
         crate::util::test::init_management_test_stores().await;
-        let branch = crate::session::worker_branch_agent_id("stopped");
+        let branch = crate::address::AgentAddress::worker_branch("stopped".to_owned()).id();
         let workspace = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
         let chain = crate::launch::Chain {
             id: "stopped_step".to_string(),
@@ -1092,7 +1082,7 @@ mod tests {
     #[serial_test::serial(drain)]
     async fn an_unreadable_chain_step_is_abandoned_loudly() {
         crate::util::test::init_management_test_stores().await;
-        let branch = crate::session::worker_branch_agent_id("corrupt");
+        let branch = crate::address::AgentAddress::worker_branch("corrupt".to_owned()).id();
         let workspace = crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME);
         crate::session::store()
             .set_branch(&branch, None, Some("corrupt"), None, None, None)
@@ -1110,7 +1100,8 @@ mod tests {
             extract: None,
         };
         let mut rx = crate::agent::message_router::register_agent(&branch);
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin =
+            crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME.to_owned()).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
         assert!(
@@ -1456,7 +1447,7 @@ mod tests {
                 conn,
                 &job_id,
                 &row.agent_id,
-                crate::jobs::RowStatus::Done,
+                crate::outcome::Outcome::Done,
                 Some(outcome),
             )
             .await
@@ -1592,11 +1583,9 @@ mod tests {
             "engineer".into(),
             None,
             &ws,
-            tokio_util::sync::CancellationToken::new(),
-            tokio_util::sync::CancellationToken::new(),
+            std::sync::Arc::new(crate::stop::Stop::default()),
             None,
             None,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
         recover_dead_sessions().await.unwrap();

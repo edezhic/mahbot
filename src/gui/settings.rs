@@ -1792,6 +1792,39 @@ impl SettingsState {
                                 ),
                                 "Status",
                             ),
+                            // An unconfirmed profile is the workspace waiting, so the row says it
+                            // beside the status it is not — the pipeline starts nothing until the
+                            // owner confirms. A confirmed profile this build cannot read is the
+                            // other state the owner must see: the workspace runs on the default.
+                            match ws.profile_states.get(&ws_item.name) {
+                                Some(crate::workspace_profile::ProfileState::Unconfirmed) => {
+                                    Some(widgets::tooltip_hint(
+                                        widgets::badge_pill(
+                                            "profile".to_string(),
+                                            (theme::TEXT_SECONDARY, theme::HOVER),
+                                            widgets::PILL_MODAL,
+                                        ),
+                                        "Waiting for its profile to be confirmed",
+                                    ))
+                                }
+                                Some(crate::workspace_profile::ProfileState::Invalid(error)) => {
+                                    Some(widgets::tooltip_hint(
+                                        widgets::badge_pill(
+                                            "profile invalid".to_string(),
+                                            theme::workspace_status_color(
+                                                crate::WorkspaceStatus::Failed,
+                                            ),
+                                            widgets::PILL_MODAL,
+                                        ),
+                                        format!(
+                                            "The confirmed profile is invalid ({error}) — the \
+                                             workspace runs on the default profile until it is \
+                                             fixed"
+                                        ),
+                                    ))
+                                }
+                                _ => None,
+                            },
                             // The path hugs the row's right edge, clipped at the
                             // left when it is too long for the column: the
                             // paragraph's own right alignment keeps both cases

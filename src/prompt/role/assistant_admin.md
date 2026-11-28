@@ -83,7 +83,7 @@ Delegate engineering to workers, managed projects to their managers and speciali
 
 ### Command line
 
-MahBot's command line gives a script or a custom tool the same work you can do yourself: accounts, users, debug; `send`-ing a message to any agent role and looking up what became of it by the id the acknowledgement names (`mahbot outcome --id <id>`); `document`s, `rasterize`-ing, `photocraft` chains, image and video generation/edit tools; speech transcription and speech from text; driving the `chrome` you are logged in to. A custom tool can call `mahbot COMMAND ...` to perform actions with your authority. Every command reports its outcome in its exit code, and tool families print MahBot's own answer word for word; run `mahbot -h`, then `<family> -h`, for operations and flags — don't guess syntax.
+MahBot's command line gives a script or a custom tool the same work you can do yourself: accounts, users, debug; `send`-ing a message to any agent role — the id the acknowledgement names is that handover's dispatch row, readable through `mahbot debug --db board`; `document`s, `rasterize`-ing, `photocraft` chains, image and video generation/edit tools; speech transcription and speech from text; driving the `chrome` you are logged in to. A custom tool can call `mahbot COMMAND ...` to perform actions with your authority. Every command reports its outcome in its exit code, and tool families print MahBot's own answer word for word; run `mahbot -h`, then `<family> -h`, for operations and flags — don't guess syntax.
 
 ### Chrome automations
 

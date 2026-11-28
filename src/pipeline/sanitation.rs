@@ -2,13 +2,14 @@
 
 use std::sync::Arc;
 
+use crate::outcome::Outcome;
 use crate::pipeline::board::Ticket;
 use crate::prompt::{load_prompt, substitute};
 use crate::{Agent, Role, Workspace};
 
 use super::{
-    BoardStore, FinalizeOutcome, StageRunKind, TicketPhase, TransitionCtx, board,
-    bounce_to_development, clear_implementation_roster, error, guard_job_phase, guard_stage, info,
+    BoardStore, StageRunKind, TicketPhase, TransitionCtx, board, bounce_to_development,
+    clear_implementation_roster, error, guard_job_phase, guard_stage, info,
     list_new_or_untracked_files, notice, pause_freezing, reset_phase_attempt, run_git_status,
     run_stage_agent, sync_phase_job_task, warn, with_comment_and_transition,
 };
@@ -36,7 +37,7 @@ async fn transition_ticket_to_done_no_comment(ticket: &Ticket, source: TicketPha
             async |_tx| Ok(()),
         )
         .await,
-        FinalizeOutcome::Applied
+        Outcome::Done
     ) {
         info!(ticket = %ticket.id, "{reason}");
         let _ = crate::jobs::complete_ticket_phase_jobs(&crate::session::store().conn, &ticket.id)
@@ -149,7 +150,7 @@ async fn reset_sanitation_attempt(
     terms: notice::Terms,
 ) {
     let death = (!agent.cut_short()).then(|| {
-        notice::Cause::Participants(vec![notice::Participant {
+        notice::Cause::Participants(vec![notice::Member {
             label: "sanitation agent".to_string(),
             produced,
             terms,
@@ -196,7 +197,7 @@ async fn finalize_commit_and_transition(
             },
         )
         .await,
-        FinalizeOutcome::Applied
+        Outcome::Done
     ) {
         info!(ticket = %ticket.id, "Committed {}, moving to Done", commit_info.short_hash());
         let _ = crate::jobs::complete_ticket_phase_jobs(&crate::session::store().conn, &ticket.id)

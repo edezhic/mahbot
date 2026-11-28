@@ -41,6 +41,36 @@ struct StoredMaintainerRecommendations {
     generated_at: String,
 }
 
+/// Whether a workspace gets a maintainer run this cycle. The maintainer writes the code, so a
+/// freeze reaches it, and the folder's single-writer hold makes a run wait for the writer already
+/// there and retry on a later cycle. A pass over the folder does not hold it, so a workspace being
+/// re-analysed is maintained; one whose first discovery has not run, or has failed, has nothing to
+/// maintain yet.
+fn should_run_maintainer(ws: &Workspace) -> bool {
+    if !ws.maintenance_enabled {
+        return false;
+    }
+    if matches!(
+        ws.status,
+        WorkspaceStatus::Pending | WorkspaceStatus::Failed
+    ) {
+        debug!(workspace = %ws.name, status = %ws.status, "Maintainer: skipping — workspace not ready");
+        return false;
+    }
+    if ws.paused {
+        debug!(workspace = %ws.name, "Maintainer: skipping — workspace paused");
+        return false;
+    }
+    if crate::agent::registry::AGENT_REGISTRY
+        .folder_holder(ws.as_path(), &[])
+        .is_some()
+    {
+        debug!(workspace = %ws.name, "Maintainer: skipping — folder held by another writer");
+        return false;
+    }
+    true
+}
+
 /// Run the maintainer background loop.
 ///
 /// Runs a Maintainer agent per workspace with the investigation prompt. The agent id is
@@ -114,21 +144,12 @@ pub async fn run_maintainer_loop() {
 
         let tasks: Vec<_> = workspaces
             .into_iter()
-            .filter(|ws| {
-                if !ws.maintenance_enabled {
-                    return false;
-                }
-                if ws.status != WorkspaceStatus::Ready {
-                    debug!(workspace = %ws.name, status = %ws.status, "Maintainer: skipping — workspace not ready");
-                    return false;
-                }
-                true
-            })
+            .filter(should_run_maintainer)
             .map(|ws| {
                 let prompt = prompt.clone();
                 let shutdown = shutdown.clone();
                 tokio::spawn(async move {
-                    let agent_id = crate::session::maintainer_agent_id(&ws.name);
+                    let agent_id = crate::address::AgentAddress::maintainer(ws.name.clone()).id();
 
                     // Defensive double-dispatch guard: never re-dispatch a live run for the same
                     // deterministic ID.
@@ -167,8 +188,7 @@ pub async fn run_maintainer_loop() {
                         &message,
                         resume,
                         None,
-                        None,
-                        None,
+                        crate::work_unit::WorkUnit::Turn,
                     )
                     .await;
 
@@ -470,6 +490,8 @@ mod tests {
             diagnostics: None,
             notes: String::new(),
             last_analyzed_commit: None,
+            profile_confirmed: true,
+            profile: None,
         }
     }
 

@@ -1,6 +1,5 @@
 //! The deep-research cancel action and the cancelled-run sweep (durable row removal, folder
-//! release, archive deletion). The shared per-round cancel signal registry lives in
-//! [`crate::round_cancel`].
+//! release, archive deletion). The registry of live runs' stops lives in [`crate::stop`].
 //!
 //! A manual cancel from the Running Agents page is a DISTINCT, PERMANENT stop: unlike the
 //! shutdown/drain abort (the run stays alive and resumes at boot), a manual cancel stops the run so
@@ -28,12 +27,12 @@ use crate::research_cleanup::COMMAND_DUMP_FILE;
 ///
 /// Infallible by design: some path always makes progress, so the GUI has no cancel failure.
 pub(crate) async fn cancel_research_run(job_id: &str) {
-    crate::round_cancel::cancel(job_id);
+    crate::stop::fire(job_id);
     crate::agent::registry::AGENT_REGISTRY
         .cancel_by_parent_key(&ParentKey::Research(job_id.to_string()));
     crate::agent::registry::NON_AGENT_CALLS
         .remove_by_parent_key(&ParentKey::Research(job_id.to_string()));
-    if !crate::round_cancel::is_registered(job_id)
+    if !crate::stop::is_registered(job_id)
         && let Err(e) = sweep_cancelled_run(job_id).await
     {
         tracing::warn!(job = %job_id, error = %e, "cancel sweep failed — durable rows left for boot resume");
@@ -541,8 +540,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let _guard = crate::round_cancel::register(job_id, None);
-        crate::round_cancel::cancel(job_id);
+        let _guard = crate::stop::register(job_id, None);
+        crate::stop::fire(job_id);
         let envelope = crate::jobs::complete_durable_job(
             job_id,
             "report".to_string(),

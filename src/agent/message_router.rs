@@ -19,6 +19,7 @@ use crate::channels::{
     broadcast_and_persist_agent_response, spawn_scoped_typing_task, stop_typing,
 };
 use crate::db;
+use crate::outcome::Outcome;
 use crate::users::UserRecord;
 use crate::util::UnwrapPoison;
 use crate::{Channel, ChatEvent, RefusedMarker, Role, SendFailure, SendMessage};
@@ -148,7 +149,7 @@ impl AgentJob {
     /// The schema this job's answer must come back as, when it asked for one — on the branch
     /// launch when there is one, else on the job itself (the manager leg).
     #[must_use]
-    fn answer_extract(&self) -> Option<&crate::extract::Extract> {
+    pub(crate) fn answer_extract(&self) -> Option<&crate::extract::Extract> {
         self.custom_role
             .as_ref()
             .and_then(|launch| launch.extract.as_ref())
@@ -344,7 +345,7 @@ pub fn user_message_agent_id(user_name: &str, role: Role, workspace_name: &str) 
     // The same normalization `route_user_message` applies, so the two can never
     // name different agents for one message.
     let user_name = crate::session::normalize_user_name(user_name, "route_user_message");
-    crate::session::resolve_agent_id(user_name, role.as_str(), workspace_name)
+    crate::address::AgentAddress::routed(user_name, role.as_str(), workspace_name).id()
 }
 
 /// Route a user message to the agent for `role` in a workspace, resolving the agent ID
@@ -370,7 +371,8 @@ pub async fn route_user_message(
     // name the same person, never a bare "_ws_role" key.
     let user_name =
         crate::session::normalize_user_name(&user_name, "route_user_message").to_string();
-    let agent_id = crate::session::resolve_agent_id(&user_name, role.as_str(), &workspace_name);
+    let agent_id =
+        crate::address::AgentAddress::routed(&user_name, role.as_str(), &workspace_name).id();
 
     let mut job = user_message_job(
         content,
@@ -418,8 +420,8 @@ pub(crate) enum AnsweredFor {
 // [`Caller`](AnsweredFor::Caller) handover returns `Err`; any other failure is
 // logged and routed best-effort — the price of never dropping a failed write.
 //
-// Returns the id a status query names, when this handover opened a record — the command line's
-// own, never an agent's, a chain step's or the one-way `guest` address's.
+// Returns the id the acknowledgement prints, when this handover opened a record — the command
+// line's own, never an agent's, a chain step's or the one-way `guest` address's.
 pub(crate) async fn hand_over(
     mut job: AgentJob,
     target: &str,
@@ -451,17 +453,20 @@ pub(crate) async fn hand_over(
             false
         }
     };
-    // The command line's own handover opens the record its id answers: after the durable row
-    // exists, so a handover that could not be made durable records nothing, and before the work
-    // leaves, so a completion that arrives first cannot be missed. A chain's record is the chain's
-    // own id, opened where the chain starts, and the one-way `guest` address answers nothing, so
-    // neither opens one.
+    // The command line's own handover opens the record its id answers — the dispatch row itself:
+    // a `turn` job plus the roster row naming the conversation that will hold its answer. Written
+    // after the durable row exists, so a handover that could not be made durable records nothing,
+    // and before the work leaves, so a completion that arrives first cannot be missed. A chain's
+    // record is the chain's own id, opened where the chain starts, and the one-way `guest` address
+    // answers nothing, so neither opens one.
     let opened = persisted
         && crate::agent::tool_command_line()
         && job.chain().is_none()
         && job.kind != MessageKind::GuestMessage;
-    if opened {
-        crate::send_outcome::begin(&id, None).await;
+    if opened && let Err(e) = crate::jobs::open_handover_record(&id, &job, target).await {
+        // The handover must not fail for its record: the acknowledgement still returns the id,
+        // and the status reports `unknown`.
+        warn!(id, error = %e, "Failed to open a command-line send's record row");
     }
     // Computed once: the id is the acknowledgement's, whichever way this handover ends.
     let acknowledged = opened.then_some(id);
@@ -516,13 +521,13 @@ pub(crate) async fn route_agent_message_to_manager(
     content: String,
     workspace_name: String,
     user_name: String,
+    target: &str,
     asker: Option<Asker>,
     extract: Option<crate::extract::Extract>,
     answered_for: AnsweredFor,
 ) -> anyhow::Result<Option<String>> {
     let job = agent_message_job(content, workspace_name, &user_name, asker, extract);
-    let target = crate::jobs::envelope_target(&job);
-    hand_over(job, &target, "agent message", answered_for).await
+    hand_over(job, target, "agent message", answered_for).await
 }
 
 /// Hand one message from the owner's Assistant to a guest's own Assistant
@@ -532,6 +537,7 @@ pub(crate) async fn route_agent_message_to_manager(
 pub(crate) async fn route_guest_message(
     content: String,
     guest_name: &str,
+    target: &str,
     answered_for: AnsweredFor,
 ) -> anyhow::Result<()> {
     let job = AgentJob {
@@ -554,8 +560,7 @@ pub(crate) async fn route_guest_message(
         urgent: false,
         extract: None,
     };
-    let target = crate::jobs::envelope_target(&job);
-    hand_over(job, &target, "guest message", answered_for)
+    hand_over(job, target, "guest message", answered_for)
         .await
         .map(|_| ())
 }
@@ -569,6 +574,7 @@ pub(crate) async fn route_guest_message(
 /// through. `Err` (no owner, or a failed write) REFUSES the handover.
 pub(crate) async fn deliver_command_line_message(
     content: String,
+    target: &str,
 ) -> anyhow::Result<Option<String>> {
     // The owner the CALL carries, never a second copy of the constant: the command line
     // scopes the identity it acts with ([`crate::cli::instance`]). Checked rather than
@@ -589,8 +595,7 @@ pub(crate) async fn deliver_command_line_message(
         Role::Assistant,
         None,
     );
-    let target = crate::jobs::envelope_target(&job);
-    let id = hand_over(job, &target, "command-line message", AnsweredFor::Caller).await?;
+    let id = hand_over(job, target, "command-line message", AnsweredFor::Caller).await?;
 
     crate::channels::broadcast_and_persist_incoming_message(
         &crate::ChannelMessage {
@@ -892,7 +897,7 @@ async fn consumer_loop(
                     workspace = %item.workspace_name,
                     "Message router: pinned role with empty user — refusing to run unpinned, skipping job"
                 );
-                crate::send_outcome::fail_dropped(
+                crate::jobs::settle_dropped(
                     item.pending_job_id.as_deref(),
                     "the handover names no user it could run as",
                 )
@@ -938,8 +943,7 @@ async fn consumer_loop(
                         crate::tools::chain::fail(chain, refusal).await;
                         continue;
                     }
-                    crate::send_outcome::fail_dropped(item.pending_job_id.as_deref(), refusal)
-                        .await;
+                    crate::jobs::settle_dropped(item.pending_job_id.as_deref(), refusal).await;
                     confirm_pending_delivery(&item).await;
                     continue;
                 }
@@ -978,7 +982,7 @@ async fn consumer_loop(
                 );
                 for item in queued.iter().chain(std::iter::once(&job)) {
                     report_unrunnable_branch(item).await;
-                    crate::send_outcome::fail_dropped(
+                    crate::jobs::settle_dropped(
                         item.pending_job_id.as_deref(),
                         "the handover's workspace no longer exists",
                     )
@@ -1065,24 +1069,22 @@ async fn consumer_loop(
             .first()
             .is_some_and(|user| crate::users::is_admin_name(&user.name));
         // The Running Agents grouping: a branch launch is one conversation keyed by its own
-        // agent id, labelled with its role and branch; everything else stays ungrouped.
-        let (parent_key, parent_label) = match (&job.custom_role, job.chain()) {
+        // agent id, labelled with its role and branch; everything else is a plain turn.
+        let work = match (&job.custom_role, job.chain()) {
             // Every step of one chain is one group, labelled by the chain's original task.
-            (_, Some(chain)) => (
-                Some(crate::agent::registry::ParentKey::Chain(chain.id.clone())),
-                Some(chain.task.clone()),
-            ),
-            (Some(launch), None) => (
-                Some(crate::agent::registry::ParentKey::Launch(
-                    launch.agent_id.clone(),
-                )),
-                Some(crate::launch::display_label(
+            (_, Some(chain)) => crate::work_unit::WorkUnit::Chain {
+                id: chain.id.clone(),
+                label: chain.task.clone(),
+            },
+            (Some(launch), None) => crate::work_unit::WorkUnit::Launch {
+                id: launch.agent_id.clone(),
+                label: crate::launch::display_label(
                     launch.role,
                     &launch.name,
                     launch.identifier.as_deref(),
-                )),
-            ),
-            (None, None) => (None, None),
+                ),
+            },
+            (None, None) => crate::work_unit::WorkUnit::Turn,
         };
         // The turn answers every message of the batch. Two things cut it: an announcement
         // (taken at staging, so it never waits for that message's own attachments) and an
@@ -1091,12 +1093,12 @@ async fn consumer_loop(
         let message_refs: Vec<&str> = messages.iter().map(String::as_str).collect();
         let mut queue_open = true;
         // The turn's own calls group under the same key its agents are registered with.
-        let answer_parent = parent_key.clone();
+        let answer_parent = work.parent();
         let mut turn = std::pin::pin!(crate::agent::run_agent(
             agent_id.clone(),
             role,
             &ws,
-            None,
+            work,
             &message_refs,
             job.user_name.clone(),
             job.channel.clone(),
@@ -1104,8 +1106,6 @@ async fn consumer_loop(
             None,
             false,
             None,
-            parent_key,
-            parent_label,
             job.custom_role.clone(),
         ));
         // `interrupt` is a no-op when the run has already concluded or has not registered
@@ -1138,9 +1138,12 @@ async fn consumer_loop(
         // A chain step's answer goes on to the next step, or comes back as the chain's final
         // answer. A turn that produced no answer at all is a failure inside a chain — a failed
         // turn, one cut short, or one that ended in a sleep — and the reason is the agent's own,
-        // never a generic sentence. A deliberate stop or a cancel delivers nothing.
+        // never a generic sentence. A deliberate stop or a cancel delivers nothing, and a step a
+        // workspace freeze cut short ends its chain quietly: stopped, not failed.
         if let Some(chain) = job.chain() {
-            if !agent.is_cancelled() && !crate::shutdown::aborting() {
+            if agent.is_paused_frozen() {
+                crate::tools::chain::stop_quietly(chain).await;
+            } else if !agent.cut_short() {
                 let reason = agent.failure_reason("the step ended without an answer");
                 crate::tools::chain::settle(chain, Some(&agent_id), response.as_deref(), &reason)
                     .await;
@@ -1156,21 +1159,35 @@ async fn consumer_loop(
         }
 
         let Some(response) = response else {
+            // A workspace freeze stops the turn without failing it: the pending envelope and its
+            // record stay, exactly as a drain leaves them — nothing is reported as a failure. The
+            // owner is told the message is kept, and resuming the workspace answers it
+            // (`set_paused` replays the envelopes it kept, including one whose message already
+            // landed) — no restart, and no waiting for the recovery poller.
+            if agent.is_paused_frozen() {
+                if job.kind == MessageKind::UserMessage {
+                    deliver_unregistered_user_response(
+                        crate::prompt::load_prompt("paused_turn.md").trim(),
+                        &job,
+                        &role,
+                        &file_roots,
+                    )
+                    .await;
+                }
+                continue;
+            }
             // The record is the same truth as the ticket history: a handover that produced no
-            // answer must not read as running. A handover still queued when a drain stops the
-            // consumer never reaches this arm — its record stays `running` and the boot replay
-            // completes it.
-            fail_turn_outcomes(
-                &job,
-                &queued,
-                &agent.failure_reason("the turn ended without an answer"),
-            )
-            .await;
+            // answer must not read as running. A deliberate stop — a cancel or a drain — ends the
+            // record without delivering a failure notice. A handover still queued when a drain
+            // stops the consumer never reaches this arm — its record stays `running` and the boot
+            // replay completes it.
+            let reason = agent.failure_reason("the turn ended without an answer");
+            fail_turn_outcomes(&agent, &job, &queued, &reason).await;
             // A custom role's failure produces no answer: deliver the durable failure notice to
             // the admin's Assistant — never the emoji, never anything to the owner. A worker
             // branch's failure goes into the asking conversation, guarded the same way.
             if role == Role::Custom {
-                if !agent.is_cancelled() && !crate::shutdown::aborting() {
+                if !agent.cut_short() {
                     let name = job
                         .custom_role
                         .as_ref()
@@ -1191,7 +1208,7 @@ async fn consumer_loop(
                     .await;
                 }
             } else if let Some(launch) = worker_branch_launch(&job) {
-                if !agent.is_cancelled() && !crate::shutdown::aborting() {
+                if !agent.cut_short() {
                     route_worker_branch_message(
                         crate::prompt::load_prompt("worker_failure.md").trim(),
                         launch,
@@ -1201,12 +1218,9 @@ async fn consumer_loop(
                 }
             }
             // The emoji only for a UserMessage job whose agent truly failed; internal kinds get
-            // no feedback. Both the agent token AND the global shutdown token are checked, since
-            // during SIGTERM/SIGINT the global one fires first. A drained agent must NOT emit it.
-            else if job.kind == MessageKind::UserMessage
-                && !agent.is_cancelled()
-                && !crate::shutdown::aborting()
-            {
+            // no feedback. A deliberate stop — a cancel, a drain or a workspace pause — emits
+            // nothing.
+            else if job.kind == MessageKind::UserMessage && !agent.cut_short() {
                 deliver_unregistered_user_response(AGENT_FAILURE_EMOJI, &job, &role, &file_roots)
                     .await;
             }
@@ -1224,11 +1238,16 @@ async fn consumer_loop(
             // failure. An urgent message cut it instead, and the answer it was writing is
             // abandoned — the handover failed rather than finished.
             if agent.sleep_ended {
-                finish_turn_outcomes(&job, &queued, "", crate::send_outcome::Shape::None).await;
+                finish_turn_outcomes(&agent_id, &job, &queued, "").await;
                 confirm_pause_notices(&job, &queued).await;
             } else {
-                fail_turn_outcomes(&job, &queued, "the turn was cut short before it answered")
-                    .await;
+                fail_turn_outcomes(
+                    &agent,
+                    &job,
+                    &queued,
+                    "the turn was cut short before it answered",
+                )
+                .await;
             }
             confirm_turn_delivery(&queued).await;
             confirm_pending_delivery(&job).await;
@@ -1238,11 +1257,12 @@ async fn consumer_loop(
         // A schema the caller asked for replaces the answer with the JSON document that matches
         // it; a transformation that fails forwards the whole answer unchanged, so the step's work
         // is never lost.
-        let Some((response, shape)) =
+        let Some(response) =
             answer_to_deliver(&job, &agent, &agent_id, answer_parent, response).await
         else {
             // A cancelled turn's record ends as the failure it is: no answer was produced.
             fail_turn_outcomes(
+                &agent,
                 &job,
                 &queued,
                 &agent.failure_reason("the turn ended without an answer"),
@@ -1255,7 +1275,7 @@ async fn consumer_loop(
 
         // The answer is final and unwrapped here, so the record and the conversation carry the same
         // text — the conversation gets it wrapped in an envelope for the non-`assistant` addresses.
-        finish_turn_outcomes(&job, &queued, &response, shape).await;
+        finish_turn_outcomes(&agent_id, &job, &queued, &response).await;
         confirm_pause_notices(&job, &queued).await;
 
         // Manager: a durable `<manager-message>` into the admin's Assistant, or back into the
@@ -1344,14 +1364,14 @@ async fn answer_to_deliver(
     agent_id: &str,
     parent: Option<ParentKey>,
     answer: String,
-) -> Option<(String, crate::send_outcome::Shape)> {
+) -> Option<String> {
     let Some(extract) = job.answer_extract() else {
-        return Some((answer, crate::send_outcome::Shape::None));
+        return Some(answer);
     };
     if agent.is_cancelled() {
         return None;
     }
-    let (transformed, produced) = crate::extract::answer_as_json_reporting(
+    let transformed = crate::extract::answer_as_json(
         Some(extract),
         &crate::extract::StepContext {
             role: job.role,
@@ -1362,7 +1382,7 @@ async fn answer_to_deliver(
         &answer,
     )
     .await;
-    (!agent.is_cancelled()).then_some((transformed, crate::send_outcome::Shape::of(true, produced)))
+    (!agent.cut_short()).then_some(transformed)
 }
 
 /// The launch of a worker-branch job: `Some` only when the job carries a launch whose role
@@ -1423,51 +1443,54 @@ async fn confirm_turn_delivery(queued: &[AgentJob]) {
     }
 }
 
-/// The command-line handovers a turn answered, with the shape each one's answer took: its own job
-/// and those of the messages it carried. One turn delivers one answer, so several records may hold
-/// the same text; the turn shaped it for its own job, while a carried handover's schema was never
-/// applied, so its answer was forwarded unchanged. Only the ids that still have a record are
-/// returned — one read for the whole turn, so a turn that answered no command-line handover writes
-/// nothing to the shared core writer; a failed read returns them all and each guarded write decides.
-async fn turn_outcomes<'a>(
-    job: &'a AgentJob,
-    queued: &'a [AgentJob],
-    shape: crate::send_outcome::Shape,
-) -> Vec<(&'a str, crate::send_outcome::Shape)> {
-    let carried = queued.iter().map(|item| {
-        let forwarded = crate::send_outcome::Shape::of(item.answer_extract().is_some(), false);
-        (item, forwarded)
-    });
-    let outcomes: Vec<(&str, crate::send_outcome::Shape)> = carried
-        .chain(std::iter::once((job, shape)))
-        .filter_map(|(item, shape)| Some((item.pending_job_id.as_deref()?, shape)))
-        .collect();
-    let ids: Vec<&str> = outcomes.iter().map(|(id, _)| *id).collect();
-    let Some(running) = crate::send_outcome::running(&ids).await else {
-        return outcomes;
-    };
-    outcomes
-        .into_iter()
-        .filter(|(id, _)| running.contains(*id))
+/// The command-line handovers a turn answered: its own job and those of the messages it carried. One
+/// turn answers them all at once, so each record is settled with the same outcome — never with the
+/// answer itself, which the conversation holds; a handover's id is the id of the row it names, and
+/// the guarded write is what decides whether that row is still there.
+fn turn_record_ids<'a>(job: &'a AgentJob, queued: &'a [AgentJob]) -> Vec<&'a str> {
+    queued
+        .iter()
+        .chain(std::iter::once(job))
+        .filter_map(|item| item.pending_job_id.as_deref())
         .collect()
 }
 
-/// Complete the records of the handovers this turn answered with its one answer.
-async fn finish_turn_outcomes(
-    job: &AgentJob,
-    queued: &[AgentJob],
-    answer: &str,
-    shape: crate::send_outcome::Shape,
-) {
-    for (id, shape) in turn_outcomes(job, queued, shape).await {
-        crate::send_outcome::finish(id, answer, shape).await;
+/// Complete the records of the handovers this turn answered with its one answer. An ordinary turn
+/// settles the records whose ids it printed; only a recovery retry — the one turn that knows just
+/// its own agent id — settles by the conversation as well.
+async fn finish_turn_outcomes(agent_id: &str, job: &AgentJob, queued: &[AgentJob], answer: &str) {
+    let state = if answer.trim().is_empty() {
+        Outcome::Empty
+    } else {
+        Outcome::Done
+    };
+    if job.kind == MessageKind::RecoveryRetry {
+        crate::jobs::settle_conversation(agent_id, state, None).await;
+    }
+    for id in turn_record_ids(job, queued) {
+        crate::jobs::settle_record(id, state, None).await;
     }
 }
 
-/// End the records of the handovers this turn ended without an answer.
-async fn fail_turn_outcomes(job: &AgentJob, queued: &[AgentJob], reason: &str) {
-    for (id, _) in turn_outcomes(job, queued, crate::send_outcome::Shape::None).await {
-        crate::send_outcome::fail(id, reason).await;
+/// End the records of the handovers this turn ended without an answer: a deliberate stop is
+/// recorded as stopped, never as a failed launch. Settled the same way as
+/// [`finish_turn_outcomes`] — by id, and by the conversation only for a recovery retry.
+async fn fail_turn_outcomes(
+    agent: &crate::Agent,
+    job: &AgentJob,
+    queued: &[AgentJob],
+    reason: &str,
+) {
+    let state = if agent.cut_short() {
+        Outcome::Stopped
+    } else {
+        Outcome::Failed
+    };
+    if job.kind == MessageKind::RecoveryRetry {
+        crate::jobs::settle_conversation(&agent.agent_id, state, Some(reason)).await;
+    }
+    for id in turn_record_ids(job, queued) {
+        crate::jobs::settle_record(id, state, Some(reason)).await;
     }
 }
 
@@ -2396,11 +2419,12 @@ mod tests {
 
     /// One turn answers every message of its batch, so every command-line handover it carried is
     /// settled with that one answer; an id with no record is untouched.
-    #[serial_test::serial(send_outcome)]
+    #[serial_test::serial(handover_records)]
     #[tokio::test]
     async fn a_turn_settles_every_handover_it_answered() {
         let _store = crate::util::test::STORE_LOCK.lock().await;
         crate::util::test::init_management_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/settle_ws");
         let mut job = make_job(Role::Assistant, "settle_ws", "alice", "cli");
         job.pending_job_id = Some("settle_turn_job".to_string());
         let mut carried = make_job(Role::Assistant, "settle_ws", "alice", "cli");
@@ -2413,48 +2437,91 @@ mod tests {
         );
         let mut stranger = make_job(Role::Assistant, "settle_ws", "alice", "gui");
         stranger.pending_job_id = Some("settle_no_record".to_string());
-        let batch = vec![carried, schema_asking, stranger];
         let settled = ["settle_turn_job", "settle_queued_job", "settle_schema_job"];
-        for id in settled {
-            crate::send_outcome::begin(id, None).await;
-        }
-
-        finish_turn_outcomes(&job, &batch, "the answer", crate::send_outcome::Shape::Json).await;
-        // The turn's own job carries the shape the answer came back in; a carried handover asked
-        // for no schema (or for one the turn never applied), so its answer was forwarded unchanged.
-        for (id, shape) in [
-            ("settle_turn_job", Some(crate::send_outcome::Shape::Json)),
-            ("settle_queued_job", Some(crate::send_outcome::Shape::None)),
-            (
-                "settle_schema_job",
-                Some(crate::send_outcome::Shape::Forwarded),
-            ),
+        let target = crate::jobs::envelope_target(&job);
+        for (id, carried) in [
+            ("settle_turn_job", &job),
+            ("settle_queued_job", &carried),
+            ("settle_schema_job", &schema_asking),
         ] {
-            let record = crate::send_outcome::lookup(id)
+            crate::jobs::open_handover_record(id, carried, &target)
                 .await
-                .expect("read the record")
+                .expect("the handover's record row");
+        }
+        let batch = vec![carried, schema_asking, stranger];
+        // The turn answered, so the conversation holds the answer the records report.
+        crate::util::test::seed_session_row(
+            &crate::session::store().conn,
+            &target,
+            "assistant",
+            "the answer",
+        )
+        .await;
+
+        finish_turn_outcomes(&target, &job, &batch, "the answer").await;
+        for id in settled {
+            let (status, _) = crate::util::test::record_row(id)
+                .await
                 .expect("the handover opened one");
-            assert_eq!(record.state, crate::send_outcome::State::Done);
-            assert_eq!(record.answer.as_deref(), Some("the answer"));
-            assert_eq!(record.shape, shape);
+            assert_eq!(status, crate::outcome::Outcome::Done.as_str(), "{id}");
         }
 
+        // The same handovers, re-armed as a new run and then answered with nothing: a finished turn
+        // with nothing to report, never a failure.
         for id in settled {
-            crate::send_outcome::begin(id, None).await;
-        }
-        fail_turn_outcomes(&job, &batch, "the turn failed").await;
-        for id in settled {
-            let record = crate::send_outcome::lookup(id)
+            crate::session::store()
+                .conn
+                .execute(
+                    "UPDATE jobs SET status = 'launched', reason = NULL WHERE id = ?1",
+                    crate::db::params![id],
+                )
                 .await
-                .expect("read the record")
+                .expect("re-arm the record row");
+        }
+        finish_turn_outcomes(&target, &job, &batch, "  \n").await;
+        for id in settled {
+            let (status, _) = crate::util::test::record_row(id)
+                .await
                 .expect("the handover opened one");
-            assert_eq!(record.state, crate::send_outcome::State::Failed);
-            assert_eq!(record.reason.as_deref(), Some("the turn failed"));
+            assert_eq!(
+                status,
+                crate::outcome::Outcome::Empty.as_str(),
+                "{id}: an empty answer is done_no_answer"
+            );
+        }
+
+        // And once more, ended without an answer at all.
+        for id in settled {
+            crate::session::store()
+                .conn
+                .execute(
+                    "UPDATE jobs SET status = 'launched', reason = NULL WHERE id = ?1",
+                    crate::db::params![id],
+                )
+                .await
+                .expect("re-arm the record row");
+        }
+        let agent = crate::Agent::new(
+            "settle_agent".to_string(),
+            Role::Worker,
+            &ws,
+            crate::work_unit::WorkUnit::Turn,
+            "admin".to_string(),
+            "gui".to_string(),
+            false,
+            None,
+        );
+        fail_turn_outcomes(&agent, &job, &batch, "the turn failed").await;
+        for id in settled {
+            let (status, reason) = crate::util::test::record_row(id)
+                .await
+                .expect("the handover opened one");
+            assert_eq!(status, crate::outcome::Outcome::Failed.as_str(), "{id}");
+            assert_eq!(reason.as_deref(), Some("the turn failed"), "{id}");
         }
         assert!(
-            crate::send_outcome::lookup("settle_no_record")
+            crate::util::test::record_row("settle_no_record")
                 .await
-                .expect("read the record")
                 .is_none(),
             "an id with no record is untouched"
         );
@@ -2467,7 +2534,7 @@ mod tests {
     async fn a_delivered_steps_schema_does_not_outlive_it() {
         let _store = crate::util::test::STORE_LOCK.lock().await;
         crate::util::test::init_management_test_stores().await;
-        let agent_id = crate::session::worker_branch_agent_id("extract-spent");
+        let agent_id = crate::address::AgentAddress::worker_branch("extract-spent".to_owned()).id();
         let extract = crate::extract::Extract::from_text(
             r#"{"type":"object","properties":{"a":{"type":"string"}}}"#,
         )
@@ -2527,12 +2594,10 @@ mod tests {
             "extract_stop_agent".to_string(),
             Role::Worker,
             &ws,
-            None,
+            crate::work_unit::WorkUnit::Turn,
             "admin".to_string(),
             "gui".to_string(),
             false,
-            None,
-            None,
             None,
         );
         let mut job = make_job(Role::Worker, &ws.name, "admin", "gui");
@@ -2545,15 +2610,12 @@ mod tests {
 
         assert_eq!(
             answer_to_deliver(&job, &agent, "conv", None, "the answer".into()).await,
-            Some((
-                r#"{"a":"one"}"#.to_string(),
-                crate::send_outcome::Shape::Json
-            )),
-            "the JSON document replaces the answer, and the shape says so"
+            Some(r#"{"a":"one"}"#.to_string()),
+            "the JSON document replaces the answer"
         );
         assert_eq!(fake.request_fingerprints.lock().unwrap().len(), 1);
 
-        agent.cancel_token.cancel();
+        agent.stop.fire(crate::stop::StopReason::Cancelled);
         assert_eq!(
             answer_to_deliver(&job, &agent, "conv", None, "the answer".into()).await,
             None,
@@ -2564,6 +2626,514 @@ mod tests {
             1,
             "a turn already stopped spends no transformation call"
         );
+    }
+
+    /// A chain step a workspace freeze cut short ends its chain quietly: the step was stopped, not
+    /// failed, so its durable record goes (nothing is left `running` for a boot replay to re-drive)
+    /// and the caller is told nothing — a failure message here would report work that never failed.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain, handover_records)]
+    async fn a_frozen_chain_step_ends_its_chain_quietly() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let _ = init_global();
+        crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // The first call is held so the freeze lands while the round is in flight; the tool-call
+        // answer sends the loop back to its round top, where the pause is seen.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let fake = Arc::new(
+            crate::util::test::FakeProvider::new()
+                .ok_tool_call("read")
+                .ok("never reached")
+                .hold_call(1, gate.clone()),
+        );
+        let _provider_guard = crate::util::test::install_fake_provider(fake.clone());
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("frozen_chain_step")
+                .to_string_lossy(),
+            "frozen_chain_step_ws",
+        )
+        .await;
+        let chain = crate::launch::Chain {
+            id: "frozen_step_chain".to_string(),
+            task: "draft it".to_string(),
+            user: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "gui".to_string(),
+            workspace: ws.name.clone(),
+            inherited: None,
+            current: crate::launch::Step {
+                addressee: crate::tools::send::Addressee::WorkerBranch,
+                place: None,
+                branch: Some("frozen_step".to_string()),
+                name: None,
+                extract: None,
+            },
+            step: 1,
+            next: Vec::new(),
+        };
+        let admin =
+            crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME.to_owned()).id();
+        let mut admin_rx = register_agent(&admin);
+        crate::jobs::open_chain_record(&chain)
+            .await
+            .expect("the chain's record row");
+
+        crate::launch::worker_branch(
+            &ws,
+            "frozen_step",
+            "do the work",
+            None,
+            None,
+            crate::launch::BusyFolder::Chain(&chain),
+            None,
+            AnsweredFor::Nobody,
+        )
+        .await
+        .expect("the step is dispatched");
+        assert_eq!(
+            crate::jobs::chain_has_records(&chain.id, [1]).await,
+            Some(true),
+            "the queued envelope is the running step's record",
+        );
+
+        // The round is in flight: freeze the workspace, then let the held call answer.
+        for _ in 0..500 {
+            if !fake.request_fingerprints.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        crate::agent::registry::AGENT_REGISTRY.cancel_by_workspace_pause(&ws.name);
+        gate.notify_one();
+
+        for _ in 0..500 {
+            if crate::jobs::chain_has_records(&chain.id, [1]).await == Some(false) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            crate::jobs::chain_has_records(&chain.id, [1]).await,
+            Some(false),
+            "the frozen step's record goes, so nothing is left running to re-drive",
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), admin_rx.recv())
+                .await
+                .is_err(),
+            "a stopped step delivers nothing — the caller is never told of a failure",
+        );
+        let (status, reason) = crate::util::test::record_row(&chain.id)
+            .await
+            .expect("the chain's record stands");
+        assert_eq!(
+            status,
+            crate::outcome::Outcome::Stopped.as_str(),
+            "the record says the chain was stopped, not failed and not still launched",
+        );
+        assert_eq!(
+            reason.as_deref(),
+            Some(crate::agent::PAUSED_REASON),
+            "and why",
+        );
+        unregister_agent(&admin);
+    }
+
+    /// The durable worker round — the other kind of chain step — settles the same way: a freeze
+    /// that cut it short ends the chain quietly instead of delivering the failure the round would
+    /// otherwise report to the caller.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain, handover_records)]
+    async fn a_frozen_worker_round_ends_its_chain_quietly() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let _ = init_global();
+        crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let fake = Arc::new(
+            crate::util::test::FakeProvider::new()
+                .ok_tool_call("read")
+                .ok("never reached")
+                .hold_call(1, gate.clone()),
+        );
+        let _provider_guard = crate::util::test::install_fake_provider(fake.clone());
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("frozen_worker_round")
+                .to_string_lossy(),
+            "frozen_worker_round_ws",
+        )
+        .await;
+        let chain = crate::launch::Chain {
+            id: "frozen_worker_round_chain".to_string(),
+            task: "draft it".to_string(),
+            user: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "gui".to_string(),
+            workspace: ws.name.clone(),
+            inherited: None,
+            current: crate::launch::Step::worker(),
+            step: 1,
+            next: Vec::new(),
+        };
+        let admin =
+            crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME.to_owned()).id();
+        let mut admin_rx = register_agent(&admin);
+        crate::jobs::open_chain_record(&chain)
+            .await
+            .expect("the chain's record row");
+
+        crate::tools::chain::dispatch(&chain, "do the work", &ws, AnsweredFor::Nobody)
+            .await
+            .expect("the step is dispatched");
+        assert_eq!(
+            crate::jobs::chain_has_records(&chain.id, [1]).await,
+            Some(true),
+            "the round's rows are the running step's record",
+        );
+
+        // The round is in flight: freeze the workspace, then let the held call answer.
+        for _ in 0..500 {
+            if !fake.request_fingerprints.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        crate::agent::registry::AGENT_REGISTRY.cancel_by_workspace_pause(&ws.name);
+        gate.notify_one();
+
+        for _ in 0..500 {
+            if crate::jobs::chain_has_records(&chain.id, [1]).await == Some(false) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            crate::jobs::chain_has_records(&chain.id, [1]).await,
+            Some(false),
+            "the frozen step's record goes, so nothing is left running to re-drive",
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), admin_rx.recv())
+                .await
+                .is_err(),
+            "a stopped step delivers nothing — the caller is never told of a failure",
+        );
+        let (status, reason) = crate::util::test::record_row(&chain.id)
+            .await
+            .expect("the chain's record stands");
+        assert_eq!(
+            status,
+            crate::outcome::Outcome::Stopped.as_str(),
+            "the record says the chain was stopped, not failed and not still launched",
+        );
+        assert_eq!(
+            reason.as_deref(),
+            Some(crate::agent::PAUSED_REASON),
+            "and why",
+        );
+        unregister_agent(&admin);
+    }
+
+    /// A freeze that lands before a turn starts still reaches it: the run reads the pause live at
+    /// its own start, delivers the paused-turn notice, and keeps the envelope and its record — so
+    /// the message is answered when the workspace is resumed instead of the turn writing a frozen
+    /// tree.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain, handover_records)]
+    async fn a_turn_dispatched_after_a_freeze_delivers_the_paused_notice() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let _ = init_global();
+        crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = Arc::new(crate::util::test::FakeProvider::new().ok("never reached"));
+        let _provider_guard = crate::util::test::install_fake_provider(fake.clone());
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("frozen_before_turn")
+                .to_string_lossy(),
+            "frozen_before_turn_ws",
+        )
+        .await;
+        // The freeze is already in force when the turn is dequeued: no agent is registered yet, so
+        // `cancel_by_workspace_pause` has nothing to reach.
+        crate::workspace::store()
+            .conn
+            .execute(
+                "UPDATE workspaces SET paused = 1 WHERE name = ?1",
+                crate::db::params![ws.name.as_str()],
+            )
+            .await
+            .expect("freeze the workspace");
+
+        let agent_id = format!("frozen_turn_{}", crate::generate_suffix());
+        let mut job = make_job(Role::Worker, &ws.name, "admin", "gui");
+        job.pending_job_id = Some("frozen_before_turn_job".to_string());
+        crate::jobs::open_handover_record("frozen_before_turn_job", &job, &agent_id)
+            .await
+            .expect("the handover's record row");
+        persist_pending(&job, "frozen_before_turn_job".to_string())
+            .await
+            .expect("the handover's envelope");
+
+        // Nothing is registered yet, so this route starts the agent's consumer — the freeze is
+        // already in force when its first turn is dequeued.
+        route(&agent_id, job);
+
+        let notice = crate::prompt::load_prompt("paused_turn.md")
+            .trim()
+            .to_string();
+        let mut delivered = false;
+        for _ in 0..500 {
+            let found = crate::channels::chat_history::store()
+                .conn
+                .query_optional(
+                    "SELECT 1 FROM chat_history WHERE workspace = ?1 AND content = ?2 LIMIT 1",
+                    crate::db::params![ws.name.as_str(), notice.as_str()],
+                    |_| Ok::<(), anyhow::Error>(()),
+                )
+                .await
+                .expect("read the chat history");
+            if found.is_some() {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(delivered, "the paused-turn notice reaches the owner");
+        assert!(
+            !fake.ran_turn(&agent_id),
+            "a frozen turn never reaches the model",
+        );
+        let kept = crate::session::store()
+            .conn
+            .query_optional(
+                "SELECT 1 FROM pending_jobs WHERE id = ?1 LIMIT 1",
+                crate::db::params!["frozen_before_turn_job"],
+                |_| Ok::<(), anyhow::Error>(()),
+            )
+            .await
+            .expect("read the envelope")
+            .is_some();
+        assert!(kept, "the envelope stays for the resume");
+        let (status, _) = crate::util::test::record_row("frozen_before_turn_job")
+            .await
+            .expect("the record stands");
+        assert_eq!(
+            status,
+            crate::outcome::Outcome::Running.as_str(),
+            "the record is kept too — nothing failed"
+        );
+        // The consumer this route started has nothing left to answer: drop its entry so the loop
+        // exits instead of waiting on a sender for the rest of the run.
+        if let Some(map) = ROUTER.get() {
+            map.write().unwrap_poison().remove(&agent_id);
+        }
+    }
+
+    /// A freeze refuses an ordinary writer's turn and admits the Manager's: the notice that
+    /// explains the pause is a Manager turn delivered into the frozen workspace, so a gate that
+    /// refused every role would drop the explanation forever.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain, handover_records)]
+    async fn a_paused_workspace_refuses_a_worker_turn_and_admits_the_manager() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let _ = init_global();
+        crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = Arc::new(crate::util::test::FakeProvider::new().ok("the answer"));
+        let _provider_guard = crate::util::test::install_fake_provider(fake.clone());
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("paused_roles")
+                .to_string_lossy(),
+            "paused_roles_ws",
+        )
+        .await;
+        crate::workspace::store()
+            .conn
+            .execute(
+                "UPDATE workspaces SET paused = 1 WHERE name = ?1",
+                crate::db::params![ws.name.as_str()],
+            )
+            .await
+            .expect("freeze the workspace");
+
+        // A worker turn is refused before it reaches the model, and told why.
+        let worker = format!("paused_worker_{}", crate::generate_suffix());
+        let mut job = make_job(Role::Worker, &ws.name, "admin", "gui");
+        job.content = "do the work".to_string();
+        route(&worker, job);
+        let notice = crate::prompt::load_prompt("paused_turn.md")
+            .trim()
+            .to_string();
+        let mut told = false;
+        for _ in 0..500 {
+            let found = crate::channels::chat_history::store()
+                .conn
+                .query_optional(
+                    "SELECT 1 FROM chat_history WHERE workspace = ?1 AND content = ?2 LIMIT 1",
+                    crate::db::params![ws.name.as_str(), notice.as_str()],
+                    |_| Ok::<(), anyhow::Error>(()),
+                )
+                .await
+                .expect("read the chat history");
+            if found.is_some() {
+                told = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(told, "a refused worker turn is told why");
+        assert!(
+            !fake.ran_turn(&worker),
+            "a frozen worker turn never reaches the model",
+        );
+
+        // The Manager's own triage is the one exemption: the pause notice is one of its turns.
+        let manager = format!("paused_manager_{}", crate::generate_suffix());
+        let mut job = make_job(Role::Manager, &ws.name, "admin", "gui");
+        job.content = "why is this workspace paused?".to_string();
+        route(&manager, job);
+        let mut ran = false;
+        for _ in 0..500 {
+            if fake.ran_turn(&manager) {
+                ran = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ran, "the Manager's triage is the freeze's one exemption");
+
+        if let Some(map) = ROUTER.get() {
+            let mut map = map.write().unwrap_poison();
+            map.remove(&worker);
+            map.remove(&manager);
+        }
+    }
+
+    /// A chain step dequeued into a frozen workspace ends its chain quietly: the step was stopped,
+    /// not failed, so its record goes and nothing is left `launched` for a replay that only runs at
+    /// boot — and the caller is told nothing.
+    #[tokio::test]
+    #[serial_test::serial(provider, drain, handover_records)]
+    async fn a_chain_step_dequeued_into_a_freeze_ends_its_chain_quietly() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let _ = init_global();
+        crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        let fake = Arc::new(crate::util::test::FakeProvider::new().ok("never reached"));
+        let _provider_guard = crate::util::test::install_fake_provider(fake.clone());
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("frozen_queued_chain")
+                .to_string_lossy(),
+            "frozen_queued_chain_ws",
+        )
+        .await;
+        crate::workspace::store()
+            .conn
+            .execute(
+                "UPDATE workspaces SET paused = 1 WHERE name = ?1",
+                crate::db::params![ws.name.as_str()],
+            )
+            .await
+            .expect("freeze the workspace");
+        let chain = crate::launch::Chain {
+            id: "queued_step_chain".to_string(),
+            task: "draft it".to_string(),
+            user: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "gui".to_string(),
+            workspace: ws.name.clone(),
+            inherited: None,
+            current: crate::launch::Step {
+                addressee: crate::tools::send::Addressee::WorkerBranch,
+                place: None,
+                branch: Some("queued_step".to_string()),
+                name: None,
+                extract: None,
+            },
+            step: 1,
+            next: Vec::new(),
+        };
+        crate::jobs::open_chain_record(&chain)
+            .await
+            .expect("the chain's record row");
+
+        // The step's envelope as the dispatch leaves it: its record id, its launch carrying the
+        // chain, aimed at the branch's conversation.
+        let branch = crate::address::AgentAddress::WorkerBranch {
+            branch: "queued_step".to_string(),
+        }
+        .id();
+        let mut job = make_job(Role::Worker, &ws.name, crate::users::ADMIN_USER_NAME, "gui");
+        job.content = "do the work".to_string();
+        job.custom_role = Some(crate::Launch {
+            role: Role::Worker,
+            name: String::new(),
+            identifier: None,
+            prompt: String::new(),
+            tools: Vec::new(),
+            agent_id: branch.clone(),
+            reply_to: None,
+            chain: Some(Box::new(chain.clone())),
+            extract: None,
+        });
+        let record = crate::launch::record_id(&chain.id, 1);
+        job.pending_job_id = Some(record.clone());
+        persist_pending(&job, record.clone())
+            .await
+            .expect("the step's envelope");
+        route(&branch, job);
+
+        let mut stopped = false;
+        for _ in 0..500 {
+            if crate::jobs::chain_has_records(&chain.id, [1]).await == Some(false) {
+                stopped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped, "the queued step's record goes");
+        let (status, reason) = crate::util::test::record_row(&chain.id)
+            .await
+            .expect("the chain's record stands");
+        assert_eq!(
+            status,
+            crate::outcome::Outcome::Stopped.as_str(),
+            "the chain was stopped, not failed and not left launched",
+        );
+        assert_eq!(
+            reason.as_deref(),
+            Some(crate::agent::PAUSED_REASON),
+            "and why",
+        );
+        assert!(!fake.ran_turn(&branch), "the step never reached the model");
+        // The envelope went with the chain, so nothing is left for the boot replay.
+        let kept = crate::session::store()
+            .conn
+            .query_optional(
+                "SELECT 1 FROM pending_jobs WHERE id = ?1 LIMIT 1",
+                crate::db::params![record.as_str()],
+                |_| Ok::<(), anyhow::Error>(()),
+            )
+            .await
+            .expect("read the envelope")
+            .is_some();
+        assert!(!kept, "the step's envelope goes with its chain");
+        if let Some(map) = ROUTER.get() {
+            map.write().unwrap_poison().remove(&branch);
+        }
     }
 
     #[tokio::test]
@@ -2926,7 +3496,8 @@ mod tests {
     #[serial_test::serial(provider)]
     async fn manager_notify_delivers_to_admin_assistant() {
         setup_response_test_infra().await;
-        let target = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let target =
+            crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME.to_owned()).id();
 
         // Snapshot existing rows so cleanup removes ONLY rows this test created.
         let before: HashSet<String> = crate::jobs::list_pending_jobs(&crate::session::store().conn)
@@ -3066,7 +3637,8 @@ mod tests {
     async fn custom_role_notify_targets_the_admin_assistant() {
         setup_response_test_infra().await;
         let conn = &crate::session::store().conn;
-        let target = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let target =
+            crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME.to_owned()).id();
 
         let before: HashSet<String> = crate::jobs::list_pending_jobs(conn)
             .await
@@ -3149,7 +3721,7 @@ mod tests {
             identifier: Some("feature".to_string()),
             prompt: String::new(),
             tools: Vec::new(),
-            agent_id: crate::session::worker_branch_agent_id("feature"),
+            agent_id: crate::address::AgentAddress::worker_branch("feature".to_owned()).id(),
             reply_to: None,
             chain: None,
             extract: None,
@@ -3159,7 +3731,8 @@ mod tests {
         let mut job = make_job(Role::Worker, "personal:admin", "admin", "gui");
         job.custom_role = Some(launch.clone());
 
-        let assistant_agent = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let assistant_agent =
+            crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME.to_owned()).id();
         let mut assistant_rx = register_agent(&assistant_agent);
         let mut branch_rx = register_agent(&launch.agent_id);
 
@@ -3315,7 +3888,7 @@ mod tests {
             identifier: None,
             prompt: "you brief".to_string(),
             tools: Vec::new(),
-            agent_id: crate::session::custom_role_agent_id("briefer", None),
+            agent_id: crate::address::AgentAddress::custom_role("briefer", None).id(),
             reply_to: None,
             chain: None,
             extract: None,
@@ -3325,7 +3898,8 @@ mod tests {
             workspace: crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
         };
         let mut asker_rx = register_agent(&asker_launch.agent_id);
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin =
+            crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME.to_owned()).id();
         let mut admin_rx = register_agent(&admin);
 
         // The role's answer was produced in its own folder, which travels with the envelope: a
@@ -3368,7 +3942,7 @@ mod tests {
                 identifier: None,
                 prompt: String::new(),
                 tools: Vec::new(),
-                agent_id: crate::session::custom_role_agent_id("editor", None),
+                agent_id: crate::address::AgentAddress::custom_role("editor", None).id(),
                 reply_to: None,
                 chain: None,
                 extract: None,
@@ -3388,7 +3962,7 @@ mod tests {
             identifier: None,
             prompt: String::new(),
             tools: Vec::new(),
-            agent_id: crate::session::custom_role_agent_id("editor", None),
+            agent_id: crate::address::AgentAddress::custom_role("editor", None).id(),
             reply_to: Some(Box::new(Asker {
                 launch: crate::Launch {
                     role: Role::Custom,

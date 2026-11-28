@@ -86,6 +86,8 @@ pub(crate) fn install_test_retry_policy(policy: crate::retry::RetryPolicy) -> Re
 pub(crate) struct SentRequest {
     pub model: String,
     pub provider: Option<String>,
+    /// The conversation the request was made for, when it named one.
+    pub agent_id: Option<String>,
 }
 
 /// Scripted [`crate::Provider`] test double for the scoped retry loops: each
@@ -289,6 +291,18 @@ impl FakeProvider {
         let msg = format!("OpenRouter API error ({status}): {body}");
         self.err(crate::retry::FailureClass::InvalidRequest, &msg)
     }
+
+    /// Whether any request this fake received was made for `agent_id` — the per-turn form of "this
+    /// turn never ran". The fake is process-wide, so another test's leaked request can land on it;
+    /// a bare request count is therefore not evidence about one turn, and this is.
+    #[must_use]
+    pub(crate) fn ran_turn(&self, agent_id: &str) -> bool {
+        self.sent
+            .lock()
+            .unwrap_poison()
+            .iter()
+            .any(|request| request.agent_id.as_deref() == Some(agent_id))
+    }
 }
 
 #[async_trait::async_trait]
@@ -314,6 +328,7 @@ impl crate::Provider for FakeProvider {
         self.sent.lock().unwrap().push(SentRequest {
             model: request.model.clone(),
             provider: request.provider.clone(),
+            agent_id: request.meta.as_ref().map(|meta| meta.agent_id.clone()),
         });
         let hold = self.gate.lock().unwrap().clone();
         if let Some((call, gate)) = hold
@@ -625,6 +640,10 @@ extern "C" fn cleanup_test_root() {
 #[macro_export]
 macro_rules! open_test_store {
     ($store:ty, $store_name:expr) => {{
+        // A standalone store still answers through the process-global ones — `set_paused`'s
+        // resume replays the process's own session store, because that is what the product does.
+        // Nothing here may branch on which store it holds, so the test brings the globals up.
+        $crate::util::test::init_test_stores().await;
         let tmp = ::tempfile::TempDir::new().expect("temp dir for test store");
         let store = <$store>::open(tmp.path()).await.unwrap_or_else(|e| {
             ::std::panic!(
@@ -1018,13 +1037,29 @@ pub async fn create_test_workspace(path: &str, name: &str) -> crate::Workspace {
     crate::workspace::store()
         .conn
         .execute(
-            "INSERT INTO workspaces (name, path, created_at, updated_at, paused) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO workspaces (name, path, created_at, updated_at, paused, profile_confirmed) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1)",
             db::params![name, path, now.clone(), now, 0],
         )
         .await
         .expect("insert test workspace");
-    test_ws_named(path, name)
+    // A test workspace stands in for one the migration already confirmed: its pipeline runs.
+    let mut ws = test_ws_named(path, name);
+    ws.profile_confirmed = true;
+    ws
+}
+
+/// Leave a test workspace's profile unconfirmed, as a workspace added after the profile shipped
+/// is until its owner confirms it.
+pub async fn unconfirm_test_workspace(name: &str) {
+    crate::workspace::store()
+        .conn
+        .execute(
+            "UPDATE workspaces SET profile_confirmed = 0 WHERE name = ?1",
+            db::params![name],
+        )
+        .await
+        .expect("unconfirm test workspace");
 }
 
 /// Seed one session row directly via SQL (the store's `batch_append` is
@@ -1041,6 +1076,21 @@ pub(crate) async fn seed_session_row(
     )
     .await
     .unwrap();
+}
+
+/// The `status` and `reason` a dispatch row reads, as `mahbot debug --db board` prints them; `None`
+/// when no row stands under the id. The record of a command-line handover IS that row, so a test
+/// reads it here rather than through a surface of its own.
+pub(crate) async fn record_row(id: &str) -> Option<(String, Option<String>)> {
+    crate::session::store()
+        .conn
+        .query_optional(
+            "SELECT status, reason FROM jobs WHERE id = ?1",
+            db::params![id],
+            |row| Ok::<_, anyhow::Error>((row.get::<String>(0)?, row.get::<Option<String>>(1)?)),
+        )
+        .await
+        .expect("read the record row")
 }
 
 /// Make `dir` a repository git answers for, with no commit of its own — for the

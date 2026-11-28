@@ -30,8 +30,10 @@
 //! owner's Assistant, the one conversation a chain can be started from — gets one step-numbered
 //! failure in the envelope that step's addressee already uses. Only the final answer comes back.
 //! A chain is one stoppable group in Running Agents for its whole life. Ending a chain is loud in
-//! every case but one: a chain the owner stopped delivers nothing, and any other way its records
-//! disappear is a failure the caller is told about.
+//! every case but two: a chain the owner stopped delivers nothing, and a step cut short by a
+//! workspace freeze is [`stop_quietly`](crate::tools::chain::stop_quietly) — stopped, not failed,
+//! so the caller is told nothing either. Any other way its records disappear is a failure the
+//! caller is told about.
 
 use anyhow::{Context as _, Result, bail};
 
@@ -39,7 +41,7 @@ use crate::Workspace;
 use crate::agent::message_router::AnsweredFor;
 use crate::agent::registry::ParentKey;
 use crate::launch::{BusyFolder, Chain, MAX_STEPS, Step, Stored, record_id};
-use crate::send_outcome::Shape;
+use crate::outcome::Outcome;
 use crate::tools::delegation::Provenance;
 use crate::tools::send::{Addressee, Argument, FOR_ARG};
 use crate::util::UnwrapPoison as _;
@@ -368,7 +370,7 @@ pub(crate) async fn start(
     match crate::jobs::chain_has_records(&chain.id, 1..=chain.total()).await {
         Some(false) => {}
         Some(true) => {
-            return Ok(crate::send_outcome::acknowledged(
+            return Ok(crate::jobs::acknowledged(
                 format!(
                     "The chain of {} steps this call describes is already in flight; its final \
                      answer will arrive as the last step's own message.",
@@ -387,20 +389,28 @@ pub(crate) async fn start(
     // A re-issued call after a stop is a NEW chain: the stop's mark belongs to the chain that was
     // running, and this call asks for another.
     STOPPED.lock().unwrap_poison().remove(&chain.id);
-    // The record is opened before step one leaves: the run in flight returned above, leaving the
-    // record it reports untouched.
-    if id.is_some() {
-        crate::send_outcome::begin(&chain.id, Some(chain.total())).await;
+    // The record row is written before step one leaves: the run in flight returned above, leaving
+    // the record it reports untouched. A chain's record is the chain's own dispatch row, keyed by
+    // its id, with its length on it — and a re-issued identical chain re-arms it there.
+    if id.is_some()
+        && let Err(e) = crate::jobs::open_chain_record(&chain).await
+    {
+        tracing::warn!(chain = %chain.id, error = %e, "Failed to open a chain's record row");
     }
     let message = first_message(&chain);
     if let Err(e) = dispatch(&chain, &message, origin, answered_for).await {
         forget(&chain.id);
+        // A frozen workspace is not a failed chain: `dispatch` settles it as stopped before it
+        // returns the freeze, and the typed error carries the one refusal sentence.
+        if crate::launch::is_paused(&e) {
+            return Err(e);
+        }
         // No caller ever received this id and nothing will answer it, so its record must not read
         // as running.
-        crate::send_outcome::fail(&chain.id, &e.to_string()).await;
+        crate::jobs::settle_record(&chain.id, Outcome::Failed, Some(&e.to_string())).await;
         return Err(e);
     }
-    Ok(crate::send_outcome::acknowledged(
+    Ok(crate::jobs::acknowledged(
         format!(
             "Chain of {} steps started; only the final answer will arrive, as the last step's own \
              message.",
@@ -473,13 +483,24 @@ pub(crate) async fn dispatch(
         },
     )
     .await?;
-    match step.addressee {
+    let folder = place.as_ref().unwrap_or(origin);
+    let dispatched = match step.addressee {
         Addressee::Worker => {
-            // A single worker run in an occupied folder fails the chain: two agents in one folder
-            // overwrite each other's edits.
-            BusyFolder::Chain(chain).check(place.as_ref().unwrap_or(origin), None)?;
-            crate::tools::implement::hand_over_chain_round(origin, place.as_ref(), message, chain)
-                .await
+            // A single worker run in an occupied folder fails the chain: one writer holds a folder
+            // at a time — every role but the Manager, not just another chain — and a step only
+            // waits its turn in its own chain's folder.
+            match BusyFolder::Chain(chain).check(folder, None).await {
+                Ok(()) => {
+                    crate::tools::implement::hand_over_chain_round(
+                        origin,
+                        place.as_ref(),
+                        message,
+                        chain,
+                    )
+                    .await
+                }
+                Err(e) => Err(e),
+            }
         }
         Addressee::WorkerBranch => {
             // A step waits its turn in the conversation it names; another agent in the folder still
@@ -522,13 +543,24 @@ pub(crate) async fn dispatch(
             .map(|_| ())
         }
         other => bail!("usage: `{}` cannot be a chain step", other.as_str()),
+    };
+    // A frozen workspace stops the chain instead of failing a step: the owner asked for the pause,
+    // so nothing failed — the chain settles as stopped — and the caller learns the step never
+    // started instead of waiting for an answer that cannot come. Every arm's refusal passes through
+    // here, and the pause each one obeys is read live at the moment the step would start.
+    if let Err(e) = &dispatched
+        && crate::launch::is_paused(e)
+    {
+        stop_quietly(chain).await;
     }
+    dispatched
 }
 
 /// Hand one step's answer on: dispatch the next step, or deliver the final answer to the chain's
-/// caller. `shape` is what the answer came back as, and the final answer's shape is the chain's
-/// outcome. An ended chain says what became of it — silence only for a deliberate stop.
-async fn hand_on(chain: &Chain, answer: &str, shape: Shape) {
+/// caller. `conversation` is the session that produced the answer: the final answer IS that
+/// conversation's last assistant message, so the chain's record names it rather than storing the
+/// text a second time. An ended chain says what became of it — silence only for a deliberate stop.
+async fn hand_on(chain: &Chain, answer: &str, conversation: Option<&str>) {
     if stopped(chain) {
         // Stopped: nothing is delivered, and the group went with the stop.
         return;
@@ -547,7 +579,21 @@ async fn hand_on(chain: &Chain, answer: &str, shape: Shape) {
         forget(&chain.id);
         // The final answer is the chain's outcome and is final here, before the envelope the
         // caller's conversation receives wraps it.
-        crate::send_outcome::finish(&chain.id, answer, shape).await;
+        if let Some(conversation) = conversation
+            && let Err(e) = crate::jobs::attach_conversation(
+                &chain.id,
+                conversation,
+                chain.current.extract.as_ref(),
+            )
+            .await
+        {
+            tracing::warn!(
+                chain = %chain.id,
+                error = %e,
+                "Failed to record the chain's answering conversation",
+            );
+        }
+        crate::jobs::settle_record(&chain.id, Outcome::Done, None).await;
         deliver(chain, answer).await;
         consume(chain).await;
         return;
@@ -579,7 +625,11 @@ async fn hand_on(chain: &Chain, answer: &str, shape: Shape) {
     // could not be recorded is reported to the caller rather than swallowed as an agent's own
     // best-effort delivery would be.
     if let Err(e) = dispatch(&next_chain, &message, &origin, AnsweredFor::Caller).await {
-        fail(&next_chain, &e.to_string()).await;
+        // A pause between steps is a stop, not a failure: the step already settled the chain as
+        // stopped and nothing was dispatched.
+        if !crate::launch::is_paused(&e) {
+            fail(&next_chain, &e.to_string()).await;
+        }
         return;
     }
     // The hand-off is one transition: the next step's record is durable before this one is
@@ -602,9 +652,8 @@ pub(crate) async fn settle(
     match answer {
         Some(answer) if !answer.trim().is_empty() => {
             // A step that asked for JSON hands JSON on; a transformation that fails forwards the
-            // whole answer, and a stop landing meanwhile is caught by `hand_on`. The chain's shape
-            // is the FINAL step's, so each step reports what its own answer came back as.
-            let (answer, produced) = crate::extract::answer_as_json_reporting(
+            // whole answer, and a stop landing meanwhile is caught by `hand_on`.
+            let answer = crate::extract::answer_as_json(
                 chain.current.extract.as_ref(),
                 &crate::extract::StepContext {
                     role: chain.current.role(),
@@ -615,12 +664,7 @@ pub(crate) async fn settle(
                 answer,
             )
             .await;
-            hand_on(
-                chain,
-                &answer,
-                Shape::of(chain.current.extract.is_some(), produced),
-            )
-            .await;
+            hand_on(chain, &answer, conversation).await;
         }
         _ => fail(chain, reason).await,
     }
@@ -693,9 +737,22 @@ pub(crate) async fn fail(chain: &Chain, reason: &str) {
     if stopped(chain) {
         return;
     }
-    crate::send_outcome::fail(&chain.id, reason).await;
+    crate::jobs::settle_record(&chain.id, Outcome::Failed, Some(reason)).await;
     let message = failure_message(&format!("Step {} of {}", chain.step, chain.total()), reason);
     deliver(chain, &message).await;
+    end_quietly(&chain.id).await;
+}
+
+/// End a chain whose work was stopped rather than failed — a step cut short by a workspace freeze.
+/// The one quiet ending besides the owner's own [`stop`]: the outcome is recorded so the chain does
+/// not read as running, its rows go, and the caller is told nothing, because nothing failed.
+pub(crate) async fn stop_quietly(chain: &Chain) {
+    crate::jobs::settle_record(
+        &chain.id,
+        Outcome::Stopped,
+        Some(crate::agent::PAUSED_REASON),
+    )
+    .await;
     end_quietly(&chain.id).await;
 }
 
@@ -742,9 +799,10 @@ pub(crate) async fn abandon_unreadable(
     };
     crate::agent::message_router::deliver_chain_message(step, &message, &folder, &root).await;
     if let Some(chain_id) = chain_id {
-        crate::send_outcome::fail(
+        crate::jobs::settle_record(
             chain_id,
-            "its stored record could not be read, so the chain stopped",
+            Outcome::Failed,
+            Some("its stored record could not be read, so the chain stopped"),
         )
         .await;
         end_quietly(chain_id).await;
@@ -846,7 +904,8 @@ pub(crate) async fn stop(chain_id: &str) -> Result<()> {
     crate::agent::registry::AGENT_REGISTRY.cancel_by_parent_key(
         &crate::agent::registry::ParentKey::Chain(chain_id.to_string()),
     );
-    crate::send_outcome::fail(chain_id, "the chain was stopped").await;
+    // The owner stopped it: stopped, not failed — nothing went wrong.
+    crate::jobs::settle_record(chain_id, Outcome::Stopped, Some("the chain was stopped")).await;
     end(chain_id).await
 }
 
@@ -1128,7 +1187,7 @@ mod tests {
             identifier: None,
             prompt: String::new(),
             tools: Vec::new(),
-            agent_id: crate::session::worker_branch_agent_id("drifted"),
+            agent_id: crate::address::AgentAddress::worker_branch("drifted".to_owned()).id(),
             reply_to: None,
             chain: None,
             extract: None,
@@ -1212,7 +1271,7 @@ mod tests {
         );
         let filled = chain("filled", "chain_filled_ws", 1, 1, current, Vec::new());
         seed_step(&filled, &ws).await;
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
         settle(&filled, None, Some("the whole answer"), "no answer").await;
@@ -1262,7 +1321,7 @@ mod tests {
                 .ok("not json at all"),
         );
         let _provider_guard = crate::util::test::install_fake_provider(fake.clone());
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
         let mut current = role("writer");
@@ -1407,7 +1466,7 @@ mod tests {
             vec![branch("two")],
         );
         let mut next_rx = crate::agent::message_router::register_agent(
-            &crate::session::worker_branch_agent_id("two"),
+            &crate::address::AgentAddress::worker_branch("two".to_owned()).id(),
         );
 
         dispatch(&chain, "draft it", &ws, AnsweredFor::Caller)
@@ -1442,9 +1501,9 @@ mod tests {
             "the finished step's record is consumed once its answer was handed on"
         );
 
-        crate::agent::message_router::unregister_agent(&crate::session::worker_branch_agent_id(
-            "two",
-        ));
+        crate::agent::message_router::unregister_agent(
+            &crate::address::AgentAddress::worker_branch("two".to_owned()).id(),
+        );
         crate::jobs::delete_chain_rows(&chain.id)
             .await
             .expect("clean up this test's chain");
@@ -1475,12 +1534,12 @@ mod tests {
         seed_step(&chain, &ws).await;
 
         let mut next_rx = crate::agent::message_router::register_agent(
-            &crate::session::worker_branch_agent_id("two"),
+            &crate::address::AgentAddress::worker_branch("two".to_owned()).id(),
         );
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
-        hand_on(&chain, "the drafted text", Shape::None).await;
+        hand_on(&chain, "the drafted text", None).await;
 
         let job = tokio::time::timeout(std::time::Duration::from_secs(2), next_rx.recv())
             .await
@@ -1513,9 +1572,9 @@ mod tests {
             Some(true),
             "the next step's record is durable before it runs"
         );
-        crate::agent::message_router::unregister_agent(&crate::session::worker_branch_agent_id(
-            "two",
-        ));
+        crate::agent::message_router::unregister_agent(
+            &crate::address::AgentAddress::worker_branch("two".to_owned()).id(),
+        );
         crate::agent::message_router::unregister_agent(&admin);
     }
 
@@ -1543,10 +1602,10 @@ mod tests {
         );
         seed_step(&chain, &ws).await;
 
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
-        hand_on(&chain, "the final text", Shape::None).await;
+        hand_on(&chain, "the final text", None).await;
 
         let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
             .await
@@ -1581,10 +1640,10 @@ mod tests {
         );
         seed_step(&chain, &ws).await;
 
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
-        hand_on(&chain, "the drafted text", Shape::None).await;
+        hand_on(&chain, "the drafted text", None).await;
 
         let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
             .await
@@ -1622,7 +1681,7 @@ mod tests {
         );
         seed_step(&chain, &ws).await;
 
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
         fail(&chain, "the folder is gone").await;
@@ -1700,7 +1759,7 @@ mod tests {
                     identifier: Some("shared".to_string()),
                     prompt: String::new(),
                     tools: Vec::new(),
-                    agent_id: crate::session::worker_branch_agent_id("shared"),
+                    agent_id: crate::address::AgentAddress::worker_branch("shared".to_owned()).id(),
                     reply_to: None,
                     chain: Some(Box::new(queued)),
                     extract: None,
@@ -1753,10 +1812,10 @@ mod tests {
         )
         .await;
         let chain = chain("vanished", &ws.name, 2, 2, branch("two"), Vec::new());
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
-        hand_on(&chain, "the drafted text", Shape::None).await;
+        hand_on(&chain, "the drafted text", None).await;
 
         let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
             .await
@@ -1799,7 +1858,7 @@ mod tests {
             vec![branch("next")],
         );
         seed_step(&chain, &ws).await;
-        let conversation = crate::session::worker_branch_agent_id("editor");
+        let conversation = crate::address::AgentAddress::worker_branch("editor".to_owned()).id();
         crate::session::store()
             .set_branch(
                 &conversation,
@@ -1912,7 +1971,7 @@ mod tests {
         )
         .await;
         let chain = chain("reasoned", &ws.name, 1, 1, branch("editor"), Vec::new());
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
         settle(&chain, None, None, "the provider refused the request (401)").await;
@@ -1992,7 +2051,7 @@ mod tests {
             .await
             .expect("consume the envelope");
         // Only the conversation of step two exists — a role or worker-branch step has no round.
-        let conversation = crate::session::worker_branch_agent_id("two");
+        let conversation = crate::address::AgentAddress::worker_branch("two".to_owned()).id();
         let second = Chain {
             step: 2,
             next: Vec::new(),
@@ -2042,12 +2101,12 @@ mod tests {
             branch("two"),
             vec![branch("three")],
         );
-        let sibling = crate::session::worker_branch_agent_id("one");
+        let sibling = crate::address::AgentAddress::worker_branch("one".to_owned()).id();
         crate::session::store()
             .set_branch(&sibling, None, Some("one"), None, Some(&chain), None)
             .await
             .expect("an earlier step's conversation records the chain");
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
         assert!(
@@ -2114,12 +2173,12 @@ mod tests {
             vec![branch("three")],
         );
         keep_visible(&chain);
-        let sibling = crate::session::worker_branch_agent_id("one");
+        let sibling = crate::address::AgentAddress::worker_branch("one".to_owned()).id();
         crate::session::store()
             .set_branch(&sibling, None, Some("one"), None, Some(&chain), None)
             .await
             .expect("an earlier step's conversation records the chain");
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
         // A record this build cannot read as a chain, but which still says which chain it is.
         let corrupt = Stored::parse(Some(
@@ -2391,7 +2450,7 @@ mod tests {
     /// A step's report and its failure both name the folder the step actually worked in, not the
     /// caller's.
     #[tokio::test]
-    #[serial_test::serial(drain, send_outcome)]
+    #[serial_test::serial(drain, handover_records)]
     async fn a_report_and_a_failure_name_the_folder_the_step_worked_in() {
         let _store = crate::util::test::STORE_LOCK.lock().await;
         crate::util::test::init_management_test_stores().await;
@@ -2420,10 +2479,10 @@ mod tests {
         failed.inherited = Some(folder.clone());
         seed_step(&failed, &ws).await;
 
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
-        hand_on(&moved, "the final text", Shape::None).await;
+        hand_on(&moved, "the final text", None).await;
         let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
             .await
             .expect("the final answer is delivered")
@@ -2464,7 +2523,7 @@ mod tests {
         let mut vanished = chain("report_gone", "chain_report_ws", 2, 2, worker(), Vec::new());
         vanished.inherited = Some(gone.clone());
         seed_step(&vanished, &ws).await;
-        hand_on(&vanished, "the final text", Shape::None).await;
+        hand_on(&vanished, "the final text", None).await;
         let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
             .await
             .expect("the final answer is delivered")
@@ -2505,7 +2564,7 @@ mod tests {
         crate::session::store()
             .conn
             .query_row(
-                "SELECT created_at FROM send_outcomes WHERE id = ?1",
+                "SELECT created_at FROM jobs WHERE id = ?1",
                 crate::db::params![chain_id.to_string()],
                 |row| row.get::<String>(0),
             )
@@ -2516,7 +2575,7 @@ mod tests {
     /// A chain started from the command line opens the record its own id answers, before step one
     /// leaves; a re-issue while it is in flight reports that same run and leaves the record alone.
     #[tokio::test]
-    #[serial_test::serial(drain, send_outcome)]
+    #[serial_test::serial(drain, handover_records)]
     async fn a_command_line_chain_opens_its_own_record() {
         let _store = crate::util::test::STORE_LOCK.lock().await;
         crate::util::test::init_management_test_stores().await;
@@ -2537,7 +2596,7 @@ mod tests {
         );
         // Step one's envelope is consumed here, so no turn of its own runs.
         let mut first_rx = crate::agent::message_router::register_agent(
-            &crate::session::worker_branch_agent_id("recorded_one"),
+            &crate::address::AgentAddress::worker_branch("recorded_one".to_owned()).id(),
         );
 
         let ack = start_from_the_command_line(&chain, &ws)
@@ -2547,13 +2606,22 @@ mod tests {
             ack.contains(&format!("(job {})", chain.id)),
             "the acknowledgement names the chain's id: {ack}"
         );
-        let record = crate::send_outcome::lookup(&chain.id)
+        let (status, _) = crate::util::test::record_row(&chain.id)
+            .await
+            .expect("the chain's record stands");
+        assert_eq!(status, crate::outcome::Outcome::Running.as_str());
+        let steps = crate::session::store()
+            .conn
+            .query_optional(
+                "SELECT chain_steps FROM jobs WHERE id = ?1",
+                crate::db::params![chain.id.as_str()],
+                |row| row.get::<Option<i64>>(0),
+            )
             .await
             .expect("read the record")
             .expect("the chain's record stands");
-        assert_eq!(record.state, crate::send_outcome::State::Running);
         assert_eq!(
-            record.chain_steps,
+            steps.and_then(|steps| usize::try_from(steps).ok()),
             Some(2),
             "the record names the chain's own length"
         );
@@ -2571,13 +2639,12 @@ mod tests {
             again.contains(&format!("(job {})", chain.id)),
             "a script re-issuing gets the same id back: {again}"
         );
-        let record = crate::send_outcome::lookup(&chain.id)
+        let (status, _) = crate::util::test::record_row(&chain.id)
             .await
-            .expect("read the record")
             .expect("the chain's record stands");
         assert_eq!(
-            record.state,
-            crate::send_outcome::State::Running,
+            status,
+            crate::outcome::Outcome::Running.as_str(),
             "the re-issue leaves the record it reports untouched"
         );
         assert_eq!(
@@ -2585,15 +2652,15 @@ mod tests {
             created,
             "and it is the run already going, not a second one"
         );
-        crate::agent::message_router::unregister_agent(&crate::session::worker_branch_agent_id(
-            "recorded_one",
-        ));
+        crate::agent::message_router::unregister_agent(
+            &crate::address::AgentAddress::worker_branch("recorded_one".to_owned()).id(),
+        );
     }
 
     /// The final answer is the chain's outcome: `settle` completes the record with the answer, and
     /// with the shape it came back in.
     #[tokio::test]
-    #[serial_test::serial(drain, send_outcome)]
+    #[serial_test::serial(drain, handover_records)]
     async fn the_chains_final_answer_completes_its_record() {
         let _store = crate::util::test::STORE_LOCK.lock().await;
         crate::util::test::init_management_test_stores().await;
@@ -2613,46 +2680,56 @@ mod tests {
             Vec::new(),
         );
         let mut first_rx = crate::agent::message_router::register_agent(
-            &crate::session::worker_branch_agent_id("recorded_final_one"),
+            &crate::address::AgentAddress::worker_branch("recorded_final_one".to_owned()).id(),
         );
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
         start_from_the_command_line(&chain, &ws)
             .await
             .expect("the chain starts");
-        settle(&chain, None, Some("the final answer"), "no answer").await;
+        // The final answer IS the step's conversation's last assistant message: the record names
+        // that conversation and reads the answer from it.
+        let conversation =
+            crate::address::AgentAddress::worker_branch("recorded_final_one".to_owned()).id();
+        crate::util::test::seed_session_row(
+            &crate::session::store().conn,
+            &conversation,
+            "assistant",
+            "the final answer",
+        )
+        .await;
+        settle(
+            &chain,
+            Some(&conversation),
+            Some("the final answer"),
+            "no answer",
+        )
+        .await;
 
         let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
             .await
             .expect("the final answer is delivered")
             .expect("the final envelope");
         assert!(job.content.contains("the final answer"), "{}", job.content);
-        let record = crate::send_outcome::lookup(&chain.id)
+        let (status, _) = crate::util::test::record_row(&chain.id)
             .await
-            .expect("read the record")
             .expect("the chain's record stands");
-        assert_eq!(record.state, crate::send_outcome::State::Done);
-        assert_eq!(record.answer.as_deref(), Some("the final answer"));
-        assert_eq!(
-            record.shape,
-            Some(Shape::None),
-            "a step with no schema forwarded its answer as it was"
-        );
+        assert_eq!(status, crate::outcome::Outcome::Done.as_str());
         tokio::time::timeout(std::time::Duration::from_secs(2), first_rx.recv())
             .await
             .expect("step one is dispatched")
             .expect("step one's envelope");
-        crate::agent::message_router::unregister_agent(&crate::session::worker_branch_agent_id(
-            "recorded_final_one",
-        ));
+        crate::agent::message_router::unregister_agent(
+            &crate::address::AgentAddress::worker_branch("recorded_final_one".to_owned()).id(),
+        );
         crate::agent::message_router::unregister_agent(&admin);
     }
 
     /// A chain that ends badly marks its record failed: a failure carries its reason, and a stop
     /// says it was stopped.
     #[tokio::test]
-    #[serial_test::serial(drain, send_outcome)]
+    #[serial_test::serial(drain, handover_records)]
     async fn a_chain_that_fails_or_is_stopped_marks_its_record_failed() {
         let _store = crate::util::test::STORE_LOCK.lock().await;
         crate::util::test::init_management_test_stores().await;
@@ -2664,7 +2741,7 @@ mod tests {
             "chain_record_fail_ws",
         )
         .await;
-        let admin = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let admin = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut admin_rx = crate::agent::message_router::register_agent(&admin);
 
         let failing = chain(
@@ -2675,14 +2752,15 @@ mod tests {
             branch("recorded_fail_one"),
             vec![branch("recorded_fail_two")],
         );
-        crate::send_outcome::begin(&failing.id, Some(failing.total())).await;
-        fail(&failing, "the folder is gone").await;
-        let record = crate::send_outcome::lookup(&failing.id)
+        crate::jobs::open_chain_record(&failing)
             .await
-            .expect("read the record")
+            .expect("the chain's record row");
+        fail(&failing, "the folder is gone").await;
+        let (status, reason) = crate::util::test::record_row(&failing.id)
+            .await
             .expect("the chain's record stands");
-        assert_eq!(record.state, crate::send_outcome::State::Failed);
-        assert_eq!(record.reason.as_deref(), Some("the folder is gone"));
+        assert_eq!(status, crate::outcome::Outcome::Failed.as_str());
+        assert_eq!(reason.as_deref(), Some("the folder is gone"));
         let job = tokio::time::timeout(std::time::Duration::from_secs(2), admin_rx.recv())
             .await
             .expect("the failure is delivered")
@@ -2701,14 +2779,68 @@ mod tests {
             branch("recorded_stop_one"),
             Vec::new(),
         );
-        crate::send_outcome::begin(&stopped_chain.id, Some(stopped_chain.total())).await;
-        stop(&stopped_chain.id).await.expect("the chain stops");
-        let record = crate::send_outcome::lookup(&stopped_chain.id)
+        crate::jobs::open_chain_record(&stopped_chain)
             .await
-            .expect("read the record")
+            .expect("the chain's record row");
+        stop(&stopped_chain.id).await.expect("the chain stops");
+        let (status, reason) = crate::util::test::record_row(&stopped_chain.id)
+            .await
             .expect("the chain's record stands");
-        assert_eq!(record.state, crate::send_outcome::State::Failed);
-        assert_eq!(record.reason.as_deref(), Some("the chain was stopped"));
+        assert_eq!(status, crate::outcome::Outcome::Stopped.as_str());
+        assert_eq!(reason.as_deref(), Some("the chain was stopped"));
         crate::agent::message_router::unregister_agent(&admin);
+    }
+
+    /// A step that would start on a frozen workspace ends its chain quietly: the owner asked for the
+    /// pause, so nothing failed — the record says stopped — and the caller learns the step never
+    /// started instead of waiting for an answer that cannot come.
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn a_step_on_a_frozen_workspace_ends_the_chain_stopped() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("chain_frozen")
+                .to_string_lossy(),
+            "chain_frozen_ws",
+        )
+        .await;
+        let chain = chain(
+            "frozen_step",
+            "chain_frozen_ws",
+            1,
+            2,
+            worker(),
+            vec![branch("later")],
+        );
+        crate::jobs::open_chain_record(&chain)
+            .await
+            .expect("the chain's record row");
+        crate::workspace::store()
+            .set_paused(&ws.name, true)
+            .await
+            .expect("freeze the workspace");
+
+        let refused = dispatch(&chain, "draft it", &ws, AnsweredFor::Caller)
+            .await
+            .expect_err("a frozen workspace refuses the step");
+        assert!(
+            crate::launch::is_paused(&refused),
+            "the refusal is the typed pause: {refused}"
+        );
+        let (status, reason) = crate::util::test::record_row(&chain.id)
+            .await
+            .expect("the chain's record stands");
+        assert_eq!(
+            status,
+            crate::outcome::Outcome::Stopped.as_str(),
+            "a pause stops the chain, it does not fail it"
+        );
+        assert_eq!(reason.as_deref(), Some(crate::agent::PAUSED_REASON));
+
+        crate::jobs::delete_chain_rows(&chain.id)
+            .await
+            .expect("clean up this test's chain");
     }
 }

@@ -83,7 +83,7 @@ async fn inventory_pass() {
             continue;
         }
 
-        let agent_id = crate::session::assistant_agent_id(&user);
+        let agent_id = crate::address::AgentAddress::assistant(&user).id();
         info!(
             user = %user,
             chars = memory.chars().count(),

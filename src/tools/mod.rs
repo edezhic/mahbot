@@ -41,7 +41,6 @@ pub(crate) mod say;
 pub(crate) mod search;
 pub(crate) mod search_archived_tickets;
 pub(crate) mod send;
-pub(crate) mod send_outcome;
 pub(crate) mod shell;
 // Raises the browser tab the admin's Assistant is working in, in front of the owner's windows.
 pub(crate) mod show_tab;
@@ -214,7 +213,6 @@ pub(crate) use say::SayTool;
 pub(crate) use search::SearchTool;
 pub(crate) use search_archived_tickets::SearchArchivedTicketsTool;
 pub(crate) use send::{Addressee, SendTool};
-pub(crate) use send_outcome::SendOutcomeTool;
 pub(crate) use shell::{ShellMode, ShellTool};
 pub(crate) use show_tab::ShowTabTool;
 pub(crate) use sleep::SleepTool;
@@ -532,11 +530,11 @@ pub(crate) enum SyncCoreOutcome {
     Cancelled,
 }
 
-/// A durable round's answer and the shape it came back in: a handover's record needs both, the
-/// conversation it is wrapped for needs only the text.
+/// A durable round's answer — what the conversation it is wrapped for receives. The record needs no
+/// copy of it: the answer is the conversation's own last message, and its shape is derived when a
+/// caller reads the record back.
 pub(crate) struct Delivered {
     pub answer: String,
-    pub shape: crate::send_outcome::Shape,
 }
 
 impl Delivered {
@@ -553,10 +551,6 @@ pub(crate) enum SyncDurableCore {
     Analyze,
     Worker,
 }
-
-/// What a command-line handover's record is told when its round's row vanished before the round
-/// could resume: nothing will answer it.
-const GONE_BEFORE_RESUME: &str = "the handover's work was gone when it tried to resume";
 
 impl SyncDurableCore {
     #[must_use]
@@ -658,13 +652,9 @@ impl SyncDurableCore {
     }
 
     /// The cancel-signal guard for the one core the cancel action can stop, `None` for the rest.
-    fn cancel_guard(
-        self,
-        job_id: &str,
-        caller: Option<&str>,
-    ) -> Option<crate::round_cancel::CancelGuard> {
+    fn cancel_guard(self, job_id: &str, caller: Option<&str>) -> Option<crate::stop::RunGuard> {
         match self {
-            Self::Analyze => Some(crate::round_cancel::register(job_id, caller)),
+            Self::Analyze => Some(crate::stop::register(job_id, caller)),
             Self::Worker => None,
         }
     }
@@ -672,33 +662,11 @@ impl SyncDurableCore {
     /// Whether the cancel signal fired — the delivery path's last look before the result is handed
     /// over.
     fn stopped_by_cancel(self, job_id: &str) -> bool {
-        if !crate::round_cancel::is_cancelled(job_id) {
+        if !crate::stop::cancelled(job_id) {
             return false;
         }
         tracing::info!(job = %job_id, "{} round stopped by cancel — nothing delivered", self.label());
         true
-    }
-
-    /// Whether a command-line handover's record can stand under `job_id`, and still be settled:
-    /// only an implement round ever opens one ([`implement::hand_over_worker_round`]), and the
-    /// record's own existence is the marker — an analysis round settles nothing, and an implement
-    /// round the assistant dispatched itself writes nothing to the shared writer. A failed read
-    /// settles as before, each guarded write deciding.
-    async fn holds_record(self, job_id: &str) -> bool {
-        match self {
-            Self::Analyze => false,
-            Self::Worker => crate::send_outcome::running(&[job_id])
-                .await
-                .is_none_or(|running| running.contains(job_id)),
-        }
-    }
-
-    /// Fail the record under `job_id`, when this round holds one: a round that opened none has
-    /// nothing to fail.
-    async fn fail_record(self, job_id: &str, reason: &str) {
-        if self.holds_record(job_id).await {
-            crate::send_outcome::fail(job_id, reason).await;
-        }
     }
 
     /// Shared sync dispatch: read the task-locals, generate a fresh job id, run the core as a fresh
@@ -962,6 +930,18 @@ impl SyncDurableCore {
         if let Some(place) = place {
             crate::tools::delegation::release_exec_engine(place);
         }
+        // A workspace freeze cut the round short: stopped, not failed. The row stays `launched` for
+        // the unpause re-drive, and the caller is told nothing.
+        if let Err(e) = &result
+            && crate::launch::is_paused(e)
+        {
+            tracing::info!(
+                job = %job_id,
+                "{} round stopped by a workspace pause — resumes at unpause",
+                self.label(),
+            );
+            return None;
+        }
         // The schema the caller asked for replaces the answer with JSON; a transformation that
         // fails forwards the whole answer unchanged.
         let result = self
@@ -997,13 +977,10 @@ impl SyncDurableCore {
     ) -> anyhow::Result<Delivered> {
         let answer = result?;
         let Some(extract) = extract else {
-            return Ok(Delivered {
-                answer,
-                shape: crate::send_outcome::Shape::None,
-            });
+            return Ok(Delivered { answer });
         };
         let conversation = round_conversation(job_id).await;
-        let (transformed, produced) = crate::extract::answer_as_json_reporting(
+        let transformed = crate::extract::answer_as_json(
             Some(extract),
             &crate::extract::StepContext {
                 role: self.role(),
@@ -1016,7 +993,6 @@ impl SyncDurableCore {
         .await;
         Ok(Delivered {
             answer: transformed,
-            shape: crate::send_outcome::Shape::of(true, produced),
         })
     }
 
@@ -1069,13 +1045,11 @@ impl SyncDurableCore {
                 let custom = caller.custom_launch.as_deref().cloned();
                 (caller_role, caller, custom, result)
             }
-            // Drain-cut mid-resume: abort quietly — the core logs the reason, and the record is
-            // left `running` on purpose, for the boot resume that completes it.
-            Ok(crate::jobs::SyncResumeOutcome::DrainCut) => return,
-            // The row is gone (an explicit abandon, or a cancel that removed it while this resume
-            // ran): nothing will answer this handover, so its record must not read as running.
-            Ok(crate::jobs::SyncResumeOutcome::Gone) => {
-                self.fail_record(job_id, GONE_BEFORE_RESUME).await;
+            // Drain-cut mid-resume: abort quietly — the core logs the reason, and the row is left
+            // `launched` on purpose, for the boot resume that completes it. The row is gone (an
+            // explicit abandon, or a cancel that removed it while this resume ran): nothing will
+            // answer this handover, and its record went with the row. Neither is a verdict.
+            Ok(crate::jobs::SyncResumeOutcome::DrainCut | crate::jobs::SyncResumeOutcome::Gone) => {
                 return;
             }
             // Resume infra failure, an unusable recorded directory, or a panicked round: deliver an
@@ -1093,15 +1067,11 @@ impl SyncDurableCore {
                     crate::jobs::ResumePreamble::Proceed(caller, caller_role) => {
                         (caller, caller_role)
                     }
-                    // A row gone under this resume has no caller to report to — but the handover
-                    // still gets its record settled.
-                    crate::jobs::ResumePreamble::Gone => {
-                        self.fail_record(job_id, GONE_BEFORE_RESUME).await;
-                        return;
-                    }
-                    // A drain keeps the record for the boot resume; an unreadable row is retried
-                    // by the next cycle, so neither is a verdict.
-                    crate::jobs::ResumePreamble::DrainCut
+                    // A row gone under this resume has no caller to report to and no record to
+                    // settle; a drain keeps the row for the boot resume, and an unreadable one is
+                    // retried by the next cycle. Neither is a verdict.
+                    crate::jobs::ResumePreamble::Gone
+                    | crate::jobs::ResumePreamble::DrainCut
                     | crate::jobs::ResumePreamble::Unreadable(_) => return,
                 };
                 let custom = caller.custom_launch.as_deref().cloned();
@@ -1124,8 +1094,6 @@ impl SyncDurableCore {
                     crate::tools::chain::fail(chain, &e.to_string()).await;
                     return;
                 }
-                // The caller is told the round failed, so its record must not read as running.
-                self.fail_record(job_id, &e.to_string()).await;
                 let envelope = crate::jobs::complete_durable_job(
                     job_id,
                     self.build_async_message(job_id, &Err(e), exec_dir, delivery),
@@ -1162,9 +1130,16 @@ impl SyncDurableCore {
         // A chain step's answer goes on to the next step, or comes back as the chain's final
         // answer. The hand-off consumes this round's row, so a replay finds the next step instead
         // of delivering the answer to the caller; a round that produced none names its own reason.
-        // The step's transformation runs where the round ran, so its conversation is read — before
-        // the row goes — only when the step carries a schema.
+        // A round a workspace freeze cut short was stopped, not failed, so it ends the chain
+        // quietly. The step's transformation runs where the round ran, so its conversation is read
+        // — before the row goes — only when the step carries a schema.
         if let Some(chain) = caller.chain.step() {
+            if let Err(e) = &result
+                && crate::launch::is_paused(e)
+            {
+                crate::tools::chain::stop_quietly(chain).await;
+                return;
+            }
             let conversation = if chain.current.extract.is_some() {
                 round_conversation(job_id).await
             } else {
@@ -1185,16 +1160,18 @@ impl SyncDurableCore {
         let delivered = self
             .deliverable(job_id, &delivery.name, caller.extract.as_ref(), result)
             .await;
-        // The round's answer is final here: a command-line handover's record takes it, and a round
-        // that failed takes its reason. A round that opened no record — an analysis round, or an
-        // implement round the assistant dispatched itself — is settled by nothing.
-        if self.holds_record(job_id).await {
-            match &delivered {
-                Ok(delivered) => {
-                    crate::send_outcome::finish(job_id, &delivered.answer, delivered.shape).await;
-                }
-                Err(e) => crate::send_outcome::fail(job_id, &e.to_string()).await,
-            }
+        // A workspace freeze cut the round short: it was stopped, not failed. The row stays
+        // `launched` and the caller is told nothing — the unpause re-drive resumes exactly this
+        // round ([`crate::jobs::resumable_for_workspace`]).
+        if let Err(e) = &delivered
+            && crate::launch::is_paused(e)
+        {
+            tracing::info!(
+                job = %job_id,
+                "{} round stopped by a workspace pause — resumes at unpause",
+                self.label(),
+            );
+            return;
         }
         let result = delivered.map(Delivered::into_answer);
         let envelope = crate::jobs::complete_durable_job(
@@ -2105,6 +2082,7 @@ async fn fetch_async_video(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Role;
     use crate::Tool;
     use crate::workspace::test_ws_named;
     use tempfile::TempDir;
@@ -2913,37 +2891,97 @@ mod tests {
         }
     }
 
-    /// A record can stand only under an implement round, and only while it is `running`: the one
-    /// question a resume asks before it writes, so a round that opened none settles nothing.
+    /// A workspace freeze cuts a durable worker round short: nothing went wrong, so no failure
+    /// envelope reaches the caller, and the row stays `launched` — which is what the unpause
+    /// re-drive picks up.
     #[tokio::test]
-    async fn only_a_running_implement_record_is_settled() {
+    #[serial_test::serial(provider, drain, handover_records)]
+    async fn a_frozen_durable_round_stays_launched_for_the_unpause_re_drive() {
+        use std::sync::Arc;
         let _guard = crate::util::test::STORE_LOCK.lock().await;
-        crate::util::test::init_test_stores().await;
-
-        assert!(
-            !SyncDurableCore::Analyze.holds_record("probe_record").await,
-            "an analysis round never opens a record"
+        crate::util::test::init_management_test_stores().await;
+        let _ = crate::agent::message_router::init_global();
+        crate::CHANNEL_REGISTRY.get_or_init(crate::ChannelRegistry::default);
+        let _policy_guard =
+            crate::util::test::install_test_retry_policy(crate::retry::tiny_test_policy());
+        // The first call is held so the freeze lands while the round is in flight; the tool-call
+        // answer sends the loop back to its round top, where the pause is seen.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let fake = Arc::new(
+            crate::util::test::FakeProvider::new()
+                .ok_tool_call("read")
+                .ok("never reached")
+                .hold_call(1, gate.clone()),
         );
-        assert!(
-            !SyncDurableCore::Worker.holds_record("probe_record").await,
-            "an implement round that opened no record has nothing to settle"
-        );
-
-        crate::send_outcome::begin("probe_record", None).await;
-        assert!(
-            SyncDurableCore::Worker.holds_record("probe_record").await,
-            "a running record is what a resume settles"
-        );
-
-        crate::send_outcome::finish(
-            "probe_record",
-            "the answer",
-            crate::send_outcome::Shape::None,
+        let _provider_guard = crate::util::test::install_fake_provider(fake.clone());
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("frozen_durable_round")
+                .to_string_lossy(),
+            "frozen_durable_round_ws",
         )
         .await;
-        assert!(
-            !SyncDurableCore::Worker.holds_record("probe_record").await,
-            "a settled record has nothing left to settle"
+        let job_id = format!("frozen_round_{}", crate::generate_suffix());
+        let worker = format!("frozen_worker_{}", crate::generate_suffix());
+        crate::jobs::spawn_job(
+            &crate::session::store().conn,
+            &job_id,
+            "do the work",
+            &ws.name,
+            crate::users::ADMIN_USER_NAME,
+            "cli",
+            Role::Assistant,
+            &[crate::jobs::NewAgent {
+                agent_id: worker,
+                kind: crate::jobs::AgentKind::Worker,
+                idx: Some(0),
+                task: "do the work".to_string(),
+            }],
+            &crate::jobs::SpawnChild::Implement,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("the round's own row");
+        let target = crate::jobs::target_agent_id(
+            None,
+            crate::users::ADMIN_USER_NAME,
+            Role::Assistant.as_str(),
+            &ws.name,
         );
+        let mut report = crate::agent::message_router::register_agent(&target);
+
+        let round = {
+            let job_id = job_id.clone();
+            let ws = ws.clone();
+            tokio::spawn(async move {
+                crate::tools::implement::resume_implement_round(&job_id, &ws, None).await;
+            })
+        };
+        for _ in 0..500 {
+            if !fake.request_fingerprints.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        crate::agent::registry::AGENT_REGISTRY.cancel_by_workspace_pause(&ws.name);
+        gate.notify_one();
+        round.await.expect("the round finishes");
+
+        assert!(
+            report.try_recv().is_err(),
+            "a stopped round delivers no failure envelope — nothing went wrong"
+        );
+        let resumable = crate::jobs::resumable_for_workspace(&ws.name)
+            .await
+            .expect("the rounds a resume would re-drive");
+        assert!(
+            resumable
+                .iter()
+                .any(|job| matches!(job, crate::jobs::ResumableJob::Implement { job_id: id, .. } if *id == job_id)),
+            "the stopped round is exactly what the unpause re-drive resumes"
+        );
+        crate::agent::message_router::unregister_agent(&target);
     }
 }

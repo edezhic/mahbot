@@ -33,7 +33,6 @@ use crate::pipeline::board::{Ticket, TicketPhase};
 use crate::pipeline::verdict::{MemberOutcome, ParallelVerdict};
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::retry::{FailureClass, RetryExhausted};
-use crate::session::manager_agent_id;
 use crate::workspace;
 
 /// How often the delivery loop looks for a notice that is due.
@@ -103,7 +102,7 @@ pub(crate) enum Cause {
     SanitationStop { terms: Terms },
     /// Round participants never produced a usable result. One notice per death, naming every
     /// participant that failed.
-    Participants(Vec<Participant>),
+    Participants(Vec<Member>),
     /// The workspace's project commands could not be loaded — the round cannot be judged without
     /// them, and no participant was involved.
     ProjectCommands { terms: Terms },
@@ -111,9 +110,9 @@ pub(crate) enum Cause {
     Panic(String),
 }
 
-/// One participant that failed in a round.
+/// One member of a round that failed.
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct Participant {
+pub(crate) struct Member {
     /// Its name in the round — "code reviewer 2", "functional tester", "sanitation agent".
     pub label: String,
     /// What it produced instead of a result.
@@ -121,8 +120,8 @@ pub(crate) struct Participant {
     pub terms: Terms,
 }
 
-impl Participant {
-    /// The participant a round member reports as a stage death, or `None` when it completed or was
+impl Member {
+    /// The member a round reports as a stage death, or `None` when it completed or was
     /// cut short — a phase-gate bail, a pause-freeze, a cancellation, a shutdown or a drain.
     #[must_use]
     pub(crate) fn of(label: &str, member: &MemberOutcome) -> Option<Self> {
@@ -358,7 +357,9 @@ async fn deliver_row(row: &Notice) {
     // The workspace's Manager is mid-turn: its own turn may still complete with this notice, and
     // routing again would only queue a duplicate behind it. The row stays due, so it goes out as
     // soon as the turn ends.
-    if crate::agent::registry::AGENT_REGISTRY.contains(&manager_agent_id(&row.workspace_name)) {
+    if crate::agent::registry::AGENT_REGISTRY
+        .contains(&crate::address::AgentAddress::manager(&row.workspace_name).id())
+    {
         return;
     }
     // Stamped before the read and the route: a crash or a failed read between them costs a retry
@@ -429,7 +430,7 @@ async fn stamp_attempt(notice_id: &str) -> anyhow::Result<()> {
 fn route(row: &Notice, paused_now: bool) {
     let content = render(row, paused_now);
     message_router::route(
-        &manager_agent_id(&row.workspace_name),
+        &crate::address::AgentAddress::manager(&row.workspace_name).id(),
         AgentJob {
             content,
             workspace_name: row.workspace_name.clone(),
@@ -586,7 +587,7 @@ fn with_terms(template: &str, terms: &Terms) -> String {
 
 /// The failed participants: the list's intro, then one bullet per participant — the asset's shape
 /// for what it produced, with the product's own terms indented under it.
-fn participants_block(participants: &[Participant]) -> String {
+fn participants_block(participants: &[Member]) -> String {
     let sections = load_prompt_sections("pipeline/stage_failure_participants.md");
     let bullets = participants
         .iter()
@@ -771,7 +772,7 @@ mod tests {
         let row = notice(
             Stage::Verification,
             Cause::Participants(vec![
-                Participant {
+                Member {
                     label: "code reviewer 1".to_string(),
                     produced: Produced::NoAnswer,
                     terms: Terms::new(
@@ -780,7 +781,7 @@ mod tests {
                         "13 attempt(s) failed (last: transport): connection reset",
                     ),
                 },
-                Participant {
+                Member {
                     label: "functional tester".to_string(),
                     produced: Produced::UnreadableVerdict,
                     terms: Terms::plain("no verdict in the answer"),
@@ -1101,7 +1102,9 @@ mod tests {
             .await
             .expect("resume the test workspace");
 
-        let mut inbox = message_router::register_agent(&manager_agent_id("notice_delivery_ws"));
+        let mut inbox = message_router::register_agent(
+            &crate::address::AgentAddress::manager("notice_delivery_ws").id(),
+        );
 
         deliver_row(row).await;
 
@@ -1129,7 +1132,9 @@ mod tests {
         );
         assert!(inbox.try_recv().is_err());
         assert_eq!(stored("notice_delivery_ws").await.len(), 1);
-        message_router::unregister_agent(&manager_agent_id("notice_delivery_ws"));
+        message_router::unregister_agent(
+            &crate::address::AgentAddress::manager("notice_delivery_ws").id(),
+        );
     }
 
     /// A round frozen by a pause, a superseded round and a completed participant are never
@@ -1145,20 +1150,20 @@ mod tests {
         };
         let failure = || ParallelVerdict::NoResponse("provider down".to_string());
 
-        let reported = Participant::of("functional tester", &member(failure(), false, false))
+        let reported = Member::of("functional tester", &member(failure(), false, false))
             .expect("a technical failure is a death");
         assert_eq!(reported.label, "functional tester");
         assert_eq!(reported.terms.attempts, Some(3));
         assert!(
-            Participant::of("functional tester", &member(failure(), true, true)).is_none(),
+            Member::of("functional tester", &member(failure(), true, true)).is_none(),
             "a pause-frozen round is not a death"
         );
         assert!(
-            Participant::of("functional tester", &member(failure(), false, true)).is_none(),
+            Member::of("functional tester", &member(failure(), false, true)).is_none(),
             "a cancelled or superseded round is not a death"
         );
         assert!(
-            Participant::of(
+            Member::of(
                 "functional tester",
                 &MemberOutcome::of_verdict(ParallelVerdict::Verdict(crate::Verdict {
                     score: 9,

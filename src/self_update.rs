@@ -1172,7 +1172,7 @@ pub async fn announce_update_to_assistant() {
         changelog_at_notice_time,
         |content| {
             crate::agent::message_router::post_assistant_notice(
-                &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
+                &crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id(),
                 crate::users::ADMIN_USER_NAME,
                 content,
             );

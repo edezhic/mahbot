@@ -80,7 +80,7 @@ struct TurnBlocks {
 /// empty unpersisted tail is expected (a drain cut after the last commit) or anomalous depends on
 /// shutdown state this module does not track, so the caller logs with full attribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FinalizeOutcome {
+pub(crate) enum SessionFlush {
     /// The unpersisted tail was flushed and the persisted prefix advanced.
     Flushed,
     /// Nothing was unpersisted — everything committed is already durable; the caller decides
@@ -207,7 +207,7 @@ impl Session {
         messages: &[&str],
         ws: &Workspace,
         role: &Role,
-        ticket: Option<&crate::pipeline::board::Ticket>,
+        work: &crate::work_unit::WorkUnit,
         channel: &str,
         user_name: &str,
         round_ts: Option<&str>,
@@ -224,7 +224,7 @@ impl Session {
                 message,
                 ws,
                 role,
-                ticket,
+                work,
                 channel,
                 user_name,
                 round_ts,
@@ -249,7 +249,7 @@ impl Session {
         msg: &str,
         ws: &Workspace,
         role: &Role,
-        ticket: Option<&crate::pipeline::board::Ticket>,
+        work: &crate::work_unit::WorkUnit,
         channel: &str,
         user_name: &str,
         round_ts: Option<&str>,
@@ -276,7 +276,7 @@ impl Session {
                     &content,
                     ws,
                     role,
-                    ticket,
+                    work,
                     round_ts,
                     is_admin,
                     user_name,
@@ -318,7 +318,7 @@ impl Session {
                     // Refreshed for EVERY folder change, including one whose previous folder no
                     // longer resolves: the block's length was recorded when it was written, so
                     // nothing about the old folder is needed.
-                    self.refresh_context_block(agent_id, ws, role, ticket, is_admin, user_name)
+                    self.refresh_context_block(agent_id, ws, role, work, is_admin, user_name)
                         .await?;
                     // The launch landed in a different folder than the one recorded, so the engine
                     // the branch held for that folder is now unreferenced — release it (the new
@@ -404,7 +404,7 @@ impl Session {
         agent_id: &str,
         ws: &Workspace,
         role: &Role,
-        ticket: Option<&crate::pipeline::board::Ticket>,
+        work: &crate::work_unit::WorkUnit,
         is_admin: bool,
         user_name: &str,
     ) -> Result<()> {
@@ -425,15 +425,9 @@ impl Session {
             // Written with the block it describes, so it always fits; clamped so the slice cannot
             // panic.
             .min(self.history.len());
-        let (fresh, _) = Self::build_context_messages(
-            ws,
-            role,
-            ticket,
-            is_admin,
-            user_name,
-            self.launch.as_ref(),
-        )
-        .await;
+        let (fresh, _) =
+            Self::build_context_messages(ws, role, work, is_admin, user_name, self.launch.as_ref())
+                .await;
         let fresh_len = fresh.len();
         let mut rebuilt = fresh;
         rebuilt.extend_from_slice(&self.history[previous_block_len..]);
@@ -731,21 +725,15 @@ impl Session {
         summary_text: &str,
         ws: &Workspace,
         role: &Role,
-        ticket: Option<&crate::pipeline::board::Ticket>,
+        work: &crate::work_unit::WorkUnit,
         is_admin: bool,
         user_name: &str,
         turn_start: usize,
     ) {
         // Build the fresh system prompt (it may have changed since session start).
-        let (mut compacted, snapshot) = Self::build_context_messages(
-            ws,
-            role,
-            ticket,
-            is_admin,
-            user_name,
-            self.launch.as_ref(),
-        )
-        .await;
+        let (mut compacted, snapshot) =
+            Self::build_context_messages(ws, role, work, is_admin, user_name, self.launch.as_ref())
+                .await;
         // The leading context block is exactly `compacted` here; a launch session records its
         // length.
         let context_block_len = compacted.len();
@@ -820,21 +808,21 @@ impl Session {
     // Flush any unpersisted history tail to the store and advance the persisted prefix — the final
     // assistant answer, or just delivered comments on aborted turns. No-op on an empty tail (a
     // drain cut after the last tool-group commit, or a turn with no output), so a retained answer
-    // is never duplicated; the no-op is surfaced as [`FinalizeOutcome::NoUnpersistedTail`] for the
+    // is never duplicated; the no-op is surfaced as [`SessionFlush::NoUnpersistedTail`] for the
     // caller to log with attribution. Skipped by the agent-level cancel path.
 
-    pub(crate) async fn finalize(&mut self, agent_id: &str) -> Result<FinalizeOutcome> {
+    pub(crate) async fn finalize(&mut self, agent_id: &str) -> Result<SessionFlush> {
         debug_assert!(self.persisted_len <= self.history.len());
         if self.persisted_len == self.history.len() {
-            return Ok(FinalizeOutcome::NoUnpersistedTail);
+            return Ok(SessionFlush::NoUnpersistedTail);
         }
         self.persist_messages(agent_id, &[]).await?;
-        Ok(FinalizeOutcome::Flushed)
+        Ok(SessionFlush::Flushed)
     }
 
-    /// Build fresh system prompt + ticket context for the current turn: the system-level messages
-    /// plus the model snapshot rendered in the `<active-models-opts>` block (`Default` when none was
-    /// injected).
+    /// Build fresh system prompt + the work unit's ticket block for the current turn: the
+    /// system-level messages plus the model snapshot rendered in the `<active-models-opts>` block
+    /// (`Default` when none was injected).
     ///
     /// Message order, which the cached prefix depends on: role description, onboarding guide (the
     /// admin's Assistant while onboarding), active-models opts (Assistant), workspace boilerplate
@@ -855,7 +843,7 @@ impl Session {
     async fn build_context_messages(
         ws: &Workspace,
         role: &Role,
-        ticket: Option<&crate::pipeline::board::Ticket>,
+        work: &crate::work_unit::WorkUnit,
         is_admin: bool,
         user_name: &str,
         launch: Option<&crate::Launch>,
@@ -992,13 +980,13 @@ impl Session {
         if let Some(board_context) = board_context {
             msgs.push(ChatMessage::system(&board_context));
         }
-        if let Some(t) = ticket {
+        if let Some(t) = work.ticket() {
             msgs.push(ChatMessage::system(format_ticket_block(t)));
         }
         (msgs, snapshot)
     }
 
-    /// Build the fresh system prompt, ticket context and user message for the current turn: the
+    /// Build the fresh system prompt, the work unit's ticket block and the user message: the
     /// system messages above plus the user message, and the rendered active-models snapshot
     /// (Assistant only). Caching contract: the output is persisted on the FIRST turn (via
     /// `batch_append_with_context` in [`Self::append_turn_message`]) and loaded from the DB
@@ -1010,14 +998,14 @@ impl Session {
         msg: &str,
         ws: &Workspace,
         role: &Role,
-        ticket: Option<&crate::pipeline::board::Ticket>,
+        work: &crate::work_unit::WorkUnit,
         round_ts: Option<&str>,
         is_admin: bool,
         user_name: &str,
         launch: Option<&crate::Launch>,
     ) -> (Vec<ChatMessage>, ModelSnapshot) {
         let (mut msgs, snapshot) =
-            Self::build_context_messages(ws, role, ticket, is_admin, user_name, launch).await;
+            Self::build_context_messages(ws, role, work, is_admin, user_name, launch).await;
         msgs.push(crate::session::user_msg_with_ts(msg, round_ts));
         (msgs, snapshot)
     }
@@ -2188,7 +2176,7 @@ mod tests {
         let (messages, _) = Session::build_context_messages(
             &ws,
             &crate::Role::Custom,
-            None,
+            &crate::work_unit::WorkUnit::Turn,
             false,
             "admin",
             Some(&launch),
@@ -2234,7 +2222,7 @@ mod tests {
         let (messages, _) = Session::build_context_messages(
             &ws,
             &crate::Role::Custom,
-            None,
+            &crate::work_unit::WorkUnit::Turn,
             false,
             "admin",
             Some(&launch),
@@ -2270,7 +2258,7 @@ mod tests {
                     msg,
                     ws,
                     &crate::Role::Worker,
-                    None,
+                    &crate::work_unit::WorkUnit::Turn,
                     "gui",
                     "tester",
                     None,
@@ -2285,7 +2273,7 @@ mod tests {
             Session::build_context_messages(
                 ws,
                 &crate::Role::Worker,
-                None,
+                &crate::work_unit::WorkUnit::Turn,
                 false,
                 "tester",
                 Some(launch),
@@ -2315,7 +2303,7 @@ mod tests {
         let ws_a = crate::workspace::test_ws_named(&path_a, &path_a);
         let ws_b = crate::workspace::test_ws_named(&path_b, &path_b);
 
-        let agent_id = crate::session::worker_branch_agent_id("feature");
+        let agent_id = crate::address::AgentAddress::worker_branch("feature".to_owned()).id();
         let launch = crate::Launch {
             role: crate::Role::Worker,
             name: String::new(),
@@ -2397,7 +2385,7 @@ mod tests {
                 "next message",
                 &ws,
                 &crate::Role::Worker,
-                None,
+                &crate::work_unit::WorkUnit::Turn,
                 "telegram",
                 "ada",
                 None,
@@ -2444,13 +2432,20 @@ mod tests {
         const SHARED: &str = "the user's folder";
 
         async fn context(ws: &Workspace, role: crate::Role, user_name: &str) -> String {
-            Session::build_context_messages(ws, &role, None, false, user_name, None)
-                .await
-                .0
-                .iter()
-                .map(|m| m.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
+            Session::build_context_messages(
+                ws,
+                &role,
+                &crate::work_unit::WorkUnit::Turn,
+                false,
+                user_name,
+                None,
+            )
+            .await
+            .0
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
         }
 
         crate::util::test::init_test_stores().await;

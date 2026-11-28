@@ -60,11 +60,12 @@
 //!   existing store is still pending on them.
 //! - `85` — the `jobs.extract` / `session_metadata.extract` columns a `send` schema
 //!   rides on (see [`run_add_extract_columns`]), arriving with the same release.
-//! - `86` — the `send_outcomes` table the command line's `outcome` lookup reads (see
-//!   [`SEND_OUTCOMES_TABLE`]). It arrives with this release, so every existing store
-//!   is still pending on it.
 //! - `87` — the `pause_notices` table the workspace-stop notice is delivered from (see
 //!   [`PAUSE_NOTICES_TABLE`]), arriving with the same release.
+//! - `88` — the workspace profile's two columns, the confirmation of every workspace that
+//!   predates them, the `jobs.reason` / `jobs.chain_steps` columns the command line's receipt
+//!   rides on, and the drop of the retired `send_outcomes` table (see
+//!   [`run_add_workspace_profile`]), arriving with the same release.
 //!
 //! # The id → release record, and the retired ids
 //!
@@ -77,9 +78,13 @@
 //! - `82`, `83` — added after the 0.10.6 tag, so no shipped build records either.
 //! - `84` — the `send` chain's columns; no shipped build records it.
 //! - `85` — the `send` schema's columns; no shipped build records it.
-//! - `86` — the `send_outcomes` table; no shipped build records it.
+//! - `86` — retired: the `send_outcomes` table. Shipped in 0.11.2, so a store that applied it
+//!   carries the table and may hold a receipt written on that build. **Never reuse this id** —
+//!   entry `88` carries those rows onto their `turn` records and then drops the table.
 //! - `87` — the `pause_notices` table; no shipped build records it.
-//! - Next id: `88`.
+//! - `88` — the workspace profile's columns and their confirmation, the `jobs.reason` /
+//!   `jobs.chain_steps` columns and the drop of `send_outcomes`; no shipped build records it.
+//! - Next id: `89`.
 //!
 //! Retired, and never to be reused:
 //!
@@ -341,7 +346,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     exec_dir       TEXT,
     custom_launch  TEXT,
     chain          TEXT,
-    extract        TEXT
+    extract        TEXT,
+    round_profile  TEXT,
+    reason         TEXT,
+    chain_steps    INTEGER
 );
 CREATE TABLE IF NOT EXISTS agents (
     job_id     TEXT REFERENCES jobs(id) ON DELETE CASCADE,
@@ -379,7 +387,9 @@ CREATE TABLE IF NOT EXISTS workspaces (
     diagnostics_generation INTEGER NOT NULL DEFAULT 0,
     notes TEXT NOT NULL DEFAULT '',
     last_analyzed_commit TEXT,
-    discovery_generation INTEGER NOT NULL DEFAULT 0
+    discovery_generation INTEGER NOT NULL DEFAULT 0,
+    profile_confirmed INTEGER NOT NULL DEFAULT 0,
+    profile TEXT
 );
 CREATE TABLE IF NOT EXISTS workspace_contexts (
     workspace_name TEXT NOT NULL REFERENCES workspaces(name) ON DELETE CASCADE,
@@ -491,16 +501,6 @@ CREATE TABLE IF NOT EXISTS automations (
     workspace           TEXT,
     retry_at            TEXT,
     unfinished_attempts INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS send_outcomes (
-    id TEXT PRIMARY KEY,
-    state TEXT NOT NULL,
-    answer TEXT,
-    reason TEXT,
-    shape TEXT,
-    chain_steps INTEGER,
-    created_at TEXT NOT NULL,
-    finished_at TEXT
 );
 CREATE TABLE IF NOT EXISTS pause_notices (
     id                TEXT PRIMARY KEY,
@@ -691,20 +691,6 @@ const GUEST_REPORTS_TABLE: &str = "CREATE TABLE IF NOT EXISTS guest_reports (
     PRIMARY KEY (user_name, day, digest)
 );";
 
-/// Entry `86` (existing installs): the `send_outcomes` table behind the command line's `outcome`
-/// lookup — one row per command-line handover, keyed by the id its acknowledgement printed. The
-/// baseline (`24`) already declares it, so on a fresh install this is an `IF NOT EXISTS` no-op.
-const SEND_OUTCOMES_TABLE: &str = "CREATE TABLE IF NOT EXISTS send_outcomes (
-    id TEXT PRIMARY KEY,
-    state TEXT NOT NULL,
-    answer TEXT,
-    reason TEXT,
-    shape TEXT,
-    chain_steps INTEGER,
-    created_at TEXT NOT NULL,
-    finished_at TEXT
-);";
-
 /// Entry `87` (existing installs): the `pause_notices` table behind the workspace-stop notice a
 /// stage's technical death sends to the workspace's Manager (see [`crate::pipeline::notice`]).
 /// One row per death holds the DEATH — the stage, the ticket it happened on and what failed — not
@@ -732,9 +718,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_pause_notices_job ON pause_notices(job_id)
 ///
 /// Twelve entries, split by the module header's rule: the fresh-install half is
 /// `24`, `26` and `69`; the upgrade half is `79`, `80`, `81`, `82`, `83`, `84`,
-/// `85`, `86` and `87` — the entries that can still be pending on a store that has run
-/// a 0.10.x build. The header also carries the id → release record and the
-/// retired ids.
+/// `85`, `87` and `88` — the entries that can still be pending on a store that has run
+/// a 0.10.x build. `86` is retired (see the module header) and is never reused. The
+/// header also carries the id → release record and the retired ids.
 ///
 /// - `24` builds the full core schema; on an existing store every statement is
 ///   `IF NOT EXISTS`, so it is a strict no-op.
@@ -756,9 +742,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_pause_notices_job ON pause_notices(job_id)
 ///   rides on (see [`run_add_chain_columns`]).
 /// - `85` adds the nullable `jobs.extract` and `session_metadata.extract` columns a `send`
 ///   schema rides on (see [`run_add_extract_columns`]).
-/// - `86` creates `send_outcomes` on an existing core store (see
-///   [`SEND_OUTCOMES_TABLE`]).
 /// - `87` creates `pause_notices` on an existing core store (see [`PAUSE_NOTICES_TABLE`]).
+/// - `88` adds the workspace profile's columns, the receipt's `jobs.reason` /
+///   `jobs.chain_steps` columns and drops the retired `send_outcomes` table (see
+///   [`run_add_workspace_profile`]).
 pub(crate) const MIGRATIONS: &[Migration] = &[
     Migration {
         id: "24",
@@ -811,14 +798,14 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         body: MigrationBody::Rust(add_extract_columns),
     },
     Migration {
-        id: "86",
-        target: TargetDb::Core,
-        body: MigrationBody::Sql(SEND_OUTCOMES_TABLE),
-    },
-    Migration {
         id: "87",
         target: TargetDb::Core,
         body: MigrationBody::Sql(PAUSE_NOTICES_TABLE),
+    },
+    Migration {
+        id: "88",
+        target: TargetDb::Core,
+        body: MigrationBody::Rust(add_workspace_profile),
     },
 ];
 
@@ -975,6 +962,81 @@ fn add_extract_columns(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
 async fn run_add_extract_columns(conn: &Connection) -> anyhow::Result<()> {
     add_column_if_missing(conn, "jobs", "extract", "TEXT").await?;
     add_column_if_missing(conn, "session_metadata", "extract", "TEXT").await
+}
+
+fn add_workspace_profile(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
+    Box::pin(run_add_workspace_profile(conn))
+}
+
+/// Entry `88`: the workspace profile's columns, the confirmation of every workspace that
+/// predates them, and the round-profile snapshot. `profile` holds only what the owner customised;
+/// `profile_confirmed` records the owner's acceptance. The migration confirms every existing
+/// workspace so nothing stops after the upgrade, and copies no value into `profile` — an unpinned
+/// field keeps following the shipped default. `jobs.round_profile` is the profile a verification
+/// round started on, so a resumed round finishes on the settings it began with.
+///
+/// It also adds the two columns a command-line handover's receipt rides on — `jobs.reason` (why a
+/// handover ended without an answer) and `jobs.chain_steps` (the chain's length) — and drops the
+/// retired `send_outcomes` table: the receipt is the dispatch row itself, and nothing reads a
+/// second record. Guarded by [`add_column_if_missing`]; every update is idempotent.
+async fn run_add_workspace_profile(conn: &Connection) -> anyhow::Result<()> {
+    add_column_if_missing(
+        conn,
+        "workspaces",
+        "profile_confirmed",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    add_column_if_missing(conn, "workspaces", "profile", "TEXT").await?;
+    add_column_if_missing(conn, "jobs", "round_profile", "TEXT").await?;
+    add_column_if_missing(conn, "jobs", "reason", "TEXT").await?;
+    add_column_if_missing(conn, "jobs", "chain_steps", "INTEGER").await?;
+    // The command line's receipt is the dispatch row itself, so the second record it used to keep
+    // goes — after its rows are carried over, never dropped under them. A store that applied the
+    // retired entry `86` carries the table and may have written a receipt on that build; the
+    // conversion keeps each one as the `turn` record row it would be today, so an id a script
+    // still holds keeps answering. The answer text is not carried: it was delivered to the caller
+    // when the handover ran, and the record it leaves is what happened, not a second copy of it.
+    let carried = conn
+        .query_optional(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'send_outcomes'",
+            (),
+            |_| Ok::<(), anyhow::Error>(()),
+        )
+        .await
+        .context("Failed to look for the retired send_outcomes table")?
+        .is_some();
+    if carried {
+        conn.execute(
+            "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
+             retry_count, created_at, updated_at, reason, chain_steps) \
+             SELECT id, 'turn', CASE state WHEN 'running' THEN 'launched' ELSE state END, '', '', \
+             '', '', 'assistant', 0, created_at, COALESCE(finished_at, created_at), reason, \
+             chain_steps FROM send_outcomes \
+             ON CONFLICT (id) DO NOTHING",
+            (),
+        )
+        .await
+        .context("Failed to carry the retired send_outcomes rows onto their dispatch rows")?;
+        conn.execute("DROP TABLE send_outcomes", ())
+            .await
+            .context("Failed to drop the retired send_outcomes table")?;
+    }
+    conn.execute("UPDATE workspaces SET profile_confirmed = 1", ())
+        .await
+        .context("Failed to confirm the profile of every existing workspace")?;
+    // The retired "born paused" latch: before this build a successful discovery cleared the
+    // pause, so a pause that reached `ready` is deliberate (the owner's, or a stage death's) and a
+    // pause on a row that is not `ready` is that latch and nothing else. Clearing it here is what
+    // keeps the upgrade from stranding a workspace; a pause written after the upgrade is honoured
+    // everywhere, `ready` or not.
+    conn.execute(
+        "UPDATE workspaces SET paused = 0 WHERE status <> 'ready'",
+        (),
+    )
+    .await
+    .context("Failed to retire the born-paused latch")?;
+    Ok(())
 }
 
 fn add_session_metadata_provider(conn: &Connection) -> BoxFuture<'_, anyhow::Result<()>> {
@@ -1248,6 +1310,9 @@ mod tests {
                 "custom_launch",
                 "chain",
                 "extract",
+                "round_profile",
+                "reason",
+                "chain_steps",
             ],
         ),
         (
@@ -1272,19 +1337,6 @@ mod tests {
         ),
         ("research_jobs", &["id", "state"]),
         ("schema_migrations", &["id", "applied_at"]),
-        (
-            "send_outcomes",
-            &[
-                "id",
-                "state",
-                "answer",
-                "reason",
-                "shape",
-                "chain_steps",
-                "created_at",
-                "finished_at",
-            ],
-        ),
         (
             "session_metadata",
             &[
@@ -1423,6 +1475,8 @@ mod tests {
                 "notes",
                 "last_analyzed_commit",
                 "discovery_generation",
+                "profile_confirmed",
+                "profile",
             ],
         ),
     ];
@@ -1637,10 +1691,10 @@ mod tests {
         assert_eq!(
             applied,
             [
-                "24", "69", "79", "80", "81", "82", "83", "84", "85", "86", "87"
+                "24", "69", "79", "80", "81", "82", "83", "84", "85", "87", "88"
             ]
             .map(String::from),
-            "fresh core applies the baseline, the 69 seed and the nine upgrade entries exactly"
+            "fresh core applies the baseline, the 69 seed and the eight upgrade entries exactly"
         );
     }
 
@@ -2319,10 +2373,65 @@ CREATE TABLE IF NOT EXISTS llm_failures (
         )
         .await
         .expect("seed the routing row entry 81 deletes");
+        conn.execute(
+            "INSERT INTO workspaces (name, path, created_at, updated_at) \
+             VALUES ('legacy', '/tmp/legacy', ?1, ?1)",
+            params![crate::db::now()],
+        )
+        .await
+        .expect("seed a workspace that predates the profile");
+        conn.execute(
+            "INSERT INTO workspaces (name, path, status, created_at, updated_at, paused) \
+             VALUES ('ready_frozen', '/tmp/ready_frozen', 'ready', ?1, ?1, 1)",
+            params![crate::db::now()],
+        )
+        .await
+        .expect("seed a ready workspace the owner paused");
 
         run_migrations(&conn, TargetDb::Core)
             .await
             .expect("upgrade the v0.10.0 store");
+
+        let confirmed: i64 = conn
+            .query(
+                "SELECT profile_confirmed FROM workspaces WHERE name = 'legacy'",
+                (),
+            )
+            .await
+            .expect("read the upgraded workspace")
+            .first()
+            .and_then(|row| row.get::<i64>(0).ok())
+            .expect("the workspace survives the upgrade");
+        assert_eq!(
+            confirmed, 1,
+            "entry 88 confirms every workspace that predates the profile, so nothing stops"
+        );
+        let paused: i64 = conn
+            .query("SELECT paused FROM workspaces WHERE name = 'legacy'", ())
+            .await
+            .expect("read the upgraded workspace's pause")
+            .first()
+            .and_then(|row| row.get::<i64>(0).ok())
+            .expect("the workspace survives the upgrade");
+        assert_eq!(
+            paused, 0,
+            "entry 88 retires the born-paused latch on a row that is not `ready`, so the upgrade \
+             does not strand it"
+        );
+        let ready_frozen: i64 = conn
+            .query(
+                "SELECT paused FROM workspaces WHERE name = 'ready_frozen'",
+                (),
+            )
+            .await
+            .expect("read the ready workspace's pause")
+            .first()
+            .and_then(|row| row.get::<i64>(0).ok())
+            .expect("the ready workspace survives the upgrade");
+        assert_eq!(
+            ready_frozen, 1,
+            "a pause that reached `ready` is the owner's: the migration never lifts it"
+        );
 
         let fresh = crate::db::open_consolidated_store(&tmp.path().join("fresh"))
             .await
@@ -2338,6 +2447,74 @@ CREATE TABLE IF NOT EXISTS llm_failures (
             model_routing_orders(&fresh).await,
             "entry 81 must delete the routing row a v0.10.0 store carries"
         );
+    }
+
+    /// Entry `88` carries a retired `send_outcomes` row onto the dispatch row before dropping the
+    /// table: an id a script still holds keeps answering, and a deliberate ending survives as the
+    /// ending it was. A store that never recorded the retired entry has no table and is unaffected.
+    #[tokio::test]
+    async fn the_retired_send_outcomes_rows_become_their_dispatch_rows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let conn = v0_10_0_store(
+            &crate::db::store_db_path(&tmp.path().join("upgrade"), crate::db::CONSOLIDATED_DB_NAME),
+            V0_10_0_CORE_SCHEMA,
+            V0_10_0_CORE_IDS,
+        )
+        .await;
+        // The retired entry `86`'s table, as that build created it, with one finished and one
+        // still-running receipt.
+        conn.execute(
+            "CREATE TABLE send_outcomes (id TEXT PRIMARY KEY, state TEXT NOT NULL, answer TEXT, \
+             reason TEXT, shape TEXT, chain_steps INTEGER, created_at TEXT NOT NULL, \
+             finished_at TEXT)",
+            (),
+        )
+        .await
+        .expect("the retired table");
+        for (id, state, finished) in [
+            ("retired_done", "done", Some("2024-01-01T00:00:01+00:00")),
+            ("retired_running", "running", None),
+        ] {
+            conn.execute(
+                "INSERT INTO send_outcomes (id, state, answer, shape, created_at, finished_at) \
+                 VALUES (?1, ?2, 'the answer', 'none', '2024-01-01T00:00:00+00:00', ?3)",
+                params![id, state, finished],
+            )
+            .await
+            .expect("a receipt on the retired table");
+        }
+
+        run_migrations(&conn, TargetDb::Core)
+            .await
+            .expect("upgrade the store");
+
+        for (id, expected) in [("retired_done", "done"), ("retired_running", "launched")] {
+            let (kind, status) = conn
+                .query("SELECT kind, status FROM jobs WHERE id = ?1", params![id])
+                .await
+                .expect("read the carried record")
+                .first()
+                .map(|row| {
+                    (
+                        row.get::<String>(0).unwrap_or_default(),
+                        row.get::<String>(1).unwrap_or_default(),
+                    )
+                })
+                .expect("the receipt survives as a dispatch row");
+            assert_eq!(kind, "turn", "{id}: a command-line handover's record");
+            assert_eq!(status, expected, "{id}");
+        }
+        let table_left: i64 = conn
+            .query(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'send_outcomes'",
+                (),
+            )
+            .await
+            .expect("look for the retired table")
+            .first()
+            .and_then(|row| row.get::<i64>(0).ok())
+            .unwrap_or_default();
+        assert_eq!(table_left, 0, "the second record is gone, not kept beside");
     }
 
     /// The logs half: a v0.10.0 logs store already carries the whole logs

@@ -18,12 +18,14 @@
 //! ([`PHASE_BODIES_RUNNING`]), a runtime-transport guard that stops a second
 //! phase body from being spawned on the same job during the pre-roster window.
 //! The poll step's job/claim gate ([`process_single_workspace`]) runs the ticket
-//! pipeline only for a workspace that is both unpaused and ready: a freeze and a
-//! workspace that is not ready (awaiting its first analysis, re-analysing, or
-//! failed) hold every claim and job creation, while the discovery itself and the
-//! manager/maintainer/auxiliary agents are not gated by it. A workspace holding a
-//! failed ticket awaiting Manager triage skips the `Queued -> InDevelopment` claim
-//! (enforced inside the claim predicate, not here); every other puller step still runs.
+//! pipeline only for a workspace that is unpaused, past its first discovery, has a confirmed
+//! profile and whose folder no other writer holds: a freeze, a workspace whose discovery has not
+//! run or has failed, a profile the owner has not confirmed and a folder another writer is working
+//! in all hold every claim and job creation. A workspace being re-analysed is NOT held out: reading
+//! takes no hold, so a pass over the folder and the pipeline run side by side. The discovery itself
+//! and the manager/maintainer/auxiliary agents are not gated by it. A workspace holding a failed
+//! ticket awaiting Manager triage skips the `Queued -> InDevelopment` claim (enforced inside the
+//! claim predicate, not here); every other puller step still runs.
 //!
 //! A stage whose death STOPS the workspace — development, verification, sanitation — records a
 //! [`notice`] for the workspace's Manager. The row is the death, not its text: the delivery loop
@@ -54,9 +56,9 @@ use crate::agent::role::SYSTEM_ROLE;
 use crate::agent::run_agent;
 use crate::db::TxGuard;
 use crate::git::commands::{list_new_or_untracked_files, run_git_status};
+use crate::outcome::Outcome;
 use crate::pipeline::board::{BoardStore, PIPELINE_ACTOR, Ticket, TicketPhase};
 use crate::prompt::{load_prompt, substitute};
-use crate::session::manager_agent_id;
 use crate::util::UnwrapPoison;
 use crate::{Agent, Role, Workspace, WorkspaceStatus};
 
@@ -136,76 +138,7 @@ pub async fn run_management() {
 
     // Resume selected rounds (silent background resume); all remaining variants
     // are non-ticket envelope kinds carrying job_id + workspace_name.
-    for stage in resumable {
-        let (job_id, workspace_name) = match &stage {
-            crate::jobs::ResumableJob::Research {
-                job_id,
-                workspace_name,
-            }
-            | crate::jobs::ResumableJob::Analyze {
-                job_id,
-                workspace_name,
-                ..
-            }
-            | crate::jobs::ResumableJob::Implement {
-                job_id,
-                workspace_name,
-                ..
-            }
-            | crate::jobs::ResumableJob::ResearchCleanup {
-                job_id,
-                workspace_name,
-            } => (job_id, workspace_name),
-        };
-        let Ok(Some(workspace)) = crate::users::resolve_workspace(workspace_name).await else {
-            warn!(
-                job = %job_id,
-                workspace = %workspace_name,
-                "Resume workspace unresolvable — job left in place (deleted only by explicit abandon)",
-            );
-            continue;
-        };
-        match stage {
-            crate::jobs::ResumableJob::Research { job_id, .. } => {
-                info!(job = %job_id, "Resuming research run at boot");
-                tokio::spawn(async move {
-                    crate::tools::research::resume_research_run(&job_id, &workspace).await;
-                });
-            }
-            crate::jobs::ResumableJob::Analyze {
-                job_id, exec_dir, ..
-            } => {
-                info!(job = %job_id, "Resuming analyze round at boot");
-                tokio::spawn(async move {
-                    crate::tools::analyze::resume_analyze_round(
-                        &job_id,
-                        &workspace,
-                        exec_dir.as_deref(),
-                    )
-                    .await;
-                });
-            }
-            crate::jobs::ResumableJob::Implement {
-                job_id, exec_dir, ..
-            } => {
-                info!(job = %job_id, "Resuming implement round at boot");
-                tokio::spawn(async move {
-                    crate::tools::implement::resume_implement_round(
-                        &job_id,
-                        &workspace,
-                        exec_dir.as_deref(),
-                    )
-                    .await;
-                });
-            }
-            crate::jobs::ResumableJob::ResearchCleanup { job_id, .. } => {
-                info!(job = %job_id, "Resuming research cleanup agent at boot");
-                tokio::spawn(async move {
-                    crate::research_cleanup::resume_research_cleanup(&job_id, &workspace).await;
-                });
-            }
-        }
-    }
+    resume_jobs(resumable).await;
 
     // 100ms cadence: claim and phase-job creation react ~10x faster than a 1s
     // tick. Per-round work stays cheap; if DB load surfaces, cheapen the round
@@ -251,9 +184,10 @@ async fn process_single_workspace(ws: Workspace) {
     // 0. Pending-workspace pickup — a pending workspace (added without a
     // provider key, or returned to pending after provider-class discovery
     // failures) is claimed into its first discovery when the provider is
-    // configured. Deliberately ahead of the gate below and exempt from it, so
-    // the discovery it starts always runs to completion; the freshly claimed
-    // state (analyzing + paused) then fails that gate and ends this round.
+    // configured. Deliberately ahead of the gate below, because a pending row
+    // fails that gate by its status alone. The claim is reading, so neither a pause nor another
+    // writer in the folder refuses it; the freshly claimed state (analyzing) passes the gate, so
+    // the pipeline runs beside the pass.
     let ws = match pickup_pending_workspace(&ws).await {
         Some(claimed) => claimed,
         None => ws,
@@ -261,18 +195,41 @@ async fn process_single_workspace(ws: Workspace) {
 
     // The gate from the module doc — re-read the LIVE state, so a pause or a
     // status change landing mid-round bites immediately.
-    if let Ok(Some(live)) = crate::workspace::store().get_by_name(&ws.name).await
-        && (live.paused || live.status != WorkspaceStatus::Ready)
+    let ws = match crate::workspace::store().get_by_name(&ws.name).await {
+        Ok(Some(live)) => live,
+        _ => ws,
+    };
+    // A workspace whose discovery has not run yet, or failed, has nothing sound to work on; one
+    // being re-analysed does — reading is outside the hold, so a pass over the folder never keeps
+    // the pipeline out.
+    if ws.paused
+        || matches!(
+            ws.status,
+            WorkspaceStatus::Pending | WorkspaceStatus::Failed
+        )
     {
         tracing::debug!(
             workspace = %ws.name,
-            paused = live.paused,
-            status = %live.status,
+            paused = ws.paused,
+            status = %ws.status,
             "Workspace not ready for the ticket pipeline — skipping claim/dispatch for this round"
         );
         return;
     }
 
+    // The gate: an unconfirmed profile, or a folder another writer holds, means no claim and no
+    // phase job this round — the work waits and the workspace's state says so. A hold is bounded by
+    // its holder's own run and by `FOLDER_HOLD_CEILING`, so a leaked registration cannot block a
+    // workspace for the life of the process.
+    let read = crate::workspace_profile::read(&ws);
+    if let Some(reason) = crate::workspace::pipeline_gate(&ws, &read) {
+        tracing::debug!(
+            workspace = %ws.name,
+            reason = %reason,
+            "Workspace pipeline waits — skipping claim/dispatch for this round"
+        );
+        return;
+    }
     // 1. Pipeline claims — atomic source→target transitions.
     run_claim_pipeline(&ws).await;
 
@@ -283,7 +240,7 @@ async fn process_single_workspace(ws: Workspace) {
 
 /// Claim a pending workspace into its first discovery, returning the fresh
 /// post-claim [`Workspace`] so the caller does not keep a stale pre-claim copy;
-/// `None` when the workspace stays pending (not pending / provider
+/// `None` when the workspace stays pending (not pending / paused / provider
 /// unconfigured / cooldown armed / claim lost).
 async fn pickup_pending_workspace(ws: &Workspace) -> Option<Workspace> {
     let (generation, discover_diagnostics) = pickup_claim(ws).await?;
@@ -296,9 +253,10 @@ async fn pickup_pending_workspace(ws: &Workspace) -> Option<Workspace> {
     );
     crate::workspace::spawn_workspace_discovery(ws, generation, discover_diagnostics);
 
-    // Re-read so the returned copy is the claimed state (analyzing + paused),
-    // not the stale pre-claim one. On a read failure the caller keeps the
-    // poll-round copy — its own round is gated on live state anyway.
+    // Re-read so the returned copy is the claimed state (analyzing, its discovery
+    // generation bumped — the claim never touches the pause), not the stale
+    // pre-claim one. On a read failure the caller keeps the poll-round copy — its
+    // own round is gated on live state anyway.
     crate::workspace::store()
         .get_by_name(&ws.name)
         .await
@@ -311,12 +269,10 @@ async fn pickup_pending_workspace(ws: &Workspace) -> Option<Workspace> {
 /// agents. Returns `Some((discovery_generation, discover_diagnostics))` when
 /// the workspace was atomically claimed, `None` when it must stay pending.
 ///
-/// The claim deliberately does **not** gate on `ws.paused`: a `Pending`
-/// workspace is born paused (the analysis pause written by `add()`), so gating
-/// on the paused column would block every pending pickup and break the
-/// analysis-pause flow. The poll step's own gate holds claims and dispatch for a
-/// frozen or not-ready workspace; this pickup is deliberately exempt, since the
-/// discovery it starts must run to completion.
+/// Nothing about a writer holds a first discovery back: it is reading, so neither a pause nor
+/// another writer in the folder refuses it. The born-paused latch the old build left on non-ready
+/// rows is retired by the migration that introduced the profile, so a pause seen here is the
+/// owner's and holds the ticket pipeline once the discovery is done.
 async fn pickup_claim(ws: &Workspace) -> Option<(i64, bool)> {
     if ws.status != WorkspaceStatus::Pending {
         return None;
@@ -572,7 +528,7 @@ async fn run_claim_pipeline(ws: &Workspace) {
             &crate::session::store().conn,
             &ticket.id,
             &ticket.title,
-            crate::jobs::RowStatus::Launched,
+            crate::outcome::Outcome::Running,
             Role::Engineer,
         )
         .await
@@ -739,18 +695,8 @@ impl<'t, 'l> TransitionCtx<'t, 'l> {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum FinalizeOutcome {
-    Applied,
-    Moved,
-    Failed,
-}
-
 #[must_use]
-async fn with_comment_and_transition<F>(
-    ctx: TransitionCtx<'_, '_>,
-    write_comments: F,
-) -> FinalizeOutcome
+async fn with_comment_and_transition<F>(ctx: TransitionCtx<'_, '_>, write_comments: F) -> Outcome
 where
     F: AsyncFnOnce(&TxGuard<'_>) -> anyhow::Result<()>,
 {
@@ -772,14 +718,14 @@ where
     )
     .await
     {
-        Ok(true) => FinalizeOutcome::Applied,
+        Ok(true) => Outcome::Done,
         Ok(false) => {
             debug!(
                 ticket = %ctx.ticket.id,
                 "{}: ticket moved externally while in {} — finalization skipped (nothing written)",
                 ctx.log_label, ctx.source,
             );
-            FinalizeOutcome::Moved
+            Outcome::Superseded
         }
         Err(e) => {
             warn!(
@@ -788,11 +734,11 @@ where
                 "{}: transition to {} failed",
                 ctx.log_label, ctx.target,
             );
-            FinalizeOutcome::Failed
+            Outcome::Failed
         }
     };
 
-    if matches!(outcome, FinalizeOutcome::Applied) {
+    if matches!(outcome, Outcome::Done) {
         match ctx.notify {
             NotifyPolicy::Notify => notify_ticket(&ctx).await,
             // Buffer: the transition is materialized by the CDC-driven chronicle
@@ -804,11 +750,7 @@ where
 }
 
 #[must_use]
-async fn comment_and_transition(
-    ctx: TransitionCtx<'_, '_>,
-    role: &str,
-    text: &str,
-) -> FinalizeOutcome {
+async fn comment_and_transition(ctx: TransitionCtx<'_, '_>, role: &str, text: &str) -> Outcome {
     let ticket = ctx.ticket;
     with_comment_and_transition(ctx, async |tx| {
         BoardStore::add_comment_tx(tx, &ticket.id, role, text).await?;
@@ -825,10 +767,7 @@ async fn comment_and_transition_or_bail(
 ) {
     let ticket_id = &ctx.ticket.id;
     let target = ctx.target;
-    if !matches!(
-        comment_and_transition(ctx, role, text).await,
-        FinalizeOutcome::Applied
-    ) {
+    if !matches!(comment_and_transition(ctx, role, text).await, Outcome::Done) {
         return;
     }
     info!(ticket = %ticket_id, target = %target, "{message}");
@@ -862,9 +801,10 @@ async fn resolve_ticket_workspace(ticket: &Ticket, log_label: &str) -> Option<Wo
 /// pause-freeze, and mark any still-`launched` roster rows `failed` (via
 /// [`crate::jobs::interrupt_phase_job_roster`]) so the puller can re-dispatch:
 /// those rows carry the interrupted round's stored per-slot tasks, so they are
-/// preserved for a slot-resume rather than discarded. The `paused` signal is
-/// typed and captured immutably at the agent's bail, so this handles even the
-/// narrow window where the workspace is resumed between the bail and this finalizer.
+/// preserved for a slot-resume rather than discarded. Every source of the freeze
+/// read the pause live itself, so what reaches this finalizer is the freeze that
+/// was in force when the work stopped — even if the workspace is resumed between
+/// that read and this call.
 async fn pause_freezing(ticket: &Ticket, job_id: &str) {
     info!(
         ticket = %ticket.id,
@@ -878,7 +818,7 @@ async fn pause_freezing(ticket: &Ticket, job_id: &str) {
 }
 
 fn paused_workspace_sentence() -> &'static str {
-    "all in-flight work stops and no pipeline stage advances until the workspace is resumed"
+    "every writer stops and no pipeline stage advances until the workspace is resumed"
 }
 
 /// The `{{workspace_status}}` fragment of the failed-ticket notice: whether the workspace is
@@ -909,11 +849,10 @@ pub(crate) async fn pause_workspace_on_failure(ticket: &Ticket, reason: &str) ->
         return false;
     };
     if ws.paused {
-        // Already frozen — possibly by the discovery's own analysis pause, which
-        // writes the flag through direct SQL and never signals the registry.
-        // Signal it here so the freeze stops in-flight ticket agents at their
-        // next round boundary at every workspace status, not just the ones that
-        // went through `set_paused`.
+        // Already frozen — the owner's pause, or a stage death's, which may have landed
+        // without signalling the registry. Signal it here so the freeze stops in-flight
+        // ticket agents at their next round boundary at every workspace status, not just the
+        // ones that went through `set_paused`.
         crate::agent::registry::AGENT_REGISTRY.cancel_by_workspace_pause(&ws.name);
         return false;
     }
@@ -1052,11 +991,11 @@ fn carries_header(target: TicketPhase) -> bool {
     )
 }
 
-/// Enqueue a notification for the Manager about a ticket transition: the
-/// envelope with the digest of the transition that triggered it, plus the extra
-/// block the transition context calls for — the failure-triage block on a Failed
-/// transition, or the bounce warning on a return to development that lands on
-/// the ticket's notice grid.
+/// Hand the Manager a notification about a ticket transition: the envelope with the digest of the
+/// transition that triggered it, plus the extra block the transition context calls for — the
+/// failure-triage block on a Failed transition, or the bounce warning on a return to development
+/// that lands on the ticket's notice grid. It rides the one durable outbox, so a transition that
+/// committed is not lost to a restart before the Manager's turn.
 async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
     let ticket = ctx.ticket;
     let Some(ws) = resolve_ticket_workspace(ticket, "skipping notification").await else {
@@ -1138,9 +1077,8 @@ async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
         ],
     );
 
-    let agent_id = manager_agent_id(&ws.name);
-    message_router::route(
-        &agent_id,
+    let agent_id = crate::address::AgentAddress::manager(ws.name.clone()).id();
+    message_router::stamp_and_route(
         message_router::AgentJob {
             content: message,
             workspace_name: ws.name,
@@ -1157,7 +1095,10 @@ async fn notify_ticket(ctx: &TransitionCtx<'_, '_>) {
             urgent: false,
             extract: None,
         },
-    );
+        &agent_id,
+        "ticket-notify",
+    )
+    .await;
 }
 
 /// Register an agent in the message router and write a job-bound launched
@@ -1176,7 +1117,7 @@ async fn register_running_agent(
         job_id,
         agent_id,
         kind,
-        crate::jobs::RowStatus::Launched,
+        crate::outcome::Outcome::Running,
     )
     .await
     {
@@ -1192,11 +1133,15 @@ async fn register_running_agent(
     incoming_rx
 }
 
-/// Canonical agent-id format for ticket phase roster slots
-/// (`ticket_{ticket_id}_{idx}_{suffix}_{role}`).
+/// The agent id of a ticket phase roster slot: the ticket's own address with the slot's
+/// `_{idx}_{suffix}` folded into the ticket key.
 #[must_use]
 fn agent_id(ticket_id: &str, idx: i64, suffix: &str, role: Role) -> String {
-    format!("ticket_{}_{}_{}_{}", ticket_id, idx, suffix, role.as_str())
+    crate::address::AgentAddress::ticket(
+        format!("{ticket_id}_{idx}_{suffix}"),
+        role.as_str().to_string(),
+    )
+    .id()
 }
 
 /// Render the FINAL per-agent task for a ticket phase roster slot: the work
@@ -1250,7 +1195,7 @@ fn build_agent_slots(
             idx,
             agent_id,
             task,
-            status: crate::jobs::RowStatus::Launched,
+            status: crate::outcome::Outcome::Running,
             outcome: None,
         });
     }
@@ -1267,10 +1212,8 @@ fn agent_slot_from_roster_row(r: &crate::jobs::AgentRow) -> AgentSlot {
         idx: r.idx.unwrap_or(0),
         agent_id: r.agent_id.clone(),
         task: r.task.clone(),
-        status: r
-            .status
-            .parse::<crate::jobs::RowStatus>()
-            .unwrap_or(crate::jobs::RowStatus::Failed),
+        status: crate::outcome::Outcome::parse(&r.status)
+            .unwrap_or(crate::outcome::Outcome::Failed),
         outcome: r.outcome.clone(),
     }
 }
@@ -1319,7 +1262,7 @@ async fn rearm_resumed_slots(ticket_id: &str, job_id: &str, stage: &str, cohorts
     let not_done: Vec<String> = cohorts
         .iter()
         .flat_map(|cohort| cohort.iter())
-        .filter(|slot| slot.status != crate::jobs::RowStatus::Done)
+        .filter(|slot| slot.status != crate::outcome::Outcome::Done)
         .map(|slot| slot.agent_id.clone())
         .collect();
     let conn = &crate::session::store().conn;
@@ -1342,9 +1285,9 @@ async fn checkpoint_parallel_outcomes(
         // — it did produce a response but the extraction failed, so its stored
         // outcome is only a diagnostic dump, not a completed verdict.
         let status = if result.verdict.is_technical_failure() {
-            crate::jobs::RowStatus::Failed
+            crate::outcome::Outcome::Failed
         } else {
-            crate::jobs::RowStatus::Done
+            crate::outcome::Outcome::Done
         };
         if let Err(e) =
             crate::jobs::write_agent_outcome(conn, job_id, &slot.agent_id, status, Some(&outcome))
@@ -1369,7 +1312,7 @@ fn assemble_parallel_results(
 ) -> Vec<MemberOutcome> {
     let mut results = Vec::with_capacity(slots.len());
     for slot in slots {
-        if slot.status == crate::jobs::RowStatus::Done {
+        if slot.status == crate::outcome::Outcome::Done {
             results.push(MemberOutcome::of_verdict(deserialize_verdict_outcome(
                 slot.outcome.as_deref().unwrap_or(""),
             )));
@@ -1408,7 +1351,7 @@ async fn run_parallel_agents(
 ) -> (Vec<MemberOutcome>, bool) {
     let launched: Vec<&AgentSlot> = slots
         .iter()
-        .filter(|s| s.status != crate::jobs::RowStatus::Done)
+        .filter(|s| s.status != crate::outcome::Outcome::Done)
         .collect();
     let receivers: Vec<_> = launched
         .iter()
@@ -1451,7 +1394,7 @@ async fn run_parallel_agents(
                         agent_id.clone(),
                         role,
                         &ws,
-                        Some(&ticket),
+                        crate::work_unit::WorkUnit::of_ticket(std::sync::Arc::clone(&ticket)),
                         &[if has_session { "" } else { task.as_str() }],
                         String::new(),
                         String::new(),
@@ -1460,19 +1403,16 @@ async fn run_parallel_agents(
                         resume,
                         Some(round),
                         None,
-                        None,
-                        None,
                     )
                     .await;
 
                     let response = response.unwrap_or_default();
                     if response.is_empty() {
                         // A cooperative pause-freeze is a TYPED signal captured
-                        // immutably at the agent's LLM-boundary bail (the
-                        // `paused_frozen` snapshot is never cleared by an
-                        // unpause, unlike the live `pause_stop` flag): the
-                        // agent stopped rather than failing. It is not a
-                        // technical failure.
+                        // immutably at the agent's LLM-boundary bail (the run's
+                        // obeyed record in `crate::stop::Stop` is never cleared by
+                        // an unpause, unlike the live request): the agent stopped
+                        // rather than failing. It is not a technical failure.
                         if agent.is_paused_frozen() {
                             MemberOutcome {
                                 verdict: ParallelVerdict::NoResponse("agent paused".to_string()),
@@ -1624,7 +1564,7 @@ async fn run_single_agent(
     agent_id: String,
     role: Role,
     ws: &Workspace,
-    ticket: &Ticket,
+    ticket: &std::sync::Arc<Ticket>,
     message: &str,
     incoming_rx: tokio::sync::mpsc::UnboundedReceiver<message_router::AgentJob>,
     resume: bool,
@@ -1633,15 +1573,13 @@ async fn run_single_agent(
         agent_id,
         role,
         ws,
-        Some(ticket),
+        crate::work_unit::WorkUnit::of_ticket(std::sync::Arc::clone(ticket)),
         &[message],
         String::new(),
         String::new(),
         false,
         Some(incoming_rx),
         resume,
-        None,
-        None,
         None,
         None,
     )
@@ -1678,7 +1616,7 @@ async fn guard_stage(
 /// Run the stage-agent round tail shared by fresh dispatch. The NULL-seat
 /// pin preserves the accumulated stage session across round-job deletion.
 async fn run_stage_agent(
-    ticket: &Ticket,
+    ticket: &std::sync::Arc<Ticket>,
     ws: &Workspace,
     job_id: &str,
     task: &str,
@@ -1689,7 +1627,7 @@ async fn run_stage_agent(
         &crate::session::store().conn,
         &ticket.id,
         task,
-        crate::jobs::RowStatus::Launched,
+        crate::outcome::Outcome::Running,
         role,
     )
     .await
@@ -1862,7 +1800,7 @@ async fn bounce_to_development(
     actor: &str,
     failure_comment: &str,
     job_id: &str,
-) -> FinalizeOutcome {
+) -> Outcome {
     let trip = bounce_exhausted(ticket.bounce_count);
     let bounce_notice = bounce_notice_mark(ticket.bounce_count);
     let target = if trip {
@@ -1896,7 +1834,7 @@ async fn bounce_to_development(
     })
     .await;
 
-    if matches!(outcome, FinalizeOutcome::Applied) {
+    if matches!(outcome, Outcome::Done) {
         let conn = &crate::session::store().conn;
         // Delete the phase job in both paths: a non-exhausting bounce gets a
         // fresh InDevelopment attempt from the puller on the next tick; a
@@ -1918,4 +1856,82 @@ async fn bounce_to_development(
         }
     }
     outcome
+}
+
+/// Re-drive the rounds a restart or a workspace unpause left behind: resolve each one's
+/// workspace and spawn its resume. Silent — the work is already durable, so nothing is reported
+/// to the owner unless the workspace it names is gone.
+pub(crate) async fn resume_jobs(jobs: Vec<crate::jobs::ResumableJob>) {
+    // Resume selected rounds (silent background resume); all remaining variants
+    // are non-ticket envelope kinds carrying job_id + workspace_name.
+    for stage in jobs {
+        let (job_id, workspace_name) = match &stage {
+            crate::jobs::ResumableJob::Research {
+                job_id,
+                workspace_name,
+            }
+            | crate::jobs::ResumableJob::Analyze {
+                job_id,
+                workspace_name,
+                ..
+            }
+            | crate::jobs::ResumableJob::Implement {
+                job_id,
+                workspace_name,
+                ..
+            }
+            | crate::jobs::ResumableJob::ResearchCleanup {
+                job_id,
+                workspace_name,
+            } => (job_id, workspace_name),
+        };
+        let Ok(Some(workspace)) = crate::users::resolve_workspace(workspace_name).await else {
+            warn!(
+                job = %job_id,
+                workspace = %workspace_name,
+                "Resume workspace unresolvable — job left in place (deleted only by explicit abandon)",
+            );
+            continue;
+        };
+        match stage {
+            crate::jobs::ResumableJob::Research { job_id, .. } => {
+                info!(job = %job_id, "Resuming research run");
+                tokio::spawn(async move {
+                    crate::tools::research::resume_research_run(&job_id, &workspace).await;
+                });
+            }
+            crate::jobs::ResumableJob::Analyze {
+                job_id, exec_dir, ..
+            } => {
+                info!(job = %job_id, "Resuming analyze round");
+                tokio::spawn(async move {
+                    crate::tools::analyze::resume_analyze_round(
+                        &job_id,
+                        &workspace,
+                        exec_dir.as_deref(),
+                    )
+                    .await;
+                });
+            }
+            crate::jobs::ResumableJob::Implement {
+                job_id, exec_dir, ..
+            } => {
+                info!(job = %job_id, "Resuming implement round");
+                tokio::spawn(async move {
+                    crate::tools::implement::resume_implement_round(
+                        &job_id,
+                        &workspace,
+                        exec_dir.as_deref(),
+                    )
+                    .await;
+                });
+            }
+            crate::jobs::ResumableJob::ResearchCleanup { job_id, .. } => {
+                info!(job = %job_id, "Resuming research cleanup agent");
+                tokio::spawn(async move {
+                    crate::research_cleanup::resume_research_cleanup(&job_id, &workspace).await;
+                });
+            }
+        }
+    }
 }

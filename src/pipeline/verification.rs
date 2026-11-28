@@ -18,17 +18,19 @@ use crate::git::commands::{
     has_unstaged_changes, run_git_add_all, run_git_head, run_git_status, run_git_worktree_snapshot,
     run_git_write_tree,
 };
+use crate::outcome::Outcome;
 use crate::pipeline::board::Ticket;
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::tools::shell::{ShellMode, ShellTool};
 use crate::util::excerpt::failure_excerpt;
+use crate::workspace_profile::{Participant, Profile};
 use crate::{DiagnosticsCommands, Role, Workspace};
 
 use super::{
-    AgentSlot, ExtractionMode, FinalizeOutcome, MemberOutcome, ParallelVerdict, TicketPhase,
-    TransitionCtx, agent_slot_from_roster_row, bounce_to_development, build_agent_slots,
-    build_round_grouping, comment_and_transition, debug, guard_job_phase, info, insert_round_slots,
-    notice, pause_freezing, read_roster_or_bail, rearm_resumed_slots, render_joint_comment,
+    AgentSlot, ExtractionMode, MemberOutcome, ParallelVerdict, TicketPhase, TransitionCtx,
+    agent_slot_from_roster_row, bounce_to_development, build_agent_slots, build_round_grouping,
+    comment_and_transition, debug, guard_job_phase, info, insert_round_slots, notice,
+    pause_freezing, read_roster_or_bail, rearm_resumed_slots, render_joint_comment,
     reset_phase_attempt, run_parallel_agents, sync_phase_job_task, warn,
 };
 
@@ -39,9 +41,6 @@ pub(crate) const STAGE: &str = "Verification";
 const ACTIVE_PHASE: TicketPhase = TicketPhase::Verification;
 
 const SUCCESS_PHASE: TicketPhase = TicketPhase::InSanitation;
-
-/// Minimum acceptable score (0-10) for a verification verdict.
-const VERIFICATION_THRESHOLD: u8 = 9;
 
 /// The functional tester runs exactly one agent per round — the round's functional check,
 /// which no round may run without.
@@ -54,6 +53,11 @@ const SKIPPED_REVIEW_NOTE: &str = "\
 **Code review skipped** — the content is identical to what the reviewers were \
 last handed on this ticket (same commit, same working tree, no changes since), \
 so they were not dispatched again. The functional check still ran.\n\n";
+
+/// Rendered instead of [`SKIPPED_REVIEW_NOTE`] when the workspace's profile does not staff the
+/// verification stage with reviewers.
+const PROFILE_NO_REVIEW_NOTE: &str = "\
+**Code review not part of this workspace's profile** — the functional check still ran.\n\n";
 
 /// Static metadata for one participant cohort of a verification round — the code reviewers or the
 /// functional tester. A cohort differs from the other only here: the role (which selects the
@@ -127,6 +131,50 @@ fn engineer_response(ticket: &Ticket) -> &str {
         .map_or("(no output)", |c| c.content.as_str())
 }
 
+/// The profile a fresh round runs on, recorded on the job row so a resume finishes on the settings
+/// it began with. Best-effort: a failed write is logged and the round runs on the profile anyway.
+async fn record_round_profile(ws: &Workspace, ticket: &Ticket, job_id: &str) -> Profile {
+    let live = crate::workspace_profile::read(ws).profile;
+    if let Err(e) = crate::jobs::set_round_profile(job_id, &live.to_json()).await {
+        warn!(
+            ticket = %ticket.id,
+            job = %job_id,
+            error = %e,
+            "Failed to record the round's profile — the round runs on it anyway",
+        );
+    }
+    live
+}
+
+/// The profile a resumed round finishes on: the one it recorded when it started. Best-effort: a
+/// failed read or an unreadable record leaves it on the live profile, which is what it would have
+/// used anyway.
+async fn resumed_round_profile(ws: &Workspace, ticket: &Ticket, job_id: &str) -> Profile {
+    let live = crate::workspace_profile::read(ws).profile;
+    match crate::jobs::round_profile(job_id).await {
+        Ok(Some(recorded)) => crate::workspace_profile::Profile::from_json(&recorded)
+            .unwrap_or_else(|e| {
+                warn!(
+                    ticket = %ticket.id,
+                    job = %job_id,
+                    error = %e,
+                    "Unreadable round profile — finishing the round on the live profile",
+                );
+                live
+            }),
+        Ok(None) => live,
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                job = %job_id,
+                error = %e,
+                "Failed to read the round's profile — finishing it on the live profile",
+            );
+            live
+        }
+    }
+}
+
 /// Run the verification stage on a phase job: build a fresh round, or resume the round
 /// recorded in the job's roster.
 pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
@@ -164,6 +212,11 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
         return;
     };
     let resume = !roster.is_empty();
+    let profile = if resume {
+        resumed_round_profile(&ws, &ticket, &job_id).await
+    } else {
+        record_round_profile(&ws, &ticket, &job_id).await
+    };
     let plan = if resume {
         let Some(plan) = RoundPlan::from_roster(&roster) else {
             // A roster that is not a verification round is never resumed as one: dropping the
@@ -184,12 +237,13 @@ pub(crate) async fn run(ticket: Arc<Ticket>, ws: Workspace, job_id: String) {
     } else {
         // A roster write failure leaves the job with no plan: bail and let the poller re-drive
         // it rather than run a round the resume path could misread.
-        let Some(plan) = RoundPlan::fresh(&ticket, &ws, &job_id, commands.as_ref()).await else {
+        let Some(plan) = RoundPlan::fresh(&ticket, &ws, &job_id, commands.as_ref(), &profile).await
+        else {
             return;
         };
         plan
     };
-    execute_round(ticket, ws, job_id, plan, resume, commands).await;
+    execute_round(ticket, ws, job_id, plan, resume, commands, profile).await;
 }
 
 /// One verification round's dispatch plan: the two participant cohorts. The reviewer cohort
@@ -207,12 +261,22 @@ impl RoundPlan {
         ws: &Workspace,
         job_id: &str,
         commands: Option<&DiagnosticsCommands>,
+        profile: &Profile,
     ) -> Option<Self> {
         let commands_brief = commands_brief(commands);
         let tester_prompt = TESTER.prompt(ticket, &commands_brief);
-        // The identical-content rule: content already checked on this ticket is not checked
-        // again. It never skips the tester.
-        let (reviewer_prompt, reviewers) = if skip_review_for_identical_content(ticket, ws).await {
+        // The profile decides whether reviewers staff the stage; the identical-content rule
+        // decides whether they run this round. Neither ever skips the tester.
+        let (reviewer_prompt, reviewers) = if !profile
+            .includes(TicketPhase::Verification, Participant::Reviewer)
+        {
+            info!(
+                ticket = %ticket.id,
+                "The workspace profile staffs verification without reviewers — dispatching the \
+                 functional tester only",
+            );
+            (None, Vec::new())
+        } else if skip_review_for_identical_content(ticket, ws).await {
             info!(
                 ticket = %ticket.id,
                 "Content identical to the reviewed base — dispatching the functional tester only",
@@ -332,18 +396,22 @@ struct ProjectCommands {
 /// output is read unfiltered, so the record is built from what the tool printed rather than from
 /// a profile's positional reading of it — [`failed_command_record`] keeps the lines that name
 /// the failure, wherever they are in the output.
+///
+/// These commands write the folder outside any agent, so the freeze reaches them here: the pause is
+/// read live before each one, and a frozen workspace stops the round instead of running the rest.
+/// `Ok(None)` is that stop; `Err` is a pause that could not be read, which is no freeze at all.
 async fn run_project_commands(
     commands: Option<&DiagnosticsCommands>,
     ws: &Workspace,
-) -> ProjectCommands {
+) -> anyhow::Result<Option<ProjectCommands>> {
     let Some(commands) = commands else {
-        return ProjectCommands {
+        return Ok(Some(ProjectCommands {
             section: format!(
                 "**Project commands**\n\n{}",
                 load_prompt("pipeline/commands_none.md")
             ),
             passed: true,
-        };
+        }));
     };
 
     let mut lines = String::new();
@@ -352,6 +420,9 @@ async fn run_project_commands(
         let Some(cmd) = cmd else {
             continue;
         };
+        if crate::workspace::paused_now(&ws.name).await? {
+            return Ok(None);
+        }
         let started = std::time::Instant::now();
         let elapsed = || started.elapsed().as_secs_f64();
         match ShellTool::new(ShellMode::Full)
@@ -381,10 +452,10 @@ async fn run_project_commands(
         Some(label) => format!("{} `{label}`", load_prompt("pipeline/commands_failed.md")),
         None => load_prompt("pipeline/commands_passed.md"),
     };
-    ProjectCommands {
+    Ok(Some(ProjectCommands {
         section: format!("**Project commands**\n\n{}\n\n{footer}", lines.trim_end()),
         passed: failed_at.is_none(),
-    }
+    }))
 }
 
 /// The record of one failed command: the exit status on the command's own line, then the part of
@@ -438,6 +509,7 @@ async fn execute_round(
     plan: RoundPlan,
     resume: bool,
     commands: Option<DiagnosticsCommands>,
+    profile: Profile,
 ) {
     if resume {
         // A fresh round's slots are already launched — re-arming them would only stamp the
@@ -460,8 +532,14 @@ async fn execute_round(
     // the code review was handed, never the tree the tester may have touched by the end. A
     // repository the reading cannot read leaves no base, which only means a later round reviews
     // the same content again.
-    let review_skipped = plan.reviewers.is_empty();
-    let base = if review_skipped {
+    let review_note = plan.reviewers.is_empty().then(|| {
+        if profile.includes(TicketPhase::Verification, Participant::Reviewer) {
+            SKIPPED_REVIEW_NOTE
+        } else {
+            PROFILE_NO_REVIEW_NOTE
+        }
+    });
+    let base = if review_note.is_some() {
         None
     } else {
         match crate::git::commands::run_git_worktree_identity(ws.as_path()).await {
@@ -479,7 +557,7 @@ async fn execute_round(
 
     // One round: the two participant cohorts and the project commands, all started at the same
     // time on the same phase job.
-    let ((reviewer_results, reviewer_paused), (tester_results, tester_paused), commands_outcome) = tokio::join!(
+    let ((reviewer_results, reviewer_paused), (tester_results, tester_paused), commands) = tokio::join!(
         dispatch_cohort(&ticket, &ws, REVIEWER, &plan.reviewers, &job_id, resume),
         dispatch_cohort(&ticket, &ws, TESTER, &plan.testers, &job_id, resume),
         run_project_commands(commands.as_ref(), &ws),
@@ -488,22 +566,40 @@ async fn execute_round(
     if guard_job_phase(&ticket.id, ACTIVE_PHASE, &job_id).await {
         return;
     }
-    // A pause-freeze is NOT a technical failure: leave the job in place for the unpause
-    // re-drive (the typed `paused` signal was captured at bail time, so it survives a
-    // workspace-unpause race).
-    if reviewer_paused || tester_paused {
-        pause_freezing(&ticket, &job_id).await;
-        return;
-    }
+    // A pause-freeze is NOT a technical failure: leave the job in place for the unpause re-drive.
+    // Each of the three sources read the pause live by itself — the cohorts at their run start, the
+    // project commands before each command — so what is handled here is the freeze in force when
+    // the work stopped, not the one seen when it was decided.
+    let frozen = reviewer_paused || tester_paused;
+    let commands = match commands {
+        // A pause that cannot be read is not one: nothing would ever unpause this workspace, so the
+        // round is reset for a fresh attempt instead of being parked for a re-drive that cannot come.
+        Err(e) => {
+            warn!(
+                ticket = %ticket.id,
+                error = %e,
+                "Could not read the workspace's pause — resetting for a fresh attempt",
+            );
+            reset_phase_attempt(&ticket, ACTIVE_PHASE, &job_id, None).await;
+            return;
+        }
+        Ok(Some(commands)) if !frozen => commands,
+        // A cohort's freeze, or the project commands': the round returns with its job in place.
+        Ok(_) => {
+            pause_freezing(&ticket, &job_id).await;
+            return;
+        }
+    };
     finalize_round(
         &ws,
         &ticket,
         &reviewer_results,
         &tester_results,
         base,
-        review_skipped,
+        review_note,
         &job_id,
-        &commands_outcome,
+        &commands,
+        &profile,
     )
     .await;
 }
@@ -553,9 +649,10 @@ async fn finalize_round(
     reviewer_results: &[Labelled],
     tester_results: &[Labelled],
     base: Option<ReviewBase>,
-    review_skipped: bool,
+    review_note: Option<&'static str>,
     job_id: &str,
     commands: &ProjectCommands,
+    profile: &Profile,
 ) {
     let results: Vec<Labelled> = reviewer_results
         .iter()
@@ -563,8 +660,8 @@ async fn finalize_round(
         .cloned()
         .collect();
     let transitioned =
-        process_round_verdicts(ws, ticket, &results, review_skipped, job_id, commands).await;
-    if !review_skipped {
+        process_round_verdicts(ws, ticket, &results, review_note, job_id, commands, profile).await;
+    if review_note.is_none() {
         // Tied to the code review having actually run: the recording is what makes the
         // identical-content rule fire later, and the tester's verdict must never stand in for
         // it. A round that did not move the ticket on stages nothing.
@@ -578,9 +675,10 @@ async fn process_round_verdicts(
     ws: &Workspace,
     ticket: &Ticket,
     results: &[Labelled],
-    review_skipped: bool,
+    review_note: Option<&'static str>,
     job_id: &str,
     commands: &ProjectCommands,
+    profile: &Profile,
 ) -> bool {
     // Two failure classes: a participant that did NOT complete (NoResponse/ParseFailed) is a
     // HARD TECHNICAL failure — reset the attempt (delete job + pause; no bounce budget). One
@@ -589,12 +687,12 @@ async fn process_round_verdicts(
     let technical_failure = results
         .iter()
         .any(|(_, outcome)| outcome.verdict.is_technical_failure());
+    let verdicts: Vec<ParallelVerdict> = results
+        .iter()
+        .map(|(_, outcome)| outcome.verdict.clone())
+        .collect();
     // The rework condition is the participants' verdicts OR the project commands.
-    let rework_failure = !technical_failure
-        && (!commands.passed
-            || results.iter().any(
-                |(_, outcome)| matches!(&outcome.verdict, ParallelVerdict::Verdict(v) if !verdict_passes(v)),
-            ));
+    let rework_failure = !technical_failure && round_fails(commands.passed, &verdicts, profile);
 
     if crate::shutdown::aborting() {
         info!(
@@ -614,19 +712,14 @@ async fn process_round_verdicts(
         );
         // One notice per stage death, naming every participant that failed. A round whose only
         // failures were cancellations or bails reports nothing: those are not deaths.
-        let failed: Vec<notice::Participant> = results
+        let failed: Vec<notice::Member> = results
             .iter()
-            .filter_map(|(label, outcome)| notice::Participant::of(label, outcome))
+            .filter_map(|(label, outcome)| notice::Member::of(label, outcome))
             .collect();
         let death = (!failed.is_empty()).then_some(notice::Cause::Participants(failed));
         reset_phase_attempt(ticket, ACTIVE_PHASE, job_id, death).await;
         return false;
     }
-
-    let verdicts: Vec<ParallelVerdict> = results
-        .iter()
-        .map(|(_, outcome)| outcome.verdict.clone())
-        .collect();
 
     // The round's one artifact: the consolidated joint comment, carrying the
     // skipped-code-review note when the reviewers were not dispatched.
@@ -637,7 +730,7 @@ async fn process_round_verdicts(
         // grouping pass runs and is labelled under the same role.
         Role::Qa,
         // A skipped code review leaves the tester as the round's only participant.
-        review_skipped,
+        review_note.is_some(),
         ws,
         &ticket.id,
         &ticket.title,
@@ -648,15 +741,15 @@ async fn process_round_verdicts(
         &outcome,
         &crate::consensus::ItemTable::new(&round.issues),
     );
-    if review_skipped {
-        verdict.insert_str(0, SKIPPED_REVIEW_NOTE);
+    if let Some(note) = review_note {
+        verdict.insert_str(0, note);
     }
     // The round's ONE comment, both halves of its result: the project commands, then the
     // participants' verdict.
     let comment = format!("{}\n\n---\n\n{verdict}", commands.section);
 
     if !rework_failure {
-        return apply_clean_round(ticket, &comment, job_id).await;
+        return apply_clean_round(ticket, &comment, job_id, profile).await;
     }
 
     let outcome = bounce_to_development(
@@ -669,12 +762,17 @@ async fn process_round_verdicts(
         job_id,
     )
     .await;
-    matches!(outcome, FinalizeOutcome::Applied)
+    matches!(outcome, Outcome::Done)
 }
 
 /// Apply the clean-pass outcome: write the joint comment, transition the ticket to sanitation,
 /// and delete the phase job. `false` if the transition was not applied (phase moved concurrently).
-async fn apply_clean_round(ticket: &Ticket, comment: &str, job_id: &str) -> bool {
+async fn apply_clean_round(
+    ticket: &Ticket,
+    comment: &str,
+    job_id: &str,
+    profile: &Profile,
+) -> bool {
     if !matches!(
         comment_and_transition(
             TransitionCtx::buffered(
@@ -688,23 +786,28 @@ async fn apply_clean_round(ticket: &Ticket, comment: &str, job_id: &str) -> bool
             comment,
         )
         .await,
-        FinalizeOutcome::Applied
+        Outcome::Done
     ) {
         return false;
     }
     info!(
         ticket = %ticket.id,
-        "{STAGE}: the project commands and every participant passed (≥ {threshold}/10)",
-        threshold = VERIFICATION_THRESHOLD,
+        threshold = profile.pass_threshold,
+        every_check = profile.require_all_checks,
+        "{STAGE}: passed",
     );
     // Delete the phase job; the puller creates the next phase job.
     let _ = crate::jobs::terminalize_job(&crate::session::store().conn, job_id).await;
     true
 }
 
-#[must_use]
-fn verdict_passes(verdict: &crate::Verdict) -> bool {
-    verdict.score >= VERIFICATION_THRESHOLD
+/// Whether the round must bounce: a project command that failed where the profile requires every
+/// check to pass, or a participant scoring under the profile's threshold.
+fn round_fails(commands_passed: bool, verdicts: &[ParallelVerdict], profile: &Profile) -> bool {
+    (profile.require_all_checks && !commands_passed)
+        || verdicts.iter().any(|verdict| {
+            matches!(verdict, ParallelVerdict::Verdict(v) if v.score < profile.pass_threshold)
+        })
 }
 
 /// Whether git is usable for the reviewer cohort; the tester never consults it.
@@ -912,7 +1015,10 @@ mod tests {
             ..Default::default()
         };
 
-        let record = run_project_commands(Some(&commands), &ws).await;
+        let record = run_project_commands(Some(&commands), &ws)
+            .await
+            .expect("the pause was read")
+            .expect("the round ran");
 
         assert!(!record.passed);
         assert!(
@@ -960,7 +1066,10 @@ mod tests {
             ..Default::default()
         };
 
-        let record = run_project_commands(Some(&commands), &ws).await;
+        let record = run_project_commands(Some(&commands), &ws)
+            .await
+            .expect("the pause was read")
+            .expect("the round ran");
 
         assert!(record.passed);
         assert!(
@@ -991,7 +1100,10 @@ mod tests {
             ..Default::default()
         };
 
-        let record = run_project_commands(Some(&commands), &ws).await;
+        let record = run_project_commands(Some(&commands), &ws)
+            .await
+            .expect("the pause was read")
+            .expect("the round ran");
 
         assert!(record.section.contains("````"), "{}", record.section);
         assert!(
@@ -1012,7 +1124,10 @@ mod tests {
             ..Default::default()
         };
 
-        let record = run_project_commands(Some(&commands), &ws).await;
+        let record = run_project_commands(Some(&commands), &ws)
+            .await
+            .expect("the pause was read")
+            .expect("the round ran");
 
         assert!(!record.passed);
         assert!(
@@ -1021,5 +1136,184 @@ mod tests {
             record.section
         );
         assert!(record.section.contains("(no output)"), "{}", record.section);
+    }
+
+    /// A freeze stops the project commands before the first one runs: the round is left for the
+    /// unpause re-drive, so nothing was written and there is no record to render.
+    #[cfg(unix)]
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn a_frozen_workspace_runs_no_project_command() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = crate::util::test::create_test_workspace(
+            dir.path().to_str().unwrap(),
+            "frozen_commands_ws",
+        )
+        .await;
+        crate::workspace::store()
+            .set_paused(&ws.name, true)
+            .await
+            .expect("freeze the workspace");
+        let marker = dir.path().join("ran");
+        let commands = DiagnosticsCommands {
+            unit_test: Some(format!("touch {}", marker.display())),
+            ..Default::default()
+        };
+
+        assert!(
+            run_project_commands(Some(&commands), &ws)
+                .await
+                .expect("the pause was read")
+                .is_none(),
+            "a frozen workspace runs no command"
+        );
+        assert!(!marker.exists(), "and nothing was written to the folder");
+    }
+
+    /// The profile's `require_all_checks` decides whether a failed project command bounces the
+    /// round: the default requires it, a profile that pins `false` does not.
+    #[test]
+    fn a_failed_command_bounces_only_when_the_profile_requires_every_check() {
+        let lenient = Profile::resolve(Some(r#"{"require_all_checks":false}"#)).unwrap();
+        assert!(
+            !round_fails(false, &[], &lenient),
+            "a profile that does not require every check lets a failed command pass the round"
+        );
+        assert!(
+            round_fails(false, &[], &Profile::default()),
+            "the default profile bounces a round whose project command failed"
+        );
+    }
+
+    /// The profile's `pass_threshold` is the round's bar: a participant at it passes, one under it
+    /// bounces the round.
+    #[test]
+    fn a_verdict_at_the_profiles_threshold_passes_and_one_below_it_fails() {
+        let profile = Profile::resolve(Some(r#"{"pass_threshold":7}"#)).unwrap();
+        let at_threshold = ParallelVerdict::Verdict(crate::Verdict {
+            score: 7,
+            issues_detected: Vec::new(),
+        });
+        let below = ParallelVerdict::Verdict(crate::Verdict {
+            score: 6,
+            issues_detected: Vec::new(),
+        });
+
+        assert!(!round_fails(true, &[at_threshold], &profile));
+        assert!(round_fails(true, &[below], &profile));
+    }
+
+    /// A profile may staff verification without reviewers: the round then runs the functional
+    /// tester alone, which the stage reads off the profile rather than off a missing roster.
+    #[test]
+    fn a_profile_can_staff_verification_without_reviewers() {
+        let profile = Profile::resolve(Some(r#"{"stages":{"verification":["tester"]}}"#)).unwrap();
+        assert!(!profile.includes(TicketPhase::Verification, Participant::Reviewer));
+        assert!(profile.includes(TicketPhase::Verification, Participant::Tester));
+    }
+
+    /// A resumed round finishes on the profile it started with: the record on its job row wins over
+    /// whatever the workspace carries now, so a mid-round edit cannot change its pass conditions.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_resumed_round_reads_the_profile_it_recorded() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("round_profile")
+                .to_string_lossy(),
+            "round_profile_ws",
+        )
+        .await;
+        let board = crate::pipeline::board::store();
+        let id =
+            crate::util::test::make_ticket(board, &ws, "A ticket", TicketPhase::Verification).await;
+        let ticket = crate::util::test::expect_ticket(board, &id).await;
+        let job_id = &format!("round_profile_job_{}", crate::generate_suffix());
+        crate::util::test::JobRowBuilder::new(
+            &crate::session::store().conn,
+            job_id,
+            "verification",
+            "reviewer",
+            &ws.name,
+        )
+        .timestamps(crate::db::now())
+        .insert()
+        .await
+        .expect("seed the round's job row");
+
+        // The round starts under one profile and the workspace is edited to another mid-round.
+        let started = Profile::resolve(Some(r#"{"pass_threshold":6,"require_all_checks":false}"#))
+            .expect("a legal profile");
+        crate::jobs::set_round_profile(job_id, &started.to_json())
+            .await
+            .expect("record the round's profile");
+        crate::workspace::store()
+            .set_profile(
+                &ws.name,
+                Some(r#"{"pass_threshold":10,"require_all_checks":true}"#),
+            )
+            .await
+            .expect("edit the workspace's profile mid-round");
+        let edited = crate::workspace::store()
+            .get_by_name(&ws.name)
+            .await
+            .expect("read the workspace")
+            .expect("the workspace exists");
+
+        assert_eq!(
+            resumed_round_profile(&edited, &ticket, job_id).await,
+            started,
+            "the resumed round finishes on the pass conditions it began with"
+        );
+        assert_eq!(
+            record_round_profile(&edited, &ticket, job_id).await,
+            Profile::resolve(edited.profile.as_deref()).expect("the live profile"),
+            "a fresh round reads the live profile"
+        );
+    }
+
+    /// The profile's reviewer roster reaches the plan: a reviewer-less profile dispatches the
+    /// functional tester alone, and the roster rows say so.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_reviewerless_profile_dispatches_the_tester_alone() {
+        let _store = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_management_test_stores().await;
+        let ws = crate::util::test::create_test_workspace(
+            &crate::util::test::test_root()
+                .join("reviewerless_round")
+                .to_string_lossy(),
+            "reviewerless_ws",
+        )
+        .await;
+        let board = crate::pipeline::board::store();
+        let id =
+            crate::util::test::make_ticket(board, &ws, "A ticket", TicketPhase::Verification).await;
+        let ticket = crate::util::test::expect_ticket(board, &id).await;
+        let job_id = &format!("reviewerless_job_{}", crate::generate_suffix());
+        crate::util::test::JobRowBuilder::new(
+            &crate::session::store().conn,
+            job_id,
+            "verification",
+            "reviewer",
+            &ws.name,
+        )
+        .timestamps(crate::db::now())
+        .insert()
+        .await
+        .expect("seed the round's job row");
+        let profile = Profile::resolve(Some(r#"{"stages":{"verification":["tester"]}}"#))
+            .expect("a tester-only profile");
+
+        let plan = RoundPlan::fresh(&ticket, &ws, job_id, None, &profile)
+            .await
+            .expect("the round is planned");
+
+        assert!(plan.reviewers.is_empty(), "the profile staffs no reviewers");
+        assert_eq!(plan.testers.len(), TESTER_COUNT, "the tester still runs");
     }
 }

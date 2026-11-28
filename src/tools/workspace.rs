@@ -1,8 +1,8 @@
 //! The admin's own view into the managed workspaces: list them, add one (which activates
 //! it), inspect one, delete one, freeze/unfreeze their pipelines, switch maintenance on or
-//! off, restart discovery, write their rules and their diagnostics commands, make one the
-//! active project, read a board and a single ticket, and leave a clarification note on a
-//! ticket.
+//! off, restart discovery, write their rules and their diagnostics commands, read and change
+//! their profile, make one the active project, read a board and a single ticket, and leave a
+//! clarification note on a ticket.
 //!
 //! The detail of that surface is not here: every action and every field is documented in the
 //! `reference` action ([`crate::settings::reference`], the same text `mahbot config reference`
@@ -20,6 +20,7 @@ use crate::pipeline::board::{TicketPhase, store as board_store};
 use crate::tools::ToolAnswer;
 use crate::tools::ticket::{GET_TICKET_COMMENT_MAX, GET_TICKET_DESC_MAX, GET_TICKET_LAST_N_FULL};
 use crate::workspace::WorkspaceStore;
+use crate::workspace_profile;
 use crate::{Role, Tool, Workspace, WorkspaceStatus};
 
 /// The tool's own byte budget, needed because the framework's ~5 KB tool-output truncation is
@@ -36,8 +37,8 @@ const NO_WORKSPACE: &str = "No managed workspaces exist.";
 
 /// The `workspace` tool: the admin's project view and the settings of each project —
 /// `reference`, `list`, `show`, `add`, `delete`, `pause`, `resume`, `maintenance`,
-/// `rediscover`, `rediscover_diagnostics`, `set_diagnostics`, `set_rules`, `use`, `board`,
-/// `ticket`, `comment`.
+/// `rediscover`, `rediscover_diagnostics`, `set_diagnostics`, `set_rules`, `use`, `profile`,
+/// `confirm_profile`, `set_profile`, `reset_profile`, `board`, `ticket`, `comment`.
 pub(crate) struct WorkspaceTool;
 
 /// This tool's schema, built once: [`Tool::parameters_schema`] hands out a copy, and the
@@ -47,98 +48,131 @@ fn schema() -> &'static serde_json::Value {
     &SCHEMA
 }
 
+/// Every action the tool serves, in the order the struct doc lists them.
+const ACTIONS: [&str; 20] = [
+    "reference",
+    "list",
+    "show",
+    "add",
+    "delete",
+    "pause",
+    "resume",
+    "maintenance",
+    "rediscover",
+    "rediscover_diagnostics",
+    "set_diagnostics",
+    "set_rules",
+    "use",
+    "profile",
+    "confirm_profile",
+    "set_profile",
+    "reset_profile",
+    "board",
+    "ticket",
+    "comment",
+];
+
+/// The profile fields' descriptions, shared by the `workspace` and `config` schemas: one text for
+/// the one setting, whichever tool the assistant reaches it through.
+pub(crate) const STAGE_FIELD: &str = "The stage whose participants change: analysis, planning, \
+                                      in_development, verification or in_sanitation — passed \
+                                      with its `participants`.";
+pub(crate) const PARTICIPANTS_FIELD: &str = "The stage's participants: analyst, manager, \
+                                             engineer, reviewer, tester or sanitation. An empty \
+                                             list returns the stage to the default.";
+pub(crate) const PASS_THRESHOLD_FIELD: &str = "Verification's passing score, 0-10.";
+pub(crate) const REQUIRE_ALL_CHECKS_FIELD: &str = "Whether every project command must pass.";
+
 fn build_schema() -> serde_json::Value {
-    super::tool_params_schema(
-        &json!({
-            "action": {
-                "type": "string",
-                "enum": [
-                    "reference",
-                    "list",
-                    "show",
-                    "add",
-                    "delete",
-                    "pause",
-                    "resume",
-                    "maintenance",
-                    "rediscover",
-                    "rediscover_diagnostics",
-                    "set_diagnostics",
-                    "set_rules",
-                    "use",
-                    "board",
-                    "ticket",
-                    "comment"
-                ],
-                "description": "The operation; its `reference` action lists every one."
-            },
-            "workspace": {
-                "type": "string",
-                "description": "The managed workspace, spelled as `list` spells it."
-            },
-            "name": {
-                "type": "string",
-                "description": "(add) Short unique name."
-            },
-            "path": {
-                "type": "string",
-                "description": "(add) The project directory."
-            },
-            "phase": {
-                "type": "string",
-                "description": "(board) One ticket phase."
-            },
-            "ticket_id": {
-                "type": "string",
-                "description": "(ticket/comment) Full id `<workspace>-<number>`."
-            },
-            "full": {
-                "type": "boolean",
-                "description": "(ticket) Whole and unclipped. Default false."
-            },
-            "content": {
-                "type": "string",
-                "description": "(comment) The note to leave."
-            },
-            "rules": {
-                "type": "string",
-                "description": "(set_rules) Project rules; empty clears."
-            },
-            "maintenance": {
-                "type": "boolean",
-                "description": "(maintenance) Background maintainer on or off."
-            },
-            "format": {
-                "type": "string",
-                "description": "(set_diagnostics) Format command."
-            },
-            "format_check": {
-                "type": "string",
-                "description": "(set_diagnostics) Format-check command."
-            },
-            "lint": {
-                "type": "string",
-                "description": "(set_diagnostics) Lint command."
-            },
-            "lint_fix": {
-                "type": "string",
-                "description": "(set_diagnostics) Lint-fix command."
-            },
-            "type_check": {
-                "type": "string",
-                "description": "(set_diagnostics) Type-check command."
-            },
-            "build": {
-                "type": "string",
-                "description": "(set_diagnostics) Build command."
-            },
-            "unit_test": {
-                "type": "string",
-                "description": "(set_diagnostics) Unit-test command."
-            }
-        }),
-        &["action"],
-    )
+    let fields = json!({
+        "action": {
+            "type": "string",
+            "enum": ACTIONS,
+            "description": "The operation; its `reference` action lists every one."
+        },
+        "workspace": {
+            "type": "string",
+            "description": "The managed workspace, spelled as `list` spells it."
+        },
+        "name": {
+            "type": "string",
+            "description": "(add) Short unique name."
+        },
+        "path": {
+            "type": "string",
+            "description": "(add) The project directory."
+        },
+        "phase": {
+            "type": "string",
+            "description": "(board) One ticket phase."
+        },
+        "ticket_id": {
+            "type": "string",
+            "description": "(ticket/comment) Full id `<workspace>-<number>`."
+        },
+        "full": {
+            "type": "boolean",
+            "description": "(ticket) Whole and unclipped. Default false."
+        },
+        "content": {
+            "type": "string",
+            "description": "(comment) The note to leave."
+        },
+        "rules": {
+            "type": "string",
+            "description": "(set_rules) Project rules; empty clears."
+        },
+        "maintenance": {
+            "type": "boolean",
+            "description": "(maintenance) Background maintainer on or off."
+        },
+        "format": {
+            "type": "string",
+            "description": "(set_diagnostics) Format command."
+        },
+        "format_check": {
+            "type": "string",
+            "description": "(set_diagnostics) Format-check command."
+        },
+        "lint": {
+            "type": "string",
+            "description": "(set_diagnostics) Lint command."
+        },
+        "lint_fix": {
+            "type": "string",
+            "description": "(set_diagnostics) Lint-fix command."
+        },
+        "type_check": {
+            "type": "string",
+            "description": "(set_diagnostics) Type-check command."
+        },
+        "build": {
+            "type": "string",
+            "description": "(set_diagnostics) Build command."
+        },
+        "unit_test": {
+            "type": "string",
+            "description": "(set_diagnostics) Unit-test command."
+        },
+        "stage": {
+            "type": "string",
+            "description": STAGE_FIELD
+        },
+        "participants": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": PARTICIPANTS_FIELD
+        },
+        "pass_threshold": {
+            "type": "integer",
+            "description": PASS_THRESHOLD_FIELD
+        },
+        "require_all_checks": {
+            "type": "boolean",
+            "description": REQUIRE_ALL_CHECKS_FIELD
+        }
+    });
+    super::tool_params_schema(&fields, &["action"])
 }
 
 #[async_trait]
@@ -202,6 +236,16 @@ impl WorkspaceTool {
             )),
             "set_diagnostics" => Ok(ToolAnswer::done(set_diagnostics(&args).await?)),
             "set_rules" => Ok(ToolAnswer::done(set_rules(&args).await?)),
+            "profile" => Ok(ToolAnswer::done(
+                show_profile(super::get_str(&args, "workspace")?).await?,
+            )),
+            "confirm_profile" => Ok(ToolAnswer::done(
+                confirm_profile(super::get_str(&args, "workspace")?).await?,
+            )),
+            "set_profile" => Ok(ToolAnswer::done(set_profile(&args).await?)),
+            "reset_profile" => Ok(ToolAnswer::done(
+                reset_profile(super::get_str(&args, "workspace")?).await?,
+            )),
             "use" => Ok(ToolAnswer::done(
                 use_workspace(super::get_str(&args, "workspace")?).await?,
             )),
@@ -346,9 +390,12 @@ async fn list_workspaces(only: Option<&str>) -> anyhow::Result<String> {
         } else {
             ""
         };
+        let waiting = crate::workspace::status_reason(ws, &workspace_profile::read(ws))
+            .map(|reason| format!(", {reason}"))
+            .unwrap_or_default();
         let _ = writeln!(
             listing,
-            "- {} ({}{paused}{maintenance}): {}{active_marker}",
+            "- {} ({}{paused}{maintenance}{waiting}): {}{active_marker}",
             ws.name, ws.status, ws.path
         );
     }
@@ -380,7 +427,9 @@ async fn add_workspace(args: &serde_json::Value) -> anyhow::Result<ToolAnswer> {
         Ok(()) => Ok(ToolAnswer::done(format!(
             "Added managed workspace '{name}' at {path} and made it your active workspace. \
              The workspace is being picked up — if the model provider is configured its first \
-             discovery pass will start shortly."
+             discovery pass will start shortly. Its pipeline does not run until you confirm its \
+             profile, which is the profile as shipped unless you edit it first: confirm it with \
+             the `workspace` tool's `confirm_profile` action (or the `config` tool's)."
         ))),
         Err(e) => Ok(ToolAnswer::partial(format!(
             "Added managed workspace '{name}' at {path}, but making it your active workspace \
@@ -402,14 +451,35 @@ async fn show_workspace(name: &str) -> anyhow::Result<String> {
     // unknown — never as "not active".
     let active = crate::users::resolve_selected_workspace_name(crate::users::ADMIN_USER_NAME).await;
     let commands = crate::workspace::store().get_diagnostics(&ws.name).await?;
+    let read = workspace_profile::read(&ws);
     let mut out = format!("Workspace '{}':\n", ws.name);
     let _ = writeln!(out, "- path: {}", ws.path);
     let _ = writeln!(out, "- status: {}", ws.status);
+    // One line, not two: a workspace that claims nothing is not "running" beside a wait — the
+    // pipeline line carries the reason it is not, or says it starts nothing yet.
+    let waiting = crate::workspace::status_reason(&ws, &read);
     let _ = writeln!(
         out,
         "- pipeline: {}",
-        if ws.paused { "paused" } else { "running" }
+        if ws.paused {
+            "paused".to_string()
+        } else if let Some(waiting) = waiting {
+            waiting
+        } else if matches!(
+            ws.status,
+            WorkspaceStatus::Pending | WorkspaceStatus::Failed
+        ) {
+            format!("nothing to claim while the workspace is {}", ws.status)
+        } else {
+            // Ready, or re-analysing: a pass over the folder is reading, so it never holds the
+            // pipeline out.
+            "running".to_string()
+        }
     );
+    // The parse error stays out of the listing line and is spelled here, where the owner asked.
+    if let workspace_profile::ProfileState::Invalid(error) = &read.state {
+        let _ = writeln!(out, "  (what cannot be read: {error})");
+    }
     let _ = writeln!(
         out,
         "- maintenance: {}",
@@ -442,6 +512,202 @@ async fn show_workspace(name: &str) -> anyhow::Result<String> {
         }
     }
     Ok(out.trim_end().to_string())
+}
+
+/// The workspace profile as the owner's assistant reads it: what is in force, and the project's
+/// checks — the check list keeps its own column and its own writers.
+pub(crate) async fn show_profile(name: &str) -> anyhow::Result<String> {
+    use crate::workspace_profile::ProfileState;
+    let ws = managed_workspace(name).await?;
+    let read = workspace_profile::read(&ws);
+    let state = &read.state;
+    let mut out = format!("Workspace '{}' profile:\n", ws.name);
+    match state {
+        ProfileState::Unconfirmed => {
+            let _ = writeln!(
+                out,
+                "- status: waiting for confirmation — the pipeline does not run until the \
+                 profile is confirmed; the `confirm_profile` action (here, or on the `config` \
+                 tool) accepts it"
+            );
+        }
+        ProfileState::Invalid(error) => {
+            let _ = writeln!(
+                out,
+                "- status: the confirmed profile is invalid ({error}) — the workspace runs on \
+                 the default profile until it is fixed"
+            );
+        }
+        ProfileState::Confirmed => {
+            let _ = writeln!(out, "- status: confirmed");
+        }
+    }
+    // For an unconfirmed workspace the stages below are what confirmation would put in force, so
+    // the header says so rather than reading as the roster the pipeline runs on.
+    if matches!(state, ProfileState::Unconfirmed) {
+        let _ = writeln!(out, "stages (what confirmation puts in force):");
+    } else {
+        let _ = writeln!(out, "stages:");
+    }
+    out.push_str(&workspace_profile::render(&read.profile));
+    let _ = writeln!(out);
+    let commands = crate::workspace::store().get_diagnostics(&ws.name).await?;
+    match commands.as_ref().filter(|commands| !commands.is_empty()) {
+        Some(commands) => {
+            let _ = writeln!(out, "checks:");
+            write_commands(&mut out, commands, "  ");
+        }
+        None => {
+            let _ = writeln!(out, "checks: not discovered");
+        }
+    }
+    Ok(out.trim_end().to_string())
+}
+
+/// Accept the workspace's profile. Confirmation records that the owner saw and accepted the
+/// workspace's settings; it copies no value, so an unpinned field keeps following the default.
+pub(crate) async fn confirm_profile(name: &str) -> anyhow::Result<String> {
+    use crate::workspace_profile::Profile;
+    let ws = managed_workspace(name).await?;
+    let unreadable = ws
+        .profile
+        .as_deref()
+        .and_then(|profile| Profile::resolve(Some(profile)).err());
+    // Confirming is the one moment the owner is told, and the workspace then runs on the default
+    // until the profile is repaired. The owner action returns the same information, so this is one
+    // warning beside it, not a record the poll round has to remember.
+    if let Some(error) = &unreadable {
+        tracing::warn!(
+            workspace_name = ws.name,
+            error = %error,
+            "The confirmed workspace profile cannot be used — running on the default profile \
+             until it is fixed",
+        );
+    }
+    crate::workspace::store()
+        .confirm_profile(&ws.name)
+        .await
+        .map(|_| ())?;
+    if unreadable.is_some() {
+        return Ok(format!(
+            "Workspace '{}' profile confirmed, but the stored profile cannot be read — the \
+             workspace runs on the default profile until it is fixed; hint: `reset_profile` \
+             returns it to the default, which repairs it.",
+            ws.name
+        ));
+    }
+    Ok(format!(
+        "Workspace '{}' profile confirmed — the pipeline runs from the next stage round.",
+        ws.name
+    ))
+}
+
+/// Change part of the workspace's profile. Every named field is pinned; a stage with an
+/// explicitly empty participant list follows the default again.
+///
+/// A stage and its participants are one edit: `participants` without a `stage` names nobody's
+/// roster and a `stage` without `participants` would read as "this stage has nobody" and wipe it,
+/// so either alone is a usage error. An invalid result is refused and nothing is stored.
+pub(crate) async fn set_profile(args: &serde_json::Value) -> anyhow::Result<String> {
+    use crate::workspace_profile::StoredProfile;
+    let ws = managed_workspace(super::get_str(args, "workspace")?).await?;
+    let mut stored = match ws.profile.as_deref() {
+        Some(json) => StoredProfile::parse(json).map_err(|e| {
+            anyhow!(
+                "{e} — hint: `reset_profile` returns the profile to the default, which repairs \
+                 a stored profile this build cannot read"
+            )
+        })?,
+        None => StoredProfile::default(),
+    };
+    // The two fields are read as a PAIR: an absent key is not an empty roster.
+    let stage = super::get_opt_str_strict(args, "stage")?;
+    let participants = args
+        .get("participants")
+        .filter(|value| !value.is_null())
+        .map(|_| super::get_str_array(args, "participants"))
+        .transpose()?;
+    match (stage, participants) {
+        (None, Some(_)) => {
+            return Err(anyhow!(
+                "usage: \"participants\" is a stage's roster, so the call must name the \
+                 \"stage\" too — hint: pass both, or drop \"participants\""
+            ));
+        }
+        (Some(_), None) => {
+            return Err(anyhow!(
+                "usage: a stage needs its participants — hint: pass \"participants\" with the \
+                 stage's participants, or an empty list to return it to the default"
+            ));
+        }
+        (Some(stage), Some(participants)) => {
+            let stage = crate::workspace_profile::stage_named(stage).ok_or_else(|| {
+                anyhow!(
+                    "usage: '{}' is not a stage — pass analysis, planning, in_development, \
+                     verification or in_sanitation",
+                    stage.trim()
+                )
+            })?;
+            if participants.is_empty() {
+                stored.stages.remove(stage.as_ref());
+            } else {
+                stored
+                    .stages
+                    .insert(stage.as_ref().to_string(), participants);
+            }
+        }
+        (None, None) => {}
+    }
+    if let Some(threshold) = super::get_opt_u64(args, "pass_threshold")? {
+        stored.pass_threshold = Some(u8::try_from(threshold).map_err(|_| {
+            anyhow!("usage: the pass threshold must be a whole number between 0 and 10")
+        })?);
+    }
+    if args
+        .get("require_all_checks")
+        .is_some_and(|value| !value.is_null())
+    {
+        stored.require_all_checks = Some(super::get_bool(args, "require_all_checks", true)?);
+    }
+    stored
+        .validate()
+        .map_err(|e| anyhow!("usage: {e} — the profile was not changed"))?;
+    let json = (!stored.is_empty()).then(|| stored.to_json());
+    crate::workspace::store()
+        .set_profile(&ws.name, json.as_deref())
+        .await?;
+    // An unconfirmed workspace's pipeline is not waiting for the next round — it is not running at
+    // all, and this edit is not what lifts that.
+    Ok(if ws.profile_confirmed {
+        format!(
+            "Workspace '{}' profile updated — it takes effect from the next stage round; a round \
+             already running finishes on the settings it started with.",
+            ws.name
+        )
+    } else {
+        format!(
+            "Workspace '{}' profile updated — its pipeline still waits for the profile to be \
+             confirmed, and runs from the next stage round once it is.",
+            ws.name
+        )
+    })
+}
+
+/// Return every profile field to the shipped default, keeping the confirmation.
+pub(crate) async fn reset_profile(name: &str) -> anyhow::Result<String> {
+    let ws = managed_workspace(name).await?;
+    crate::workspace::store()
+        .set_profile(&ws.name, None)
+        .await?;
+    Ok(if ws.profile_confirmed {
+        format!("Workspace '{}' profile reset to the default.", ws.name)
+    } else {
+        format!(
+            "Workspace '{}' profile reset to the default — its pipeline still waits for the \
+             profile to be confirmed.",
+            ws.name
+        )
+    })
 }
 
 /// Delete a managed workspace: its row, its jobs and its research runs go; the project on disk
@@ -511,14 +777,15 @@ async fn set_maintenance(args: &serde_json::Value) -> anyhow::Result<String> {
 }
 
 /// Re-analyse a workspace: the store sets it back to `analyzing`, clears the per-role contexts
-/// and spawns a fresh discovery. The answer must say the pipeline is paused until that finishes
-/// — the pause is the store's, and the admin would otherwise read it as their own.
+/// and spawns a fresh discovery. Nothing refuses it — reading is outside the freeze and the
+/// folder's hold — and the answer says the pipeline keeps running beside the pass and that the
+/// owner's pause is untouched.
 async fn rediscover(name: &str) -> anyhow::Result<String> {
     let ws = managed_workspace(name).await?;
     crate::workspace::store().rediscover(&ws.name).await?;
     Ok(format!(
         "Discovery restarted for workspace '{}': its per-role contexts were cleared. The \
-         pipeline is paused until discovery finishes.",
+         pipeline keeps running beside the pass; its pause state is untouched.",
         ws.name
     ))
 }
@@ -660,21 +927,17 @@ async fn use_workspace(name: &str) -> anyhow::Result<String> {
 }
 
 /// What a pause/resume request does to one workspace — the rule both forms follow, so the
-/// named and the fleet-wide answer can never disagree about which rows are written.
+/// named and the fleet-wide answer can never disagree about which rows are written. A pause is
+/// written for any status: every workspace has work a freeze holds, and one whose first discovery
+/// has not run is held out of the pipeline by the `pending` status until it has.
 enum PipelineChange {
-    /// Not `ready`: only a `ready` row is dispatchable (the poll gates every claim and phase
-    /// dispatch on the status), so a non-ready row's `paused` flag is the discovery's own
-    /// analysis pause rather than a freeze of running work, and it is never written.
-    NotReady,
     /// Already in the requested state: reported as such, never written again.
     Already,
     Write,
 }
 
 fn pipeline_change(ws: &Workspace, paused: bool) -> PipelineChange {
-    if ws.status != WorkspaceStatus::Ready {
-        PipelineChange::NotReady
-    } else if ws.paused == paused {
+    if ws.paused == paused {
         PipelineChange::Already
     } else {
         PipelineChange::Write
@@ -695,11 +958,6 @@ async fn pause_or_resume(name: Option<&str>, paused: bool) -> anyhow::Result<Too
 async fn set_one_pipeline_paused(name: &str, paused: bool) -> anyhow::Result<String> {
     let ws = managed_workspace(name).await?;
     match pipeline_change(&ws, paused) {
-        PipelineChange::NotReady => Err(anyhow!(
-            "Workspace '{}' is {} — only a ready workspace has a pipeline to pause or resume.",
-            ws.name,
-            ws.status
-        )),
         PipelineChange::Already => Ok(if paused {
             format!("The pipeline of workspace '{}' is already paused.", ws.name)
         } else {
@@ -723,14 +981,10 @@ async fn set_one_pipeline_paused(name: &str, paused: bool) -> anyhow::Result<Str
 ///
 /// Takes the store the writes go to and the set they cover, so the fleet-wide form is not
 /// hardwired to the process-global store: a fleet-wide write can then never reach a row a test
-/// created. Never [`WorkspaceStore::pause_all`](crate::workspace::WorkspaceStore::pause_all):
-/// that would also pause not-ready rows and the discovery's own analysis pause.
+/// created.
 ///
-/// PARTIAL exactly when the requested state was not reached for a workspace: a write that
-/// failed, or a workspace skipped as not ready. A workspace already in the requested state
-/// leaves the operation whole. The not-ready skip counts in BOTH directions on purpose,
-/// `resume` included: the named form refuses a not-ready workspace the same way, and one rule
-/// for both forms keeps them from disagreeing about the same workspace.
+/// PARTIAL exactly when the requested state was not reached for a workspace: a write that failed.
+/// A workspace already in the requested state leaves the operation whole.
 async fn set_pipelines_paused(
     store: &WorkspaceStore,
     workspaces: &[Workspace],
@@ -748,11 +1002,6 @@ async fn set_pipelines_paused(
     let mut incomplete = false;
     for ws in workspaces {
         let line = match pipeline_change(ws, paused) {
-            // The caller asked for every managed workspace; this one was left untouched.
-            PipelineChange::NotReady => {
-                incomplete = true;
-                format!("- {}: skipped — not ready ({})", ws.name, ws.status)
-            }
             PipelineChange::Already if paused => format!("- {}: already paused", ws.name),
             PipelineChange::Already => format!("- {}: not paused", ws.name),
             PipelineChange::Write => match store.set_paused(&ws.name, paused).await {
@@ -960,11 +1209,12 @@ mod tests {
         );
     }
 
-    /// Every managed workspace at once: the ready one is written, the not-ready one is skipped
-    /// and reported as skipped. Driven against the test's own store, so the fleet-wide write
-    /// can only reach rows this test created.
+    /// Every managed workspace at once: each row is written, whatever its status — a pause is the
+    /// pipeline's switch, and a workspace whose first discovery has not run is held out of the
+    /// pipeline by its `pending` status until it has. Driven against the test's own store, so the
+    /// fleet-wide write can only reach rows this test created.
     #[tokio::test]
-    async fn pause_every_managed_workspace_skips_not_ready() {
+    async fn pause_every_managed_workspace_writes_every_row() {
         let (store, _dir) = crate::open_test_store!(WorkspaceStore, "workspace");
         let root = crate::util::test::test_root();
         let ready = root.join("ws_fleet");
@@ -978,75 +1228,61 @@ mod tests {
             .set_status("ws_fleet", &WorkspaceStatus::Ready)
             .await
             .expect("mark ready");
-        // A fresh row is created paused (the pickup step lifts it), so the fleet pause below
-        // starts from a running pipeline.
-        store.set_paused("ws_fleet", false).await.expect("unpause");
-        // Another not-ready workspace must be skipped rather than written — left unpaused, so
-        // a write would show.
         store
             .add("ws_fleet_pending", pending.to_str().expect("utf-8 path"))
             .await
             .expect("add ws_fleet_pending");
-        store
-            .set_paused("ws_fleet_pending", false)
-            .await
-            .expect("unpause ws_fleet_pending");
         let workspaces = store.list().await.expect("list");
 
         let reply = set_pipelines_paused(&store, &workspaces, true)
             .await
             .expect("pause all");
         assert!(
-            reply.text.contains("- ws_fleet: paused"),
-            "got: {}",
+            reply.text.contains("- ws_fleet: paused")
+                && reply.text.contains("- ws_fleet_pending: paused"),
+            "every row is written, whatever its status: {}",
             reply.text
         );
-        assert!(
-            reply
-                .text
-                .contains("- ws_fleet_pending: skipped — not ready (pending)"),
-            "got: {}",
-            reply.text
-        );
-        assert!(
-            reply.partial,
-            "a workspace the call left untouched makes the fleet call partial: {}",
-            reply.text
-        );
-        assert!(
-            store
-                .get_by_name("ws_fleet")
-                .await
-                .expect("read")
-                .expect("exists")
-                .paused
-        );
-        assert!(
-            !store
-                .get_by_name("ws_fleet_pending")
-                .await
-                .expect("read")
-                .expect("exists")
-                .paused,
-            "a not-ready workspace must not be paused"
-        );
+        assert!(!reply.partial, "nothing was left undone: {}", reply.text);
+        for name in ["ws_fleet", "ws_fleet_pending"] {
+            assert!(
+                store
+                    .get_by_name(name)
+                    .await
+                    .expect("read")
+                    .expect("exists")
+                    .paused,
+                "{name} is paused"
+            );
+        }
 
-        // A second fleet call, resuming: the ready workspace is written again and the
-        // not-ready one is still skipped.
+        // The fleet resume lifts every row back.
         let workspaces = store.list().await.expect("list");
         let reply = set_pipelines_paused(&store, &workspaces, false)
             .await
             .expect("resume all");
         assert!(
-            reply.text.contains("- ws_fleet: resumed"),
+            reply.text.contains("- ws_fleet: resumed")
+                && reply.text.contains("- ws_fleet_pending: resumed"),
             "got: {}",
             reply.text
         );
         assert!(
-            reply.partial,
-            "the not-ready workspace is left untouched by the resume too: {}",
+            !reply.partial,
+            "a resume is never left undone: {}",
             reply.text
         );
+        for name in ["ws_fleet", "ws_fleet_pending"] {
+            assert!(
+                !store
+                    .get_by_name(name)
+                    .await
+                    .expect("read")
+                    .expect("exists")
+                    .paused,
+                "{name} is resumed"
+            );
+        }
 
         // Nothing managed: the same plain wording `list` uses.
         let reply = set_pipelines_paused(&store, &[], true)
@@ -1429,7 +1665,7 @@ mod tests {
         for expected in [
             "- path: /tmp/ws_show",
             "- status: pending",
-            "- pipeline: running",
+            "- pipeline: nothing to claim while the workspace is pending",
             "- maintenance: on",
             "- active project: no",
             "- rules:\n  be nice to the fixtures",
@@ -1810,24 +2046,70 @@ mod tests {
                     "the stored commands are cleared while they are re-detected"
                 );
 
-                let reply = WorkspaceTool
+                // Reading is outside the freeze: a re-analysis of a paused workspace runs, and the
+                // pause it does not touch stays in force.
+                crate::workspace::store()
+                    .set_paused("ws_reanalyse", true)
+                    .await
+                    .expect("freeze the workspace");
+                WorkspaceTool
                     .execute(&ws, tool_args("rediscover", Some("ws_reanalyse")))
                     .await
-                    .expect("rediscover");
-                assert!(
-                    reply.contains("per-role contexts were cleared")
-                        && reply.contains("pipeline is paused until discovery finishes"),
-                    "got: {reply}"
-                );
+                    .expect(
+                        "a paused workspace is still re-analysed: reading is outside the freeze",
+                    );
+                WorkspaceTool
+                    .execute(
+                        &ws,
+                        tool_args("rediscover_diagnostics", Some("ws_reanalyse")),
+                    )
+                    .await
+                    .expect("diagnostics discovery is reading too");
                 let row = crate::workspace::store()
                     .get_by_name("ws_reanalyse")
                     .await
                     .expect("read")
                     .expect("the workspace is still there");
-                assert!(row.paused, "a full rediscovery pauses the pipeline");
+                assert!(
+                    row.paused,
+                    "a re-analysis leaves the owner's pause in force"
+                );
             },
         )
         .await;
+    }
+
+    /// The schema's action list and the dispatch are one surface: the enum is what the model is
+    /// offered, so an entry without a dispatch arm would be a dead end. The match has one string
+    /// arm per action, and this scan is what keeps the two from drifting.
+    #[test]
+    fn every_action_the_schema_offers_is_dispatched() {
+        let source = include_str!("workspace.rs");
+        for action in ACTIONS {
+            assert!(
+                source.contains(&format!("\"{action}\" =>")),
+                "'{action}' is offered by the schema but has no dispatch arm"
+            );
+        }
+    }
+
+    /// The four profile actions ride the tool's own dispatch: a missing arm answers "unknown
+    /// action" instead of reaching the implementation.
+    #[tokio::test]
+    async fn the_profile_actions_are_reachable_through_the_tool_dispatch() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/ws_profile_dispatch");
+        for action in ["profile", "confirm_profile", "set_profile", "reset_profile"] {
+            let error = WorkspaceTool
+                .execute(&ws, tool_args(action, Some("no_such_workspace")))
+                .await
+                .expect_err("an unknown workspace is refused");
+            assert!(
+                !error.to_string().contains("unknown action"),
+                "'{action}' must reach the profile implementation, got: {error}"
+            );
+        }
     }
 
     /// An action and a field this tool does not know both teach where the whole surface is: the
@@ -1856,6 +2138,369 @@ mod tests {
         assert!(
             err.contains("unknown field 'folder'") && err.contains("reference"),
             "got: {err}"
+        );
+    }
+
+    /// The profile is a workspace setting the owner's assistant reads, confirms and edits with no
+    /// window open.
+    #[tokio::test]
+    async fn profile_actions_read_confirm_edit_and_reset() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/ws_profile");
+        let tool = WorkspaceTool;
+        crate::util::test::create_test_workspace("/tmp/ws_profile", "ws_profile").await;
+        crate::workspace::store()
+            .set_status("ws_profile", &WorkspaceStatus::Ready)
+            .await
+            .expect("mark ready");
+        crate::util::test::unconfirm_test_workspace("ws_profile").await;
+
+        let listing = tool
+            .execute(&ws, tool_args("list", None))
+            .await
+            .expect("list");
+        assert!(
+            listing.contains("waiting for its profile to be confirmed"),
+            "the listing says the workspace waits: {listing}"
+        );
+
+        let read = tool
+            .execute(&ws, tool_args("profile", Some("ws_profile")))
+            .await
+            .expect("profile");
+        assert!(
+            read.contains("waiting for confirmation")
+                && read.contains("`confirm_profile`")
+                && read.contains("stages (what confirmation puts in force):")
+                && read.contains("- analysis: analyst"),
+            "the profile says how to confirm it: {read}"
+        );
+
+        let reply = tool
+            .execute(&ws, tool_args("confirm_profile", Some("ws_profile")))
+            .await
+            .expect("confirm");
+        assert!(reply.contains("confirmed"), "got: {reply}");
+
+        let reply = tool
+            .execute(
+                &ws,
+                json!({
+                    "action": "set_profile",
+                    "workspace": "ws_profile",
+                    "stage": "verification",
+                    "participants": ["tester"],
+                    "pass_threshold": 7,
+                    "require_all_checks": false,
+                }),
+            )
+            .await
+            .expect("set profile");
+        assert!(reply.contains("next stage round"), "got: {reply}");
+        let read = tool
+            .execute(&ws, tool_args("profile", Some("ws_profile")))
+            .await
+            .expect("profile");
+        assert!(
+            read.contains("- verification: tester")
+                && read.contains("pass threshold: 7/10")
+                && read.contains("every check must pass: no"),
+            "got: {read}"
+        );
+
+        let reply = tool
+            .execute(&ws, tool_args("reset_profile", Some("ws_profile")))
+            .await
+            .expect("reset");
+        assert!(reply.contains("reset to the default"), "got: {reply}");
+        assert!(
+            !reply.contains("still waits"),
+            "a confirmed workspace runs on the reset profile: {reply}"
+        );
+        let read = tool
+            .execute(&ws, tool_args("profile", Some("ws_profile")))
+            .await
+            .expect("profile");
+        assert!(
+            read.contains("- verification: reviewer, tester")
+                && read.contains("pass threshold: 9/10"),
+            "got: {read}"
+        );
+    }
+
+    /// An edit on an unconfirmed workspace promises no next round: the pipeline is not running at
+    /// all, and neither the edit nor the reset is what lifts that.
+    #[tokio::test]
+    async fn an_edit_on_an_unconfirmed_workspace_says_its_pipeline_still_waits() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/ws_unconfirmed_edit");
+        crate::util::test::create_test_workspace("/tmp/ws_unconfirmed_edit", "ws_unconfirmed_edit")
+            .await;
+        crate::util::test::unconfirm_test_workspace("ws_unconfirmed_edit").await;
+
+        let reply = WorkspaceTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "set_profile",
+                    "workspace": "ws_unconfirmed_edit",
+                    "pass_threshold": 8,
+                }),
+            )
+            .await
+            .expect("set profile");
+        assert!(
+            reply.contains("still waits for the profile to be confirmed")
+                && !reply.contains("takes effect from the next stage round"),
+            "got: {reply}"
+        );
+
+        let reply = WorkspaceTool
+            .execute(&ws, tool_args("reset_profile", Some("ws_unconfirmed_edit")))
+            .await
+            .expect("reset");
+        assert!(
+            reply.contains("reset to the default")
+                && reply.contains("still waits for the profile to be confirmed"),
+            "got: {reply}"
+        );
+    }
+
+    /// A stage and its roster are one edit: either alone is refused, the same participant twice is
+    /// not a roster, and a refused edit stores nothing.
+    #[tokio::test]
+    async fn a_profile_edit_names_a_stage_with_its_roster() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/ws_profile_edits");
+        let tool = WorkspaceTool;
+        crate::util::test::create_test_workspace("/tmp/ws_profile_edits", "ws_profile_edits").await;
+        tool.execute(&ws, tool_args("confirm_profile", Some("ws_profile_edits")))
+            .await
+            .expect("confirm");
+        tool.execute(
+            &ws,
+            json!({
+                "action": "set_profile",
+                "workspace": "ws_profile_edits",
+                "stage": "verification",
+                "participants": ["tester"],
+            }),
+        )
+        .await
+        .expect("set the roster");
+
+        // A roster without its stage would silently change nothing.
+        let err = tool
+            .execute(
+                &ws,
+                json!({
+                    "action": "set_profile",
+                    "workspace": "ws_profile_edits",
+                    "participants": ["tester"],
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("usage:")
+                && err.contains("\"participants\"")
+                && err.contains("\"stage\""),
+            "got: {err}"
+        );
+
+        // A stage without its participants would read as an empty roster and wipe it.
+        let err = tool
+            .execute(
+                &ws,
+                json!({
+                    "action": "set_profile",
+                    "workspace": "ws_profile_edits",
+                    "stage": "verification",
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a stage needs its participants"), "got: {err}");
+
+        // The same participant twice is not a roster.
+        let err = tool
+            .execute(
+                &ws,
+                json!({
+                    "action": "set_profile",
+                    "workspace": "ws_profile_edits",
+                    "stage": "verification",
+                    "participants": ["tester", "tester"],
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("twice"), "got: {err}");
+
+        // A participant outside its stage is refused too.
+        let err = tool
+            .execute(
+                &ws,
+                json!({
+                    "action": "set_profile",
+                    "workspace": "ws_profile_edits",
+                    "stage": "analysis",
+                    "participants": ["reviewer"],
+                }),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not do the analysis"), "got: {err}");
+
+        // Every refusal above left the stored roster alone.
+        let read = tool
+            .execute(&ws, tool_args("profile", Some("ws_profile_edits")))
+            .await
+            .expect("profile");
+        assert!(
+            read.contains("- verification: tester") && read.contains("- analysis: analyst"),
+            "a refused edit changes nothing: {read}"
+        );
+    }
+
+    /// An explicitly empty participant list is how a stage returns to the default — the one edit
+    /// that is not refused for naming nobody.
+    #[tokio::test]
+    async fn an_empty_roster_returns_a_stage_to_the_default() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/ws_profile_default_roster");
+        let tool = WorkspaceTool;
+        crate::util::test::create_test_workspace(
+            "/tmp/ws_profile_default_roster",
+            "ws_profile_default_roster",
+        )
+        .await;
+        tool.execute(
+            &ws,
+            tool_args("confirm_profile", Some("ws_profile_default_roster")),
+        )
+        .await
+        .expect("confirm");
+        tool.execute(
+            &ws,
+            json!({
+                "action": "set_profile",
+                "workspace": "ws_profile_default_roster",
+                "stage": "verification",
+                "participants": ["tester"],
+            }),
+        )
+        .await
+        .expect("set the roster");
+
+        tool.execute(
+            &ws,
+            json!({
+                "action": "set_profile",
+                "workspace": "ws_profile_default_roster",
+                "stage": "verification",
+                "participants": [],
+            }),
+        )
+        .await
+        .expect("clear the roster");
+        let read = tool
+            .execute(&ws, tool_args("profile", Some("ws_profile_default_roster")))
+            .await
+            .expect("profile");
+        assert!(
+            read.contains("- verification: reviewer, tester"),
+            "an empty list returns the stage to the default: {read}"
+        );
+    }
+
+    /// The `config` tool is the owner's other way into the profile: the same four actions, the same
+    /// answers, one implementation.
+    #[tokio::test]
+    async fn the_config_tool_reads_confirms_edits_and_resets_the_profile() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/ws_config_profile");
+        let tool = crate::tools::mahbot_config::MahbotConfigTool;
+        crate::util::test::create_test_workspace("/tmp/ws_config_profile", "ws_config_profile")
+            .await;
+        crate::util::test::unconfirm_test_workspace("ws_config_profile").await;
+
+        let read = tool
+            .execute(
+                &ws,
+                json!({ "action": "profile", "workspace": "ws_config_profile" }),
+            )
+            .await
+            .expect("profile");
+        assert!(read.contains("waiting for confirmation"), "got: {read}");
+
+        let reply = tool
+            .execute(
+                &ws,
+                json!({ "action": "confirm_profile", "workspace": "ws_config_profile" }),
+            )
+            .await
+            .expect("confirm");
+        assert!(reply.contains("confirmed"), "got: {reply}");
+
+        let reply = tool
+            .execute(
+                &ws,
+                json!({
+                    "action": "set_profile",
+                    "workspace": "ws_config_profile",
+                    "pass_threshold": 6,
+                }),
+            )
+            .await
+            .expect("set");
+        assert!(reply.contains("next stage round"), "got: {reply}");
+
+        let reply = tool
+            .execute(
+                &ws,
+                json!({ "action": "reset_profile", "workspace": "ws_config_profile" }),
+            )
+            .await
+            .expect("reset");
+        assert!(reply.contains("reset to the default"), "got: {reply}");
+    }
+
+    /// Adding a workspace says the one thing the owner must do next: its pipeline does not run until
+    /// the profile is confirmed, and confirming accepts the profile as shipped unless it is edited.
+    #[tokio::test]
+    async fn the_add_answer_says_the_pipeline_waits_for_the_profile() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let ws = crate::workspace::test_ws("/tmp/ws_added_answer");
+        let folder = crate::util::test::test_root().join("ws_added_answer_folder");
+        std::fs::create_dir_all(&folder).expect("create the project folder");
+
+        let reply = WorkspaceTool
+            .execute(
+                &ws,
+                json!({
+                    "action": "add",
+                    "name": "ws_added_answer",
+                    "path": folder.to_str().expect("utf-8 path"),
+                }),
+            )
+            .await
+            .expect("add");
+        assert!(
+            reply.contains("does not run until you confirm its profile")
+                && reply.contains("`confirm_profile`")
+                && reply.contains("as shipped unless you edit it"),
+            "got: {reply}"
         );
     }
 }

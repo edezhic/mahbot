@@ -26,7 +26,8 @@ A message to a continuous role is handled one at a time, in the order sent, so a
 
 ## Refusals
 
-- A folder another worker or custom role is already working in: two agents in one folder overwrite each other's edits. Split the work across folders, or wait for the running one to finish.
+- A paused workspace: no writer starts there until it is resumed. A discovery pass or a separately launched analysis keeps running in it.
+- A folder any other writer already holds — the engineer, a reviewer, the pipeline's analysis stage, the tester, sanitation, the maintainer, the admin Assistant, a worker or a custom role: one writer holds a folder at a time, because two in one folder overwrite each other's edits. The refusal names the holder. Split the work across folders, or wait for the running one to finish. Reading never holds a folder: a discovery pass and a separately launched analysis do not refuse a send.
 - An address your tool does not offer, and an address's own missing argument.
 - A `role` name no custom role answers to, and a `guest` name that is not an existing account (or is your own).
 
@@ -34,4 +35,4 @@ A message to a continuous role is handled one at a time, in the order sent, so a
 
 An acknowledgement naming where the work went — `Work handed to a worker in <folder>; its report arrives as a <worker-report> message.`, `Worker branch '<branch>' is on it in <folder>; …`, `Message delivered to the manager of workspace '<name>'.`, `custom role '<name>' launched on branch <agent> in <workspace>`, or the guest's one-way notice. Only a synchronous send returns the work's own result.
 
-Every command-line acknowledgement ends with `(job <id>)` — the id the `send_outcome` lookup answers. The one-way `guest` address prints no id, because nothing will answer it.
+Every command-line acknowledgement ends with `(job <id>)` — the id names the dispatch row the handover wrote (the `jobs` row, with the roster that names the conversation its answer arrives in), readable through `mahbot debug --db board`. The one-way `guest` address prints no id, because nothing will answer it.

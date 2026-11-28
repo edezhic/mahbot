@@ -62,6 +62,10 @@ Bracketed fields are the ones the action reads.
 `user` names the account an action acts on: `bind_telegram` defaults to the owner and `list_grants`
 to every account; the other four require it.
 
+The profile's four actions — `profile`, `confirm_profile`, `set_profile`, `reset_profile` — are
+here too, with the same fields as `workspace`'s: a workspace's profile is read, confirmed and
+edited through the configuration tool as well.
+
 ## settings for get / set
 
 - `provider_key` — the OpenRouter key. Secret; written by `setup`, which checks it live. Cannot be
@@ -115,38 +119,71 @@ Wake-word enrolment needs a microphone and stays in the window.
 Bracketed fields are the ones the action reads.
 
 - `reference` — this text, whole: every action, every field, and what is inert where.
-- `list` (`workspace`) — the managed workspaces, read live: name, status, whether the pipeline is
-  paused, whether background maintenance is on, and the project folder; the active one is marked, or
-  the listing says none is. Without `workspace`, every managed workspace; with it, only the one
-  named. Use it for any question about current state — the `<managed-workspaces>` block is a
-  session-start snapshot and carries neither state.
-- `show` (`workspace`) — one workspace: path, status, paused, maintenance, active, rules, commands.
-- `add` (`name`, `path`) — add a project directory and make it active; it starts pending and paused,
-  and awaits its first discovery pass, which begins by itself once the model provider is configured.
-  Managed workspaces are for software projects only — documents, notes and research files go in the
-  personal workspace. The name is up to 40 ASCII letters and underscores, starting with a letter;
-  `path` must be an existing directory (absolute, relative or `~`, resolved where the call runs).
+- `list` (`workspace`) — the managed workspaces, read live: name, status in parentheses together
+  with `, paused`, `, maintenance on` and the reason it is waiting, then the project folder; the
+  active one is marked, or the listing says none is. Without `workspace`, every managed workspace;
+  with it, only the one named. Use it for any question about current state — the
+  `<managed-workspaces>` block is a session-start snapshot and carries neither state.
+- `show` (`workspace`) — one workspace: path, status, pipeline, maintenance, active, rules,
+  commands. The `- pipeline:` line is `running`, `paused`, the reason it is claiming nothing — its
+  profile unconfirmed, another writer holding the folder, or a confirmed profile this build cannot
+  read (that one never stops the workspace: it runs on the default, and the line under it and
+  `profile` name what is wrong) — or `nothing to claim` while its first discovery has not run or
+  has failed. A workspace being re-analysed is `running`: reading never holds the pipeline out.
+- `add` (`name`, `path`) — add a project directory and make it active; it starts pending, and its
+  pipeline does not run until its profile is confirmed. Its first discovery pass begins by itself
+  once the model provider is configured. Managed workspaces are for software projects only —
+  documents, notes and research files go in the personal workspace. The name is up to 40 ASCII
+  letters and underscores, starting with a letter; `path` must be an existing directory (absolute,
+  relative or `~`, resolved where the call runs).
 - `delete` (`workspace`) — remove a workspace, its jobs and its research runs; the folder and the
   tickets stay on disk.
-- `pause` / `resume` (`workspace`) — freeze or unfreeze a pipeline: no stage advances, and agents
-  stop at their next round boundary; a resume lets work in flight continue from where it stopped,
-  and neither direction loses anything. Only a `ready` workspace has one, and a named one that is
-  not ready is refused; for a workspace that is not `ready`, the `, paused` that `list` prints is
-  its discovery's own analysis pause, not a freeze you applied. With no `workspace`, all of them:
-  the ready ones are acted on, the rest skipped. That is a fleet-wide write — use it only when the
-  owner asked for all of them, and then pass nothing else. The answer reports workspace by
-  workspace: paused, resumed, already in that state, or skipped because it was not ready.
+- `pause` / `resume` (`workspace`) — freeze or unfreeze a pipeline: no stage advances, and every
+  writer stops at its next round boundary; a resume lets work in flight continue from where it
+  stopped, answers the messages the freeze kept, and re-drives the rounds a freeze actually
+  stopped — one still running is left to finish. Reading is outside the freeze: a discovery pass
+  and a separately launched analysis neither hold the folder nor stop, so a pause never refuses a
+  re-analysis. A pause is written for any status — a workspace whose first discovery has not run is
+  held out of the pipeline by its `pending` status until it has. With no `workspace`, all of them,
+  and the answer reports workspace by workspace: paused, resumed, or already in that state. That is
+  a fleet-wide write — use it only when the owner asked for all of them, and then pass nothing
+  else.
 - `maintenance` (`workspace`, `maintenance`) — turn the background maintainer on or off.
 - `rediscover` (`workspace`) — re-analyse a project: its per-role contexts are cleared and discovery
-  starts again; the pipeline is paused until it finishes, and the answer says so.
+  starts again; the answer says so. Nothing refuses it: reading is outside both the freeze and the
+  folder's single-writer hold, so a paused workspace and one another writer is working in are both
+  re-analysed, and a re-analysis never lifts a pause.
 - `rediscover_diagnostics` (`workspace`) — re-detect only the project's commands: the stored ones
-  are cleared while they are; status, pause and per-role contexts are untouched.
+  are cleared while they are; status, pause and per-role contexts are untouched. Nothing refuses it
+  either, for the same reason: it reads the folder, so neither a pause nor another writer stops it.
 - `set_diagnostics` (`workspace`, `format`, `format_check`, `lint`, `lint_fix`, `type_check`,
   `build`, `unit_test`) — write the project's commands by hand: omit a field to keep it, pass an
   empty string to clear it, and name at least one.
 - `set_rules` (`workspace`, `rules`) — write the project rules, at most 4000 characters (longer
   text is truncated). They reach a session's prompt when it is built or next compacted, not a
   running one.
+- `profile` (`workspace`) — read a workspace's profile: the participants of each stage, the pass
+  threshold and whether every project check must pass, plus the project's checks. A workspace added
+  after the profile shipped waits until its profile is confirmed — its pipeline does not run, and it
+  says so; a workspace that predates it is confirmed automatically. For an unconfirmed workspace it
+  shows what confirmation puts in force. There is no separate proposal to adopt and no revision to
+  confirm: discovery proposes the project's checks as it always has, and the profile is confirmed as
+  it stands and edited by the owner if they want to. A confirmed profile this build cannot read
+  never stops the workspace: it is reported and the default runs.
+- `confirm_profile` (`workspace`) — accept the workspace's profile as it stands. It copies no value:
+  a field the owner did not edit keeps following the default, so a later change to the default
+  reaches it. Confirmation takes effect from the next stage round; a round already running finishes
+  on the settings it started with — its pass conditions included.
+- `set_profile` (`workspace`, `stage`, `participants`, `pass_threshold`, `require_all_checks`) —
+  change part of the profile; an omitted field is untouched. `stage` and `participants` go together:
+  naming a stage without its participants is refused, and an empty list returns that stage to the
+  default. `stage` names one of `analysis`, `planning`, `in_development`, `verification`,
+  `in_sanitation`; `participants` are `analyst`, `manager`, `engineer`, `reviewer`, `tester`,
+  `sanitation`. The tester always takes part in verification, the analyst cohort stays at two, the
+  reviewer count follows the size of the change, and a stage left with nobody to do its work is
+  refused.
+- `reset_profile` (`workspace`) — return every profile field to the shipped default, keeping the
+  confirmation.
 - `use` (`workspace`) — make a workspace the active project.
 - `board` (`workspace`, `phase`) — the tickets of the addressed workspaces, one line each: who
   filed it, its phase, its id and its title. Without `workspace`, every managed workspace's tickets

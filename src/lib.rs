@@ -41,6 +41,16 @@ pub mod session;
 pub mod users;
 // Workspace records, discovery and analysis, and the editor's open tabs.
 pub mod workspace;
+// The per-workspace profile: who staffs each stage, its pass threshold and its pass conditions.
+pub(crate) mod workspace_profile;
+// Why a run stopped — one vocabulary — and the one place a run's stop is owned.
+pub(crate) mod stop;
+// Which agent the product is talking to: one type, one formatter, one parse.
+pub(crate) mod address;
+// What became of one piece of work handed to an agent: the one outcome vocabulary.
+pub(crate) mod outcome;
+// What one agent invocation works for: its ticket, round, run, launch, chain step or plain turn.
+pub(crate) mod work_unit;
 // The per-workspace file index shared by search, read, edit and the Git page.
 pub mod workspace_index;
 
@@ -152,8 +162,6 @@ pub mod power;
 pub mod autostart;
 // Downloading, verifying and swapping in a new version, under the instance lock.
 pub mod self_update;
-// The durable record of one command-line `send`, by the id its acknowledgement printed.
-pub mod send_outcome;
 // The owner's own shell environment, re-read in the background.
 pub mod shell_env;
 // Shutdown and drain: the token, the signal sources and the two-request protocol.
@@ -170,8 +178,6 @@ pub(crate) mod analyze_cancel;
 pub(crate) mod research_cancel;
 // The single release point for a research run's folders, archive and command dump.
 pub mod research_cleanup;
-// Stop flags for running deep-research and analyze rounds.
-pub(crate) mod round_cancel;
 
 // Shared helpers: HTTP and TLS, locking, paths, managed binaries, media markers, fixtures.
 pub mod util;
@@ -202,7 +208,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
 
 use crate::session::Session;
 use crate::util::UnwrapPoison;
@@ -296,19 +301,19 @@ pub struct Workspace {
     pub name: String,
     pub path: String,
     pub status: WorkspaceStatus,
-    /// Gates only the maintainer loop, unlike [`Self::paused`] (which freezes the
-    /// whole pipeline): a paused workspace can still be maintained, and disabling
-    /// maintenance cancels a running maintainer outright where pausing is
-    /// cooperative. Persisted with a `DEFAULT 0` schema default.
+    /// Gates the maintainer loop: disabling maintenance cancels a running maintainer outright,
+    /// where [`Self::paused`] is cooperative. Persisted with a `DEFAULT 0` schema default.
     pub maintenance_enabled: bool,
-    /// A strict freeze: no pipeline stage advances — including the dispatcher
-    /// finalizers — and its agents freeze at their next LLM round boundary until
-    /// manual resume (no cancel token is fired, so a round in flight finishes its
-    /// turn first). Set automatically on technical failures, and by a
-    /// `mahbot paused` launch, so queued tickets aren't claimed and don't cascade;
-    /// lifted by the normal unpause path. A discovery in flight when the pause
-    /// lands clears it on completion without checking who set it — see
-    /// `finalize_discovery`.
+    /// A strict freeze: no pipeline stage advances — including the dispatcher finalizers — and
+    /// every writer to the folder stops at its next LLM round boundary until manual resume (no
+    /// cancel token is fired, so a round in flight finishes its turn first). Set automatically on
+    /// technical failures, and by a `mahbot paused` launch, so queued tickets aren't claimed and
+    /// don't cascade; lifted by the normal unpause path. Reading is outside it: a discovery pass
+    /// and a separately launched analysis neither hold the folder nor stop on a freeze, so the
+    /// workspace's `status` — not this flag — is what holds the ticket pipeline out while the first
+    /// discovery has not run. The Manager's own triage is exempt, so the notice that explains the
+    /// pause stays deliverable. The pipeline, a launch, an agent's own run start, the verification's
+    /// project commands and the maintainer all ask this one flag, so a freeze reaches every writer.
     pub paused: bool,
     /// RFC 3339 timestamp of the last completed maintainer run; `None` means never.
     pub maintainer_last_run_at: Option<String>,
@@ -320,6 +325,11 @@ pub struct Workspace {
     /// The git HEAD commit captured after the last successful discovery, read by the
     /// nightly re-analysis check; `None` if not a git repository or no commits.
     pub last_analyzed_commit: Option<String>,
+    /// Whether the owner has accepted this workspace's profile. An unconfirmed profile stops the
+    /// pipeline; the migration confirms every workspace that predates the profile.
+    pub profile_confirmed: bool,
+    /// The profile fields the owner customised, as JSON; `None` follows every default.
+    pub profile: Option<String>,
 }
 
 impl Default for Workspace {
@@ -334,6 +344,8 @@ impl Default for Workspace {
             diagnostics: Option::default(),
             notes: String::default(),
             last_analyzed_commit: Option::default(),
+            profile_confirmed: bool::default(),
+            profile: Option::default(),
         }
     }
 }
@@ -424,6 +436,14 @@ pub fn generate_id() -> String {
 #[must_use]
 pub(crate) fn generate_suffix() -> String {
     generate_nanoid(6)
+}
+
+/// Whether `s` has the shape [`generate_suffix`] produces — the length and the alphabet, which is
+/// what lets an id family tell its generated segment from a hand-written one. A shape test, not a
+/// validity check: the alphabet includes `_` and `-`.
+#[must_use]
+pub(crate) fn is_generated_suffix(s: &str) -> bool {
+    s.len() == 6 && s.bytes().all(|b| NANOID_ALPHABET.contains(&b))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -970,22 +990,14 @@ pub struct Agent {
     chrome_sessions: std::sync::Arc<crate::tools::chrome::ChromeRunSessions>,
     /// Cached tool specs — computed once from `tools` at construction time.
     pub(crate) tool_specs: Vec<ToolSpec>,
-    /// Cancellation token for cooperative mid-loop cancellation (a deliberate stop — GUI cancel,
-    /// re-dispatch, phase transition, or shutdown).
-    cancel_token: CancellationToken,
-    /// A workspace-pause (strict freeze) cancellation was requested for this run, set
-    /// by `cancel_by_workspace_pause` — a FREEZE distinct from a code-driven
-    /// cancellation; the pipeline failure classifier leaves the ticket in its source
-    /// phase for unpause.
-    pause_stop: Arc<std::sync::atomic::AtomicBool>,
-    /// IMMUTABLE bail-time snapshot of whether this run stopped at a cooperative
-    /// workspace-pause freeze — set once at the LLM-round boundary, never cleared.
-    /// Unlike the live `pause_stop` flag, it survives the window where the agent is
-    /// still registered and the workspace is resumed between the bail and the pipeline
-    /// finalizer reading it, so a frozen run is never misrouted to the hard-failure path.
-    paused_frozen: std::sync::atomic::AtomicBool,
-    /// The board ticket this agent is working on (board-dispatched agents only).
-    ticket: Option<crate::pipeline::board::Ticket>,
+    /// Everything that can stop this run — the cancel, the turn's interrupt and the workspace
+    /// pause — owned in one place and shared with the registry, whose sweeps fire it. See
+    /// [`crate::stop::Stop`].
+    pub(crate) stop: Arc<crate::stop::Stop>,
+    /// What this invocation works for — its ticket, analyze round, research run, launch, chain
+    /// step or plain turn. The one descriptor the session, the prompt, the registry card, the
+    /// ticket-scoped log columns and the tool attribution read.
+    pub(crate) work: crate::work_unit::WorkUnit,
     /// Generation counter from the agent registry, for safe deregistration in [`Drop`];
     /// 0 means not registered (e.g. test agents).
     generation: u64,
@@ -1000,14 +1012,6 @@ pub struct Agent {
     pub(crate) is_admin: bool,
     /// The channel origin (gui, telegram, voice, cli) of the triggering message.
     pub(crate) channel: String,
-    /// DIRECT PARENT INVOCATION grouping key for the Running Agents view (ticket /
-    /// analyze round / research run); `None` for workspace singletons. Propagated to
-    /// sub-agents via [`CURRENT_TOOL_PARENT_KEY`](crate::agent::CURRENT_TOOL_PARENT_KEY).
-    pub(crate) parent_key: Option<crate::agent::registry::ParentKey>,
-    /// The DIRECT PARENT INVOCATION's label (ticket title / analyze or research
-    /// question), purely presentational for the group header. Propagated to sub-agents
-    /// via [`CURRENT_TOOL_PARENT_LABEL`](crate::agent::CURRENT_TOOL_PARENT_LABEL).
-    pub(crate) parent_label: Option<String>,
     /// The provider this run's model calls are pinned to; see [`crate::providers::selection`] for
     /// when it moves. `Default` (no provider) until the turn starts.
     pub(crate) provider: crate::providers::selection::ProviderSelection,
@@ -1051,13 +1055,6 @@ pub struct Agent {
     /// ([`Drop`]) — see [`crate::tools::shell::BackgroundSessions`]. Reachable from the
     /// tool-batch context via [`crate::agent::CURRENT_TOOL_BACKGROUND_SESSIONS`].
     background_sessions: std::sync::Arc<crate::tools::shell::BackgroundSessions>,
-    /// Fired by [`crate::agent::registry::AgentRegistry::interrupt`] on an urgent user
-    /// message: the turn is cut where it stands — a pending model request or tool call
-    /// is dropped — and ends with [`TurnState::interrupted`] set instead of an answer. Never a
-    /// cancellation: [`Self::cancel_token`] is untouched, so the turn still settles its
-    /// tool results and finalizes its session. One token per turn, so an urgent message
-    /// interrupts at most the turn it cuts.
-    pub(crate) interrupt_token: CancellationToken,
 }
 
 /// Result of a single verification pass (code reviewer or functional tester).

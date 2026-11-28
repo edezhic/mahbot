@@ -64,6 +64,9 @@ pub(crate) enum ContextKind {
 
 pub struct WorkspacesState {
     pub(crate) workspaces: Vec<Workspace>,
+    /// Each workspace's profile state, resolved when the list is synced: parsing the stored
+    /// profile JSON belongs to the data boundary, not to every frame of the render.
+    pub(crate) profile_states: HashMap<String, crate::workspace_profile::ProfileState>,
     pub(crate) load_state: super::common::AsyncLoadState,
     pub(crate) delete_target: Option<String>,
 
@@ -121,6 +124,7 @@ impl WorkspacesState {
     pub fn new() -> Self {
         Self {
             workspaces: Vec::new(),
+            profile_states: HashMap::new(),
             load_state: super::common::AsyncLoadState::new(),
             delete_target: None,
             context_view: None,

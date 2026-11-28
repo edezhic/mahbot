@@ -13,16 +13,15 @@ mod manager;
 pub(crate) mod personal_changes;
 pub(crate) mod transcript;
 pub(crate) mod unreadable;
-pub(crate) use manager::FinalizeOutcome;
 pub(crate) use manager::RewriteOutcome;
 pub(crate) use manager::Session;
+pub(crate) use manager::SessionFlush;
 pub(crate) use transcript::{TRANSCRIPT_REGISTRY, TranscriptSnapshot};
 
 use crate::db::{self, IntoParams, Row, TxGuard, Value, params};
 use crate::{ChatMessage, ChatRole, Reasoning, ToolCall, ToolResultPayload};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use std::borrow::Cow;
 
 // The summarization LLM call lives in `crate::Agent::summarize` so its parameters (model,
 // reasoning_effort, tools, pinned provider) stay byte-identical to the work loop's.
@@ -156,47 +155,6 @@ crate::columns! {
         LAUNCH_STOPPED    => "sm.launch_stopped",
     }
 }
-
-/// Agent ID prefixes for transient (background-only, non-user-facing) sessions — auto-created
-/// analysts, engineers, maintainer, discovery, etc., cleaned up by
-/// [`cleanup_old_transient_sessions`].
-///
-/// User-facing agents persist indefinitely and are deliberately excluded: direct chat
-/// `{user}_{ws_name}_{role}` (or deduped `{user}_personal:{role}`, a colliding user escaped with a
-/// `user_` prefix — [`safe_user_segment`]); `manager_{ws_name}`, which carries chat conversation
-/// and notification context; and a custom role's continuable branch `role_{name}[:{identifier}]`
-/// ([`custom_role_agent_id`]), where only the `rolerun_` siblings are transient. A new role that
-/// can talk to users directly must be excluded here too.
-const TRANSIENT_AGENT_ID_PREFIXES: &[&str] = &[
-    "ticket_",
-    "analyze_",
-    "research_",
-    "cleanup_",
-    "maintainer_",
-    "discovery_",
-    "rolerun_",
-];
-
-/// Agent-id prefix of a custom role's continuable branch — `role_{name}` (the record's default
-/// branch) or `role_{name}:{identifier}`. The `:` separator keeps the two forms injective: names
-/// and identifiers may both contain `_`, so `_` would alias `(a_b, None)` with `(a, Some(b))` —
-/// and `personal:{user}` already establishes `:` in agent ids.
-///
-/// Deliberately NOT in [`TRANSIENT_AGENT_ID_PREFIXES`]: it is a user-facing conversation, never
-/// TTL-purged and eligible for dead-session recovery. It is in the wider
-/// [`reserved_agent_id_prefixes`] union, so a user literally named `role` becomes `user_role`.
-pub(crate) const CUSTOM_ROLE_AGENT_ID_PREFIX: &str = "role_";
-
-/// Agent-id prefix of a custom role's ONE-OFF run — `rolerun_{name}:{suffix}`. Same `:` injectivity
-/// rule as [`CUSTOM_ROLE_AGENT_ID_PREFIX`]: the [`crate::generate_suffix`] NanoID may itself
-/// contain `_`. Transient, so it expires with the ordinary session lifetime.
-pub(crate) const CUSTOM_ROLE_RUN_AGENT_ID_PREFIX: &str = "rolerun_";
-
-/// Agent-id prefix of a worker branch — `worker_{branch}`, a continuable conversation like a custom
-/// role's branch: deliberately NOT in [`TRANSIENT_AGENT_ID_PREFIXES`] (never TTL-purged), IS
-/// recovered by the dead-session poller, and IS in [`reserved_agent_id_prefixes`] so no direct user
-/// id can shadow it. Not in [`non_user_facing_agent_id_prefixes`]: the branch is user-facing.
-pub(crate) const WORKER_BRANCH_AGENT_ID_PREFIX: &str = "worker_";
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionMetadata {
@@ -1645,7 +1603,7 @@ pub async fn cleanup_old_transient_sessions() -> Result<u64> {
     let session_store = store();
     let tx = session_store.conn.begin_tx().await?;
 
-    let likes = TRANSIENT_AGENT_ID_PREFIXES
+    let likes = crate::address::TRANSIENT_AGENT_ID_PREFIXES
         .iter()
         .map(|_| "agent_id LIKE ?")
         .collect::<Vec<_>>()
@@ -1654,16 +1612,15 @@ pub async fn cleanup_old_transient_sessions() -> Result<u64> {
 
     let mut build_params = vec![Value::Text(cutoff)];
     build_params.extend(
-        TRANSIENT_AGENT_ID_PREFIXES
+        crate::address::TRANSIENT_AGENT_ID_PREFIXES
             .iter()
             .map(|prefix| Value::Text(format!("{prefix}%"))),
     );
 
     // Safety-critical predicate shared by both DELETEs. The agents table IS the protection marker:
     // a session referenced by any agents row is never purged. For ticket-phase jobs that protection
-    // ends when the phase purge removes the job row; launched non-phase jobs are never
-    // time-deleted, so their protection is indefinite by design (released by completion or explicit
-    // abandon).
+    // ends when the phase purge removes the job row; a launched non-phase job's protection ends when
+    // the job ends, and a settled record's when its retention deletes the record row.
     let safety_predicate = format!(
         "last_activity < ? AND {prefix_patterns} \
          AND agent_id NOT IN (SELECT agent_id FROM agents)"
@@ -1720,44 +1677,13 @@ pub async fn cleanup_old_transient_sessions() -> Result<u64> {
     Ok(deleted)
 }
 
-/// The prefixes of every non-user-facing agent id: `manager_` plus every
-/// [`TRANSIENT_AGENT_ID_PREFIXES`] entry.
-///
-/// These identify session keys a user never talks to directly. The dead-session poller excludes
-/// this whole union, while [`cleanup_old_transient_sessions`] purges only the transient entries
-/// (`manager_` is intentionally excluded there). Both match via SQL `LIKE 'prefix_%'`, which Turso
-/// applies case-insensitively for ASCII.
-pub(crate) fn non_user_facing_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
-    std::iter::once("manager_").chain(TRANSIENT_AGENT_ID_PREFIXES.iter().copied())
-}
-
-/// The union a **user-facing direct agent id** must never start with: every
-/// non-user-facing prefix ([`non_user_facing_agent_id_prefixes`]) plus
-/// [`CUSTOM_ROLE_AGENT_ID_PREFIX`] and [`WORKER_BRANCH_AGENT_ID_PREFIX`], which a
-/// direct id must also not shadow.
-///
-/// A real user whose name collides with any of these is escaped with a `user_`
-/// prefix by [`safe_user_segment`] — so a user literally named `role` becomes
-/// `user_role`, protecting the start of a custom-role or worker-branch address.
-pub(crate) fn reserved_agent_id_prefixes() -> impl Iterator<Item = &'static str> {
-    non_user_facing_agent_id_prefixes()
-        .chain([CUSTOM_ROLE_AGENT_ID_PREFIX, WORKER_BRANCH_AGENT_ID_PREFIX])
-}
-
-/// Case-insensitive (ASCII) [`str::starts_with`], matching Turso's `LIKE`
-/// semantics for the reserved-prefix exclusion.
-fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-    s.get(..prefix.len())
-        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
-}
-
 /// Normalize a routed user identity, enforcing the never-empty-user invariant.
 ///
 /// Returns the seeded `admin` name for an empty input, otherwise the input
 /// unchanged. `context` labels the calling layer in the [`tracing::warn!`]
 /// canary so a malformed `admin` fallback is traceable. This is the single
 /// source of the `admin` fallback, shared by the ID chokepoint
-/// ([`direct_agent_id`]) and the delivery-payload layers
+/// ([`crate::address::AgentAddress::Direct`]) and the delivery-payload layers
 /// ([`crate::agent::message_router::route_user_message`],
 /// [`crate::agent::message_router::deliver_unregistered_user_response`]).
 pub(crate) fn normalize_user_name<'a>(user_name: &'a str, context: &str) -> &'a str {
@@ -1772,219 +1698,32 @@ pub(crate) fn normalize_user_name<'a>(user_name: &'a str, context: &str) -> &'a 
     }
 }
 
-/// Does a user name collide with a reserved agent-ID prefix when it becomes the
-/// leading segment of a direct agent ID? Such a name would otherwise be purged by
-/// the SQL exclusion `LIKE 'prefix_%'` (case-insensitive for ASCII, `_` = any one
-/// char), so `ticket`, `ticketx`, and `TicketBob` all collide. Names already
-/// starting with `user_` are also treated as colliding to keep [`safe_user_segment`] injective.
-#[must_use]
-fn user_segment_collides(user_name: &str) -> bool {
-    let touches_reserved = reserved_agent_id_prefixes()
-        .any(|prefix| starts_with_ignore_ascii_case(user_name, prefix.trim_end_matches('_')));
-    touches_reserved || starts_with_ignore_ascii_case(user_name, "user_")
-}
-
-/// Escape a user name for the leading segment of a direct agent ID by prefixing colliding names
-/// ([`user_segment_collides`]) with `user_`, so their session is never mistaken for a
-/// transient/background one. The escape is injective: a name already starting with `user_` is ALSO
-/// escaped (`user_ticket` → `user_user_ticket`), so `ticket` → `user_ticket` can never collide with
-/// a distinct real user named `user_ticket`.
-#[must_use]
-fn safe_user_segment(user_name: &str) -> Cow<'_, str> {
-    if user_segment_collides(user_name) {
-        Cow::Owned(format!("user_{user_name}"))
-    } else {
-        Cow::Borrowed(user_name)
-    }
-}
-
-/// Construct an agent ID for direct user-to-agent chat: `{user}_{ws_name}_{role}`, channel-agnostic
-/// — one conversation per (user + workspace + role) whatever the originating channel. For the
-/// user's OWN personal workspace (`personal:{user}`) the duplicated user segment is dropped, giving
-/// `{user}_personal:{role}`. Role last for consistent identification in logs and debugging, and
-/// immune to underscores in the other segments; the router no longer parses these strings (the role
-/// is carried by [`AgentJob`](crate::agent::message_router::AgentJob)). Stable across messages, so
-/// the conversation accumulates in a single session.
-///
-/// A real user whose name collides with a reserved transient/manager prefix is escaped with a
-/// `user_` prefix ([`safe_user_segment`]).
-#[must_use]
-fn direct_agent_id(user_name: &str, role: &str, ws_name: &str) -> String {
-    // Invariant: the routed user identity is never empty ([`normalize_user_name`]). Guard the ID
-    // itself so no bare "_ws_role" key can be produced — the single chokepoint for every direct ID
-    // builder (resolve_agent_id, envelope_target). route_user_message normalizes the delivery
-    // payload too; the layers are complementary (that one feeds `job.user_name`, this one the ID
-    // key), not redundant.
-    let user_name = normalize_user_name(user_name, "direct_agent_id");
-    // Dedup the user for the user's OWN personal workspace so the ID reads
-    // `{user}_personal:{role}`.
-    // Key strictly on the `personal:` prefix AND the embedded user matching the routed raw user — a
-    // project named `personal_work` or another user's personal workspace keeps the full
-    // `{user}_{ws_name}_{role}` form. The leading segment stays escaped, comparing the embedded
-    // user raw so reserved names like `manager` yield `user_manager_personal:{role}`.
-    //
-    // Orphaned sessions keyed `{user}_personal:support` are intentionally NOT migrated — the
-    // Support role is gone and those rows are dead weight by design.
-    if ws_name.strip_prefix("personal:") == Some(user_name) {
-        return format!("{}_personal:{role}", safe_user_segment(user_name));
-    }
-    format!("{}_{}_{}", safe_user_segment(user_name), ws_name, role)
-}
-
-/// Construct a base agent ID for ticket-driven agent work: `ticket_{ticket_id}_{role}`.
-///
-/// Singular dispatch (e.g. Engineer at `dispatch_engineer`) uses it directly; parallel agents
-/// (analysts, reviewers, QA via `run_parallel_agents`) append `_{index}_{suffix}`, producing IDs
-/// like `ticket_{ticket_id}_0_nano_{role}` (role last).
-#[must_use]
-pub(crate) fn ticket_agent_id(ticket_id: &str, role: &str) -> String {
-    format!("ticket_{ticket_id}_{role}")
-}
-
-/// Construct an agent ID for Manager agents (workspace-scoped): `manager_{ws_name}`.
-#[must_use]
-pub(crate) fn manager_agent_id(ws_name: &str) -> String {
-    format!("manager_{ws_name}")
-}
-
-/// Construct an agent ID for a user message, dispatching on role: Manager agents get the
-/// workspace-scoped `manager_{ws_name}`, everyone else the channel-agnostic [`direct_agent_id`]
-/// form. Parameter order matches [`direct_agent_id`] — `user_name`, `role`, `ws_name`.
-#[must_use]
-pub(crate) fn resolve_agent_id(user_name: &str, role: &str, ws_name: &str) -> String {
-    if role == "manager" {
-        manager_agent_id(ws_name)
-    } else {
-        direct_agent_id(user_name, role, ws_name)
-    }
-}
-
-/// The agent address of `user_name`'s Assistant session — the single source of the owner's
-/// Assistant address, used by automation arming and by notices addressed to the assistant.
-#[must_use]
-pub(crate) fn assistant_agent_id(user_name: &str) -> String {
-    resolve_agent_id(
-        user_name,
-        crate::Role::Assistant.as_str(),
-        &crate::users::personal_workspace_name(user_name),
-    )
-}
-
-/// Whether `agent_id` addresses a custom-role session: a continuable branch
-/// ([`CUSTOM_ROLE_AGENT_ID_PREFIX`]) or a one-off run ([`CUSTOM_ROLE_RUN_AGENT_ID_PREFIX`]).
-#[must_use]
-pub(crate) fn is_custom_role_agent_id(agent_id: &str) -> bool {
-    agent_id.starts_with(CUSTOM_ROLE_AGENT_ID_PREFIX)
-        || agent_id.starts_with(CUSTOM_ROLE_RUN_AGENT_ID_PREFIX)
-}
-
 /// Clear the session for a user/role/workspace, returning the confirmation message. Fail-closed:
 /// the session's unfinished sync jobs are abandoned FIRST, and a failed abandon aborts the clear so
 /// the caller can surface the error — deleting the rows anyway would orphan the jobs with no caller
 /// session left to resume them. Internal cleanup paths (maintainer self-cleanup, the transient TTL
 /// bulk DELETE) deliberately skip the abandon.
 pub async fn clear_session(user_name: &str, role: &str, ws_name: &str) -> anyhow::Result<String> {
-    let agent_id = resolve_agent_id(user_name, role, ws_name);
+    let agent_id = crate::address::AgentAddress::routed(user_name, role, ws_name).id();
     crate::jobs::abandon_session_jobs(&agent_id).await?;
     crate::session::store().delete(&agent_id).await?;
     Ok("Session cleared. Starting fresh.".to_string())
 }
 
-/// Build a transient agent ID shared by the suffixed builder family (`analyze_`, `research_`,
-/// `discovery_`): `{prefix}{ws_name}_{suffix}_{label}`. `prefix` must carry its trailing underscore
-/// (as stored in [`TRANSIENT_AGENT_ID_PREFIXES`]) so the result stays byte-identical to the
-/// historical literal builders — a bare prefix plus an inserted separator would emit a double
-/// underscore.
-#[must_use]
-fn transient_agent_id(prefix: &str, ws_name: &str, label: &str) -> String {
-    let suffix = crate::generate_suffix();
-    format!("{prefix}{ws_name}_{suffix}_{label}")
-}
-
-/// Construct the Maintainer agent ID for a workspace (deterministic, workspace-scoped):
-/// `maintainer_{ws_name}`, the same stable-ID precedent as `manager_{ws_name}`. A stable ID makes
-/// runs resumable — the next cycle, including after a daemon restart, picks up the interrupted
-/// session instead of restarting. Keep `maintainer_` registered in
-/// [`TRANSIENT_AGENT_ID_PREFIXES`] so the TTL purge still applies to stale sessions.
-#[must_use]
-pub(crate) fn maintainer_agent_id(ws_name: &str) -> String {
-    format!("maintainer_{ws_name}")
-}
-
-/// Construct an agent ID for sub-agent analyze rounds (Engineer/Maintainer → sub-agent):
-/// `analyze_{ws_name}_{suffix}_{role}`, role LAST ([`direct_agent_id`]).
-#[must_use]
-pub(crate) fn analyze_agent_id(ws_name: &str, role: &str) -> String {
-    transient_agent_id("analyze_", ws_name, role)
-}
-
-/// Construct an agent ID for a deep-research sub-agent (decomposers, round-1 researchers,
-/// gap-round analysts, verification analysts): `research_{ws_name}_{suffix}_{label}`.
-#[must_use]
-pub(crate) fn research_agent_id(ws_name: &str, label: &str) -> String {
-    transient_agent_id("research_", ws_name, label)
-}
-
-/// Construct an agent ID for workspace role discovery: `discovery_{ws_name}_{suffix}_{role}`,
-/// role LAST ([`direct_agent_id`]).
-#[must_use]
-pub(crate) fn discovery_agent_id(ws_name: &str, role: &str) -> String {
-    transient_agent_id("discovery_", ws_name, role)
-}
-
-/// Construct the agent ID of a custom role's continuable branch: `role_{name}` for the record's
-/// default branch, `role_{name}:{identifier}` for a named one. Deterministic, so the next message
-/// on the branch resumes the same session, which persists like a direct conversation
-/// ([`CUSTOM_ROLE_AGENT_ID_PREFIX`]).
-#[must_use]
-pub(crate) fn custom_role_agent_id(name: &str, identifier: Option<&str>) -> String {
-    match identifier {
-        Some(identifier) => format!("{CUSTOM_ROLE_AGENT_ID_PREFIX}{name}:{identifier}"),
-        None => format!("{CUSTOM_ROLE_AGENT_ID_PREFIX}{name}"),
-    }
-}
-
-/// Construct the agent ID of a custom role's ONE-OFF run: `rolerun_{name}:{suffix}` — fresh per
-/// launch and transient ([`CUSTOM_ROLE_RUN_AGENT_ID_PREFIX`]).
-#[must_use]
-pub(crate) fn custom_role_run_agent_id(name: &str) -> String {
-    format!(
-        "{CUSTOM_ROLE_RUN_AGENT_ID_PREFIX}{name}:{}",
-        crate::generate_suffix()
-    )
-}
-
-/// Construct the agent ID of a worker branch: `worker_{branch}` — deterministic, so the next
-/// message on the branch resumes the same session, which persists like a direct conversation
-/// ([`WORKER_BRANCH_AGENT_ID_PREFIX`]).
-#[must_use]
-pub(crate) fn worker_branch_agent_id(branch: &str) -> String {
-    format!("{WORKER_BRANCH_AGENT_ID_PREFIX}{branch}")
-}
-
-#[must_use]
-pub(crate) fn is_worker_branch_agent_id(agent_id: &str) -> bool {
-    agent_id.starts_with(WORKER_BRANCH_AGENT_ID_PREFIX)
-}
-
-/// The branch name inside a worker branch's agent id, when the id is one.
-#[must_use]
-pub(crate) fn worker_branch_name(agent_id: &str) -> Option<&str> {
-    agent_id.strip_prefix(WORKER_BRANCH_AGENT_ID_PREFIX)
-}
-
 /// Whether a custom role's `name` may not be used: it IS a built-in agent-address namespace word,
 /// or it begins that namespace's address family (the prefix including its `_`), so the role's id
-/// ([`custom_role_agent_id`] / [`custom_role_run_agent_id`]) cannot read as a built-in one.
+/// ([`crate::address::AgentAddress::CustomRole`]) cannot read as a built-in one.
 ///
 /// The `_` is part of an address, not the SQL `LIKE` wildcard the user-name escaper
-/// ([`user_segment_collides`]) must defend against: `ticket`, `role` and the `ticket_*` / `role_*`
-/// families are refused, while `ticketx`, `rolex` and `roleplay` shadow nothing.
+/// ([`crate::address::safe_user_segment`]) must defend against: `ticket`, `role` and the
+/// `ticket_*` / `role_*` families are refused, while `ticketx`, `rolex` and `roleplay` shadow
+/// nothing.
 #[must_use]
 pub(crate) fn custom_role_name_is_reserved(name: &str) -> bool {
     reserved_custom_role_prefixes().any(|prefix| {
         let word = prefix.trim_end_matches('_');
-        name.eq_ignore_ascii_case(word) || starts_with_ignore_ascii_case(name, prefix)
+        name.eq_ignore_ascii_case(word)
+            || crate::address::starts_with_ignore_ascii_case(name, prefix)
     })
 }
 
@@ -1993,8 +1732,11 @@ pub(crate) fn custom_role_name_is_reserved(name: &str) -> bool {
 /// both a transient prefix and a custom-role one.
 pub(crate) fn reserved_custom_role_prefixes() -> impl Iterator<Item = &'static str> {
     let mut seen = std::collections::BTreeSet::new();
-    non_user_facing_agent_id_prefixes()
-        .chain([CUSTOM_ROLE_AGENT_ID_PREFIX, CUSTOM_ROLE_RUN_AGENT_ID_PREFIX])
+    crate::address::non_user_facing_agent_id_prefixes()
+        .chain([
+            crate::address::CUSTOM_ROLE_AGENT_ID_PREFIX,
+            crate::address::CUSTOM_ROLE_RUN_AGENT_ID_PREFIX,
+        ])
         .filter(move |prefix| seen.insert(*prefix))
 }
 
@@ -2022,7 +1764,7 @@ mod tests {
                 msg,
                 ws,
                 &crate::Role::Assistant,
-                None,
+                &crate::work_unit::WorkUnit::Turn,
                 "gui",
                 "tester",
                 None,
@@ -2208,7 +1950,8 @@ mod tests {
         let conn = &crate::session::store().conn;
         // clear_session resolves the pin internally from user/role/workspace, so
         // the sync job must be owned by that resolved agent id.
-        let agent_id = resolve_agent_id("clear_user", "engineer", "clear_ws");
+        let agent_id =
+            crate::address::AgentAddress::routed("clear_user", "engineer", "clear_ws").id();
 
         crate::jobs::spawn_job(
             conn,
@@ -2672,10 +2415,11 @@ mod tests {
         let (store, _dir) = crate::open_test_store!(crate::session::SessionStore, "session");
 
         // Direct session plus one per excluded prefix — the union of `manager_` and
-        // [`TRANSIENT_AGENT_ID_PREFIXES`], plus the custom-role `role_` branch the reserved set
+        // [`crate::address::TRANSIENT_AGENT_ID_PREFIXES`], plus the custom-role `role_` branch the
+        // reserved set
         // adds.
         let direct_id = unique_key();
-        let excluded_prefixes: Vec<&str> = reserved_agent_id_prefixes().collect();
+        let excluded_prefixes: Vec<&str> = crate::address::reserved_agent_id_prefixes().collect();
         let prefixed_ids: Vec<String> = excluded_prefixes
             .iter()
             .map(|p| format!("{p}{}", unique_key()))
@@ -2754,8 +2498,12 @@ mod tests {
     #[tokio::test]
     async fn a_chain_step_is_a_recovery_candidate_whatever_its_prefix() {
         let (store, _dir) = crate::open_test_store!(crate::session::SessionStore, "session");
-        let excluded_prefixes: Vec<&str> = reserved_agent_id_prefixes().collect();
-        let step_id = format!("{CUSTOM_ROLE_RUN_AGENT_ID_PREFIX}{}", unique_key());
+        let excluded_prefixes: Vec<&str> = crate::address::reserved_agent_id_prefixes().collect();
+        let step_id = format!(
+            "{}{}",
+            crate::address::CUSTOM_ROLE_RUN_AGENT_ID_PREFIX,
+            unique_key()
+        );
         store
             .batch_append_with_context(
                 &step_id,
@@ -2813,7 +2561,7 @@ mod tests {
     #[tokio::test]
     async fn a_branch_records_the_schema_its_answer_must_come_back_as() {
         let (store, _dir) = crate::open_test_store!(crate::session::SessionStore, "session");
-        let agent_id = crate::session::worker_branch_agent_id(&unique_key());
+        let agent_id = crate::address::AgentAddress::worker_branch(unique_key()).id();
         let extract = crate::extract::Extract::from_text(
             r#"{"type":"object","properties":{"summary":{"type":"string"}}}"#,
         )
@@ -3076,15 +2824,12 @@ mod tests {
         // re-appended; the empty-tail no-op is reported.
         assert_eq!(
             session.finalize(&k).await.unwrap(),
-            FinalizeOutcome::NoUnpersistedTail
+            SessionFlush::NoUnpersistedTail
         );
         assert_eq!(store().load(&k).await.len(), 3);
 
         session.push_assistant("a2".to_string());
-        assert_eq!(
-            session.finalize(&k).await.unwrap(),
-            FinalizeOutcome::Flushed
-        );
+        assert_eq!(session.finalize(&k).await.unwrap(), SessionFlush::Flushed);
         let msgs = store().load(&k).await;
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[3].content, "a2");
@@ -3165,252 +2910,6 @@ mod tests {
             .map(|m| m.content)
             .collect();
         assert_eq!(contents, ["prompt", "u1", "C1"]);
-    }
-}
-
-// [`TRANSIENT_AGENT_ID_PREFIXES`] controls which sessions [`cleanup_old_transient_sessions`]
-// purges (SQL `LIKE '{prefix}%'`). Two invariants:
-//
-// 1. **Forward (no collision)**: user-facing agent IDs must never start with a transient prefix,
-//    or the cleanup would silently delete user history — a colliding name is escaped by
-//    [`safe_user_segment`].
-// 2. **Reverse (inclusion)**: every transient builder must produce an ID whose prefix is
-//    registered, or those sessions never get cleaned up (a leak). A new transient role must add
-//    its builder to the reverse test.
-
-#[cfg(test)]
-mod transient_prefix_tests {
-    use super::*;
-
-    #[test]
-    fn forward_no_collision_with_user_facing_agent_ids() {
-        // Every reserved prefix (manager_ plus all transient prefixes) is a
-        // possible leading segment of a direct agent ID. A real user whose
-        // name collides with a reserved prefix is escaped with a `user_`
-        // prefix by `safe_user_segment`, so their conversation is never
-        // mistaken for a transient/background agent.
-        let reserved_prefixes: Vec<&str> = reserved_agent_id_prefixes().collect();
-
-        for prefix in &reserved_prefixes {
-            let bare_word = prefix.trim_end_matches('_');
-
-            // Capitalized variant (uppercase only the first char) covers the
-            // ASCII case-insensitivity of Turso's SQLite-compatible `LIKE`,
-            // e.g. `Ticket`, `Manager`.
-            let capitalized = {
-                let mut chars = bare_word.chars();
-                match chars.next() {
-                    Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
-                    None => bare_word.to_string(),
-                }
-            };
-
-            // Forms 1–5: bare word, underscore separator, the no-underscore
-            // SQL-LIKE gap (e.g. "ticketx"), a capitalized variant, and a
-            // capitalized+suffixed variant. Each must be escaped by
-            // `safe_user_segment` so the produced ID never starts
-            // (case-insensitively) with the bare reserved word.
-            let user_names: [String; 5] = [
-                bare_word.to_string(),
-                format!("{bare_word}_bob"),
-                format!("{bare_word}x"),
-                capitalized.clone(),
-                format!("{capitalized}Bob"),
-            ];
-            for user_name in &user_names {
-                let key = direct_agent_id(user_name, "analyst", "test-ws");
-                assert!(
-                    !starts_with_ignore_ascii_case(&key, bare_word),
-                    "DIRECT AGENT ID COLLISION: bare-word='{bare_word}' \
-                     (case-insensitive) matches id='{key}' (user='{user_name}'). \
-                     Fix: safe_user_segment must escape any user name starting \
-                     (case-insensitively) with '{bare_word}'.",
-                );
-            }
-
-            // Form 6 (injective escape): a real user whose name already begins
-            // with `user_` is escaped AGAIN, so `user_{bare_word}` (the escape
-            // of the bare reserved word) can never collide with a distinct
-            // real user literally named `user_{bare_word}`.
-            let user_word = format!("user_{bare_word}");
-            let escaped_key = direct_agent_id(&user_word, "analyst", "test-ws");
-            assert!(
-                escaped_key.starts_with("user_user_"),
-                "real user '{user_word}' should be double-escaped to start \
-                 with 'user_user_', got '{escaped_key}'",
-            );
-            assert_ne!(
-                escaped_key,
-                direct_agent_id(bare_word, "analyst", "test-ws"),
-                "escape of '{bare_word}' collides with escape of '{user_word}'",
-            );
-        }
-
-        // Manager uses a separate ID format (manager_{ws_name}) — it must
-        // never collide with a transient prefix.
-        for prefix in TRANSIENT_AGENT_ID_PREFIXES {
-            let manager_key = manager_agent_id("test-ws");
-            assert!(
-                !manager_key.starts_with(prefix),
-                "MANAGER AGENT ID COLLISION: prefix='{prefix}' \
-                 matches id='{manager_key}'. \
-                 Fix: remove '{prefix}' from TRANSIENT_AGENT_ID_PREFIXES \
-                 or change the manager_agent_id pattern.",
-            );
-        }
-
-        // A normal user is NOT escaped — the id keeps its raw user segment.
-        assert_eq!(
-            direct_agent_id("alice", "analyst", "test-ws"),
-            "alice_test-ws_analyst",
-        );
-
-        // A bare reserved word IS escaped with a `user_` prefix so its session
-        // is never mistaken for the manager/transient session with the same prefix.
-        for prefix in &reserved_prefixes {
-            let bare_word = prefix.trim_end_matches('_');
-            let key = direct_agent_id(bare_word, "analyst", "test-ws");
-            assert!(
-                key.starts_with("user_"),
-                "bare reserved word '{bare_word}' should be escaped to start \
-                 with 'user_', got '{key}'",
-            );
-        }
-    }
-
-    fn assert_transient_key(key: &str, expected_prefix: &str, builder_expr: &str) {
-        assert!(
-            key.starts_with(expected_prefix),
-            "{builder_expr} = '{key}' does not start with '{expected_prefix}'.\n\
-             Fix: update {builder_expr} to produce IDs starting with '{expected_prefix}'.",
-        );
-        assert!(
-            TRANSIENT_AGENT_ID_PREFIXES.contains(&expected_prefix),
-            "TRANSIENT_AGENT_ID_PREFIXES is missing '{expected_prefix}' — \
-             {builder_expr} sessions will never be cleaned up.\n\
-             Fix: add \"{expected_prefix}\" to TRANSIENT_AGENT_ID_PREFIXES.",
-        );
-    }
-
-    #[test]
-    fn reverse_transient_builders_use_registered_prefixes() {
-        // Each transient agent ID builder must produce IDs starting with a prefix registered in
-        // TRANSIENT_AGENT_ID_PREFIXES.
-        assert_transient_key(
-            &ticket_agent_id("abc123", "analyst"),
-            "ticket_",
-            "ticket_agent_id('abc123', 'analyst')",
-        );
-        assert_transient_key(
-            &analyze_agent_id("ws", "worker"),
-            "analyze_",
-            "analyze_agent_id('ws', 'worker')",
-        );
-        assert_transient_key(
-            &research_agent_id("ws", "decomposer"),
-            "research_",
-            "research_agent_id('ws', 'decomposer')",
-        );
-        // The research-cleanup Sanitation id is built by the shared `cleanup_agent_id` builder in
-        // research_cleanup.rs (fresh dispatch and boot-resume) — asserting the REAL builder keeps
-        // the invariant honest; a literal would silently pass if the builder changed, leaking one
-        // session per research run.
-        assert_transient_key(
-            &crate::research_cleanup::cleanup_agent_id("run_abc123"),
-            "cleanup_",
-            "cleanup_agent_id('run_abc123')",
-        );
-        assert_transient_key(
-            &maintainer_agent_id("ws"),
-            "maintainer_",
-            "maintainer_agent_id('ws')",
-        );
-        assert_transient_key(
-            &discovery_agent_id("ws", "analyst"),
-            "discovery_",
-            "discovery_agent_id('ws', 'analyst')",
-        );
-        assert_transient_key(
-            &custom_role_run_agent_id("ws"),
-            "rolerun_",
-            "custom_role_run_agent_id('ws')",
-        );
-    }
-
-    /// A one-off run's address must keep its role name recoverable: with a `_` separator, a role
-    /// named `a_b` and the NanoID suffix's own `_` would make role `a_b` + suffix `c` and role `a`
-    /// + suffix `b_c` one identical id.
-    #[test]
-    fn one_off_run_address_separates_the_name_from_its_suffix() {
-        let id = custom_role_run_agent_id("a_b");
-        let (name, suffix) = id
-            .strip_prefix(CUSTOM_ROLE_RUN_AGENT_ID_PREFIX)
-            .expect("the one-off prefix")
-            .split_once(':')
-            .expect("a `:` between the name and the generated suffix");
-        assert_eq!(name, "a_b");
-        assert!(!suffix.is_empty(), "the suffix must survive the separator");
-    }
-
-    /// Dispatch is on the role string, matched exactly as [`crate::Role`] spells it: lowercase
-    /// `manager` addresses the workspace's Manager, while every other role — a capital-M `Manager`
-    /// included — is a direct, channel-agnostic id with the role as its LAST segment.
-    #[test]
-    fn resolve_agent_id_dispatches_on_the_lowercase_manager_role() {
-        let cases = [
-            ("alice", "manager", "my-workspace", "manager_my-workspace"),
-            (
-                "bob",
-                "engineer",
-                "my-workspace",
-                "bob_my-workspace_engineer",
-            ),
-            ("carol", "Manager", "ws", "carol_ws_Manager"),
-        ];
-        for (user, role, ws, expected) in cases {
-            assert_eq!(resolve_agent_id(user, role, ws), expected);
-        }
-        assert_ne!(
-            resolve_agent_id("carol", "Manager", "ws"),
-            "manager_ws",
-            "capital-M 'Manager' must not address the Manager"
-        );
-    }
-
-    #[test]
-    fn direct_agent_id_personal_workspace_dedup() {
-        // A user's OWN personal workspace dedups the duplicated user segment, so role is
-        // `:`-delimited after the marker.
-        assert_eq!(
-            direct_agent_id("alice", "assistant", "personal:alice"),
-            "alice_personal:assistant",
-        );
-
-        // Another user's personal workspace keeps the full form.
-        assert_eq!(
-            direct_agent_id("bob", "assistant", "personal:admin"),
-            "bob_personal:admin_assistant",
-        );
-
-        // A project named `personal_work` (no `personal:` prefix) is NOT deduped.
-        assert_eq!(
-            direct_agent_id("alice", "analyst", "personal_work"),
-            "alice_personal_work_analyst",
-        );
-
-        // A reserved-name user still gets the `user_` escape on the leading
-        // segment while the embedded user is compared raw — so the ID stays
-        // collision-safe yet deduped.
-        assert_eq!(
-            direct_agent_id("manager", "engineer", "personal:manager"),
-            "user_manager_personal:engineer",
-        );
-
-        // A user already starting with `user_` is injectively double-escaped.
-        assert_eq!(
-            direct_agent_id("user_ticket", "analyst", "personal:user_ticket"),
-            "user_user_ticket_personal:analyst",
-        );
     }
 }
 

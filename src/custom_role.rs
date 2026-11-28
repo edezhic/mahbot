@@ -233,7 +233,7 @@ pub(crate) async fn delete(name: &str) -> Result<()> {
         &[("{{role}}", name)],
     );
     if let Err(e) = crate::agent::message_router::deliver_assistant_notice(
-        &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
+        &crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id(),
         crate::users::ADMIN_USER_NAME,
         content,
     )
@@ -513,8 +513,8 @@ mod tests {
 
     #[test]
     fn branch_addresses_are_injective() {
-        let default = crate::session::custom_role_agent_id("a_b", None);
-        let named = crate::session::custom_role_agent_id("a", Some("b"));
+        let default = crate::address::AgentAddress::custom_role("a_b", None).id();
+        let named = crate::address::AgentAddress::custom_role("a", Some("b")).id();
         assert_eq!(default, "role_a_b");
         assert_eq!(named, "role_a:b");
         assert_ne!(
@@ -529,7 +529,7 @@ mod tests {
     #[tokio::test]
     async fn stop_marks_the_branch_and_drops_its_deferred_envelopes() {
         crate::util::test::init_test_stores().await;
-        let branch = crate::session::custom_role_agent_id("stopper", Some("night"));
+        let branch = crate::address::AgentAddress::custom_role("stopper", Some("night")).id();
         crate::util::test::seed_session_row(
             &crate::session::store().conn,
             &branch,

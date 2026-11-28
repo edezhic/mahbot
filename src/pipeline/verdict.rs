@@ -30,7 +30,7 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use crate::jobs::RowStatus;
+use crate::outcome::Outcome;
 use crate::retry::RetryExhausted;
 use crate::util::panic_message;
 use crate::{
@@ -353,7 +353,7 @@ impl ParallelVerdict {
 
 /// One round member's result, as the round reports it: its verdict, whether it stopped rather
 /// than failed, and the provider facts a failure carried. `paused` and `cut_short` drive the
-/// round's own freeze and the death predicate ([`super::notice::Participant::of`]) — a
+/// round's own freeze and the death predicate ([`super::notice::Member::of`]) — a
 /// cancellation, a freeze or a phase-gate bail is never a stage death. `class` and `attempts` are
 /// what a death notice says about the failure.
 #[derive(Clone)]
@@ -407,7 +407,7 @@ pub(crate) struct AgentSlot {
     pub idx: i64,
     pub agent_id: String,
     pub task: String,
-    pub status: RowStatus,
+    pub status: Outcome,
     pub outcome: Option<String>,
 }
 

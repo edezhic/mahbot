@@ -226,7 +226,7 @@ fn below_threshold(free: u64, capacity: u64) -> bool {
 /// Hand the notice to the admin assistant's ordinary queue.
 fn deliver(free: u64, capacity: u64, temp_root: &Path) {
     crate::agent::message_router::post_assistant_notice(
-        &crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME),
+        &crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id(),
         crate::users::ADMIN_USER_NAME,
         render_notice(free, capacity, temp_root),
     );

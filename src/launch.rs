@@ -244,16 +244,74 @@ fn launch_job(
     }
 }
 
-/// How a launch treats a folder another agent is already working in.
+/// A launch refused because another group holds the folder. Typed so a caller with no one to
+/// refuse — an automation's fire — can wait for the next sweep instead of failing the work.
+#[derive(Debug)]
+pub(crate) struct FolderHeld {
+    /// How the holder reads in the refusal — [`crate::workspace::holder_name`]'s wording.
+    pub working: String,
+    /// The folder, as the acknowledgements spell it.
+    pub folder: String,
+}
+
+impl std::fmt::Display for FolderHeld {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let working = &self.working;
+        let folder = &self.folder;
+        write!(
+            f,
+            "usage: {working} is already working in {folder}; the message was not sent, because \
+             two writers in one folder overwrite each other's edits and parallel agents that can \
+             collide must not be started in one folder — hint: split the work across different \
+             folders, or wait for the running one to finish, then send again."
+        )
+    }
+}
+
+impl std::error::Error for FolderHeld {}
+
+/// A launch refused because the workspace is frozen. Typed for the same reason as [`FolderHeld`]:
+/// a caller with no one to refuse — an automation's fire — waits for the next sweep instead of
+/// disarming the work.
+#[derive(Debug)]
+pub(crate) struct WorkspacePaused {
+    /// The workspace, as the acknowledgements spell it.
+    pub workspace: String,
+}
+
+impl std::fmt::Display for WorkspacePaused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let workspace = &self.workspace;
+        let refusal = crate::workspace::PAUSED_REFUSAL;
+        write!(f, "usage: workspace '{workspace}' {refusal}")
+    }
+}
+
+impl std::error::Error for WorkspacePaused {}
+
+/// Whether `error` is a workspace freeze — the one typed signal a pre-start refusal and a mid-run
+/// stop share, so a caller never spells the condition a second time.
+#[must_use]
+pub(crate) fn is_paused(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<WorkspacePaused>().is_some()
+}
+
+/// Whether `error` means the work waits for a later pass instead of failing: the workspace is
+/// frozen, or another writer holds the folder. The two stay distinct conditions with their own
+/// sentences; this is the one place a caller decides that a retry is due.
+#[must_use]
+pub(crate) fn waits_for_later(error: &anyhow::Error) -> bool {
+    is_paused(error) || error.downcast_ref::<FolderHeld>().is_some()
+}
+
+/// How a launch treats a folder another group is already working in.
 #[derive(Clone, Copy)]
 pub(crate) enum BusyFolder<'a> {
-    /// An ordinary delegation refuses it: two agents in one folder overwrite each other's edits.
+    /// An ordinary delegation refuses it: two writers in one folder overwrite each other's edits.
     Refuse,
-    /// A chain step. Its own chain's earlier steps and the conversation it targets are not another
-    /// agent — it waits its turn there — while any other agent in the folder still fails it.
+    /// A chain step. Its own chain and the conversation it targets are not another writer — it
+    /// waits its turn there — while any other group in the folder still fails it.
     Chain(&'a Chain),
-    /// A launch nobody asked for and nobody can refuse, an automation's: run it as before.
-    Ignore,
 }
 
 impl BusyFolder<'_> {
@@ -261,56 +319,62 @@ impl BusyFolder<'_> {
     fn chain(&self) -> Option<&Chain> {
         match self {
             Self::Chain(chain) => Some(chain),
-            Self::Refuse | Self::Ignore => None,
+            Self::Refuse => None,
         }
     }
 
     /// Refuse `folder` under this rule. `target` is the conversation the launch is aimed at, when
     /// it has one: a chain step waits its turn in it.
-    pub(crate) fn check(&self, folder: &crate::Workspace, target: Option<&str>) -> Result<()> {
-        // The caller is not ANOTHER agent: its own run is dispatching, and a custom role handing a
-        // worker its own folder is the normal delegation. The command line has no session.
-        let caller = crate::agent::tool_agent_id().ok();
-        let (ignore, chain) = match self {
-            Self::Refuse => (caller.as_deref(), None),
-            Self::Chain(chain) => (target, Some(chain.id.as_str())),
-            Self::Ignore => return Ok(()),
+    pub(crate) async fn check(self, folder: &crate::Workspace, target: Option<&str>) -> Result<()> {
+        // The freeze reaches every writer, a branch started after the pause included — otherwise it
+        // would write the frozen tree to completion and then be cut short with nothing to show. Read
+        // live, because the copy the caller resolved may predate a resume that landed since.
+        match crate::workspace::paused_now(&folder.name).await {
+            Ok(false) => {}
+            Ok(true) => {
+                return Err(WorkspacePaused {
+                    workspace: folder.name.clone(),
+                }
+                .into());
+            }
+            // A pause that cannot be read is not one: the launch fails as the fault it is.
+            Err(e) => return Err(e.context("could not read the folder's pause before the launch")),
+        }
+        // The caller's group is not ANOTHER writer: its own run is dispatching, and the worker it
+        // hands its folder is the normal delegation. The command line has no session.
+        let mut excluded: Vec<String> = crate::agent::tool_group().into_iter().collect();
+        if let Self::Chain(chain) = self {
+            excluded.push(crate::agent::registry::ParentKey::Chain(chain.id.clone()).group());
+            if let Some(target) = target {
+                // A launch is one conversation keyed by its own agent id — the same group key it
+                // registers under, so a chain step waits its turn in the branch it continues.
+                excluded
+                    .push(crate::agent::registry::ParentKey::Launch(target.to_string()).group());
+            }
+        }
+        let excluded: Vec<&str> = excluded.iter().map(String::as_str).collect();
+        let Some(running) =
+            crate::agent::registry::AGENT_REGISTRY.folder_holder(folder.as_path(), &excluded)
+        else {
+            return Ok(());
         };
-        refuse_busy_folder_excluding(folder, ignore, chain)
+        // The holder as the acknowledgements spell it — the one mapping the refusal and the
+        // workspace's own wait message share.
+        let working = crate::workspace::holder_name(&running.role);
+        // The folder as the acknowledgements spell it — the resolved path, one way.
+        let folder = folder.path.trim_end_matches(std::path::MAIN_SEPARATOR);
+        Err(FolderHeld {
+            working,
+            folder: folder.to_string(),
+        }
+        .into())
     }
 }
 
-/// Refuse a folder another agent is already working in: two agents in one folder overwrite each
+/// Refuse a folder another group is already working in: two writers in one folder overwrite each
 /// other's edits, so parallel agents that can collide must not be started in one folder.
-pub(crate) fn refuse_busy_folder(folder: &crate::Workspace) -> Result<()> {
-    BusyFolder::Refuse.check(folder, None)
-}
-
-fn refuse_busy_folder_excluding(
-    folder: &crate::Workspace,
-    ignore: Option<&str>,
-    chain: Option<&str>,
-) -> Result<()> {
-    let Some(running) = crate::agent::registry::AGENT_REGISTRY.worker_in_folder_excluding_chain(
-        folder.as_path(),
-        ignore,
-        chain,
-    ) else {
-        return Ok(());
-    };
-    let working = if running.role == crate::Role::Worker.as_str() {
-        "a worker"
-    } else {
-        "a custom role"
-    };
-    // The folder as the acknowledgements spell it — the resolved path, one way.
-    let folder = folder.path.trim_end_matches(std::path::MAIN_SEPARATOR);
-    Err(anyhow::anyhow!(
-        "usage: {working} is already working in {folder}; the message was not sent, because two \
-         agents in one folder overwrite each other's edits and parallel agents that can collide \
-         must not be started in one folder — hint: split the work across different folders, or wait \
-         for the running one to finish, then send again."
-    ))
+pub(crate) async fn refuse_busy_folder(folder: &crate::Workspace) -> Result<()> {
+    BusyFolder::Refuse.check(folder, None).await
 }
 
 /// Launch `name`'s custom role with `message` as the launch message.
@@ -357,13 +421,13 @@ pub(crate) async fn custom_role(
     // named branch; otherwise the record's behaviour picks between the one
     // common branch and a fresh one-off run.
     let agent_id = match identifier {
-        Some(id) => crate::session::custom_role_agent_id(name, Some(id)),
+        Some(id) => crate::address::AgentAddress::custom_role(name, Some(id)).id(),
         None => match role.behavior {
             crate::custom_role::CustomRoleBehavior::Continuous => {
-                crate::session::custom_role_agent_id(name, None)
+                crate::address::AgentAddress::custom_role(name, None).id()
             }
             crate::custom_role::CustomRoleBehavior::OneOff => {
-                crate::session::custom_role_run_agent_id(name)
+                crate::address::AgentAddress::custom_role_run(name).id()
             }
         },
     };
@@ -371,7 +435,7 @@ pub(crate) async fn custom_role(
     // A chain step waits its turn in the conversation it names — its own steps and that
     // conversation are not another agent — while any other agent in the folder still fails the
     // chain; an ordinary delegation refuses the folder outright.
-    busy.check(workspace, Some(&agent_id))?;
+    busy.check(workspace, Some(&agent_id)).await?;
 
     // The answer (and the failure notice) returns to the agent that launched this one, or to the
     // owner's Assistant when nothing launched it — one carrier, the launch itself.
@@ -388,7 +452,7 @@ pub(crate) async fn custom_role(
     };
     let id = hand_over_launch(launch, message, &workspace.name, answered_for).await?;
 
-    Ok(crate::send_outcome::acknowledged(
+    Ok(crate::jobs::acknowledged(
         format!(
             "custom role '{name}' launched on branch {agent_id} in {}",
             workspace.name
@@ -407,7 +471,7 @@ pub(crate) async fn custom_role(
 /// worker runs today when none is given. A later use pointing at another folder
 /// runs it there; the branch name identifies the conversation and its history,
 /// so the same name resumes the same conversation. Returns a one-line
-/// acknowledgement — with the id a status query names, when the command line made
+/// acknowledgement — with the id the record answers to, when the command line made
 /// the launch, since a worker branch's report arrives when its turn finishes
 /// rather than in a durable round.
 ///
@@ -448,8 +512,8 @@ pub(crate) async fn worker_branch(
     // back into the same place.
     let workspace_name = place.map_or_else(|| caller_ws.name.clone(), |ws| ws.path.clone());
     let folder = place.unwrap_or(caller_ws);
-    let agent_id = crate::session::worker_branch_agent_id(branch);
-    busy.check(folder, Some(&agent_id))?;
+    let agent_id = crate::address::AgentAddress::worker_branch(branch.to_owned()).id();
+    busy.check(folder, Some(&agent_id)).await?;
 
     // The report returns to the conversation that asked: this branch's own
     // address when a custom role asked (the launch carries the asker), the
@@ -477,7 +541,7 @@ pub(crate) async fn worker_branch(
     let ack = format!(
         "Worker branch '{branch}' is on it in {folder}; its report arrives as a <worker-report> message."
     );
-    Ok(crate::send_outcome::acknowledged(ack, id.as_deref()))
+    Ok(crate::jobs::acknowledged(ack, id.as_deref()))
 }
 
 /// Hand a built launch over as one durable envelope: persisted BEFORE it is routed, so it survives
@@ -559,5 +623,58 @@ pub(crate) async fn launch_workspace(place: Option<&str>) -> Result<crate::Works
                  to an existing directory"
             )
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A freeze reaches every launch: the folder rule refuses a frozen workspace before anything
+    /// else is asked, with the owner-facing pause sentence, and the refusal is typed so a caller
+    /// with nobody to answer — an automation's fire — waits instead of failing the work. The pause
+    /// is read live, so a copy that predates a resume cannot refuse a launch.
+    #[serial_test::serial]
+    #[tokio::test]
+    async fn a_paused_workspace_refuses_every_launch() {
+        let _guard = crate::util::test::STORE_LOCK.lock().await;
+        crate::util::test::init_test_stores().await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let ws = crate::util::test::create_test_workspace(
+            dir.path().to_str().unwrap(),
+            "paused_launch_ws",
+        )
+        .await;
+        assert!(
+            BusyFolder::Refuse.check(&ws, None).await.is_ok(),
+            "an unpaused workspace with a free folder passes"
+        );
+
+        crate::workspace::store()
+            .set_paused(&ws.name, true)
+            .await
+            .expect("freeze the workspace");
+        assert!(
+            !ws.paused,
+            "the caller's copy still reads unpaused: the live read is what refuses"
+        );
+        let refused = BusyFolder::Refuse
+            .check(&ws, None)
+            .await
+            .expect_err("a frozen workspace refuses a launch");
+        assert!(
+            refused.downcast_ref::<WorkspacePaused>().is_some(),
+            "the refusal is typed: {refused}"
+        );
+        assert!(
+            refused
+                .to_string()
+                .contains(crate::workspace::PAUSED_REFUSAL),
+            "the refusal reads as the owner's pause: {refused}"
+        );
+        assert!(
+            refuse_busy_folder(&ws).await.is_err(),
+            "the plain rule agrees"
+        );
     }
 }

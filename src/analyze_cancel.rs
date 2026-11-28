@@ -1,6 +1,6 @@
 //! The analyze tool's cancel action: it stops one of the calling session's dispatched quick
 //! analysis rounds, named by the job id its acknowledgement carried, and durably discards its
-//! result. The cancel-signal registry lives in [`crate::round_cancel`].
+//! result. The cancel-signal registry lives in [`crate::stop`].
 //!
 //! Ownership: a round is the caller's while its `jobs` row (or, before that row is written, its
 //! in-process cancel-signal entry) does, or while its produced result waits in `pending_jobs`.
@@ -51,7 +51,7 @@ pub(crate) async fn cancel_round(job_id: &str, caller: &str) -> anyhow::Result<C
     };
     // The signal is fired BEFORE any row is deleted: a completion, a delivery or a spawn racing
     // this cancel then sees the signal and refuses.
-    crate::round_cancel::cancel(job_id);
+    crate::stop::fire(job_id);
     // The round's agents stop as a group, and its consolidation call is cancelled with them.
     crate::agent::registry::AGENT_REGISTRY
         .cancel_by_parent_key(&ParentKey::AnalyzeRound(job_id.to_string()));
@@ -111,7 +111,7 @@ async fn locate(
     }
     // A round whose row is not written yet, or whose row this very cancel just removed.
     Ok(
-        (crate::round_cancel::registered_caller(job_id).as_deref() == Some(caller))
+        (crate::stop::registered_caller(job_id).as_deref() == Some(caller))
             .then_some((Cancelled::Stopped, None)),
     )
 }

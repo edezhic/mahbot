@@ -817,7 +817,7 @@ async fn dispatch_temp_cleanup(roots: &[CleanupRoot]) -> Result<()> {
         "",
         crate::Role::Sanitation,
         &[crate::jobs::NewAgent {
-            agent_id: crate::research_cleanup::cleanup_agent_id(&job_id),
+            agent_id: crate::address::AgentAddress::cleanup(&job_id).id(),
             kind: crate::jobs::AgentKind::Sanitation,
             idx: None,
             task: prompt.clone(),
@@ -852,7 +852,7 @@ async fn dispatch_temp_cleanup(roots: &[CleanupRoot]) -> Result<()> {
 /// the agent. No folder hold exists for this cleaner (unlike research cleanup): the row is simply
 /// deleted when the run finishes, success or failure, so the next due pass re-runs cleanly.
 async fn run_temp_cleanup_and_finish(job_id: &str, ws: &Workspace, prompt: &str) {
-    let agent_id = crate::research_cleanup::cleanup_agent_id(job_id);
+    let agent_id = crate::address::AgentAddress::cleanup(job_id).id();
     let run = std::panic::AssertUnwindSafe(crate::agent::run_default_agent(
         &agent_id,
         crate::Role::Sanitation,
@@ -860,8 +860,7 @@ async fn run_temp_cleanup_and_finish(job_id: &str, ws: &Workspace, prompt: &str)
         prompt,
         false,
         None,
-        None,
-        None,
+        crate::work_unit::WorkUnit::Turn,
     ))
     .catch_unwind()
     .await;

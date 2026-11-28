@@ -62,12 +62,8 @@ Usage:
                          'mahbot workspace reference' lists every action and field
   mahbot send [flags]    Hand one message to an agent and finish — the answer
                          arrives later in your assistant's conversation, and the
-                         acknowledgement names the id 'mahbot outcome' reports
-                         on; nothing comes back from the one-way address
-  mahbot outcome [flags]
-                         Report what became of a command-line send: one line
-                         of JSON with its state, answer, failure reason and,
-                         for a running chain, the step it is on
+                         acknowledgement names the dispatch row its id reports on;
+                         nothing comes back from the one-way address
   mahbot document <operation> [flags]
                          Read a document with the RUNNING product's reader, or
                          produce one with its document tool
@@ -194,8 +190,7 @@ pub(crate) async fn wait_for_service() -> ServiceGate {
 /// without the target: a word or flag nobody has, a flag with no value, a token
 /// that is no flag, an argument that is not text — and, for a frontend that opens
 /// files itself, the filesystem's verdict on the paths it was handed. Everything
-/// the TARGET judges is a failed operation instead — bar the one family whose own
-/// refusal is the environment's ([`Refusal`]). A frontend that only CARRIES the
+/// the TARGET judges is a failed operation instead. A frontend that only CARRIES the
 /// operation (this one) holds no copy of the target's rules, so it never guesses a
 /// class; `mahbot audio`, which RUNS its target, may judge that target's published
 /// vocabulary as misuse. Each family's help says what its classes mean.
@@ -237,19 +232,6 @@ pub(crate) struct Family {
     pub(crate) purpose: &'static str,
     /// What follows the family's word: an operation to run, or nothing at all.
     pub(crate) surface: Surface,
-    /// What a refusal the product itself answered means for this family.
-    pub(crate) refusal: Refusal,
-}
-
-/// What a refusal the product itself answered means for one family. [`Refusal::Operation`]
-/// everywhere: the tool took the operation on and it did not happen, so the product's own
-/// wording is printed to stdout with the failed class. [`Refusal::Environment`] for the one
-/// family whose whole job is to READ a durable record: a read that failed answered nothing, so
-/// its wording is this command's diagnostic and the class is the environment's.
-#[derive(Clone, Copy)]
-pub(crate) enum Refusal {
-    Operation,
-    Environment,
 }
 
 pub(crate) enum Surface {
@@ -264,6 +246,7 @@ pub(crate) enum Surface {
 
 /// One command-line operation: the action it runs (where the tool has one) and its
 /// flags. It runs the family's tool ([`Family::tool`]).
+#[derive(Clone, Copy)]
 pub(crate) struct Operation {
     /// The tool's own `action` value, or `None` where the tool takes no action
     /// (the picture tool and the video tool): the operation then IS that tool.
@@ -360,6 +343,7 @@ fn family_syntax(family: &Family) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct Flag {
     /// The tool's own argument name; the command-line spelling is derived from it
     /// (`ticket_id` → `--ticket-id`), so a flag can never be spelled a way the tool
@@ -381,6 +365,7 @@ pub(crate) struct Flag {
 /// a `Path` its one value, a `PathList` every entry, a `Structured` every string
 /// the fields it carries name, a `Directory` its one folder — and an
 /// `UncheckedPath` and an `Output` too, minus the proof that the path is there.
+#[derive(Clone, Copy)]
 pub(crate) enum FlagKind {
     /// One value per occurrence: `--name bob`, read as text or — like the kinds
     /// below — taken from a FILE by writing `@<file>`.
@@ -475,6 +460,77 @@ impl FlagKind {
 /// every tool-backed operation to its tool's actions and pins this one separately.
 pub(crate) const DOCUMENT_READ: &str = "read";
 
+const PROFILE_READ: Operation = Operation {
+    action: Some("profile"),
+    purpose: "Read a workspace's profile: who staffs each stage, its pass conditions, what \
+              confirmation puts in force and the project's checks",
+    flags: &[Flag {
+        arg: "workspace",
+        kind: FlagKind::Value,
+        purpose: "The managed workspace whose profile is read",
+    }],
+};
+
+/// Accept a workspace's profile — served by both families.
+const PROFILE_CONFIRM: Operation = Operation {
+    action: Some("confirm_profile"),
+    purpose: "Accept a workspace's profile — the pipeline runs from the next stage round",
+    flags: &[Flag {
+        arg: "workspace",
+        kind: FlagKind::Value,
+        purpose: "The managed workspace whose profile is confirmed",
+    }],
+};
+
+/// Change part of a workspace's profile — served by both families.
+const PROFILE_SET: Operation = Operation {
+    action: Some("set_profile"),
+    purpose: "Change part of a workspace's profile; an unedited field keeps following the \
+              default",
+    flags: &[
+        Flag {
+            arg: "workspace",
+            kind: FlagKind::Value,
+            purpose: "The managed workspace whose profile changes",
+        },
+        Flag {
+            arg: "stage",
+            kind: FlagKind::Value,
+            purpose: "The stage whose participants change: analysis, planning, \
+                          in_development, verification or in_sanitation",
+        },
+        Flag {
+            arg: "participants",
+            kind: FlagKind::List,
+            purpose: "The stage's participants — analyst, manager, engineer, reviewer, \
+                          tester or sanitation; repeat once per participant (an empty list \
+                          follows the default again)",
+        },
+        Flag {
+            arg: "pass_threshold",
+            kind: FlagKind::Number,
+            purpose: "Verification's passing score, 0-10",
+        },
+        Flag {
+            arg: "require_all_checks",
+            kind: FlagKind::Present,
+            purpose: "Whether every project command must pass; write \
+                          `--require-all-checks=false` to let a round pass with a failing check",
+        },
+    ],
+};
+
+/// Return a workspace's profile to the default — served by both families.
+const PROFILE_RESET: Operation = Operation {
+    action: Some("reset_profile"),
+    purpose: "Return every profile field to the shipped default, keeping the confirmation",
+    flags: &[Flag {
+        arg: "workspace",
+        kind: FlagKind::Value,
+        purpose: "The managed workspace whose profile is reset",
+    }],
+};
+
 /// The command lines this file fronts: the admin Assistant's own toolset — the
 /// tool each family names, and nothing else the owner holds is reachable through
 /// the channel. Words are derived from here ([`family_words`],
@@ -483,14 +539,14 @@ pub(crate) const FAMILIES: &[Family] = &[
     Family {
         word: "config",
         tool: "mahbot_config",
-        // Both families whose surface this build widened carry the settings generation: a product
-        // built before it knows neither the settings actions nor the arguments they carry, and
-        // would answer a `set` as an unknown action — so it is refused as an unknown store
-        // instead, with nothing run.
-        protocol: crate::db::ipc::CALL_STORE_SETTINGS,
+        // Its surface gained the workspace profile's actions, so it carries the generation that
+        // knows them: a product built before them would answer `profile` as an unknown action, and
+        // the frame is refused as an unknown store instead, with nothing run. The settings
+        // generation it carried before is still served for a frontend one build behind.
+        protocol: crate::db::ipc::CALL_STORE_WORKSPACE_PROFILE,
         purpose: "Read and write the running product's settings — provider and endpoint, models, \
-                  media, web search, Telegram, audio, updates, accounts, grants, custom roles — \
-                  and set it all up in one command",
+                  media, web search, Telegram, audio, updates, accounts, grants, custom roles, a \
+                  workspace's profile — and set it all up in one command",
         surface: Surface::Operations(&[
             Operation {
                 action: Some("reference"),
@@ -748,18 +804,23 @@ pub(crate) const FAMILIES: &[Family] = &[
                     purpose: "The custom role to delete",
                 }],
             },
+            // The profile, reached through the product's configuration tool as well as through
+            // `mahbot workspace`: one table, one implementation.
+            PROFILE_READ,
+            PROFILE_CONFIRM,
+            PROFILE_SET,
+            PROFILE_RESET,
         ]),
-        refusal: Refusal::Operation,
     },
     Family {
         word: "workspace",
         tool: "workspace",
-        // Its surface gained the workspace's own settings and project actions — see
-        // [`CALL_STORE_SETTINGS`](crate::db::ipc::CALL_STORE_SETTINGS).
-        protocol: crate::db::ipc::CALL_STORE_SETTINGS,
+        // Its surface gained the workspace profile's actions — see
+        // [`CALL_STORE_WORKSPACE_PROFILE`](crate::db::ipc::CALL_STORE_WORKSPACE_PROFILE).
+        protocol: crate::db::ipc::CALL_STORE_WORKSPACE_PROFILE,
         purpose: "Work with the running product's workspaces — add, delete or re-analyse one, \
-                  its commands and rules, the active project and its maintenance — plus their \
-                  tickets and board",
+                  its commands and rules, its profile, the active project and its maintenance — \
+                  plus their tickets and board",
         surface: Surface::Operations(&[
             Operation {
                 action: Some("reference"),
@@ -828,9 +889,8 @@ pub(crate) const FAMILIES: &[Family] = &[
                     arg: "workspace",
                     kind: FlagKind::Value,
                     purpose: "The managed workspace to freeze; omit it to freeze EVERY \
-                              managed workspace (the fleet-wide pause — a workspace that is \
-                              not ready is skipped and left untouched, which makes that result \
-                              a partial one)",
+                              managed workspace (the fleet-wide pause — every workspace is \
+                              written, whatever its status)",
                 }],
             },
             // See `pause`: the same fleet-wide rule, the same absent key.
@@ -840,10 +900,10 @@ pub(crate) const FAMILIES: &[Family] = &[
                 flags: &[Flag {
                     arg: "workspace",
                     kind: FlagKind::Value,
-                    purpose: "The managed workspace to resume; omit it to resume EVERY \
-                              managed workspace (the fleet-wide resume — a workspace that is \
-                              not ready is skipped and left untouched, which makes that result \
-                              a partial one)",
+                    purpose: "The managed workspace to resume; omit it to resume EVERY managed \
+                              workspace (the fleet-wide resume — every workspace is written, \
+                              whatever its status, and each one's kept messages are answered and \
+                              its stopped rounds re-driven)",
                 }],
             },
             Operation {
@@ -864,8 +924,8 @@ pub(crate) const FAMILIES: &[Family] = &[
             },
             Operation {
                 action: Some("rediscover"),
-                purpose: "Re-analyse a workspace's project layout — discovery starts again, and \
-                          the pipeline waits for it",
+                purpose: "Re-analyse a workspace's project layout — discovery starts again beside \
+                          the pipeline, which keeps running",
                 flags: &[Flag {
                     arg: "workspace",
                     kind: FlagKind::Value,
@@ -952,6 +1012,11 @@ pub(crate) const FAMILIES: &[Family] = &[
                     },
                 ],
             },
+            // The same four operations `mahbot config` serves — one table, one implementation.
+            PROFILE_READ,
+            PROFILE_CONFIRM,
+            PROFILE_SET,
+            PROFILE_RESET,
             Operation {
                 action: Some("use"),
                 purpose: "Make a workspace the active project",
@@ -1013,7 +1078,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
         ]),
-        refusal: Refusal::Operation,
     },
     Family {
         word: "send",
@@ -1025,8 +1089,8 @@ pub(crate) const FAMILIES: &[Family] = &[
         // and an older instance refuses it as the environment's class instead.
         protocol: crate::db::ipc::CALL_STORE_SEND_FOLDER,
         purpose: "Hand one message to an agent and finish — the answer arrives later in your \
-                  assistant's conversation, and the acknowledgement names the id 'mahbot \
-                  outcome' reports on; nothing comes back from the one-way 'guest' address",
+                  assistant's conversation, and the acknowledgement names the dispatch row its id \
+                  reports on; nothing comes back from the one-way 'guest' address",
         surface: Surface::Standalone(&[
             Flag {
                 arg: "message",
@@ -1087,7 +1151,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                           requires an explicit '--addressee'",
             },
         ]),
-        refusal: Refusal::Operation,
     },
     // These families front the tools every Assistant holds regardless of account (the
     // media models resolve per-user), so the command line reaches what the owner's own
@@ -1270,7 +1333,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
         ]),
-        refusal: Refusal::Operation,
     },
     Family {
         word: "image",
@@ -1288,7 +1350,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 OUTPUT_DIR_FLAG,
             ],
         }]),
-        refusal: Refusal::Operation,
     },
     Family {
         word: "video",
@@ -1318,7 +1379,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 OUTPUT_DIR_FLAG,
             ],
         }]),
-        refusal: Refusal::Operation,
     },
     Family {
         word: "rasterize",
@@ -1326,7 +1386,6 @@ pub(crate) const FAMILIES: &[Family] = &[
         protocol: crate::db::ipc::CALL_STORE,
         purpose: "Turn a file into an ordinary picture with the running product's own rasterizer",
         surface: Surface::Standalone(&[RASTER_PATH_FLAG, RASTER_PAGE_FLAG, OUTPUT_DIR_FLAG]),
-        refusal: Refusal::Operation,
     },
     Family {
         word: "photocraft",
@@ -1374,20 +1433,6 @@ pub(crate) const FAMILIES: &[Family] = &[
                 ],
             },
         ]),
-        refusal: Refusal::Operation,
-    },
-    Family {
-        word: "outcome",
-        tool: "send_outcome",
-        protocol: crate::db::ipc::CALL_STORE_OUTCOME,
-        purpose: "Report what became of a command-line send, by the id its acknowledgement \
-                  printed, as one line of JSON",
-        surface: Surface::Standalone(&[Flag {
-            arg: "id",
-            kind: FlagKind::Value,
-            purpose: "The id the `send` acknowledgement printed",
-        }]),
-        refusal: Refusal::Environment,
     },
 ];
 
@@ -2325,33 +2370,16 @@ fn list_entries_from_file(flag: &Flag, file: &str) -> Result<Vec<serde_json::Val
 }
 
 /// The exit classes a family's help states: one skeleton, so no two can word it differently, and
-/// one set of sentences per refusal class — see [`Refusal`] and the split on [`Exit`].
-fn exit_class_help(refusal: Refusal) -> String {
-    let (failed, environment, closing) = match refusal {
-        Refusal::Operation => (
-            "the product took the call and it did not go through — it refused the call, carried it \
-             out only in part, or the exchange was severed after it went out (an operation that may \
-             be under way is never the environment's class)",
-            "the environment — nothing ran: the product is not up, its channel was not reachable, or \
-             it was in no state to take the call on",
-            "a call the product judged prints its own words on stdout — a refusal often beginning \
-             \"usage:\" — so the code says whether the operation was carried out, not how far it got.",
-        ),
-        // A read that failed answered nothing, so its wording is this command's diagnostic rather
-        // than the product's answer on stdout.
-        Refusal::Environment => (
-            "the operation failed — the exchange was severed after the call went out, so the record \
-             may or may not have been read",
-            "the environment — nothing was answered: the product is not up, its channel was not \
-             reachable, or the record could not be read",
-            "the state lives in the record, and only a read that worked prints it on stdout.",
-        ),
-    };
-    format!(
-        "\nExit codes:\n  0  the operation was carried out\n  1  {failed}\n  2  {environment}\n  \
-         3  this command rejected the call itself, before the product was asked\nA script reads the \
-         exit code, not the text: {closing}\n"
-    )
+/// the one set of sentences the split on [`Exit`] means.
+fn exit_class_help() -> &'static str {
+    "\nExit codes:\n  0  the operation was carried out\n  1  the product took the call and it did \
+     not go through — it refused the call, carried it out only in part, or the exchange was severed \
+     after it went out (an operation that may be under way is never the environment's class)\n  2  \
+     the environment — nothing ran: the product is not up, its channel was not reachable, or it was \
+     in no state to take the call on\n  3  this command rejected the call itself, before the product \
+     was asked\nA script reads the exit code, not the text: a call the product judged prints its own \
+     words on stdout — a refusal often beginning \"usage:\" — so the code says whether the operation \
+     was carried out, not how far it got.\n"
 }
 
 /// What one of these command lines IS — shared by every help, so a caller entering
@@ -2482,7 +2510,7 @@ fn family_help(family: &Family) -> String {
             out.push_str("\n  -h, --help  Print this help and exit\n");
         }
     }
-    out.push_str(&exit_class_help(family.refusal));
+    out.push_str(exit_class_help());
     out.push_str(OUTPUT_HELP);
     out.push_str(VALUE_FILE_HELP);
     // Where the whole surface is written down: the asset a `reference` operation prints, here and
@@ -2600,7 +2628,7 @@ fn operation_help(family: &Family, operation: &Operation) -> String {
         running_contract_help("")
     };
     out.push_str(&contract);
-    out.push_str(&exit_class_help(family.refusal));
+    out.push_str(exit_class_help());
     out.push_str(OUTPUT_HELP);
     out.push_str(VALUE_FILE_HELP);
     out
@@ -2747,7 +2775,6 @@ pub async fn run(cli: Cli, args: &[String]) -> i32 {
     };
     let decision = verdict(
         family.word,
-        family.refusal,
         crate::db::ipc::ipc_call_with_wait(&root, &call, family.protocol).await,
     );
     if let Some(answer) = decision.answer {
@@ -2961,16 +2988,14 @@ struct Verdict {
 /// An answer the product gave goes to stdout whatever its outcome: the exit code,
 /// not the text, says whether the operation was carried out, and a partial run adds
 /// one short diagnostic, so the caller need not read the product's wording for a
-/// verdict. A refusal is the family's own class ([`Refusal`]): an operation's
-/// refusal is still the product's answer on stdout with the failed class, while the
-/// one family that only READS a durable record treats a refusal as this command's
-/// diagnostic and the environment's class. An operation never taken on has no
+/// verdict. A refusal is the product's answer on stdout with the failed class. An
+/// operation never taken on has no
 /// answer: the product's wording (or this command's) goes to stderr and the class is
 /// the environment's. An exchange severed after the frame went out is NOT the
 /// environment's — it may have happened — so it is a failed operation, and the
 /// diagnostic states once that the outcome is unknown and that it was deliberately
 /// not sent again.
-fn verdict(word: &str, refusal: Refusal, attempt: CallAttempt) -> Verdict {
+fn verdict(word: &str, attempt: CallAttempt) -> Verdict {
     match attempt {
         CallAttempt::Answered(reply) => match reply.outcome {
             CallOutcome::Done => Verdict {
@@ -2986,17 +3011,10 @@ fn verdict(word: &str, refusal: Refusal, attempt: CallAttempt) -> Verdict {
                 )),
                 code: Exit::Failed,
             },
-            CallOutcome::Refused => match refusal {
-                Refusal::Operation => Verdict {
-                    answer: Some(reply.answer),
-                    diagnostic: None,
-                    code: Exit::Failed,
-                },
-                Refusal::Environment => Verdict {
-                    answer: None,
-                    diagnostic: Some(format!("mahbot {word}: {}", reply.answer)),
-                    code: Exit::Environment,
-                },
+            CallOutcome::Refused => Verdict {
+                answer: Some(reply.answer),
+                diagnostic: None,
+                code: Exit::Failed,
             },
             // A product that did not take the operation on: `Unavailable` reaches the
             // caller as the instance answered it (an unrestricted socket, a failed or
@@ -3908,28 +3926,30 @@ mod tests {
             .collect();
         assert_eq!(
             settings,
-            vec!["config", "workspace"],
-            "the two families whose surface this build widened — a product built before them \
-             would answer a `set` as an unknown action and drop a `set_diagnostics` field"
+            Vec::<&str>::new(),
+            "the settings generation the `config` family carried before it gained the profile \
+             actions — no family carries it any more, and the listener still serves it"
         );
-        let outcome: Vec<&str> = FAMILIES
+        let profile: Vec<&str> = FAMILIES
             .iter()
-            .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE_OUTCOME)
+            .filter(|cli| cli.protocol == crate::db::ipc::CALL_STORE_WORKSPACE_PROFILE)
             .map(|cli| cli.word)
             .collect();
         assert_eq!(
-            outcome,
-            vec!["outcome"],
-            "the family added after the channel had served every earlier generation"
+            profile,
+            vec!["config", "workspace"],
+            "the families whose surface gained the profile actions — a product built before them \
+             would answer `profile` as an unknown action"
         );
         // The base generation and the `send` generations this build's `send` has outgrown are
         // served but carried by no family any more: a frontend one build behind still sends them,
-        // so the listener must keep answering them.
+        // so the listener must keep answering them. The settings generation joined them when the
+        // `config` family gained the profile actions.
         for retired in [
             crate::db::ipc::CALL_STORE_BASE,
+            crate::db::ipc::CALL_STORE_SETTINGS,
             crate::db::ipc::CALL_STORE_SEND_CHAIN,
             crate::db::ipc::CALL_STORE_SEND,
-            crate::db::ipc::CALL_STORE_SEND_OUTCOME,
         ] {
             assert!(
                 crate::db::ipc::CALL_STORES.contains(&retired),
@@ -3958,7 +3978,7 @@ mod tests {
     /// A help states the contract its operation really has and the exit classes: the running
     /// product for one carried to it, this command's own answer for a static text — and the classes
     /// split by who judged the call (see [`Exit`]).
-    fn assert_help_contract(help: &str, is_static: bool, refusal: Refusal) {
+    fn assert_help_contract(help: &str, is_static: bool) {
         assert!(
             !help.contains("{{"),
             "a help placeholder was not expanded:\n{help}"
@@ -3977,28 +3997,17 @@ mod tests {
         // Class 1 is a call the product took on and judged, class 2 one it was in no state to take
         // on, and a refusal's own words — often beginning "usage:" — are on stdout, so the code
         // says whether the operation was carried out, not how far it got.
-        match refusal {
-            Refusal::Operation => {
-                for required in [
-                    "the product took the call and it did not go through",
-                    "it refused the call",
-                    "it was in no state to take the call on",
-                    "a refusal often beginning \"usage:\"",
-                    "whether the operation was carried out, not how far it got",
-                ] {
-                    assert!(
-                        help.contains(required),
-                        "'{required}' is missing from:\n{help}"
-                    );
-                }
-            }
-            // The one family whose refusal is the environment's must not claim the product judged
-            // the call; its own class is guarded by
-            // `the_outcome_help_states_the_class_its_refusal_takes`.
-            Refusal::Environment => assert!(
-                !help.contains("the product took the call"),
-                "a refusal that is the environment's must not claim the product judged it:\n{help}"
-            ),
+        for required in [
+            "the product took the call and it did not go through",
+            "it refused the call",
+            "it was in no state to take the call on",
+            "a refusal often beginning \"usage:\"",
+            "whether the operation was carried out, not how far it got",
+        ] {
+            assert!(
+                help.contains(required),
+                "'{required}' is missing from:\n{help}"
+            );
         }
         // A static text is printed here and must not claim a running product.
         if is_static {
@@ -4055,7 +4064,7 @@ mod tests {
                 }
             };
             for (is_static, help) in &helps {
-                assert_help_contract(help, *is_static, family.refusal);
+                assert_help_contract(help, *is_static);
             }
             // The family help states the exception in the sentence that claims the instance: a
             // claim with a static text in the list, contradicted a paragraph later, is false.
@@ -5151,7 +5160,6 @@ mod tests {
     fn attempt_decisions_map_to_the_documented_streams_and_exit_codes() {
         let done = verdict(
             "config",
-            Refusal::Operation,
             CallAttempt::Answered(CallReply::done("token saved")),
         );
         assert_eq!(done.answer.as_deref(), Some("token saved"));
@@ -5160,7 +5168,6 @@ mod tests {
 
         let refused = verdict(
             "config",
-            Refusal::Operation,
             CallAttempt::Answered(CallReply::refused("no such user 'bob'")),
         );
         assert_eq!(refused.answer.as_deref(), Some("no such user 'bob'"));
@@ -5169,7 +5176,6 @@ mod tests {
 
         let partial = verdict(
             "workspace",
-            Refusal::Operation,
             CallAttempt::Answered(CallReply::partial("froze 2 of 3")),
         );
         assert_eq!(partial.answer.as_deref(), Some("froze 2 of 3"));
@@ -5185,11 +5191,7 @@ mod tests {
             CallReply::unavailable("cannot serve operations"),
         ] {
             let wording = reply.answer.clone();
-            let decision = verdict(
-                "workspace",
-                Refusal::Operation,
-                CallAttempt::Answered(reply),
-            );
+            let decision = verdict("workspace", CallAttempt::Answered(reply));
             assert_eq!(decision.answer, None);
             assert_eq!(
                 decision.diagnostic.as_deref(),
@@ -5200,7 +5202,6 @@ mod tests {
 
         let not_served = verdict(
             "workspace",
-            Refusal::Operation,
             CallAttempt::NotServed("no endpoint".to_string()),
         );
         assert_eq!(not_served.answer, None);
@@ -5211,7 +5212,7 @@ mod tests {
         );
         assert_eq!(not_served.code, Exit::Environment);
 
-        let too_old = verdict("workspace", Refusal::Operation, CallAttempt::TooOld);
+        let too_old = verdict("workspace", CallAttempt::TooOld);
         assert_eq!(too_old.answer, None);
         assert!(
             too_old
@@ -5225,7 +5226,6 @@ mod tests {
 
         let severed = verdict(
             "workspace",
-            Refusal::Operation,
             CallAttempt::Severed(anyhow::anyhow!("the answer could not be read")),
         );
         assert_eq!(severed.answer, None);
@@ -5242,27 +5242,13 @@ mod tests {
         assert_eq!(severed.code, Exit::Failed);
     }
 
-    /// A refusal is the operation's class everywhere but the `outcome` lookup: that family's
-    /// whole job is to read a durable record, so a read that failed answered nothing and is this
-    /// command's diagnostic with the environment's class, never a false report on stdout.
+    /// A refusal is the product's own words on stdout with the failed class, never this command's
+    /// diagnostic — every family of this build takes the operation's class.
     #[test]
-    fn a_refusal_is_the_environment_class_only_for_the_outcome_lookup() {
+    fn a_refusal_is_the_products_answer_with_the_failed_class() {
         let refused = || CallAttempt::Answered(CallReply::refused("the record could not be read"));
-        let outcome = verdict("outcome", Refusal::Environment, refused());
-        assert_eq!(outcome.answer, None, "a failed read has no answer to print");
-        assert_eq!(
-            outcome.diagnostic.as_deref(),
-            Some("mahbot outcome: the record could not be read")
-        );
-        assert_eq!(outcome.code, Exit::Environment);
-
-        for family in FAMILIES.iter().filter(|family| family.word != "outcome") {
-            assert!(
-                matches!(family.refusal, Refusal::Operation),
-                "'mahbot {}' keeps the operation's refusal class",
-                family.word
-            );
-            let decision = verdict(family.word, family.refusal, refused());
+        for family in FAMILIES {
+            let decision = verdict(family.word, refused());
             assert_eq!(
                 decision.answer.as_deref(),
                 Some("the record could not be read")
@@ -5272,22 +5258,22 @@ mod tests {
         }
     }
 
-    /// The one family whose refusal is the environment's states that class in its own help: a
-    /// failed read answered nothing, so it is never printed as the product's answer.
+    /// Every family of this build states the operation's class in its own help: a refusal is the
+    /// product's own words on stdout, never a read that answered nothing.
     #[test]
-    fn the_outcome_help_states_the_class_its_refusal_takes() {
-        let help = family_help(
-            FAMILIES
-                .iter()
-                .find(|family| family.word == "outcome")
-                .expect("the outcome family"),
-        );
-        assert!(help.contains("the record could not be read"), "{help}");
-        assert!(!help.contains("prints its own words on stdout"), "{help}");
-        for other in FAMILIES.iter().filter(|family| family.word != "outcome") {
-            let help = family_help(other);
-            assert!(help.contains("prints its own words on stdout"), "{help}");
-            assert!(!help.contains("the record could not be read"), "{help}");
+    fn every_familys_help_states_the_class_its_refusal_takes() {
+        for family in FAMILIES {
+            let help = family_help(family);
+            assert!(
+                help.contains("prints its own words on stdout"),
+                "'mahbot {}': {help}",
+                family.word
+            );
+            assert!(
+                !help.contains("the record could not be read"),
+                "'mahbot {}': {help}",
+                family.word
+            );
         }
     }
 

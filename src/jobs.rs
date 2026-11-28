@@ -7,11 +7,14 @@
 //! the boot scan; the DDL lives in the append-only catalog
 //! ([`crate::db::migrations`]). Purge scope is phase-only: ticket-phase jobs are
 //! time-deleted (the puller re-creates them from `tickets.phase`); non-phase launched
-//! jobs and pending envelopes are never purged by time — explicit abandon only.
+//! jobs and pending envelopes are never purged by time — explicit abandon only. The one
+//! exception is a record row ([`RECORD_KINDS_SQL`]), kept [`RECORD_RETENTION_HOURS`]
+//! and then purged by [`purge_expired_records`].
 
 use crate::Role;
 use crate::agent::message_router::{AgentJob, MessageKind};
-use crate::db::{self, Connection, Row, TxGuard, Value, params};
+use crate::db::{self, Connection, IntoParams, Row, TxGuard, Value, params};
+use crate::outcome::Outcome;
 use crate::pipeline::board::{TicketPhase, WORKING_PHASES};
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
@@ -21,42 +24,6 @@ use tracing::{debug, error, info, warn};
 // Values of `jobs.kind` are fully determined by the child row (one kind per
 // child — `SpawnChild::kind_str`); the [`MessageKind`] enum travels inside the
 // serialized pending_jobs envelope and is unrelated to that vocabulary.
-
-/// Status vocabulary shared by `jobs.status` and `agents.status` — both tables are
-/// schema-locked to the same launched/done/failed dictionary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RowStatus {
-    Launched,
-    Done,
-    Failed,
-}
-
-impl RowStatus {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Launched => "launched",
-            Self::Done => "done",
-            Self::Failed => "failed",
-        }
-    }
-}
-
-impl std::str::FromStr for RowStatus {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Case-sensitive to mirror the schema dictionary exactly.
-        match s {
-            "launched" => Ok(Self::Launched),
-            "done" => Ok(Self::Done),
-            "failed" => Ok(Self::Failed),
-            _ => Err(anyhow::anyhow!(
-                "Invalid row status '{s}'. Valid statuses: launched, done, failed"
-            )),
-        }
-    }
-}
 
 /// Explicit dispatch mode of a job — replaces the NULL-sentinel overload of `caller_agent_id`.
 /// `Sync` jobs are owned by the caller session pin; `Async` jobs (research/analyze,
@@ -113,6 +80,9 @@ pub(crate) enum AgentKind {
     /// `worker` addressee).
     Worker,
     Sanitation,
+    /// A command-line handover's single answering turn: the roster row that names the conversation
+    /// which holds the handover's answer. It is never resumed as a slot.
+    Turn,
 }
 
 impl AgentKind {
@@ -126,6 +96,7 @@ impl AgentKind {
             Self::Engineer => "engineer",
             Self::Worker => "worker",
             Self::Sanitation => "sanitation",
+            Self::Turn => "turn",
         }
     }
 }
@@ -277,8 +248,9 @@ pub(crate) fn pending_job_params(id: &str, envelope: &AgentJob, now: &str) -> Re
     ])
 }
 
-/// agents roster INSERT — producers: `spawn_job` roster loop and the pipeline's
-/// `insert_round_slots`. Status is the literal 'launched'.
+/// agents roster INSERT — producers: `spawn_job`'s roster loop, the pipeline's
+/// `insert_round_slots`, `open_handover_record`, `attach_conversation` and `upsert_job_agent`.
+/// Status is the literal 'launched'.
 pub(crate) const AGENT_INSERT_SQL: &str = "INSERT INTO agents \
      (job_id, agent_id, kind, idx, status, task) \
      VALUES (?1, ?2, ?3, ?4, 'launched', ?5)";
@@ -337,7 +309,7 @@ impl SpawnChild {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::Analyze => "analyze",
-            Self::Implement => "implement",
+            Self::Implement => IMPLEMENT_KIND,
             Self::Research => "research",
             Self::ResearchCleanup => "research_cleanup",
             Self::TempCleanup => "temp_cleanup",
@@ -447,7 +419,7 @@ pub(crate) async fn spawn_job_with_chain(
     // this tx. A cancellation and the analyze row can therefore never both stand. Every
     // other child keeps its dispatch unbounded by cancel signals — a research run's id, for
     // one, is reused by the cleanup row its cancelled-run handoff still has to write.
-    if matches!(child, SpawnChild::Analyze) && crate::round_cancel::is_cancelled(id) {
+    if matches!(child, SpawnChild::Analyze) && crate::stop::cancelled(id) {
         // Rolled back HERE rather than left to the guard's drop: a cancellation that abandons
         // its own write leaves no deferred-cleanup WARN behind and no dangling transaction.
         tracing::info!(job = %id, "Job dispatch rolled back — round cancelled");
@@ -566,12 +538,400 @@ pub(crate) struct NewAgent {
     pub task: String,
 }
 
+/// The `jobs.kind` of a command-line handover's record row: the one turn that answers it.
+pub(crate) const TURN_KIND: &str = "turn";
+
+/// The `jobs.kind` of a chain's own record row.
+pub(crate) const CHAIN_KIND: &str = "chain";
+
+/// The `jobs.kind` of a durable worker round's row: the work row a boot resume re-drives, and — once
+/// settled — the record the id `send` printed answers.
+pub(crate) const IMPLEMENT_KIND: &str = "implement";
+
+/// The kinds whose row is the durable record of one handover handed to an agent, as the SQL list
+/// every record read and write carries. Every other kind shares the `jobs` table as scheduling state
+/// only, is converted to its envelope or deleted when it ends, and has no record.
+const RECORD_KINDS_SQL: &str = "'turn', 'chain', 'implement'";
+
+/// The record kinds that are receipts only: no work hangs off their row, so the interrupted-record
+/// sweep and the purge own them outright. An [`IMPLEMENT_KIND`] row is work while it is `launched`.
+const RECEIPT_KINDS_SQL: &str = "'turn', 'chain'";
+
+/// The `WHERE` fragment that keeps only work still able to move: a settled record is a record, not
+/// work, and every work row is deleted or converted when it ends.
+const ACTIVE_STATUSES_SQL: &str = "status NOT IN ('done', 'done_no_answer', 'stopped', 'failed')";
+
+/// Open the record row a command-line handover's id answers: the `jobs` row itself, kind `turn`,
+/// plus the one roster row naming the conversation that will hold its answer. Written after the
+/// handover is durable and before its work leaves, so a completion that arrives first cannot be
+/// missed, and a re-issued handover finds the row it already has.
+///
+/// The message's text is deliberately absent: the envelope and the conversation already hold it, and
+/// a record of what happened has no business keeping a third copy.
+pub(crate) async fn open_handover_record(
+    id: &str,
+    job: &AgentJob,
+    target_agent_id: &str,
+) -> Result<()> {
+    let conn = &crate::session::store().conn;
+    let now = db::now();
+    // The schema the handover asked its answer to match rides on the row, so the answer's shape is
+    // derived from what was actually asked for.
+    let extract_json = job
+        .answer_extract()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("serialize the handover's jobs.extract")?;
+    let tx = conn.begin_tx().await?;
+    tx.execute(
+        "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
+         retry_count, extract, created_at, updated_at) \
+         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?9) \
+         ON CONFLICT (id) DO NOTHING",
+        params![
+            id,
+            TURN_KIND,
+            "",
+            job.workspace_name.as_str(),
+            job.user_name.as_str(),
+            job.channel.as_str(),
+            job.role.as_str(),
+            extract_json,
+            now,
+        ],
+    )
+    .await
+    .with_context(|| format!("failed to open the handover record {id}"))?;
+    tx.execute(
+        &format!("{AGENT_INSERT_SQL} ON CONFLICT DO NOTHING"),
+        agent_params(id, target_agent_id, AgentKind::Turn, None, ""),
+    )
+    .await
+    .with_context(|| format!("failed to record the handover's conversation for {id}"))?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Open a chain's own record row: kind `chain`, keyed by the chain's id (its content), with the
+/// chain's length on it. A re-issued identical chain is a new run of the same chain, so it re-arms
+/// the row it already has — `launched` again, with no reason and a fresh answer window. Only a chain
+/// re-arms its creation time: every other handover has a fresh id and a fresh row.
+pub(crate) async fn open_chain_record(chain: &crate::launch::Chain) -> Result<()> {
+    let chain_steps = i64::try_from(chain.total()).ok();
+    let now = db::now();
+    let tx = crate::session::store().conn.begin_tx().await?;
+    tx.execute(
+        "INSERT INTO jobs (id, kind, status, task, workspace_name, user_name, channel, role, \
+         retry_count, chain_steps, created_at, updated_at) \
+         VALUES (?1, ?2, 'launched', ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9, ?9) \
+         ON CONFLICT (id) DO NOTHING",
+        params![
+            chain.id.as_str(),
+            CHAIN_KIND,
+            chain.task.as_str(),
+            chain.workspace.as_str(),
+            chain.user.as_str(),
+            chain.channel.as_str(),
+            Role::Assistant.as_str(),
+            chain_steps,
+            now.clone(),
+        ],
+    )
+    .await
+    .with_context(|| format!("failed to open the chain record {}", chain.id))?;
+    // The re-arm, in the same tx: the row may be the previous run's, settled with a reason and an
+    // older answer window.
+    tx.execute(
+        "UPDATE jobs SET status = ?2, reason = NULL, chain_steps = ?3, created_at = ?4, \
+         updated_at = ?4 WHERE id = ?1",
+        params![
+            chain.id.as_str(),
+            Outcome::Running.as_str(),
+            chain_steps,
+            now
+        ],
+    )
+    .await
+    .with_context(|| format!("failed to re-arm the chain record {}", chain.id))?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Name the conversation that holds a record row's answer: the chain's final step, whose assistant
+/// message IS the chain's answer, and the schema that step asked its answer to match. One roster row
+/// per conversation, so a replayed finish is a no-op.
+pub(crate) async fn attach_conversation(
+    job_id: &str,
+    agent_id: &str,
+    extract: Option<&crate::extract::Extract>,
+) -> Result<()> {
+    let conn = &crate::session::store().conn;
+    let tx = conn.begin_tx().await?;
+    tx.execute(
+        &format!("{AGENT_INSERT_SQL} ON CONFLICT DO NOTHING"),
+        agent_params(job_id, agent_id, AgentKind::Turn, None, ""),
+    )
+    .await
+    .with_context(|| format!("failed to record the answer's conversation for {job_id}"))?;
+    if let Some(extract) = extract {
+        let extract_json =
+            serde_json::to_string(extract).context("serialize the chain's jobs.extract")?;
+        tx.execute(
+            "UPDATE jobs SET extract = ?2 WHERE id = ?1",
+            params![job_id, extract_json],
+        )
+        .await
+        .with_context(|| format!("failed to record the answer's schema for {job_id}"))?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// How long a settled record row is kept after it settles — or after it was opened, when it never
+/// settled.
+pub const RECORD_RETENTION_HOURS: i64 = 24;
+
+/// What a record left `launched` by a stopped process is told: the handover never got its answer.
+const STOPPED_MID_FLIGHT: &str = "the product stopped before this handover's answer was delivered";
+
+/// How many expired records one delete removes: the core store is one shared writer, so the sweep
+/// bounds itself rather than holding the connection through a long pass.
+const RECORD_PURGE_BATCH: i64 = 500;
+
+/// The pause between two purge batches, so a backlog cannot monopolise the connection.
+const RECORD_PURGE_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How long one sweep may keep deleting before it yields to the next one, checked between batches.
+/// A backlog too large for one sweep is drained over several of them.
+const RECORD_PURGE_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A command-line handover's acknowledgement: its own words, plus the id it printed — the shape an
+/// analysis dispatch already uses, so a script has one thing to hold and one thing to ask about. An
+/// agent's own `send` and the one-way `guest` address open no record, so they print no id.
+#[must_use]
+pub(crate) fn acknowledged(answer: String, id: Option<&str>) -> String {
+    match id {
+        Some(id) => format!("{answer} (job {id})"),
+        None => answer,
+    }
+}
+
+/// Settle a `launched` record: what became of the handover, and the reason when there is one. Only a
+/// `launched` row moves, so a later turn under the same id cannot overwrite a report already made.
+/// `selector` names the row — its id, or the conversation whose roster names it. Neither the answer
+/// nor its shape is stored: the answer is the conversation's last assistant message already.
+async fn settle_where(selector: &str, key: &str, state: Outcome, reason: Option<&str>) {
+    let result = crate::session::store()
+        .conn
+        .execute(
+            &format!(
+                "UPDATE jobs SET status = ?2, reason = ?3, updated_at = ?4 \
+                 WHERE {selector} AND status = 'launched' AND kind IN ({RECORD_KINDS_SQL})"
+            ),
+            params![key, state.as_str(), reason, db::now()],
+        )
+        .await;
+    if let Err(e) = result {
+        warn!(key, error = %e, "Failed to settle a handover's record");
+    }
+}
+
+/// Settle the record row a handover's id names.
+pub(crate) async fn settle_record(id: &str, state: Outcome, reason: Option<&str>) {
+    settle_where("id = ?1", id, state, reason).await;
+}
+
+/// Settle the record whose conversation is `agent_id` — keyed by the conversation instead of the id.
+/// A recovered session knows only its own agent id, so this is how an answer that arrives through a
+/// recovery settles the handover it answers. Only a recovery retry turn calls this: every ordinary
+/// turn knows the ids of the records it answers ([`turn_record_ids`](crate::agent::message_router)),
+/// and the conversation-keyed write scans `agents` with no index to help it. Only a record whose
+/// envelope is already gone can be settled this way: that is the handover whose message landed and
+/// whose answer is still coming. Every other turn shares its conversation with the handovers queued
+/// behind it, and settling by the conversation would end theirs before their message was answered.
+pub(crate) async fn settle_conversation(agent_id: &str, state: Outcome, reason: Option<&str>) {
+    settle_where(
+        "id IN (SELECT job_id FROM agents WHERE agent_id = ?1) \
+         AND id NOT IN (SELECT id FROM pending_jobs)",
+        agent_id,
+        state,
+        reason,
+    )
+    .await;
+}
+
+/// A handover the router refused to run has no answer coming, so its record must not read as
+/// launched for a day. `None` — a job that was never a command-line handover — records nothing.
+pub(crate) async fn settle_dropped(pending_job_id: Option<&str>, reason: &str) {
+    if let Some(id) = pending_job_id {
+        settle_record(id, Outcome::Failed, Some(reason)).await;
+    }
+}
+
+/// The last assistant message of the conversations this record dispatched, created after the record
+/// was opened: the answer, as the conversation holds it. `None` when no conversation has answered
+/// yet, or when the answer is blank — a finished turn with nothing to report.
+async fn record_answer(id: &str, created_at: &str) -> Result<Option<String>> {
+    let answer = crate::session::store()
+        .conn
+        .query_optional(
+            "SELECT content FROM sessions WHERE role = 'assistant' AND created_at > ?2 AND agent_id \
+             IN (SELECT agent_id FROM agents WHERE job_id = ?1) ORDER BY id DESC LIMIT 1",
+            params![id, created_at],
+            |row| row.get::<String>(0),
+        )
+        .await
+        .context("read a record's answer from its conversation")?;
+    Ok(answer.filter(|answer| !answer.trim().is_empty()))
+}
+
+/// The one existence probe: does the row answering `question` still exist? `question` is what the
+/// row would prove, phrased as a question ("does a handover's work still stand"), and it is also
+/// what the one warning a failed read produces names. `None` is that failure: a read that failed
+/// proves nothing, so the caller decides which side to take.
+async fn row_answers(
+    question: &str,
+    sql: &str,
+    params: impl IntoParams + Send + 'static,
+) -> Option<bool> {
+    match crate::session::store()
+        .conn
+        .query_optional(sql, params, |_| Ok::<(), anyhow::Error>(()))
+        .await
+    {
+        Ok(found) => Some(found.is_some()),
+        Err(e) => {
+            warn!(error = %e, question, "Could not read a record's row while settling it");
+            None
+        }
+    }
+}
+
+/// The question [`row_answers`] is asked about a queued envelope, and the statement that answers it.
+const QUEUED_ENVELOPE_QUESTION: &str = "does a queued envelope still stand";
+const QUEUED_ENVELOPE_SQL: &str = "SELECT 1 FROM pending_jobs WHERE id = ?1 LIMIT 1";
+
+/// Settle every record a previous process left `launched`, so nothing reads as running forever: done
+/// when the conversation holds the answer, failed when the handover never got one, and left alone
+/// while its work still stands — an envelope still queued, or a message that landed unanswered and
+/// so is dead-session recovery's to answer. Runs BEFORE the boot replay, so a drained handover keeps
+/// its record and is completed by the replay. A chain's record is left alone while any step still
+/// has its record, because the step that is still running is what the replay resumes.
+pub async fn settle_interrupted_records() {
+    // Only the receipt kinds: an `implement` row is work, and the boot scan that runs after this
+    // sweep is what resumes it. Settling it here would fail a round the replay is about to run.
+    let rows = match crate::session::store()
+        .conn
+        .query(
+            &format!(
+                "SELECT id, chain_steps, created_at FROM jobs WHERE status = 'launched' AND \
+                 kind IN ({RECEIPT_KINDS_SQL})"
+            ),
+            params![],
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(error = %e, "Failed to read interrupted command-line send records");
+            return;
+        }
+    };
+    for row in rows {
+        let Ok(id) = row.get::<String>(0) else {
+            continue;
+        };
+        let chain_steps = row
+            .get::<Option<i64>>(1)
+            .ok()
+            .flatten()
+            .and_then(|steps| usize::try_from(steps).ok());
+        let created_at = row.get::<String>(2).unwrap_or_default();
+        match record_answer(&id, &created_at).await {
+            Ok(Some(_)) => {
+                settle_record(&id, Outcome::Done, None).await;
+                continue;
+            }
+            Ok(None) => {}
+            // A read that failed proves nothing, so the record is left as it is.
+            Err(_) => continue,
+        }
+        // A read failure proves nothing, so the record is left `launched`.
+        let in_flight = match chain_steps {
+            Some(steps) => chain_has_records(&id, 1..=steps).await != Some(false),
+            // A message that landed unanswered is what dead-session recovery answers, and that
+            // answer settles this record; otherwise the handover's own envelope is what the replay
+            // runs. Failing a record either of them will answer would be the record contradicting
+            // the conversation.
+            None => {
+                match row_answers(
+                    "does a handover's conversation still stand",
+                    "SELECT 1 FROM sessions WHERE role = 'user' AND created_at > ?2 AND agent_id \
+                     IN (SELECT agent_id FROM agents WHERE job_id = ?1) LIMIT 1",
+                    params![id.as_str(), created_at.as_str()],
+                )
+                .await
+                {
+                    // The message never landed: only its queued envelope can still answer it, and
+                    // a failed read proves nothing — both leave the record alone.
+                    Some(false) => row_answers(
+                        QUEUED_ENVELOPE_QUESTION,
+                        QUEUED_ENVELOPE_SQL,
+                        params![id.as_str()],
+                    )
+                    .await
+                    .unwrap_or(true),
+                    Some(true) | None => true,
+                }
+            }
+        };
+        if !in_flight {
+            settle_record(&id, Outcome::Failed, Some(STOPPED_MID_FLIGHT)).await;
+        }
+    }
+}
+
+/// Delete the record rows past their retention: settled before `cutoff`, or a receipt opened before
+/// it and never settled — `updated_at` moves on both, so one bound covers each. A launched
+/// [`IMPLEMENT_KIND`] row is work the unpause or the boot resume still re-drives, so it stays.
+/// `cutoff` is an RFC 3339 timestamp, the shape `db::now()` writes.
+pub async fn purge_expired_records(cutoff: String) -> Result<u64> {
+    let conn = &crate::session::store().conn;
+    let deadline = std::time::Instant::now() + RECORD_PURGE_BUDGET;
+    let mut total = 0u64;
+    loop {
+        // Turso 0.8.3 cannot parse `DELETE … LIMIT`, so the bound is an id subquery. The `agents`
+        // rows go with the job's own (the schema's cascade).
+        let deleted = conn
+            .execute(
+                &format!(
+                    "DELETE FROM jobs WHERE id IN (SELECT id FROM jobs WHERE \
+                     (kind IN ({RECEIPT_KINDS_SQL}) OR status <> 'launched') AND \
+                     kind IN ({RECORD_KINDS_SQL}) AND updated_at < ?1 LIMIT ?2)"
+                ),
+                params![cutoff.as_str(), RECORD_PURGE_BATCH],
+            )
+            .await
+            .context("delete expired command-line send records")?;
+        total += deleted;
+        if deleted == 0 || std::time::Instant::now() >= deadline {
+            break;
+        }
+        // A drain or a stop ends the sweep between batches rather than through the task's
+        // cancellation: the next one starts where this left off.
+        if !crate::shutdown::sleep_or_shutdown_or_drain(RECORD_PURGE_PAUSE).await {
+            break;
+        }
+    }
+    Ok(total)
+}
+
 /// Checkpoint a job row: bump retry_count and touch `updated_at` (a recency marker —
 /// the phase-only purge keys off it).
 async fn checkpoint_job(conn: &Connection, id: &str, retry_count: i64) -> Result<()> {
     // Boot resume re-arms the row unconditionally — status is reset to Launched
     // regardless of its prior value.
-    let status = RowStatus::Launched;
+    let status = Outcome::Running;
     let now = db::now();
     conn.execute(
         "UPDATE jobs SET status = ?1, retry_count = ?2, updated_at = ?3 WHERE id = ?4",
@@ -588,7 +948,7 @@ pub(crate) async fn write_agent_outcome(
     conn: &Connection,
     job_id: &str,
     agent_id: &str,
-    status: RowStatus,
+    status: Outcome,
     outcome: Option<&str>,
 ) -> Result<()> {
     conn.execute(
@@ -600,8 +960,9 @@ pub(crate) async fn write_agent_outcome(
     Ok(())
 }
 
-/// Complete a job whose result is a durable envelope: ONE tx — INSERT pending_jobs
-/// (id = source jobs.id) + DELETE the jobs row. Exactly-once persistence boundary.
+/// Complete a job whose result is a durable envelope: ONE tx — INSERT pending_jobs (id = source
+/// jobs.id), settle a record kind with the round's own verdict, and DELETE every other kind's row.
+/// Exactly-once persistence boundary.
 ///
 /// On INSERT failure the tx rolls back, so the job row SURVIVES and the caller routes the
 /// envelope best-effort. The surviving row is resumed at the next boot and delivers a SECOND
@@ -619,14 +980,38 @@ pub(crate) async fn complete_job_with_envelope(
     )
     .await
     .with_context(|| format!("failed to persist envelope for job {job_id}"))?;
-    delete_job_tx(&tx, job_id).await?;
+    // The pending row is the durable record for an envelope kind, so the job row goes with it. A
+    // record kind stays as the record of the handover: settled with the round's own verdict from
+    // its roster row, so the id it printed and the roster never disagree — and removed later by
+    // [`purge_expired_records`]. The answer is never copied onto it: the conversation holds it, and
+    // a record of what happened is not a second copy. Only a round that failed or was stopped keeps
+    // its reason, which is what a record of a handover that produced no answer is for. A roster row
+    // still `launched` carries no verdict yet (a round that panicked before it could checkpoint
+    // one), so the fallback stands for it and the reason stays NULL.
+    tx.execute(
+        &format!(
+            "UPDATE jobs SET status = COALESCE((SELECT status FROM agents WHERE job_id = ?1 \
+             AND status <> 'launched' LIMIT 1), ?2), reason = (SELECT outcome FROM agents WHERE \
+             job_id = ?1 AND status IN ('failed', 'stopped') LIMIT 1), updated_at = ?3 \
+             WHERE id = ?1 AND kind IN ({RECORD_KINDS_SQL})"
+        ),
+        params![job_id, Outcome::Done.as_str(), now],
+    )
+    .await
+    .with_context(|| format!("failed to settle job {job_id}"))?;
+    tx.execute(
+        &format!("DELETE FROM jobs WHERE id = ?1 AND kind NOT IN ({RECORD_KINDS_SQL})"),
+        params![job_id],
+    )
+    .await
+    .with_context(|| format!("failed to terminalize job {job_id}"))?;
     // Manual-cancel gate INSIDE the tx (after the INSERT, before the commit): the tx
     // holds the single-writer lock, so a cancel that fired after the caller's
     // pre-completion check is still observed here and rolls the tx back — the pending row
     // is never committed and the job row survives for the cancel sweep, whose DELETE then
     // serializes behind this tx. Job kinds that never register a cancel signal (a worker
     // round) keep their unbounded completion.
-    if crate::round_cancel::is_cancelled(job_id) {
+    if crate::stop::cancelled(job_id) {
         tracing::info!(job = %job_id, "Job completion rolled back — run manually cancelled");
         tx.rollback().await?;
         return Ok(());
@@ -692,19 +1077,6 @@ pub(crate) async fn terminalize_job(conn: &Connection, job_id: &str) -> Result<(
     Ok(())
 }
 
-/// Whether a queued `pending_jobs` row still exists — the boot replay's re-check that
-/// the envelope it is about to deliver was not discarded since the list was read. A
-/// read failure answers `true`: delivering is the safe side.
-async fn pending_row_exists(conn: &Connection, id: &str) -> bool {
-    conn.query_optional(
-        "SELECT 1 FROM pending_jobs WHERE id = ?1",
-        params![id],
-        |_| Ok::<(), anyhow::Error>(()),
-    )
-    .await
-    .map_or(true, |found| found.is_some())
-}
-
 /// The envelope queued for `id`, when one waits — no feature module hand-writes this
 /// table's shape. An unparsable envelope answers `None`: it addresses nothing.
 pub(crate) async fn pending_envelope(conn: &Connection, id: &str) -> Result<Option<AgentJob>> {
@@ -732,24 +1104,34 @@ pub(crate) async fn pending_envelope(conn: &Connection, id: &str) -> Result<Opti
     }
 }
 
-/// Remove a gone round's own durable state in ONE tx: its queued result row first (the
-/// boot replay would otherwise deliver it), then its `jobs` row (a surviving row would
-/// be resumed, and its deletion cascades the roster). Idempotent; a failure rolls back.
-pub(crate) async fn delete_round_rows(conn: &Connection, job_id: &str) -> Result<()> {
-    let tx = conn
-        .begin_tx()
+/// The one delete of a durable record, by exact id, in the caller's transaction: its queued
+/// envelope first (the boot replay would otherwise deliver it), then its `jobs` row (a surviving
+/// row would be resumed, and its deletion cascades the roster). Idempotent; a failure rolls the
+/// caller's transaction back.
+pub(crate) async fn delete_records_tx(tx: &crate::db::TxGuard<'_>, ids: &[Value]) -> Result<()> {
+    let placeholders = db::sql_in_placeholders(ids.len());
+    for table in ["pending_jobs", "jobs"] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE id IN ({placeholders})"),
+            ids.to_vec(),
+        )
         .await
-        .context("begin the gone round's removal tx")?;
-    tx.execute("DELETE FROM pending_jobs WHERE id = ?1", params![job_id])
-        .await
-        .context("delete the gone round's queued result")?;
-    tx.execute("DELETE FROM jobs WHERE id = ?1", params![job_id])
-        .await
-        .context("delete the gone round's job row")?;
-    tx.commit()
-        .await
-        .context("commit the gone round's removal")?;
+        .with_context(|| format!("delete the durable record from {table}"))?;
+    }
     Ok(())
+}
+
+/// [`delete_records_tx`] in a transaction of its own.
+pub(crate) async fn delete_records(conn: &Connection, ids: &[Value]) -> Result<()> {
+    let tx = conn.begin_tx().await?;
+    delete_records_tx(&tx, ids).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Remove a gone round's own durable state: its queued result and its `jobs` row.
+pub(crate) async fn delete_round_rows(conn: &Connection, job_id: &str) -> Result<()> {
+    delete_records(conn, &[Value::from(job_id)]).await
 }
 
 // Sync caller-owned jobs are never purged by time — only the caller's /clear or the
@@ -787,12 +1169,7 @@ pub(crate) async fn transition_research_to_cleanup(
     workspace_name: &str,
 ) -> Result<()> {
     let tx = conn.begin_tx().await?;
-    tx.execute("DELETE FROM pending_jobs WHERE id = ?1", params![run_id])
-        .await
-        .with_context(|| format!("failed to delete pending envelope for run {run_id}"))?;
-    tx.execute("DELETE FROM jobs WHERE id = ?1", params![run_id])
-        .await
-        .with_context(|| format!("failed to delete research job row for run {run_id}"))?;
+    delete_records_tx(&tx, &[Value::from(run_id)]).await?;
     insert_job_tx(
         &tx,
         run_id,
@@ -802,7 +1179,7 @@ pub(crate) async fn transition_research_to_cleanup(
         "",
         Role::Sanitation,
         &[NewAgent {
-            agent_id: crate::research_cleanup::cleanup_agent_id(run_id),
+            agent_id: crate::address::AgentAddress::cleanup(run_id).id(),
             kind: AgentKind::Sanitation,
             idx: None,
             task: cleanup_task.to_string(),
@@ -861,8 +1238,8 @@ pub(crate) async fn find_owned_launched_jobs(
         .query(
             &format!(
                 "SELECT {JOB_COLUMNS} FROM jobs j \
-                 WHERE j.caller_agent_id = ?1 AND j.kind IN ('analyze','implement') AND j.status = 'launched' \
-                   AND j.mode = 'sync' \
+                 WHERE j.caller_agent_id = ?1 AND j.kind IN ('analyze','{IMPLEMENT_KIND}') \
+                   AND j.status = 'launched' AND j.mode = 'sync' \
                  ORDER BY j.created_at DESC"
             ),
             params![caller_agent_id],
@@ -935,27 +1312,56 @@ pub(crate) async fn update_phase_job_task(
     Ok(())
 }
 
+/// Record the profile a verification round started on, so a resumed round finishes on the
+/// settings it began with instead of the ones in force when it happens to resume.
+pub(crate) async fn set_round_profile(job_id: &str, profile: &str) -> Result<()> {
+    let conn = &crate::session::store().conn;
+    conn.execute(
+        "UPDATE jobs SET round_profile = ?2, updated_at = ?3 WHERE id = ?1",
+        params![job_id, profile, db::now()],
+    )
+    .await
+    .context("record the round's profile")?;
+    Ok(())
+}
+
+/// The profile a verification round started on. `None` for a job that recorded none — one created
+/// before the column existed, or a stage that takes no profile — so the caller reads the live one.
+pub(crate) async fn round_profile(job_id: &str) -> Result<Option<String>> {
+    let conn = &crate::session::store().conn;
+    let stored = conn
+        .query_optional(
+            "SELECT round_profile FROM jobs WHERE id = ?1",
+            params![job_id],
+            |row| row.get::<Option<String>>(0),
+        )
+        .await
+        .context("read the round's profile")?;
+    Ok(stored.flatten())
+}
+
 /// Upsert a job-bound roster row for a currently-running stage agent — the
 /// active-agent marker that replaces `tickets.assigned_to`. The roster is keyed on
 /// (job_id, agent_id) so the NULL-seat engineer anchor remains a distinct row.
 ///
 /// The update half is the re-registration of an existing `(job_id, agent_id)`: the
 /// agent id is derived from the ticket and role, so the puller re-driving a job it left
-/// in place registers the same pair again and updates the row.
+/// in place registers the same pair again and updates the row. The insert half is the one roster
+/// INSERT ([`AGENT_INSERT_SQL`]), so a row that does not exist yet is created `launched` — the
+/// status this call carries applies to the update half.
 pub(crate) async fn upsert_job_agent(
     conn: &Connection,
     job_id: &str,
     agent_id: &str,
     kind: AgentKind,
-    status: RowStatus,
+    status: Outcome,
 ) -> Result<()> {
+    let insert = format!("{AGENT_INSERT_SQL} ON CONFLICT(job_id, agent_id) DO NOTHING");
     conn.upsert_row(
         "UPDATE agents SET status = ?1 WHERE job_id = ?2 AND agent_id = ?3",
         || params![status.as_str(), job_id, agent_id],
-        "INSERT INTO agents (job_id, agent_id, kind, idx, status, task) \
-         VALUES (?1, ?2, ?3, NULL, ?4, '') \
-         ON CONFLICT(job_id, agent_id) DO NOTHING",
-        params![job_id, agent_id, kind.as_str(), status.as_str()],
+        &insert,
+        agent_params(job_id, agent_id, kind, None, ""),
     )
     .await
     .with_context(|| format!("failed to upsert job agent {agent_id} for job {job_id}"))?;
@@ -1082,13 +1488,13 @@ pub(crate) fn target_agent_id(
     if let Some(custom) = custom {
         return custom.agent_id.clone();
     }
-    crate::session::resolve_agent_id(user_name, role, workspace_name)
+    crate::address::AgentAddress::routed(user_name, role, workspace_name).id()
 }
 
 /// Resolve the consumer-loop agent ID for an envelope (Manager role → the workspace Manager
 /// session; pinned Assistant in a personal workspace → that user's assistant session).
-/// `session::resolve_agent_id` already branches on `role == "manager"`, so this is the single
-/// canonical form.
+/// [`crate::address::AgentAddress::routed`] already branches on the manager role, so this is the
+/// single canonical form.
 ///
 /// A custom-role launch's address is carried in the envelope's `custom_role` and returned
 /// directly; boot replay uses the STORED `target_agent_id`, so both agree.
@@ -1258,20 +1664,6 @@ pub(crate) async fn chain_has_records(
     conversations_read.then_some(false)
 }
 
-/// The furthest step of a chain that still has a live record — the step it is on. `None` when
-/// nothing live was found or a read could not say, so a caller leaves the field out rather than
-/// guessing.
-pub(crate) async fn chain_live_step(chain_id: &str) -> Option<usize> {
-    let (live, conversations_read) =
-        live_chain_steps(chain_id, 1..=crate::launch::MAX_STEPS).await?;
-    if !conversations_read {
-        // A step's conversation carries its number too, so an incomplete read could fall short of
-        // the furthest one.
-        return None;
-    }
-    live.into_iter().next_back()
-}
-
 /// The conversations a chain's steps are running in, with each one's step number.
 pub(crate) async fn chain_sessions(chain_id: &str) -> Result<Vec<(String, usize)>> {
     let conn = &crate::session::store().conn;
@@ -1299,17 +1691,7 @@ pub(crate) async fn chain_sessions(chain_id: &str) -> Result<Vec<(String, usize)
 
 /// Remove one step's durable record from whichever table holds it.
 pub(crate) async fn delete_chain_step(id: &str) -> Result<()> {
-    let conn = &crate::session::store().conn;
-    let tx = conn.begin_tx().await?;
-    tx.execute(
-        "DELETE FROM pending_jobs WHERE id = ?1",
-        params![id.to_string()],
-    )
-    .await?;
-    tx.execute("DELETE FROM jobs WHERE id = ?1", params![id.to_string()])
-        .await?;
-    tx.commit().await?;
-    Ok(())
+    delete_records(&crate::session::store().conn, &[Value::from(id)]).await
 }
 
 /// Remove every durable record of one chain, so no step replays. The ids are exact — one per
@@ -1318,18 +1700,7 @@ pub(crate) async fn delete_chain_rows(chain_id: &str) -> Result<()> {
     let ids: Vec<Value> = (1..=crate::launch::MAX_STEPS)
         .map(|step| Value::from(crate::launch::record_id(chain_id, step)))
         .collect();
-    let placeholders = db::sql_in_placeholders(ids.len());
-    let conn = &crate::session::store().conn;
-    let tx = conn.begin_tx().await?;
-    for table in ["pending_jobs", "jobs"] {
-        tx.execute(
-            &format!("DELETE FROM {table} WHERE id IN ({placeholders})"),
-            ids.clone(),
-        )
-        .await?;
-    }
-    tx.commit().await?;
-    Ok(())
+    delete_records(&crate::session::store().conn, &ids).await
 }
 
 /// Drop the chain pointer from the conversation of one step: the step is over, so a later turn
@@ -1543,17 +1914,17 @@ pub(crate) async fn job_retry_count(conn: &Connection, job_id: &str) -> i64 {
     }
 }
 
-/// `RowStatus::Done` as this module's SQL spells it — `as_str` is a `const fn`, so the terminal
+/// `Outcome::Done` as this module's SQL spells it — `as_str` is a `const fn`, so the terminal
 /// status has one spelling here and cannot drift from the enum.
-const DONE_STATUS: &str = RowStatus::Done.as_str();
+const DONE_STATUS: &str = Outcome::Done.as_str();
 
-/// Load all non-terminal jobs (launched|failed) for the boot scan.
+/// Load every job that can still move — the boot scan's and the unpause re-drive's one set. A settled
+/// record is excluded: nothing will move it again, so it is neither resumed nor reported unknown.
 async fn list_active_jobs(conn: &Connection) -> Result<Vec<JobRow>> {
     let rows = conn
         .query(
             &format!(
-                "SELECT {JOB_COLUMNS} FROM jobs \
-                 WHERE status != '{DONE_STATUS}' ORDER BY created_at"
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE {ACTIVE_STATUSES_SQL} ORDER BY created_at"
             ),
             (),
         )
@@ -1573,16 +1944,16 @@ pub(crate) async fn list_agents_for_job(conn: &Connection, job_id: &str) -> Resu
     rows.iter().map(agent_row_from).collect()
 }
 
-/// The roster agent ids of every job that has not been terminalized, minus the slots
-/// that already finished: the ids a cut round resumes IN PLACE from ([`RowStatus::Done`]
-/// slots are reconstructed from their stored outcomes). A purged or terminalized job
-/// drops out — the same non-terminal set [`list_active_jobs`] takes.
+/// The roster agent ids of every job that can still move, minus the slots that already finished: the
+/// ids a cut round resumes IN PLACE from ([`Outcome::Done`] slots are reconstructed from their stored
+/// outcomes). A settled record drops out — the same set [`list_active_jobs`] takes — so a handover's
+/// conversation stops protecting its namespaces the moment the handover settles.
 pub(crate) async fn resumable_roster_agent_ids(conn: &Connection) -> Result<Vec<String>> {
     let rows = conn
         .query(
             &format!(
                 "SELECT DISTINCT a.agent_id FROM agents a \
-                 WHERE a.job_id IN (SELECT id FROM jobs WHERE status != '{DONE_STATUS}') \
+                 WHERE a.job_id IN (SELECT id FROM jobs WHERE {ACTIVE_STATUSES_SQL}) \
                  AND a.status != '{DONE_STATUS}'"
             ),
             (),
@@ -1707,7 +2078,7 @@ pub(crate) async fn delete_pending_jobs_for(target_agent_id: &str) -> Result<usi
             .and_then(|job| job.chain().cloned());
         match chain {
             Some(chain) => crate::tools::chain::fail(&chain, DROPPED_BY_STOPPED_LAUNCH).await,
-            None => crate::send_outcome::fail_dropped(Some(id), DROPPED_BY_STOPPED_LAUNCH).await,
+            None => crate::jobs::settle_dropped(Some(id), DROPPED_BY_STOPPED_LAUNCH).await,
         }
     }
     info!(
@@ -1825,20 +2196,43 @@ async fn pending_already_appended(conn: &Connection, row: &PendingJobRow) -> boo
     strip_timestamp_wrapper(&last_content).ends_with(&envelope.content) && appended_before
 }
 
+/// Deliver the envelopes one workspace kept across a freeze: the turns a pause cut short. Called on
+/// resume, so the owner's kept message is answered without restarting the product.
+pub(crate) async fn replay_pending_for_workspace(name: &str) -> Result<usize> {
+    replay_pending_jobs(&crate::session::store().conn, Some(name)).await
+}
+
 /// (0) Replay outstanding pending_jobs — the boot reclaim path for durable envelopes
 /// (at-least-once delivery). Runs before anything that could purge.
 /// Dedup semantics: the suffix + created_at tiebreaker closes the
 /// listener-interleaving race — the scan and channel listeners may run
 /// concurrently, the consumer serializes per agent.
-async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
+///
+/// A paused workspace's envelopes are kept, never delivered: the pause is what stopped them, and
+/// resuming the workspace is what answers them ([`replay_pending_for_workspace`]). That is what
+/// keeps a restart from re-routing a frozen workspace's kept messages and telling the owner a
+/// second time that they are kept.
+///
+/// `only_workspace` narrows the replay to one workspace's envelopes — the resume path. It differs
+/// in two ways that only matter there: a message the freeze cut mid-turn was already appended to
+/// its conversation, so it is delivered again rather than deduped away (a repeated answer is
+/// accepted, a lost message is not — the consumer survived the pause, so the dead-session poller
+/// will never look at it), and an envelope whose workspace cannot be read is left alone rather than
+/// settled, so resuming one workspace never touches another's work.
+async fn replay_pending_jobs(conn: &Connection, only_workspace: Option<&str>) -> Result<usize> {
     let rows = list_pending_jobs(conn).await?;
     let mut replayed = 0usize;
     for row in &rows {
         let Ok(mut job) = serde_json::from_str::<AgentJob>(&row.envelope) else {
+            // A scoped replay cannot tell whose row this is, and settling it would reach into
+            // another workspace's work: the boot replay settles it.
+            if only_workspace.is_some() {
+                continue;
+            }
             warn!(pending_job = %row.id, "Pending job envelope unreadable — skipping");
             // The row is never replayed, so nothing will answer it: a record under its id must
             // not read as running.
-            crate::send_outcome::fail_dropped(
+            crate::jobs::settle_dropped(
                 Some(&row.id),
                 "the handover's stored envelope could not be read",
             )
@@ -1846,24 +2240,51 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
             continue;
         };
         job.pending_job_id = Some(row.id.clone());
+        if only_workspace.is_some_and(|workspace| job.workspace_name != workspace) {
+            continue;
+        }
+        // Kept unless the workspace is proven running: a frozen one waits for its resume, and a
+        // pause that cannot be read is no reason to deliver blind.
+        match crate::workspace::paused_now(&job.workspace_name).await {
+            Ok(false) => {}
+            Ok(true) => {
+                debug!(
+                    pending_job = %row.id,
+                    workspace = %job.workspace_name,
+                    "Pending job kept — the workspace is frozen",
+                );
+                continue;
+            }
+            Err(e) => {
+                debug!(
+                    pending_job = %row.id,
+                    workspace = %job.workspace_name,
+                    error = %e,
+                    "Pending job kept — the workspace's pause could not be read",
+                );
+                continue;
+            }
+        }
         if pending_already_appended(conn, row).await {
+            if only_workspace.is_some() {
+                // A freeze cut this turn mid-flight: the message landed, no answer came, and the
+                // consumer survived the pause. Deliver it again — the owner asked for the answer,
+                // and a second one is better than none.
+                crate::agent::message_router::route(&row.target_agent_id, job);
+                replayed += 1;
+                continue;
+            }
             // The message already reached the session — dedup prevents a
             // duplicate append. The row is reclaimed here (delivery complete;
-            // response recovery is the dead-session poller's domain). Nothing
-            // re-runs this envelope, so a command-line handover's record must
-            // not read as running: the answer it was promised was never
-            // delivered.
+            // response recovery is the dead-session poller's domain).
             repair_chain_step(row, &job).await;
             debug!(pending_job = %row.id, "Pending job already appended — skipping");
             if let Err(e) = delete_pending_job(conn, &row.id).await {
                 warn!(pending_job = %row.id, error = %e, "Failed to delete deduped pending job");
             }
-            crate::send_outcome::fail_dropped(
-                Some(&row.id),
-                "the product stopped after this handover's message was recorded but before its \
-                 answer was delivered",
-            )
-            .await;
+            // The message landed, so the handover's answer is still coming: dead-session recovery
+            // re-runs the conversation, and the turn that answers it settles the record by the
+            // conversation it names — so nothing has to settle it here.
             continue;
         }
         // Execution-time invariant: re-pin pinned roles (Assistant)
@@ -1881,7 +2302,7 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
             if let Err(e) = delete_pending_job(conn, &row.id).await {
                 warn!(pending_job = %row.id, error = %e, "Failed to delete refused pending job");
             }
-            crate::send_outcome::fail_dropped(
+            crate::jobs::settle_dropped(
                 Some(&row.id),
                 "the handover names no user it could run as",
             )
@@ -1904,16 +2325,24 @@ async fn replay_pending_jobs(conn: &Connection) -> Result<usize> {
         {
             crate::research_cleanup::dispatch_cleanup_for_pending_envelope(&row.id, &job).await;
         }
-        if !pending_row_exists(conn, &row.id).await {
+        // The last look this path can take: a discarded round's queued row is its only trace
+        // (its invocation has long exited), and a removal committing between the read above and
+        // the route below is the one window this replay cannot close. A failed read proves nothing,
+        // so the safe side is to deliver.
+        if row_answers(
+            QUEUED_ENVELOPE_QUESTION,
+            QUEUED_ENVELOPE_SQL,
+            params![row.id.as_str()],
+        )
+        .await
+            == Some(false)
+        {
             debug!(
                 pending_job = %row.id,
                 "Pending job discarded by a cancel — not replayed",
             );
             continue;
         }
-        // The last look this path can take: a discarded round's queued row is its only trace
-        // (its invocation has long exited), and a removal committing between the read above and
-        // the route below is the one window this replay cannot close.
         // The dedup above is the authoritative "in session" check: a row whose content is NOT in
         // the session was never appended — route the FULL content. Replaying empty here would
         // silently lose the envelope forever (at-most-once violation).
@@ -2043,6 +2472,117 @@ async fn workspace_unresolvable(job: &JobRow) -> bool {
     true
 }
 
+/// What the boot scan decided about one active job row.
+enum ResumeDecision {
+    /// The row is a resume target, checkpointed as it was classified.
+    Resume(ResumableJob),
+    /// The row is not this pass's to resume, and why has been reported or is known: work a pause
+    /// deferred, a sync job its caller owns, a workspace that cannot be resolved, or a pause that
+    /// cannot be read — the row is left alone and the next boot or resume asks again.
+    Skip,
+    /// A kind this build has no resume path for — reported as unknown, because it is.
+    Unknown,
+}
+
+/// Whether one active job row is a resume target, checkpointed as it is classified — the one
+/// classification the boot scan and a workspace's unpause share, so resuming after a freeze and
+/// resuming after a restart can never disagree about what is resumable. Each skip is reported as
+/// what it is, so a job the scan cannot act on is never mistaken for an unknown kind.
+async fn resumable_of(conn: &Connection, job: &JobRow) -> ResumeDecision {
+    // The freeze reaches the boot resume: a paused workspace's work waits for the unpause, which
+    // re-drives exactly it ([`resumable_for_workspace`]) instead of writing the frozen tree now.
+    match crate::workspace::paused_now(&job.workspace_name).await {
+        Ok(false) => {}
+        Ok(true) => {
+            debug!(
+                job = %job.id,
+                workspace = %job.workspace_name,
+                "workspace paused — its work waits for the unpause",
+            );
+            return ResumeDecision::Skip;
+        }
+        // A pause that cannot be read is not one: the row is left alone, and the next boot or
+        // resume asks again.
+        Err(_) => return ResumeDecision::Skip,
+    }
+    match job.kind.as_str() {
+        // Resume at the roster/state level (dispatch re-enters the orchestrator with the stored
+        // task). Always bump retry_count.
+        "research" | "analyze" => {
+            if skip_sync_job(job) || workspace_unresolvable(job).await {
+                return ResumeDecision::Skip;
+            }
+            let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
+            ResumeDecision::Resume(if job.kind == "research" {
+                ResumableJob::Research {
+                    job_id: job.id.clone(),
+                    workspace_name: job.workspace_name.clone(),
+                }
+            } else {
+                ResumableJob::Analyze {
+                    job_id: job.id.clone(),
+                    workspace_name: job.workspace_name.clone(),
+                    exec_dir: job.exec_dir.clone(),
+                }
+            })
+        }
+        // A single-worker implement round: resume it like any other durable envelope kind. Its row is
+        // both the work row this resume re-drives and, once settled, the record the id `send` printed
+        // answers — a `launched` one is work, so the receipt sweep leaves it alone.
+        IMPLEMENT_KIND => {
+            if skip_sync_job(job) || workspace_unresolvable(job).await {
+                return ResumeDecision::Skip;
+            }
+            let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
+            ResumeDecision::Resume(ResumableJob::Implement {
+                job_id: job.id.clone(),
+                workspace_name: job.workspace_name.clone(),
+                exec_dir: job.exec_dir.clone(),
+            })
+        }
+        // A research-run cleanup Sanitation agent: the folder stays held until the resumed tail
+        // releases it; a row removed by the dump-guarded cancel sweep deliberately leaves a
+        // dump-holding folder.
+        "research_cleanup" => {
+            if workspace_unresolvable(job).await {
+                return ResumeDecision::Skip;
+            }
+            let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
+            ResumeDecision::Resume(ResumableJob::ResearchCleanup {
+                job_id: job.id.clone(),
+                workspace_name: job.workspace_name.clone(),
+            })
+        }
+        // Nothing else has a resume path: every other kind is terminalized, deleted or settled when
+        // it ends (record kinds are handled by the caller before they reach here).
+        _ => ResumeDecision::Unknown,
+    }
+}
+
+/// The resume targets of one workspace — what a freeze stopped mid-round, so resuming the
+/// workspace re-drives exactly the work it stopped instead of waiting for the next restart. A run
+/// that registers itself as live (an analysis or a research round) is not one of them: a pause
+/// never stops a reading round, so resuming during one would otherwise start a second copy under
+/// the same job id and share its single run registration.
+pub(crate) async fn resumable_for_workspace(name: &str) -> Result<Vec<ResumableJob>> {
+    let conn = &crate::session::store().conn;
+    let mut resumable = Vec::new();
+    for job in list_active_jobs(conn)
+        .await?
+        .iter()
+        .filter(|job| job.workspace_name == name)
+    {
+        if crate::stop::is_registered(&job.id) {
+            debug!(job = %job.id, "run is live — not re-driven by the resume");
+            continue;
+        }
+        if let ResumeDecision::Resume(stage) = resumable_of(conn, job).await {
+            resumable.push(stage);
+        }
+    }
+    Ok(resumable)
+}
+
 /// Boot recovery scan: first statement of run_management. Order: (0) replay pending_jobs; (1) one
 /// scan over the active jobs — ticket phase jobs only get their stale launched roster cleared (the
 /// puller re-drives them), the research/analyze/implement/research_cleanup kinds resume, and
@@ -2050,13 +2590,12 @@ async fn workspace_unresolvable(job: &JobRow) -> bool {
 ///
 /// Every resumed job gets updated_at = now (the ONLY protection for the pre-first-commit window)
 /// and retry_count + 1.
-#[expect(clippy::cast_possible_truncation)]
 pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
     let start = std::time::Instant::now();
     let conn = &crate::session::store().conn;
 
     // (0) Deliverable replay — before anything that could purge.
-    let replayed = replay_pending_jobs(conn).await?;
+    let replayed = replay_pending_jobs(conn, None).await?;
 
     // (1) Scan over the active jobs. Ticket phase jobs are NOT kind-discriminated resume
     // targets — the single puller re-drives them; we only clear their stale launched roster
@@ -2077,54 +2616,6 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
                     "Failed to mark stale launched agents on ticket phase boot scan",
                 );
             }
-        } else if job.kind == "research" || job.kind == "analyze" {
-            // Resume at the roster/state level (dispatch re-enters the
-            // orchestrator with the stored task). Always bump retry_count.
-            if skip_sync_job(job) || workspace_unresolvable(job).await {
-                continue;
-            }
-            let kind = job.kind.as_str();
-            let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
-            resumable.push(if kind == "research" {
-                ResumableJob::Research {
-                    job_id: job.id.clone(),
-                    workspace_name: job.workspace_name.clone(),
-                }
-            } else {
-                ResumableJob::Analyze {
-                    job_id: job.id.clone(),
-                    workspace_name: job.workspace_name.clone(),
-                    exec_dir: job.exec_dir.clone(),
-                }
-            });
-            resumed_other += 1;
-        } else if job.kind == "implement" {
-            // A single-worker implement round interrupted by a crash: resume it
-            // like any other durable envelope kind. The worker roster row holds
-            // the terminal outcome; the job row holds the caller identity.
-            if skip_sync_job(job) || workspace_unresolvable(job).await {
-                continue;
-            }
-            let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
-            resumable.push(ResumableJob::Implement {
-                job_id: job.id.clone(),
-                workspace_name: job.workspace_name.clone(),
-                exec_dir: job.exec_dir.clone(),
-            });
-            resumed_other += 1;
-        } else if job.kind == "research_cleanup" {
-            // A research-run cleanup Sanitation agent interrupted by a crash: resume it like any
-            // durable job. The folder stays held until the resumed tail releases it; a row removed
-            // by the dump-guarded cancel sweep deliberately leaves a dump-holding folder.
-            if workspace_unresolvable(job).await {
-                continue;
-            }
-            let _ = checkpoint_job(conn, &job.id, job.retry_count + 1).await;
-            resumable.push(ResumableJob::ResearchCleanup {
-                job_id: job.id.clone(),
-                workspace_name: job.workspace_name.clone(),
-            });
-            resumed_other += 1;
         } else if job.kind == "temp_cleanup" {
             // A periodic temp cleaner interrupted by a crash: the cleanup is best-effort and the
             // next due pass re-runs it, so a leftover row is terminalized (never resumed). The
@@ -2135,14 +2626,27 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
                 "Temp cleaner row left over from a previous lifetime — terminalizing (no resume)",
             );
             let _ = terminalize_job(conn, &job.id).await;
+        } else if matches!(job.kind.as_str(), TURN_KIND | CHAIN_KIND) {
+            // A record is not work: still `launched` means the handover's answer is still coming,
+            // which [`settle_interrupted_records`] left for its conversation to settle. Resuming it
+            // would re-dispatch an answer; reporting it unknown would be permanent noise.
         } else {
-            warn!(job = %job.id, kind = %job.kind, "Unknown job kind — skipping");
+            match resumable_of(conn, job).await {
+                ResumeDecision::Resume(stage) => {
+                    resumable.push(stage);
+                    resumed_other += 1;
+                }
+                ResumeDecision::Skip => {}
+                ResumeDecision::Unknown => {
+                    warn!(job = %job.id, kind = %job.kind, "Unknown job kind — skipping");
+                }
+            }
         }
     }
 
     let elapsed = start.elapsed();
     info!(
-        duration_ms = elapsed.as_millis() as u64,
+        duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
         resumed_other,
         replayed_pending = replayed,
         "Boot recovery scan complete",
@@ -2160,7 +2664,7 @@ pub(crate) async fn recover_from_restart() -> Result<Vec<ResumableJob>> {
 /// `ticket_{ticket_id}_{role}`, permanently job_id = NULL.
 #[must_use]
 pub(crate) fn session_pin_id(ticket_id: &str, role: Role) -> String {
-    crate::session::ticket_agent_id(ticket_id, role.as_str())
+    crate::address::AgentAddress::ticket(ticket_id.to_owned(), role.as_str().to_owned()).id()
 }
 
 /// Upsert the session pin for `role` (engineer/sanitation). NEVER sets job_id (that removes the
@@ -2174,7 +2678,7 @@ pub(crate) async fn upsert_session_pin(
     conn: &Connection,
     ticket_id: &str,
     task: &str,
-    status: RowStatus,
+    status: Outcome,
     role: Role,
 ) -> Result<()> {
     let pin_id = session_pin_id(ticket_id, role);
@@ -2282,6 +2786,48 @@ pub(crate) async fn purge_terminal_session_pins() -> usize {
 mod tests {
     use super::*;
 
+    /// A verification round's profile snapshot round-trips on the job row, and a job that recorded
+    /// none reads as none — the fallback a job created before the column existed relies on.
+    #[tokio::test]
+    async fn a_round_profile_is_recorded_and_read_back() {
+        crate::util::test::init_management_test_stores().await;
+        let job_id = "round_profile_job";
+        spawn_job(
+            &crate::session::store().conn,
+            job_id,
+            "verify it",
+            "round_profile_ws",
+            crate::users::ADMIN_USER_NAME,
+            "gui",
+            crate::Role::Reviewer,
+            &[],
+            &SpawnChild::Analyze,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("seed the job row");
+
+        assert_eq!(
+            round_profile(job_id)
+                .await
+                .expect("read the round's profile"),
+            None,
+            "a job that recorded no profile reads as none",
+        );
+        set_round_profile(job_id, r#"{"pass_threshold":6}"#)
+            .await
+            .expect("record the round's profile");
+        assert_eq!(
+            round_profile(job_id)
+                .await
+                .expect("read the round's profile")
+                .as_deref(),
+            Some(r#"{"pass_threshold":6}"#),
+        );
+    }
+
     /// The boot replay repairs the one window between a step's message landing and its
     /// conversation recording the chain, so a restart still knows the step is in flight instead of
     /// resuming it as an ordinary delegation whose answer would reach the owner.
@@ -2289,7 +2835,7 @@ mod tests {
     #[tokio::test]
     async fn the_boot_replay_records_a_chain_step_on_its_conversation() {
         crate::util::test::init_management_test_stores().await;
-        let agent_id = crate::session::worker_branch_agent_id("replayed");
+        let agent_id = crate::address::AgentAddress::worker_branch("replayed".to_owned()).id();
         let chain = crate::launch::Chain {
             id: "replayed_step".to_string(),
             task: "draft it".to_string(),
@@ -2377,8 +2923,8 @@ mod tests {
     }
 
     /// A poisoned envelope the boot replay refuses is work that will never run: its record is
-    /// failed, rather than left reading as running until it expires.
-    #[serial_test::serial(recover_from_restart, send_outcome)]
+    /// failed, rather than left reading as launched until it expires.
+    #[serial_test::serial(recover_from_restart, handover_records)]
     #[tokio::test]
     async fn the_boot_replay_fails_a_refused_handovers_record() {
         crate::util::test::init_management_test_stores().await;
@@ -2408,27 +2954,31 @@ mod tests {
         )
         .await
         .expect("seed the envelope");
-        crate::send_outcome::begin(id, None).await;
-
-        replay_pending_jobs(conn).await.expect("the replay runs");
-
-        let record = crate::send_outcome::lookup(id)
+        open_handover_record(id, &job, &envelope_target(&job))
             .await
-            .expect("read the record")
+            .expect("the handover's record row");
+
+        replay_pending_jobs(conn, None)
+            .await
+            .expect("the replay runs");
+
+        let (status, reason) = crate::util::test::record_row(id)
+            .await
             .expect("the handover opened one");
-        assert_eq!(record.state, crate::send_outcome::State::Failed);
+        assert_eq!(status, Outcome::Failed.as_str());
         assert_eq!(
-            record.reason.as_deref(),
+            reason.as_deref(),
             Some("the handover names no user it could run as"),
         );
     }
 
     /// The crash window between the message being appended and the answer leaving: the replay
-    /// reclaims the row without re-running it, so the record is failed rather than left running
-    /// while dead-session recovery re-drives the turn without its id.
-    #[serial_test::serial(recover_from_restart, send_outcome)]
+    /// reclaims the row without re-running it, and dead-session recovery answers the message. The
+    /// record is not failed — failing it would contradict the answer that arrives — and the boot
+    /// sweep settles it the moment the conversation holds that answer.
+    #[serial_test::serial(recover_from_restart, handover_records)]
     #[tokio::test]
-    async fn the_boot_replay_fails_a_record_whose_message_already_landed() {
+    async fn the_boot_replay_leaves_a_record_whose_message_already_landed_running() {
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
         let job = AgentJob {
@@ -2456,35 +3006,45 @@ mod tests {
         )
         .await
         .expect("seed the envelope");
-        crate::send_outcome::begin(id, None).await;
+        open_handover_record(id, &job, &agent_id)
+            .await
+            .expect("the handover's record row");
         // The crash window: the message landed (a later timestamp, so the dedup sees it), the
         // answer never left.
         crate::util::test::seed_session_row(conn, &agent_id, "user", "do it").await;
 
-        replay_pending_jobs(conn).await.expect("the replay runs");
-
-        let record = crate::send_outcome::lookup(id)
+        replay_pending_jobs(conn, None)
             .await
-            .expect("read the record")
+            .expect("the replay runs");
+
+        let (status, _) = crate::util::test::record_row(id)
+            .await
             .expect("the handover opened one");
-        assert_eq!(record.state, crate::send_outcome::State::Failed);
-        assert!(
-            record
-                .reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("before its answer was delivered")),
-            "the record names the crash: {:?}",
-            record.reason
+        assert_eq!(
+            status,
+            Outcome::Running.as_str(),
+            "the message landed, so the answer is still coming: the record must not read as a \
+             failure the conversation will contradict",
         );
         assert!(
-            !pending_row_exists(conn, id).await,
+            !row_answers(QUEUED_ENVELOPE_QUESTION, QUEUED_ENVELOPE_SQL, params![id])
+                .await
+                .unwrap_or(true),
             "the deduped row is reclaimed"
         );
+        // The answer arrives afterwards, and the boot sweep settles the record from it — the one
+        // record, never left launched over an answer that is already there.
+        crate::util::test::seed_session_row(conn, &agent_id, "assistant", "done").await;
+        settle_interrupted_records().await;
+        let (status, _) = crate::util::test::record_row(id)
+            .await
+            .expect("the handover's record stands");
+        assert_eq!(status, Outcome::Done.as_str());
     }
 
     /// A stopped launch's waiting envelopes are dropped without an answer, so every handover among
     /// them is failed — the custom role deleted while its envelope waited is the same discard.
-    #[serial_test::serial(send_outcome)]
+    #[serial_test::serial(handover_records)]
     #[tokio::test]
     async fn a_stopped_launch_fails_the_handovers_it_drops() {
         crate::util::test::init_management_test_stores().await;
@@ -2514,7 +3074,9 @@ mod tests {
         )
         .await
         .expect("seed the envelope");
-        crate::send_outcome::begin(id, None).await;
+        open_handover_record(id, &job, target)
+            .await
+            .expect("the handover's record row");
 
         assert_eq!(
             delete_pending_jobs_for(target)
@@ -2523,25 +3085,27 @@ mod tests {
             1
         );
 
-        let record = crate::send_outcome::lookup(id)
+        let (status, reason) = crate::util::test::record_row(id)
             .await
-            .expect("read the record")
             .expect("the handover opened one");
-        assert_eq!(record.state, crate::send_outcome::State::Failed);
+        assert_eq!(status, Outcome::Failed.as_str());
         assert!(
-            record
-                .reason
+            reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("dropped when its launch stopped")),
-            "the record names the discard: {:?}",
-            record.reason
+            "the record names the discard: {reason:?}"
         );
-        assert!(!pending_row_exists(conn, id).await, "the row is gone");
+        assert!(
+            !row_answers(QUEUED_ENVELOPE_QUESTION, QUEUED_ENVELOPE_SQL, params![id])
+                .await
+                .unwrap_or(true),
+            "the row is gone"
+        );
     }
 
     /// An envelope the replay cannot read is never re-run, so a record under its id is failed
-    /// rather than left running.
-    #[serial_test::serial(recover_from_restart, send_outcome)]
+    /// rather than left launched.
+    #[serial_test::serial(recover_from_restart, handover_records)]
     #[tokio::test]
     async fn the_boot_replay_fails_a_record_whose_envelope_is_unreadable() {
         crate::util::test::init_management_test_stores().await;
@@ -2553,26 +3117,194 @@ mod tests {
         )
         .await
         .expect("seed the envelope");
-        crate::send_outcome::begin(id, None).await;
-
-        replay_pending_jobs(conn).await.expect("the replay runs");
-
-        let record = crate::send_outcome::lookup(id)
+        crate::util::test::JobRowBuilder::new(conn, id, TURN_KIND, "assistant", "unreadable_ws")
+            .timestamps(db::now())
+            .insert()
             .await
-            .expect("read the record")
+            .expect("the handover's record row");
+
+        replay_pending_jobs(conn, None)
+            .await
+            .expect("the replay runs");
+
+        let (status, reason) = crate::util::test::record_row(id)
+            .await
             .expect("the handover opened one");
-        assert_eq!(record.state, crate::send_outcome::State::Failed);
+        assert_eq!(status, Outcome::Failed.as_str());
         assert!(
-            record
-                .reason
+            reason
                 .as_deref()
                 .is_some_and(|reason| reason.contains("could not be read")),
-            "the record names the unreadable envelope: {:?}",
-            record.reason
+            "the record names the unreadable envelope: {reason:?}"
         );
         assert!(
-            pending_row_exists(conn, id).await,
+            row_answers(QUEUED_ENVELOPE_QUESTION, QUEUED_ENVELOPE_SQL, params![id])
+                .await
+                .unwrap_or(false),
             "the unreadable row itself is left in place"
+        );
+    }
+
+    /// A paused workspace's envelopes are kept — no second delivery, and so no second notice
+    /// telling the owner a message is kept — and a resume delivers exactly its own workspace's:
+    /// the workspace-scoped path touches nothing else.
+    #[serial_test::serial(recover_from_restart, handover_records)]
+    #[tokio::test]
+    async fn a_resume_delivers_only_its_own_workspaces_kept_messages() {
+        crate::util::test::init_management_test_stores().await;
+        let _ = crate::agent::message_router::init_global();
+        let conn = &crate::session::store().conn;
+        let mut names = Vec::new();
+        let mut inboxes = Vec::new();
+        for name in ["resume_kept_ws", "resume_other_ws"] {
+            crate::util::test::create_test_workspace(&format!("/tmp/{name}"), name).await;
+            crate::workspace::store()
+                .set_paused(name, true)
+                .await
+                .expect("freeze the workspace");
+            let job = handover_job(name);
+            // A local inbox keeps the delivery from spawning a real consumer.
+            inboxes.push(crate::agent::message_router::register_agent(
+                &envelope_target(&job),
+            ));
+            let id = format!("{name}_kept_handover");
+            conn.execute(
+                PENDING_JOB_INSERT_SQL,
+                pending_job_params(&id, &job, &db::now()).expect("serialize the envelope"),
+            )
+            .await
+            .expect("seed the envelope");
+            names.push(name);
+        }
+
+        // A frozen workspace's message is kept, not delivered.
+        assert_eq!(
+            replay_pending_for_workspace(names[0])
+                .await
+                .expect("the scoped replay"),
+            0,
+            "a frozen workspace's envelope waits for its resume",
+        );
+
+        // Resuming one workspace delivers only its own messages.
+        conn.execute("UPDATE workspaces SET paused = 0", ())
+            .await
+            .expect("resume both workspaces");
+        assert_eq!(
+            replay_pending_for_workspace(names[0])
+                .await
+                .expect("the scoped replay"),
+            1,
+            "the resumed workspace's message is delivered",
+        );
+        assert!(
+            row_answers(
+                QUEUED_ENVELOPE_QUESTION,
+                QUEUED_ENVELOPE_SQL,
+                params![format!("{}_kept_handover", names[1])],
+            )
+            .await
+            .unwrap_or(false),
+            "the other workspace's message is untouched",
+        );
+        assert_eq!(
+            replay_pending_for_workspace(names[1])
+                .await
+                .expect("the scoped replay"),
+            1,
+            "and its own resume delivers it",
+        );
+        drop(inboxes);
+    }
+
+    /// The message a freeze cut mid-turn is answered on resume: the turn's own envelope was already
+    /// appended to the conversation, so the scoped replay delivers it again instead of deduping it
+    /// away — a repeated answer is accepted, a lost message is not.
+    #[serial_test::serial(recover_from_restart, handover_records)]
+    #[tokio::test]
+    async fn a_resume_answers_a_message_the_freeze_cut_mid_turn() {
+        crate::util::test::init_management_test_stores().await;
+        let _ = crate::agent::message_router::init_global();
+        let conn = &crate::session::store().conn;
+        let name = "resume_cut_mid_turn_ws";
+        crate::util::test::create_test_workspace(&format!("/tmp/{name}"), name).await;
+        let job = handover_job(name);
+        let target = envelope_target(&job);
+        let mut inbox = crate::agent::message_router::register_agent(&target);
+        let id = "cut_mid_turn_handover";
+        conn.execute(
+            PENDING_JOB_INSERT_SQL,
+            pending_job_params(id, &job, &db::now()).expect("serialize the envelope"),
+        )
+        .await
+        .expect("seed the envelope");
+        // The message landed before the freeze cut the turn, and no answer came with it.
+        crate::util::test::seed_session_row(conn, &target, "user", &job.content).await;
+
+        assert_eq!(
+            replay_pending_for_workspace(name)
+                .await
+                .expect("the scoped replay"),
+            1,
+            "the resume delivers the kept message instead of deduping it away",
+        );
+        assert!(
+            inbox.try_recv().is_ok(),
+            "and the conversation is handed it again",
+        );
+        assert!(
+            row_answers(QUEUED_ENVELOPE_QUESTION, QUEUED_ENVELOPE_SQL, params![id])
+                .await
+                .unwrap_or(false),
+            "the envelope stands until its answer is delivered",
+        );
+    }
+
+    /// The round re-drive a resume performs is scoped to one workspace, so resuming one never
+    /// picks up another's work — and it re-drives only what a freeze actually stopped: a round
+    /// whose run is still live (a pause never stops a reading pass) is left to finish.
+    #[serial_test::serial(recover_from_restart)]
+    #[tokio::test]
+    async fn a_resume_re_drives_only_its_own_workspaces_stopped_rounds() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        for workspace in ["resume_scoped_ws", "resume_foreign_ws"] {
+            crate::util::test::create_test_workspace(&format!("/tmp/{workspace}"), workspace).await;
+        }
+        for (id, workspace) in [
+            ("resume_scoped_analyze", "resume_scoped_ws"),
+            ("resume_foreign_analyze", "resume_foreign_ws"),
+            ("resume_live_analyze", "resume_scoped_ws"),
+        ] {
+            crate::util::test::JobRowBuilder::new(conn, id, "analyze", "analyst", workspace)
+                .timestamps(db::now())
+                .insert()
+                .await
+                .expect("the round's row");
+        }
+        // The live round's registration is the guard: it drops, and unregisters, at scope end.
+        let _live = crate::stop::register("resume_live_analyze", None);
+
+        let resumable = resumable_for_workspace("resume_scoped_ws")
+            .await
+            .expect("the scoped re-drive");
+        assert!(
+            resumable
+                .iter()
+                .any(|job| matches!(job, ResumableJob::Analyze { job_id, .. } if job_id == "resume_scoped_analyze")),
+            "the resumed workspace's own stopped round is re-driven",
+        );
+        assert!(
+            !resumable
+                .iter()
+                .any(|job| matches!(job, ResumableJob::Analyze { job_id, .. } if job_id == "resume_live_analyze")),
+            "a round that is still running is not started twice",
+        );
+        assert!(
+            !resumable
+                .iter()
+                .any(|job| matches!(job, ResumableJob::Analyze { job_id, .. } if job_id == "resume_foreign_analyze")),
+            "another workspace's round is left alone",
         );
     }
 
@@ -2584,8 +3316,8 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let conn = &crate::session::store().conn;
         let job_id = "spawn_gate_cancelled_round";
-        let _cancel_guard = crate::round_cancel::register(job_id, None);
-        crate::round_cancel::cancel(job_id);
+        let _cancel_guard = crate::stop::register(job_id, None);
+        crate::stop::fire(job_id);
 
         spawn_job(
             conn,
@@ -2636,8 +3368,8 @@ mod tests {
         // by the cleanup row its cancelled-run handoff still has to write, so
         // that write is not refused by the run's fired signal.
         let cleanup_id = "spawn_gate_cleanup_round";
-        let _cleanup_guard = crate::round_cancel::register(cleanup_id, None);
-        crate::round_cancel::cancel(cleanup_id);
+        let _cleanup_guard = crate::stop::register(cleanup_id, None);
+        crate::stop::fire(cleanup_id);
         spawn_job(
             conn,
             cleanup_id,
@@ -3076,5 +3808,612 @@ mod tests {
             .await
             .unwrap();
         assert!(roster.is_empty(), "every seeded agent roster cascaded away");
+    }
+
+    /// A record row settled with each ending reads that ending, and a failure carries its reason.
+    /// An empty answer is `done_no_answer` — a normal ending, not a failure.
+    #[tokio::test]
+    #[serial_test::serial(handover_records)]
+    async fn a_settled_record_reads_its_outcome_and_reason() {
+        crate::util::test::init_management_test_stores().await;
+        for (id, state, reason, expected) in [
+            ("settled_done", Outcome::Done, None, "done"),
+            ("settled_empty", Outcome::Empty, None, "done_no_answer"),
+            (
+                "settled_stopped",
+                Outcome::Stopped,
+                Some("the workspace was paused"),
+                "stopped",
+            ),
+            (
+                "settled_failed",
+                Outcome::Failed,
+                Some("the folder is gone"),
+                "failed",
+            ),
+        ] {
+            crate::util::test::JobRowBuilder::new(
+                &crate::session::store().conn,
+                id,
+                TURN_KIND,
+                "assistant",
+                "record_ws",
+            )
+            .timestamps(db::now())
+            .insert()
+            .await
+            .expect("the record row");
+
+            settle_record(id, state, reason).await;
+
+            let (status, stored) = crate::util::test::record_row(id)
+                .await
+                .expect("the record row stands");
+            assert_eq!(status, expected, "{id}");
+            assert_eq!(stored.as_deref(), reason, "{id}");
+        }
+    }
+
+    /// Settlement only ever moves a `launched` record of a record kind: a report already made cannot
+    /// be overwritten by a later ending, and another kind of work sharing the `jobs` table is never
+    /// written here.
+    #[tokio::test]
+    #[serial_test::serial(handover_records)]
+    async fn only_a_launched_record_moves() {
+        crate::util::test::init_management_test_stores().await;
+        crate::util::test::JobRowBuilder::new(
+            &crate::session::store().conn,
+            "settle_guarded",
+            TURN_KIND,
+            "assistant",
+            "record_ws",
+        )
+        .timestamps(db::now())
+        .insert()
+        .await
+        .expect("the record row");
+
+        settle_record("settle_guarded", Outcome::Failed, Some("the turn failed")).await;
+        settle_record("settle_guarded", Outcome::Done, None).await;
+        let (status, reason) = crate::util::test::record_row("settle_guarded")
+            .await
+            .expect("the record row stands");
+        assert_eq!(
+            status,
+            Outcome::Failed.as_str(),
+            "a later ending changes nothing"
+        );
+        assert_eq!(reason.as_deref(), Some("the turn failed"));
+
+        // Work that is not a handover's record is scheduling state: its row is deleted or converted
+        // when it ends, and never written here. A worker round's row IS a record, so it moves.
+        crate::util::test::JobRowBuilder::new(
+            &crate::session::store().conn,
+            "settle_analysis_round",
+            "analyze",
+            "analyst",
+            "record_ws",
+        )
+        .timestamps(db::now())
+        .insert()
+        .await
+        .expect("the round's own row");
+        settle_record("settle_analysis_round", Outcome::Done, None).await;
+        let (status, _) = crate::util::test::record_row("settle_analysis_round")
+            .await
+            .expect("the round's row stands");
+        assert_eq!(
+            status,
+            Outcome::Running.as_str(),
+            "an analysis round is not a handover's record"
+        );
+    }
+
+    /// The SQL fragments spell exactly the kinds and endings the code means: a kind or status added
+    /// to one without the other would silently stop matching.
+    #[test]
+    fn the_record_sql_spells_the_kinds_and_endings() {
+        let quoted = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| format!("'{item}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        assert_eq!(
+            RECORD_KINDS_SQL,
+            quoted(&[TURN_KIND, CHAIN_KIND, IMPLEMENT_KIND])
+        );
+        assert_eq!(
+            RECEIPT_KINDS_SQL,
+            quoted(&[TURN_KIND, CHAIN_KIND]),
+            "the receipts are the record kinds whose row is not work"
+        );
+        let settled = [
+            Outcome::Done,
+            Outcome::Empty,
+            Outcome::Stopped,
+            Outcome::Failed,
+        ]
+        .map(Outcome::as_str);
+        assert_eq!(
+            ACTIVE_STATUSES_SQL,
+            format!("status NOT IN ({})", quoted(&settled))
+        );
+    }
+
+    /// The `turn` envelope a command-line handover carries.
+    fn handover_job(workspace: &str) -> crate::agent::message_router::AgentJob {
+        crate::agent::message_router::AgentJob {
+            content: "draft it".to_string(),
+            workspace_name: workspace.to_string(),
+            user_name: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "cli".to_string(),
+            kind: crate::agent::message_router::MessageKind::UserMessage,
+            role: crate::Role::Assistant,
+            reply_target: None,
+            pending_job_id: None,
+            pause_notice_id: None,
+            originating_workspace: None,
+            custom_role: None,
+            reply_to_custom: None,
+            urgent: false,
+            extract: None,
+        }
+    }
+
+    /// A record is settled by the conversation it names, so an answer that arrives through dead
+    /// session recovery — which knows only its own agent id — ends the handover it answers.
+    #[tokio::test]
+    #[serial_test::serial(handover_records)]
+    async fn a_record_is_settled_by_its_conversation() {
+        crate::util::test::init_management_test_stores().await;
+        let job = handover_job("record_ws");
+        open_handover_record("settle_by_conversation", &job, "recovered_agent")
+            .await
+            .expect("the handover's record row");
+
+        settle_conversation("some_other_agent", Outcome::Done, None).await;
+        let (status, _) = crate::util::test::record_row("settle_by_conversation")
+            .await
+            .expect("the record row stands");
+        assert_eq!(
+            status,
+            Outcome::Running.as_str(),
+            "another conversation settles nothing"
+        );
+
+        settle_conversation("recovered_agent", Outcome::Done, None).await;
+        let (status, _) = crate::util::test::record_row("settle_by_conversation")
+            .await
+            .expect("the record row stands");
+        assert_eq!(
+            status,
+            Outcome::Done.as_str(),
+            "the conversation that answers the handover settles its record"
+        );
+    }
+
+    /// A handover queued behind a turn in the same conversation is not the turn's to settle: its
+    /// envelope is still there, so its message has not landed and no answer is coming yet. Only the
+    /// record whose envelope is already gone — the one dead-session recovery answers — moves.
+    #[tokio::test]
+    #[serial_test::serial(handover_records)]
+    async fn a_queued_handovers_record_is_not_settled_by_its_conversation() {
+        crate::util::test::init_management_test_stores().await;
+        let job = handover_job("queued_record_ws");
+        open_handover_record("settle_queued_handover", &job, "shared_conversation")
+            .await
+            .expect("the handover's record row");
+        crate::agent::message_router::persist_pending(&job, "settle_queued_handover".to_string())
+            .await
+            .expect("the handover's envelope");
+
+        settle_conversation("shared_conversation", Outcome::Done, None).await;
+        let (status, _) = crate::util::test::record_row("settle_queued_handover")
+            .await
+            .expect("the record row stands");
+        assert_eq!(
+            status,
+            Outcome::Running.as_str(),
+            "a handover still queued has not been answered yet"
+        );
+
+        // The message landed: the envelope is gone, so the answer now comes through recovery.
+        crate::session::store()
+            .conn
+            .execute(
+                "DELETE FROM pending_jobs WHERE id = ?1",
+                params!["settle_queued_handover"],
+            )
+            .await
+            .expect("the envelope leaves with the message");
+        settle_conversation("shared_conversation", Outcome::Done, None).await;
+        let (status, _) = crate::util::test::record_row("settle_queued_handover")
+            .await
+            .expect("the record row stands");
+        assert_eq!(
+            status,
+            Outcome::Done.as_str(),
+            "the record whose envelope is gone is the recovery case"
+        );
+    }
+
+    /// A worker round's record carries the round's own verdict: a failed round's printed id says
+    /// `failed`, exactly as its roster row does, instead of claiming the work was done. A round that
+    /// panicked before it could checkpoint a verdict has none, so the record still ends — never left
+    /// `launched` for a boot to retry.
+    #[tokio::test]
+    #[serial_test::serial(handover_records)]
+    async fn a_failed_worker_round_settles_its_record_with_its_own_verdict() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        crate::util::test::JobRowBuilder::new(
+            conn,
+            "failed_round_record",
+            IMPLEMENT_KIND,
+            "worker",
+            "failed_round_ws",
+        )
+        .timestamps(db::now())
+        .insert()
+        .await
+        .expect("the round's row");
+        conn.execute(
+            AGENT_INSERT_SQL,
+            agent_params(
+                "failed_round_record",
+                "failed_round_worker",
+                AgentKind::Worker,
+                None,
+                "do it",
+            ),
+        )
+        .await
+        .expect("the round's roster row");
+        write_agent_outcome(
+            conn,
+            "failed_round_record",
+            "failed_round_worker",
+            Outcome::Failed,
+            Some("the round went wrong"),
+        )
+        .await
+        .expect("the round's own verdict");
+
+        complete_job_with_envelope(
+            conn,
+            "failed_round_record",
+            &handover_job("failed_round_ws"),
+        )
+        .await
+        .expect("the round completes");
+
+        let (status, reason) = crate::util::test::record_row("failed_round_record")
+            .await
+            .expect("the record stands");
+        assert_eq!(
+            status,
+            Outcome::Failed.as_str(),
+            "the record copies the round's verdict instead of asserting one"
+        );
+        assert_eq!(
+            reason.as_deref(),
+            Some("the round went wrong"),
+            "a failed round's own text is the record's reason, not an empty one"
+        );
+
+        // A round that panicked never checkpointed a verdict: its roster row is still `launched`,
+        // and the record must still end rather than wait for a boot to resume a round that is gone.
+        crate::util::test::JobRowBuilder::new(
+            conn,
+            "panicked_round_record",
+            IMPLEMENT_KIND,
+            "worker",
+            "failed_round_ws",
+        )
+        .timestamps(db::now())
+        .insert()
+        .await
+        .expect("the round's row");
+        conn.execute(
+            AGENT_INSERT_SQL,
+            agent_params(
+                "panicked_round_record",
+                "panicked_round_worker",
+                AgentKind::Worker,
+                None,
+                "do it",
+            ),
+        )
+        .await
+        .expect("the round's roster row");
+        complete_job_with_envelope(
+            conn,
+            "panicked_round_record",
+            &handover_job("failed_round_ws"),
+        )
+        .await
+        .expect("the round completes");
+        let (status, reason) = crate::util::test::record_row("panicked_round_record")
+            .await
+            .expect("the record stands");
+        assert_eq!(
+            status,
+            Outcome::Done.as_str(),
+            "a round with no verdict settles on the fallback, never on `launched`"
+        );
+        assert_eq!(
+            reason, None,
+            "a round with no outcome gives the record no reason"
+        );
+    }
+
+    /// A settled record never stores the answer: the conversation holds it, and a record of what
+    /// happened is not a second copy. A round that failed or was stopped keeps its reason, which is
+    /// what a record of a handover that produced no answer is for.
+    #[serial_test::serial(handover_records)]
+    #[tokio::test]
+    async fn a_settled_record_keeps_an_answer_out_of_its_row_and_a_reason_in_it() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        for (id, ending, outcome) in [
+            ("answered_round_record", Outcome::Done, "the whole answer"),
+            (
+                "stopped_round_record",
+                Outcome::Stopped,
+                crate::agent::PAUSED_REASON,
+            ),
+            (
+                "empty_round_record",
+                Outcome::Empty,
+                "nothing to report, still not a reason",
+            ),
+        ] {
+            crate::util::test::JobRowBuilder::new(conn, id, IMPLEMENT_KIND, "worker", "settled_ws")
+                .timestamps(db::now())
+                .insert()
+                .await
+                .expect("the round's row");
+            conn.execute(
+                AGENT_INSERT_SQL,
+                agent_params(
+                    id,
+                    &format!("{id}_worker"),
+                    AgentKind::Worker,
+                    None,
+                    "do it",
+                ),
+            )
+            .await
+            .expect("the round's roster row");
+            write_agent_outcome(conn, id, &format!("{id}_worker"), ending, Some(outcome))
+                .await
+                .expect("the round's own verdict");
+            complete_job_with_envelope(conn, id, &handover_job("settled_ws"))
+                .await
+                .expect("the round completes");
+
+            let (status, reason) = crate::util::test::record_row(id)
+                .await
+                .expect("the record stands");
+            assert_eq!(status, ending.as_str(), "the record copies the verdict");
+            let expected = matches!(ending, Outcome::Failed | Outcome::Stopped).then_some(outcome);
+            assert_eq!(
+                reason.as_deref(),
+                expected,
+                "only a failed or stopped round's record keeps a reason",
+            );
+        }
+    }
+
+    /// A re-issued identical chain is a new run of the same chain: opening its record re-arms the
+    /// row it already has — launched again, with no reason and a fresh answer window.
+    #[tokio::test]
+    #[serial_test::serial(handover_records)]
+    async fn a_reissued_chain_re_arms_its_record() {
+        crate::util::test::init_management_test_stores().await;
+        let chain = crate::launch::Chain {
+            id: "re_armed_chain".to_string(),
+            task: "draft it".to_string(),
+            user: crate::users::ADMIN_USER_NAME.to_string(),
+            channel: "cli".to_string(),
+            workspace: "re_armed_ws".to_string(),
+            inherited: None,
+            current: crate::launch::Step::worker(),
+            step: 1,
+            next: Vec::new(),
+        };
+        open_chain_record(&chain).await.expect("the chain's row");
+        settle_record(&chain.id, Outcome::Failed, Some("the step failed")).await;
+        let opened = "2020-01-01T00:00:00+00:00";
+        crate::session::store()
+            .conn
+            .execute(
+                "UPDATE jobs SET created_at = ?1 WHERE id = ?2",
+                params![opened, chain.id.as_str()],
+            )
+            .await
+            .expect("backdate the first run");
+
+        open_chain_record(&chain).await.expect("the re-issued row");
+
+        let (status, reason) = crate::util::test::record_row(&chain.id)
+            .await
+            .expect("the chain's record stands");
+        assert_eq!(status, Outcome::Running.as_str());
+        assert_eq!(reason, None, "the previous run's reason is gone");
+        let created = crate::session::store()
+            .conn
+            .query_optional(
+                "SELECT created_at FROM jobs WHERE id = ?1",
+                params![chain.id.as_str()],
+                |row| row.get::<String>(0),
+            )
+            .await
+            .expect("read the row")
+            .expect("the row stands");
+        assert_ne!(created, opened, "the answer window starts again");
+    }
+
+    /// The boot sweep settles what a stopped process left: a record whose work is gone is failed
+    /// with the sentence a script reads, one whose envelope still stands is left for the replay,
+    /// one whose conversation answered is done, one whose message landed unanswered is left for
+    /// dead-session recovery, and a chain with a step still standing is left alone.
+    #[tokio::test]
+    #[serial_test::serial(handover_records)]
+    async fn the_boot_sweep_settles_what_a_stopped_process_left() {
+        crate::util::test::init_management_test_stores().await;
+        let conn = &crate::session::store().conn;
+        for id in [
+            "sweep_gone",
+            "sweep_live",
+            "sweep_answered",
+            "sweep_unanswered",
+            "sweep_chain",
+            "sweep_chain_gone",
+        ] {
+            crate::util::test::JobRowBuilder::new(conn, id, TURN_KIND, "assistant", "sweep_ws")
+                .timestamps(db::now())
+                .insert()
+                .await
+                .expect("the record row");
+        }
+        // The drained handover's own work still waits for the replay.
+        conn.execute(
+            "INSERT INTO pending_jobs (id, target_agent_id, envelope, created_at) \
+             VALUES ('sweep_live', 'sweep_agent', '{}', ?1)",
+            params![db::now()],
+        )
+        .await
+        .expect("the queued envelope");
+        // The answer the third record's conversation holds.
+        attach_conversation("sweep_answered", "sweep_answered_agent", None)
+            .await
+            .expect("the conversation");
+        crate::util::test::seed_session_row(conn, "sweep_answered_agent", "assistant", "done")
+            .await;
+        // The fourth record's message landed and nothing answered it: dead-session recovery will,
+        // and that answer settles the record — so the sweep must not call it a failure first.
+        attach_conversation("sweep_unanswered", "sweep_unanswered_agent", None)
+            .await
+            .expect("the conversation");
+        crate::util::test::seed_session_row(conn, "sweep_unanswered_agent", "user", "draft it")
+            .await;
+        // A chain's row is the chain's, and its first step still stands; another chain's step is
+        // gone, so nothing will ever resume it.
+        for id in ["sweep_chain", "sweep_chain_gone"] {
+            conn.execute(
+                "UPDATE jobs SET kind = ?1, chain_steps = 1 WHERE id = ?2",
+                params![CHAIN_KIND, id],
+            )
+            .await
+            .expect("the chain's row");
+        }
+        crate::util::test::JobRowBuilder::new(
+            conn,
+            crate::launch::record_id("sweep_chain", 1),
+            "worker",
+            "worker",
+            "sweep_ws",
+        )
+        .timestamps(db::now())
+        .insert()
+        .await
+        .expect("the chain's first step");
+
+        settle_interrupted_records().await;
+
+        let (gone, reason) = crate::util::test::record_row("sweep_gone")
+            .await
+            .expect("the record row stands");
+        assert_eq!(gone, Outcome::Failed.as_str());
+        assert_eq!(reason.as_deref(), Some(STOPPED_MID_FLIGHT));
+        let (chain_gone, _) = crate::util::test::record_row("sweep_chain_gone")
+            .await
+            .expect("the chain's record row stands");
+        assert_eq!(chain_gone, Outcome::Failed.as_str());
+        for (id, expected) in [
+            ("sweep_live", Outcome::Running),
+            ("sweep_answered", Outcome::Done),
+            ("sweep_unanswered", Outcome::Running),
+            ("sweep_chain", Outcome::Running),
+        ] {
+            let (status, _) = crate::util::test::record_row(id)
+                .await
+                .expect("the record row stands");
+            assert_eq!(status, expected.as_str(), "{id}");
+        }
+    }
+
+    /// The purge removes a settled record past the cutoff and keeps a running one, so finished
+    /// handovers do not accumulate.
+    #[tokio::test]
+    #[serial_test::serial(handover_records)]
+    async fn the_purge_removes_only_records_past_their_retention() {
+        crate::util::test::init_management_test_stores().await;
+        for id in ["purge_done", "purge_running", "purge_never_settled"] {
+            crate::util::test::JobRowBuilder::new(
+                &crate::session::store().conn,
+                id,
+                TURN_KIND,
+                "assistant",
+                "purge_ws",
+            )
+            .timestamps(db::now())
+            .insert()
+            .await
+            .expect("the record row");
+        }
+        settle_record("purge_done", Outcome::Done, None).await;
+        // Backdate only the settled record: the running one was created now, so a cutoff between
+        // the two removes the settled one and keeps the running one.
+        crate::session::store()
+            .conn
+            .execute(
+                "UPDATE jobs SET updated_at = '2020-01-01T00:00:00+00:00' \
+                 WHERE id IN ('purge_done', 'purge_never_settled')",
+                params![],
+            )
+            .await
+            .expect("backdate the expired records");
+
+        assert_eq!(
+            purge_expired_records("2021-01-01T00:00:00+00:00".to_string())
+                .await
+                .expect("purge once"),
+            2,
+            "a settled record and one that never settled are both past their retention"
+        );
+        assert!(
+            crate::util::test::record_row("purge_done").await.is_none(),
+            "the settled record is gone"
+        );
+        assert!(
+            crate::util::test::record_row("purge_never_settled")
+                .await
+                .is_none(),
+            "a record that never settled is not kept forever"
+        );
+        assert!(
+            crate::util::test::record_row("purge_running")
+                .await
+                .is_some(),
+            "a running record inside its retention is kept"
+        );
+    }
+
+    /// An acknowledgement names the id a script holds, and leaves the words alone without one.
+    #[test]
+    fn acknowledged_names_the_id_it_printed() {
+        assert_eq!(
+            acknowledged("Message handed over".to_string(), Some("job_1")),
+            "Message handed over (job job_1)"
+        );
+        assert_eq!(
+            acknowledged("Message handed over".to_string(), None),
+            "Message handed over",
+            "a handover that opened no record prints no id"
+        );
     }
 }

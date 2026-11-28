@@ -3183,7 +3183,7 @@ exit 0
             &store.conn,
             "job-reclaim-cu",
             finished_id,
-            crate::jobs::RowStatus::Done,
+            crate::outcome::Outcome::Done,
             Some("{}"),
         )
         .await

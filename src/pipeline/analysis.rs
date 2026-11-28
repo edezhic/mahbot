@@ -2,17 +2,17 @@
 
 use std::sync::Arc;
 
+use crate::outcome::Outcome;
 use crate::pipeline::board::Ticket;
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::{Role, Workspace};
 
 use super::{
-    AgentSlot, BoardStore, ExtractionMode, FinalizeOutcome, JointRound, MemberOutcome,
-    ParallelVerdict, TicketPhase, TransitionCtx, Write, agent_slot_from_roster_row,
-    build_agent_slots, build_round_grouping, debug, deserialize_verdict_outcome, guard_job_phase,
-    info, insert_round_slots, issue_grade, pause_freezing, rearm_resumed_slots,
-    render_joint_comment, reset_phase_attempt, run_parallel_agents, warn,
-    with_comment_and_transition,
+    AgentSlot, BoardStore, ExtractionMode, JointRound, MemberOutcome, ParallelVerdict, TicketPhase,
+    TransitionCtx, Write, agent_slot_from_roster_row, build_agent_slots, build_round_grouping,
+    debug, deserialize_verdict_outcome, guard_job_phase, info, insert_round_slots, issue_grade,
+    pause_freezing, rearm_resumed_slots, render_joint_comment, reset_phase_attempt,
+    run_parallel_agents, warn, with_comment_and_transition,
 };
 
 const BASE_ANALYST_COUNT: usize = 2;
@@ -826,7 +826,7 @@ async fn process_analyst_verdicts(
             },
         )
         .await,
-        FinalizeOutcome::Applied
+        Outcome::Done
     ) {
         return;
     }

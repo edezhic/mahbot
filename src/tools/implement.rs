@@ -6,7 +6,6 @@
 //! the tool half living in [`crate::tools::send`]. The jobs-row kind stays `implement`.
 
 use crate::agent::run_agent;
-use crate::session::analyze_agent_id;
 use crate::{Role, Workspace};
 use anyhow::anyhow;
 
@@ -28,8 +27,9 @@ pub(crate) async fn spawn_implement_rows(
             "a fresh worker dispatch carries no spawn record",
         ));
     };
-    let worker_agent_id =
-        analyze_agent_id(&exec.name, Role::Worker.as_str()) + &crate::generate_suffix();
+    let worker_agent_id = crate::address::AgentAddress::analyze(&exec.name, Role::Worker.as_str())
+        .id()
+        + &crate::generate_suffix();
     // Single-worker roster: one tx puts the job + the worker row down before any session write.
     let agents = vec![crate::jobs::NewAgent {
         agent_id: worker_agent_id.clone(),
@@ -169,13 +169,10 @@ async fn hand_over_round(
     spawn_implement_rows(exec, task, &args).await?;
 
     // The rows are down, so the handover is durable, and the round has not been spawned yet: the
-    // command line's own handover opens the record its id answers here. Only this caller reaches
-    // here without a chain — a chain step's record is the chain's own id, opened where the chain
-    // starts.
+    // record its id answers is the row itself, written `launched` by the insert above. Only this
+    // caller's id is the caller's to hold — a chain step's record is the chain's own id, opened
+    // where the chain starts.
     let opened = caller.chain.is_none();
-    if opened {
-        crate::send_outcome::begin(caller.job_id, None).await;
-    }
 
     // Run the round as a RESUME of them, so a restart landing between the two starts the very
     // round this call promised.
@@ -205,7 +202,7 @@ pub(crate) async fn run_implement_with_job(
             })?;
             // Only a completed worker's outcome is reconstructable — a failed or launched
             // one is re-run with its stored task.
-            let pre_done = (row.status == crate::jobs::RowStatus::Done.as_str())
+            let pre_done = (row.status == crate::outcome::Outcome::Done.as_str())
                 .then(|| row.outcome.clone())
                 .flatten();
             (row.agent_id.clone(), pre_done)
@@ -222,12 +219,12 @@ pub(crate) async fn run_implement_with_job(
     // session, so an interrupted attempt continues rather than redoing the task. A chain step
     // carries its own group (it runs outside any agent turn); everything else inherits the
     // caller's.
-    let (parent_key, parent_label) = match &args.chain {
-        Some(chain) => (
-            Some(crate::agent::registry::ParentKey::Chain(chain.id.clone())),
-            Some(chain.task.clone()),
-        ),
-        None => (
+    let work = match &args.chain {
+        Some(chain) => crate::work_unit::WorkUnit::Chain {
+            id: chain.id.clone(),
+            label: chain.task.clone(),
+        },
+        None => crate::work_unit::WorkUnit::of_parent(
             crate::agent::CURRENT_TOOL_PARENT_KEY
                 .try_with(std::clone::Clone::clone)
                 .unwrap_or(None),
@@ -241,7 +238,7 @@ pub(crate) async fn run_implement_with_job(
         worker_agent_id.clone(),
         Role::Worker,
         ws,
-        None,
+        work,
         &[if has_session { "" } else { task }],
         args.user_name.to_string(),
         args.channel.to_string(),
@@ -249,18 +246,22 @@ pub(crate) async fn run_implement_with_job(
         None,
         resume,
         None,
-        parent_key,
-        parent_label,
         None,
     )
     .await;
 
     // CHECKPOINT: persist the worker's terminal outcome so a drain-cut or crash resume can
-    // reconstruct it without re-running a completed worker.
+    // reconstruct it without re-running a completed worker. A round the workspace pause froze was
+    // stopped, not failed: nothing was produced, and the round resumes at unpause.
+    let frozen = response.is_none() && agent.is_paused_frozen();
     let (status, outcome) = match &response {
-        Some(r) => (crate::jobs::RowStatus::Done, r.clone()),
+        Some(r) => (crate::outcome::Outcome::Done, r.clone()),
+        None if frozen => (
+            crate::outcome::Outcome::Stopped,
+            agent.failure_reason(crate::agent::PAUSED_REASON),
+        ),
         None => (
-            crate::jobs::RowStatus::Failed,
+            crate::outcome::Outcome::Failed,
             agent.failure_reason("worker produced no response"),
         ),
     };
@@ -291,6 +292,11 @@ pub(crate) async fn run_implement_with_job(
 
     Ok(crate::tools::SyncCoreOutcome::Terminal(match response {
         Some(r) => Ok(r),
+        // A run the workspace pause froze was stopped, not lost: the typed reason is what lets a
+        // chain settle its step as stopped instead of delivering a failure to the caller.
+        None if frozen => Err(anyhow::Error::new(crate::launch::WorkspacePaused {
+            workspace: ws.name.clone(),
+        })),
         None => Err(anyhow!(
             "Sub-agent failed: {}",
             agent.failure_reason("unknown error")
@@ -462,6 +468,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(drain)] // serializes the process-global drain flag
     async fn sync_implement_draincut_and_completion_resumes_durable_job() {
+        use crate::jobs::IMPLEMENT_KIND;
         crate::util::test::init_management_test_stores().await;
         let ws = test_ws("/tmp/test_ws_sync_implement");
         let pin = "sync_implement_pin";
@@ -485,7 +492,10 @@ mod tests {
 
         let jobs = conn
             .query(
-                "SELECT id, status, caller_agent_id FROM jobs WHERE caller_agent_id = ?1 AND kind = 'implement'",
+                &format!(
+                    "SELECT id, status, caller_agent_id FROM jobs WHERE caller_agent_id = ?1 AND \
+                     kind = '{IMPLEMENT_KIND}'"
+                ),
                 crate::db::params![pin],
             )
             .await
@@ -509,7 +519,7 @@ mod tests {
             conn,
             &job_id,
             &worker_id,
-            crate::jobs::RowStatus::Done,
+            crate::outcome::Outcome::Done,
             Some("WORKER_RESPONSE"),
         )
         .await
@@ -644,7 +654,7 @@ mod tests {
             .expect("the schema is accepted")
         };
         let stopped = "worker_extract_stopped";
-        let _cancel_guard = crate::round_cancel::register(stopped, None);
+        let _cancel_guard = crate::stop::register(stopped, None);
         // The id `envelope_target` computes for this envelope: the owner's Assistant in the
         // round's workspace.
         let caller = crate::jobs::target_agent_id(
@@ -669,7 +679,7 @@ mod tests {
                         );
                         // The transformation is in flight: stop the round, then let it finish.
                         wait_for_calls(&fake, 2).await;
-                        crate::round_cancel::cancel(stopped);
+                        crate::stop::fire(stopped);
                         gate.notify_one();
                         assert!(
                             tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
@@ -715,12 +725,12 @@ mod tests {
         panic!("the fake provider never received {calls} calls");
     }
 
-    /// A boot-resumed round settles the record its command-line handover opened: the record's own
-    /// existence is the marker, so the resume asks before it writes and the record takes the
-    /// round's stored answer.
+    /// A boot-resumed round terminalizes its own row — the row is the round's work, not a receipt —
+    /// and delivers its report to the caller. Nothing is left `launched`, so the next boot does not
+    /// run the round a second time.
     #[tokio::test]
-    #[serial_test::serial(drain, send_outcome)]
-    async fn a_resumed_round_settles_the_record_its_handover_opened() {
+    #[serial_test::serial(drain, handover_records)]
+    async fn a_resumed_round_terminalizes_its_row_and_reports_to_its_caller() {
         crate::util::test::init_management_test_stores().await;
         let ws = test_ws("/tmp/test_ws_resume_record");
         let conn = &crate::session::store().conn;
@@ -751,13 +761,21 @@ mod tests {
             conn,
             job_id,
             &worker,
-            crate::jobs::RowStatus::Done,
+            crate::outcome::Outcome::Done,
             Some("the work is done"),
         )
         .await
         .expect("the worker's stored outcome");
-        // The handover opened the record before its round left; the restart kept it running.
-        crate::send_outcome::begin(job_id, None).await;
+        // The handover opened the record before its round left; the restart kept it launched.
+        // The answer the completed round produced is the conversation's last assistant message —
+        // the record reads it from there rather than keeping a second copy.
+        crate::util::test::seed_session_row(
+            &crate::session::store().conn,
+            &worker,
+            "assistant",
+            "the work is done",
+        )
+        .await;
         // The report's own consumer, so the delivered envelope does not start a turn.
         let target =
             crate::jobs::target_agent_id(None, "caller-user", Role::Assistant.as_str(), &ws.name);
@@ -766,12 +784,14 @@ mod tests {
         resume_implement_round(job_id, &ws, None).await;
         crate::agent::message_router::unregister_agent(&target);
 
-        let record = crate::send_outcome::lookup(job_id)
+        let (status, _) = crate::util::test::record_row(job_id)
             .await
-            .expect("read the record")
-            .expect("the handover opened one");
-        assert_eq!(record.state, crate::send_outcome::State::Done);
-        assert_eq!(record.answer.as_deref(), Some("the work is done"));
+            .expect("the round's row stays as the record of its handover");
+        assert_eq!(
+            status,
+            crate::outcome::Outcome::Done.as_str(),
+            "a settled record is not resumed as a second run"
+        );
         assert!(
             report
                 .try_recv()

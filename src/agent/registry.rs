@@ -14,13 +14,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::runtime_events::{RuntimeEvent, publish};
 use crate::util::UnwrapPoison;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use tokio_util::sync::CancellationToken;
 
 /// Monotonically increasing generation counter for registry entries, so
 /// [`deregister`](AgentRegistry::deregister) can detect stale entries: a new agent registered
@@ -52,6 +51,40 @@ pub enum ParentKey {
     Research(String),
     Launch(String),
     Chain(String),
+}
+
+impl ParentKey {
+    /// The kind token the group key is built from.
+    #[must_use]
+    fn token(&self) -> &'static str {
+        match self {
+            Self::Ticket(_) => "ticket",
+            Self::AnalyzeRound(_) => "analyze",
+            Self::Research(_) => "research",
+            Self::Launch(_) => "launch",
+            Self::Chain(_) => "chain",
+        }
+    }
+
+    /// The payload this run is keyed by (ticket id, round key, run key, launch agent id, chain
+    /// id) — the one spelling of a parent key's own value.
+    #[must_use]
+    pub(crate) fn key(&self) -> &str {
+        match self {
+            Self::Ticket(key)
+            | Self::AnalyzeRound(key)
+            | Self::Research(key)
+            | Self::Launch(key)
+            | Self::Chain(key) => key,
+        }
+    }
+
+    /// The group key this run belongs to — the one identity folder occupancy and group
+    /// cancellation share.
+    #[must_use]
+    pub(crate) fn group(&self) -> String {
+        format!("{}:{}", self.token(), self.key())
+    }
 }
 
 /// One tool call in the GUI's session-ledger projection (`session_view`) — the payload of a
@@ -111,6 +144,14 @@ pub struct AgentHandle {
     pub paused: bool,
 }
 
+impl AgentHandle {
+    /// The group this run belongs to — see [`group_key`], which is the one spelling of it.
+    #[must_use]
+    pub(crate) fn group(&self) -> String {
+        group_key(self.parent_key.as_ref(), &self.agent_id)
+    }
+}
+
 /// The caller's identity for the warning row a tool makes about itself. The agent id is
 /// [`crate::agent::CURRENT_TOOL_AGENT_ID`]'s and is read from there, never carried twice. `None`
 /// outside an agent run.
@@ -125,13 +166,9 @@ pub(crate) struct AgentTracking {
 struct AgentEntry {
     generation: u64,
     handle: AgentHandle,
-    cancel_token: CancellationToken,
-    /// The turn's urgent-message interrupt (see [`AgentRegistry::interrupt`]). Fired, never
-    /// removed: it dies with the entry.
-    interrupt_token: CancellationToken,
-    /// Whether a workspace-pause (strict freeze) cancellation was requested for this agent — a
-    /// FREEZE distinct from a code-driven cancellation.
-    pause_stop: Arc<AtomicBool>,
+    /// Everything that can stop this run — the same handle the agent holds, so a sweep fires the
+    /// run's own token and its obedience of a pause is recorded once. See [`crate::stop::Stop`].
+    stop: Arc<crate::stop::Stop>,
     /// Live activity label for the non-tool LLM phase currently running inside this agent;
     /// `None` between phases. Single slot: an agent runs sequentially. Snapshot into
     /// [`AgentHandle::activity`] by `list()`.
@@ -160,6 +197,12 @@ fn json_value_to_display_string(v: &serde_json::Value) -> String {
     }
 }
 
+/// How long a registration may keep holding its folder. A run that outlives this is a leak — a
+/// panicked task or a leaked `Arc` that never deregistered — and letting it hold the folder would
+/// stall the workspace's pipeline, and every launch into it, for the life of the process. Real
+/// rounds finish well inside it.
+const FOLDER_HOLD_CEILING: chrono::Duration = chrono::Duration::hours(6);
+
 #[derive(Default)]
 pub struct AgentRegistry {
     inner: Mutex<HashMap<String, AgentEntry>>,
@@ -170,20 +213,18 @@ impl AgentRegistry {
     ///
     /// Used by [`crate::Agent::new`], where deregistration is handled by [`crate::Agent::drop`]
     /// instead of a guard. `parent_label` is the parent invocation's human-readable label, and
-    /// `interrupt_token` the turn's urgent-message interrupt, stored so the router can fire it
-    /// by agent id without knowing the run.
+    /// `stop` the run's own stop, stored so a sweep can fire it by agent id without knowing the
+    /// run.
     #[expect(clippy::too_many_arguments)] // one positional arg per handle field; callers use literals
-    pub fn register(
+    pub(crate) fn register(
         &self,
         agent_id: String,
         role: String,
         ticket_id: Option<String>,
         ws: &crate::Workspace,
-        cancel_token: CancellationToken,
-        interrupt_token: CancellationToken,
+        stop: Arc<crate::stop::Stop>,
         parent_key: Option<ParentKey>,
         parent_label: Option<String>,
-        pause_stop: Arc<AtomicBool>,
     ) -> u64 {
         let generation = NEXT_ENTRY_GENERATION.fetch_add(1, Ordering::Relaxed);
         let handle = AgentHandle {
@@ -202,16 +243,14 @@ impl AgentRegistry {
         let mut map = self.inner.lock().unwrap_poison();
         // Replacing an old agent cancels the old token — the new agent is a replacement.
         if let Some(old) = map.remove(&agent_id) {
-            old.cancel_token.cancel();
+            old.stop.fire(crate::stop::StopReason::Cancelled);
         }
         map.insert(
             agent_id,
             AgentEntry {
                 generation,
                 handle,
-                cancel_token,
-                interrupt_token,
-                pause_stop,
+                stop,
                 activity: None,
             },
         );
@@ -226,7 +265,7 @@ impl AgentRegistry {
     pub fn interrupt(&self, agent_id: &str) {
         let map = self.inner.lock().unwrap_poison();
         if let Some(entry) = map.get(agent_id) {
-            entry.interrupt_token.cancel();
+            entry.stop.fire(crate::stop::StopReason::Interrupted);
         }
     }
 
@@ -277,7 +316,7 @@ impl AgentRegistry {
     fn cancel(&self, agent_id: &str) {
         let mut map = self.inner.lock().unwrap_poison();
         if let Some(entry) = map.remove(agent_id) {
-            entry.cancel_token.cancel();
+            entry.stop.fire(crate::stop::StopReason::Cancelled);
             publish(RuntimeEvent::Registries);
         }
     }
@@ -310,23 +349,22 @@ impl AgentRegistry {
         self.cancel_matching(|entry| entry.handle.ticket_id.as_deref() == Some(ticket_id));
     }
 
-    /// Cancel all agents running for a `workspace_name` as a workspace-pause (strict freeze):
-    /// sets the pause-stop flag on each matched agent WITHOUT firing its cancel token, so its
-    /// current round finishes and it stops cooperatively at the next LLM round boundary. The
-    /// flag lets the failure classifier treat a frozen run as a FREEZE (leave the ticket for
-    /// unpause), not a failure or a cancellation.
+    /// Cancel every agent writing to a `workspace_name` as a workspace-pause (strict freeze):
+    /// sets the pause-stop flag on each WITHOUT firing its cancel token, so its current round
+    /// finishes and it stops cooperatively at the next LLM round boundary. The flag lets the
+    /// failure classifier treat a frozen run as a FREEZE (leave the ticket for unpause), not a
+    /// failure or a cancellation.
     ///
-    /// Scoped to TICKET-parented pipeline agents — managers, maintainers and on-demand
-    /// analyze/research sub-agents (`ticket_id = None`) keep running, so a pause only halts the
-    /// ticket pipeline.
+    /// Every writer is reached — a stage round, a branch launch, the maintainer, whether or not it
+    /// holds a ticket — and nothing else is: reading never stops on a freeze, and the Manager's
+    /// triage is exempt, because the notice that explains the pause has to be deliverable.
     pub fn cancel_by_workspace_pause(&self, workspace_name: &str) {
         let mut changed = false;
         {
             let map = self.inner.lock().unwrap_poison();
             for entry in map.values() {
-                if entry.handle.workspace_name == workspace_name && entry.handle.ticket_id.is_some()
-                {
-                    changed |= !entry.pause_stop.swap(true, Ordering::SeqCst);
+                if entry.handle.workspace_name == workspace_name && holds_folder(&entry.handle) {
+                    changed |= entry.stop.fire(crate::stop::StopReason::Paused);
                 }
             }
         }
@@ -346,7 +384,7 @@ impl AgentRegistry {
             let map = self.inner.lock().unwrap_poison();
             for entry in map.values() {
                 if entry.handle.workspace_name == workspace_name {
-                    changed |= entry.pause_stop.swap(false, Ordering::SeqCst);
+                    changed |= entry.stop.clear_pause();
                 }
             }
         }
@@ -382,32 +420,39 @@ impl AgentRegistry {
             .map(|e| {
                 let mut handle = e.handle.clone();
                 handle.activity.clone_from(&e.activity);
-                handle.paused = e.pause_stop.load(Ordering::SeqCst);
+                handle.paused = e.stop.pause_requested();
                 handle
             })
             .collect()
     }
 
-    /// The worker or custom-role agent working in `folder` right now, other than `caller` — the
-    /// roles that edit a folder's tree — ignoring the steps of `chain`, whose own previous step
-    /// finishing there is not another agent. Path equality is component-based, so a stored
-    /// trailing separator is not a different folder.
+    /// The agent holding `folder` for a group other than `excluded_groups` — the single-writer
+    /// rule every launch and the pipeline's claim consult. Path equality is component-based, so
+    /// a stored trailing separator is not a different folder.
     #[must_use]
-    pub fn worker_in_folder_excluding_chain(
-        &self,
+    pub fn folder_holder(&self, folder: &Path, excluded_groups: &[&str]) -> Option<AgentHandle> {
+        Self::holder_among(self.list(), folder, excluded_groups)
+    }
+
+    /// The same rule over a snapshot the caller already holds, so a listing that has to read the
+    /// registry for another reason scans it once.
+    ///
+    /// A registration older than [`FOLDER_HOLD_CEILING`] no longer holds anything: an agent that
+    /// died without dropping (a panicked task, a leaked `Arc`) must not block a folder for the life
+    /// of the process, and no real run lasts that long.
+    #[must_use]
+    pub fn holder_among(
+        agents: Vec<AgentHandle>,
         folder: &Path,
-        caller: Option<&str>,
-        chain: Option<&str>,
+        excluded_groups: &[&str],
     ) -> Option<AgentHandle> {
-        self.list().into_iter().find(|agent| {
-            let role = agent.role.as_str();
-            let same_chain = chain.is_some_and(
-                |id| matches!(&agent.parent_key, Some(ParentKey::Chain(held)) if held == id),
-            );
-            (role == crate::Role::Worker.as_str() || role == crate::Role::Custom.as_str())
-                && Some(agent.agent_id.as_str()) != caller
-                && !same_chain
+        let now = Utc::now();
+        agents.into_iter().find(|agent| {
+            holds_folder(agent)
                 && Path::new(&agent.workspace_path) == folder
+                && (excluded_groups.is_empty()
+                    || !excluded_groups.contains(&agent.group().as_str()))
+                && now - agent.started_at < FOLDER_HOLD_CEILING
         })
     }
 
@@ -418,15 +463,15 @@ impl AgentRegistry {
 
     /// Cancel all running agents. Used during daemon shutdown.
     pub fn shutdown_all(&self) {
-        let entries: Vec<(String, CancellationToken)> = self
+        let entries: Vec<Arc<crate::stop::Stop>> = self
             .inner
             .lock()
             .unwrap_poison()
             .drain()
-            .map(|(id, entry)| (id, entry.cancel_token))
+            .map(|(_, entry)| entry.stop)
             .collect();
-        for (_id, token) in entries {
-            token.cancel();
+        for stop in entries {
+            stop.fire(crate::stop::StopReason::Cancelled);
         }
     }
 
@@ -454,6 +499,25 @@ impl Drop for ActivityGuard {
     fn drop(&mut self) {
         AGENT_REGISTRY.activity_finished(&self.agent_id, self.generation);
     }
+}
+
+/// The group key of one run, from its parent invocation: the one identity folder occupancy and
+/// group cancellation share. A run with no parent invocation — a direct chat, a discovery or
+/// maintenance pass, a command-line dispatch — is its own group, and a parentless run counts as a
+/// holder (a writer) unless it is the discovery pass or the Manager's own triage; the maintainer is
+/// a writer. A synchronous round inside a stage round inherits its caller's key through
+/// [`CURRENT_TOOL_PARENT_KEY`](crate::agent::CURRENT_TOOL_PARENT_KEY), so it is part of that work
+/// rather than a second writer; a *launched* worker or custom branch registers as
+/// [`ParentKey::Launch`] and is therefore its own group — the second writer the launch rule refuses.
+pub(crate) fn group_key(parent: Option<&ParentKey>, agent_id: &str) -> String {
+    parent.map_or_else(|| format!("agent:{agent_id}"), ParentKey::group)
+}
+
+/// Whether a role takes the workspace folder's single-writer hold and is stopped by a workspace
+/// freeze — [`crate::work_unit::writes_folder`] asked of a registry entry, which is where the same
+/// rule is applied to live runs. Reading and the Manager's triage are not writers.
+fn holds_folder(agent: &AgentHandle) -> bool {
+    crate::work_unit::writes_folder(agent.parent_key.as_ref(), &agent.role)
 }
 
 pub static AGENT_REGISTRY: LazyLock<AgentRegistry> = LazyLock::new(AgentRegistry::default);
@@ -612,11 +676,9 @@ mod tests {
             "analyst".to_string(),
             None,
             &ws,
-            CancellationToken::new(),
-            CancellationToken::new(),
+            std::sync::Arc::new(crate::stop::Stop::default()),
             None,
             None,
-            std::sync::Arc::new(AtomicBool::new(false)),
         )
     }
 
@@ -694,11 +756,9 @@ mod tests {
                 "analyst".to_string(),
                 None,
                 &ws,
-                CancellationToken::new(),
-                CancellationToken::new(),
+                std::sync::Arc::new(crate::stop::Stop::default()),
                 Some(parent),
                 None,
-                std::sync::Arc::new(AtomicBool::new(false)),
             )
         };
         let gen_a1 = register_with_parent(&a1, ParentKey::Research("runA".to_string()));
@@ -729,6 +789,42 @@ mod tests {
         let _ = (gen_a1, gen_a2);
     }
 
+    /// A registration older than the ceiling no longer holds its folder: a run that died without
+    /// deregistering must not stall the workspace's pipeline, and every launch into it, for the
+    /// life of the process.
+    #[test]
+    fn a_stale_registration_no_longer_holds_its_folder() {
+        let folder = Path::new("/tmp/ws_stale_hold");
+        let handle = |started_at| AgentHandle {
+            agent_id: "stale_holder".to_string(),
+            role: crate::Role::Engineer.as_str().to_string(),
+            ticket_id: None,
+            workspace_path: folder.to_string_lossy().to_string(),
+            workspace_name: "ws_stale_hold".to_string(),
+            parent_key: None,
+            parent_label: None,
+            started_at,
+            generation: 1,
+            activity: None,
+            paused: false,
+        };
+        assert!(
+            AgentRegistry::holder_among(vec![handle(Utc::now())], folder, &[]).is_some(),
+            "a live registration holds its folder"
+        );
+        assert!(
+            AgentRegistry::holder_among(
+                vec![handle(
+                    Utc::now() - FOLDER_HOLD_CEILING - chrono::Duration::minutes(1)
+                )],
+                folder,
+                &[],
+            )
+            .is_none(),
+            "a registration this old is a leak, not a writer"
+        );
+    }
+
     #[test]
     fn interrupt_fires_the_turns_own_token_and_nothing_else() {
         let agent_id = format!("interrupt_token_{}", crate::generate_suffix());
@@ -737,24 +833,24 @@ mod tests {
             path: "/tmp/ws_interrupt".to_string(),
             ..Default::default()
         };
-        let cancel_token = CancellationToken::new();
-        let interrupt_token = CancellationToken::new();
+        let stop = std::sync::Arc::new(crate::stop::Stop::default());
         let generation = AGENT_REGISTRY.register(
             agent_id.clone(),
             "assistant".to_string(),
             None,
             &ws,
-            cancel_token.clone(),
-            interrupt_token.clone(),
+            std::sync::Arc::clone(&stop),
             None,
             None,
-            std::sync::Arc::new(AtomicBool::new(false)),
         );
 
         AGENT_REGISTRY.interrupt(&agent_id);
-        assert!(interrupt_token.is_cancelled(), "the running turn is cut");
         assert!(
-            !cancel_token.is_cancelled(),
+            stop.is_fired(crate::stop::StopReason::Interrupted),
+            "the running turn is cut"
+        );
+        assert!(
+            !stop.is_fired(crate::stop::StopReason::Cancelled),
             "a cut is not a cancellation of the agent"
         );
 
@@ -807,5 +903,174 @@ mod tests {
         drop(run_a1);
         drop(run_a2);
         drop(run_b);
+    }
+
+    /// Register one agent for the folder-hold and freeze tests, returning its generation.
+    fn register_role(
+        agent_id: &str,
+        role: &str,
+        ws_name: &str,
+        ws_path: &str,
+        ticket: Option<&str>,
+        parent: Option<ParentKey>,
+    ) -> u64 {
+        let ws = crate::Workspace {
+            name: ws_name.to_string(),
+            path: ws_path.to_string(),
+            ..Default::default()
+        };
+        AGENT_REGISTRY.register(
+            agent_id.to_string(),
+            role.to_string(),
+            ticket.map(str::to_string),
+            &ws,
+            std::sync::Arc::new(crate::stop::Stop::default()),
+            parent,
+            None,
+        )
+    }
+
+    /// One folder, one writer: every role that writes holds it, a round the holder dispatched is
+    /// the same group and so not a second writer, and a launched branch — its own group — is.
+    #[tokio::test]
+    async fn the_folder_hold_covers_every_writer_and_shares_one_group() {
+        let suffix = crate::generate_suffix();
+        let folder = format!("/tmp/hold_{suffix}");
+        let ws_name = format!("hold_ws_{suffix}");
+        let engineer = format!("eng_{suffix}");
+        let round = format!("round_{suffix}");
+        let branch = format!("branch_{suffix}");
+        let engineer_gen = register_role(
+            &engineer,
+            "engineer",
+            &ws_name,
+            &folder,
+            Some("t1"),
+            Some(ParentKey::Ticket("t1".to_string())),
+        );
+        // The round the engineer dispatched: it inherits the caller's group through the
+        // task-locals, so it registers with the same parent key and the same ticket id.
+        let round_gen = register_role(
+            &round,
+            "worker",
+            &ws_name,
+            &folder,
+            Some("t1"),
+            Some(ParentKey::Ticket("t1".to_string())),
+        );
+        let path = std::path::Path::new(&folder);
+
+        // The inheritance the round's registration relies on: a dispatched round reads its group
+        // off the caller's task-locals, so it lands in the caller's group rather than its own.
+        let inherited = crate::agent::CURRENT_TOOL_AGENT_ID
+            .scope(Some(round.clone()), async {
+                crate::agent::CURRENT_TOOL_PARENT_KEY
+                    .scope(Some(ParentKey::Ticket("t1".to_string())), async {
+                        crate::agent::tool_group()
+                    })
+                    .await
+            })
+            .await;
+        assert_eq!(
+            inherited.as_deref(),
+            Some("ticket:t1"),
+            "a round dispatched by the holder inherits its group"
+        );
+        assert_eq!(
+            group_key(None, &round),
+            format!("agent:{round}"),
+            "a run with no caller grouping is its own group"
+        );
+        assert!(
+            AGENT_REGISTRY.folder_holder(path, &[]).is_some(),
+            "a writer holds the folder"
+        );
+        assert!(
+            AGENT_REGISTRY.folder_holder(path, &["ticket:t1"]).is_none(),
+            "one group's own work is not a second writer"
+        );
+        let branch_gen = register_role(
+            &branch,
+            "custom",
+            &ws_name,
+            &folder,
+            None,
+            Some(ParentKey::Launch(branch.clone())),
+        );
+        assert!(
+            AGENT_REGISTRY.folder_holder(path, &["ticket:t1"]).is_some(),
+            "the custom-role branch is another writer"
+        );
+        AGENT_REGISTRY.deregister(&engineer, engineer_gen);
+        AGENT_REGISTRY.deregister(&round, round_gen);
+        AGENT_REGISTRY.deregister(&branch, branch_gen);
+        assert!(
+            AGENT_REGISTRY.folder_holder(path, &[]).is_none(),
+            "the folder is free once every writer is gone"
+        );
+    }
+
+    /// A freeze reaches every writer, including a branch started without a ticket; the Manager's
+    /// triage is the one exemption, because the notice that explains the pause must be delivered.
+    /// Reading is not a writer at all: a discovery pass and a separately launched analysis run on.
+    #[test]
+    fn a_pause_reaches_every_writer_and_no_reader() {
+        let suffix = crate::generate_suffix();
+        let folder = format!("/tmp/freeze_{suffix}");
+        let ws_name = format!("freeze_ws_{suffix}");
+        let branch = format!("branch_{suffix}");
+        let manager = format!("manager_{suffix}");
+        let discovery = format!("discovery_{suffix}");
+        let analyst = format!("analyst_{suffix}");
+        let branch_gen = register_role(
+            &branch,
+            "custom",
+            &ws_name,
+            &folder,
+            None,
+            Some(ParentKey::Launch(branch.clone())),
+        );
+        let manager_gen = register_role(&manager, "manager", &ws_name, &folder, None, None);
+        let discovery_gen = register_role(&discovery, "discovery", &ws_name, &folder, None, None);
+        let analyst_gen = register_role(
+            &analyst,
+            "analyst",
+            &ws_name,
+            &folder,
+            None,
+            Some(ParentKey::AnalyzeRound("freeze_round".to_string())),
+        );
+
+        AGENT_REGISTRY.cancel_by_workspace_pause(&ws_name);
+
+        let paused = |agent_id: &str| {
+            AGENT_REGISTRY
+                .list()
+                .into_iter()
+                .find(|handle| handle.agent_id == agent_id)
+                .is_some_and(|handle| handle.paused)
+        };
+        assert!(
+            paused(&branch),
+            "a ticket-less branch is a writer and freezes"
+        );
+        assert!(!paused(&manager), "the Manager's triage stays exempt");
+        assert!(
+            !paused(&discovery),
+            "a discovery pass is reading: it runs on"
+        );
+        assert!(
+            !paused(&analyst),
+            "a separately launched analysis is reading: it runs on"
+        );
+
+        for (agent_id, generation) in [
+            (&branch, branch_gen),
+            (&manager, manager_gen),
+            (&discovery, discovery_gen),
+            (&analyst, analyst_gen),
+        ] {
+            AGENT_REGISTRY.deregister(agent_id, generation);
+        }
     }
 }

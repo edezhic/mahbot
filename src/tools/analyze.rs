@@ -18,7 +18,9 @@
 //! silently lost — except a round the caller cancels: its partial findings never
 //! become a result and it is never delivered (see [`crate::analyze_cancel`]).
 
+use crate::address::AgentAddress;
 use crate::agent::{run_agent, run_default_agent};
+use crate::outcome::Outcome;
 use crate::prompt::{load_prompt, load_prompt_sections, substitute};
 use crate::tools::Tool;
 use crate::{Agent, ChatMessage, DEFAULT_MAX_TOKENS, Role, Workspace};
@@ -348,7 +350,7 @@ pub(crate) async fn run_analyze_with_job(
     let deadline = std::time::Instant::now() + round_timeout();
     // The signal may have fired before the round started: the caller was already
     // answered and the round's rows swept, so stop before writing anything.
-    if crate::round_cancel::is_cancelled(job_id) {
+    if crate::stop::cancelled(job_id) {
         return Ok(crate::tools::SyncCoreOutcome::Cancelled);
     }
 
@@ -368,7 +370,7 @@ pub(crate) async fn run_analyze_with_job(
             // Done slots from their stored outcomes; the rest re-run their tasks.
             let pre_done: Vec<(String, String)> = rows
                 .iter()
-                .filter(|r| r.status == crate::jobs::RowStatus::Done.as_str())
+                .filter(|r| r.status == crate::outcome::Outcome::Done.as_str())
                 .filter_map(|r| r.outcome.clone().map(|o| (r.agent_id.clone(), o)))
                 .collect();
             (slots, pre_done)
@@ -410,7 +412,7 @@ pub(crate) async fn run_analyze_with_job(
             // A cancel can land while the roster is built or before this INSERT
             // commits. `spawn_job`'s gate refuses the row then, so this only turns the
             // stop into the round's outcome — a cancelled round is never resumed.
-            if crate::round_cancel::is_cancelled(job_id) {
+            if crate::stop::cancelled(job_id) {
                 return Ok(crate::tools::SyncCoreOutcome::Cancelled);
             }
             (slots, Vec::new())
@@ -428,7 +430,7 @@ pub(crate) async fn run_analyze_with_job(
     // Cancelled as a group while the analysts ran, so their runs already carry the
     // stopped outcome: no checkpoint write, extraction or consolidation, and the
     // partial findings never become a result.
-    if crate::round_cancel::is_cancelled(job_id) {
+    if crate::stop::cancelled(job_id) {
         return Ok(crate::tools::SyncCoreOutcome::Cancelled);
     }
 
@@ -442,14 +444,13 @@ pub(crate) async fn run_analyze_with_job(
                 slot.agent_id.clone(),
                 crate::Role::Analyst,
                 ws,
-                None,
+                crate::work_unit::WorkUnit::AnalyzeRound {
+                    id: job_id.to_string(),
+                    label: message.to_string(),
+                },
                 String::new(),
                 String::new(),
                 false,
-                Some(crate::agent::registry::ParentKey::AnalyzeRound(
-                    job_id.to_string(),
-                )),
-                Some(message.to_string()),
                 None,
             );
             let _ = agent.session.init(&slot.agent_id).await;
@@ -468,8 +469,8 @@ pub(crate) async fn run_analyze_with_job(
     let conn = &crate::session::store().conn;
     for (slot, run) in slots.iter().zip(&runs) {
         let (status, outcome) = match run {
-            AnalyzeRun::Completed { response, .. } => (crate::jobs::RowStatus::Done, response),
-            AnalyzeRun::Failed { reason } => (crate::jobs::RowStatus::Failed, reason),
+            AnalyzeRun::Completed { response, .. } => (crate::outcome::Outcome::Done, response),
+            AnalyzeRun::Failed { reason } => (crate::outcome::Outcome::Failed, reason),
         };
         if let Err(e) = crate::jobs::write_agent_outcome(
             conn,
@@ -535,7 +536,10 @@ async fn run_analyze_slots(
                     agent_id,
                     crate::Role::Analyst,
                     &ws,
-                    None,
+                    crate::work_unit::WorkUnit::AnalyzeRound {
+                        id: round_key,
+                        label: question,
+                    },
                     &[if has_session { "" } else { task.as_str() }],
                     String::new(),
                     String::new(),
@@ -543,8 +547,6 @@ async fn run_analyze_slots(
                     None,
                     resume,
                     Some(round),
-                    Some(crate::agent::registry::ParentKey::AnalyzeRound(round_key)),
-                    Some(question),
                     None,
                 )
                 .await
@@ -594,19 +596,54 @@ pub(crate) struct AnalystFindings {
     pub unanswered: Vec<String>,
 }
 
-/// Per-analyst outcome after extraction — three mutually-exclusive states mirroring
-/// `pipeline::ParallelVerdict`, so "no response" and "parse failure" cannot be confused.
-enum AnalystOutcome {
-    /// No response (crashed, cancelled, empty output); carries the reason.
-    NoResponse(String),
-    /// Agent responded and structured extraction succeeded.
-    Findings {
-        raw: String,
-        findings: AnalystFindings,
-    },
-    /// Responded, but extraction failed after retries; the raw response is kept for
-    /// the fail-open dump.
-    ParseFailed { raw: String, failure: String },
+/// One analyst's result: the shared [`Outcome`] vocabulary, with what the analyst produced beside
+/// it — the raw response, the findings it extracted, and the reason it produced none.
+///
+/// A no-response analyst and a parse failure are both [`Outcome::Failed`]; `raw` tells them apart —
+/// a parse failure kept its response, a no-response analyst had none.
+struct AnalystResult {
+    outcome: Outcome,
+    raw: String,
+    findings: Option<AnalystFindings>,
+    reason: Option<String>,
+}
+
+impl AnalystResult {
+    /// The analyst responded and its findings were extracted.
+    fn findings(raw: String, findings: AnalystFindings) -> Self {
+        Self {
+            outcome: Outcome::Done,
+            raw,
+            findings: Some(findings),
+            reason: None,
+        }
+    }
+
+    /// The analyst produced no response at all — crashed, timed out, cancelled, empty output.
+    fn no_response(reason: impl Into<String>) -> Self {
+        Self {
+            outcome: Outcome::Failed,
+            raw: String::new(),
+            findings: None,
+            reason: Some(reason.into()),
+        }
+    }
+
+    /// The analyst responded, but its response could not be turned into findings.
+    fn parse_failed(raw: String, failure: impl Into<String>) -> Self {
+        Self {
+            outcome: Outcome::Failed,
+            raw,
+            findings: None,
+            reason: Some(failure.into()),
+        }
+    }
+
+    /// Whether the analyst responded and the response failed extraction — the distinction the
+    /// fail-open marker and the failure list render.
+    fn parse_failed_here(&self) -> bool {
+        self.outcome == Outcome::Failed && !self.raw.is_empty()
+    }
 }
 
 #[derive(Debug)]
@@ -816,10 +853,8 @@ fn analyst_slot(
     } else {
         format!("{analyze}\n\n{assigned}")
     };
-    AnalyzeSlot {
-        agent_id: format!("analyze_{}_{}_{}_analyst", ws.name, suffix, i),
-        task,
-    }
+    let agent_id = AgentAddress::analyze_slot(&ws.name, suffix, i, Role::Analyst.as_str()).id();
+    AnalyzeSlot { agent_id, task }
 }
 
 /// 0 valid → error, 1 valid → raw passthrough, ≥2 valid → extract findings and run the
@@ -835,7 +870,7 @@ async fn consolidate_analyst_runs(
 ) -> Result<Option<String>> {
     // Cancelled while the analysts ran: nothing new starts, so no extraction call and
     // the partial findings never become a result.
-    if crate::round_cancel::is_cancelled(round_key) {
+    if crate::stop::cancelled(round_key) {
         return Ok(None);
     }
     // Drain-watch coverage: extraction runs while the analyst Agents are registered, which keeps
@@ -887,7 +922,7 @@ async fn extract_findings(
     runs: Vec<AnalyzeRun>,
     deadline: std::time::Instant,
     round_key: &str,
-) -> Vec<AnalystOutcome> {
+) -> Vec<AnalystResult> {
     let extraction_prompt = load_prompt("extraction/findings.md");
     let handles: Vec<_> = runs
         .into_iter()
@@ -898,7 +933,7 @@ async fn extract_findings(
                 let (mut agent, raw) = match run {
                     AnalyzeRun::Completed { agent, response } => (agent, response),
                     AnalyzeRun::Failed { reason } => {
-                        return AnalystOutcome::NoResponse(reason);
+                        return AnalystResult::no_response(reason);
                     }
                 };
                 // Nothing new starts for a cancelled round; the extraction loop re-asks
@@ -907,20 +942,17 @@ async fn extract_findings(
                 // signal first, so it wins over an extraction ready to return.
                 let extracted = tokio::select! {
                     biased;
-                    () = crate::round_cancel::cancelled(&round_key) => {
-                        return AnalystOutcome::NoResponse(
-                            "cancelled: findings extraction task was cancelled".to_string(),
+                    () = crate::stop::await_cancel(&round_key) => {
+                        return AnalystResult::no_response(
+                            "cancelled: findings extraction task was cancelled",
                         );
                     }
                     result = agent
                         .extract_verdict::<AnalystFindings>(&extraction_prompt, None, None) => result,
                 };
                 match extracted {
-                    Ok(findings) => AnalystOutcome::Findings { raw, findings },
-                    Err(e) => AnalystOutcome::ParseFailed {
-                        raw,
-                        failure: e.to_string(),
-                    },
+                    Ok(findings) => AnalystResult::findings(raw, findings),
+                    Err(e) => AnalystResult::parse_failed(raw, e.to_string()),
                 }
             })
         })
@@ -930,16 +962,15 @@ async fn extract_findings(
         .into_iter()
         .map(|m| match m {
             RoundMember::Done(outcome) => outcome,
-            RoundMember::TimedOut => AnalystOutcome::NoResponse(
-                "timeout: findings extraction still running when the round deadline expired"
-                    .to_string(),
+            RoundMember::TimedOut => AnalystResult::no_response(
+                "timeout: findings extraction still running when the round deadline expired",
             ),
             RoundMember::Panicked => {
-                AnalystOutcome::NoResponse("panic: findings extraction task panicked".to_string())
+                AnalystResult::no_response("panic: findings extraction task panicked")
             }
-            RoundMember::Cancelled => AnalystOutcome::NoResponse(
-                "cancelled: findings extraction task was cancelled".to_string(),
-            ),
+            RoundMember::Cancelled => {
+                AnalystResult::no_response("cancelled: findings extraction task was cancelled")
+            }
         })
         .collect()
 }
@@ -948,14 +979,14 @@ async fn extract_findings(
 /// so the id space matches the input. Per-agent duplicates are NOT deduped: two
 /// identical claims from one agent are two distinct ids.
 #[must_use]
-fn claims_per_agent(outcomes: &[AnalystOutcome]) -> Vec<Vec<String>> {
+fn claims_per_agent(outcomes: &[AnalystResult]) -> Vec<Vec<String>> {
     outcomes
         .iter()
-        .map(|o| match o {
-            AnalystOutcome::Findings { findings, .. } => {
-                findings.claims.iter().map(|c| c.claim.clone()).collect()
-            }
-            _ => Vec::new(),
+        .map(|o| {
+            o.findings
+                .as_ref()
+                .map(|findings| findings.claims.iter().map(|c| c.claim.clone()).collect())
+                .unwrap_or_default()
         })
         .collect()
 }
@@ -968,7 +999,7 @@ fn claims_per_agent(outcomes: &[AnalystOutcome]) -> Vec<Vec<String>> {
 fn render_unconsolidated_fallback(
     marker: &str,
     items_by_agent: &[Vec<String>],
-    outcomes: &[AnalystOutcome],
+    outcomes: &[AnalystResult],
 ) -> String {
     let flat = render_flat_claim_list(items_by_agent);
     let raw_dump = render_raw_analyst_dump(outcomes);
@@ -985,14 +1016,14 @@ fn render_unconsolidated_fallback(
 async fn consolidate_findings(
     ws: &Workspace,
     analyze: &str,
-    outcomes: Vec<AnalystOutcome>,
+    outcomes: Vec<AnalystResult>,
     round_key: &str,
     deadline: std::time::Instant,
 ) -> Result<Option<String>> {
     // A round cancelled while its analysts ran produces no text at all — not even the
     // fail-open claim list, which would render a partial result for a caller already
     // told the round was stopped.
-    if crate::round_cancel::is_cancelled(round_key) {
+    if crate::stop::cancelled(round_key) {
         return Ok(None);
     }
     let items_by_agent = claims_per_agent(&outcomes);
@@ -1000,9 +1031,7 @@ async fn consolidate_findings(
     if n_valid == 0 {
         // No parseable claims: fail open with raw reports and the per-analyst reasons.
         // The marker distinguishes extraction failures from zero-claim reports.
-        let has_parse_failures = outcomes
-            .iter()
-            .any(|o| matches!(o, AnalystOutcome::ParseFailed { .. }));
+        let has_parse_failures = outcomes.iter().any(AnalystResult::parse_failed_here);
         let raw_dump = render_raw_analyst_dump(&outcomes);
         let failures = render_extraction_failures(&outcomes);
         let marker = if has_parse_failures {
@@ -1070,7 +1099,7 @@ async fn consolidate_findings(
     // the signal without the random branch choice, so a fired signal always wins.
     let outcome = tokio::select! {
         biased;
-        () = crate::round_cancel::cancelled(round_key) => return Ok(None),
+        () = crate::stop::await_cancel(round_key) => return Ok(None),
         outcome = crate::consensus::run_grouping_repair(
             ws,
             "consolidate",
@@ -1120,7 +1149,7 @@ fn render_analyze_groups(
     references: &[crate::consensus::GroupingReference],
     table: &crate::consensus::ItemTable<'_>,
     n_valid: usize,
-    outcomes: &[AnalystOutcome],
+    outcomes: &[AnalystResult],
     verification: &str,
 ) -> String {
     let mut out = String::new();
@@ -1173,12 +1202,10 @@ fn render_analyze_groups(
 fn member_caveat(
     member: &crate::consensus::GroupingMember,
     table: &crate::consensus::ItemTable<'_>,
-    outcomes: &[AnalystOutcome],
+    outcomes: &[AnalystResult],
 ) -> Option<String> {
     let (agent, item) = table.resolve_index(member.id)?;
-    let AnalystOutcome::Findings { findings, .. } = outcomes.get(agent)? else {
-        return None;
-    };
+    let findings = outcomes.get(agent)?.findings.as_ref()?;
     let claim = findings.claims.get(item)?;
     if claim.contradictions.is_empty() {
         None
@@ -1270,9 +1297,32 @@ pub(crate) fn extract_query_telemetry(agent: &Agent) -> (usize, usize, Vec<Strin
     extract_query_telemetry_from_history(agent.session.history())
 }
 
+/// Which round family a verification round belongs to: its slots are addressed under the analyze
+/// round's prefix or the research run's.
+#[derive(Clone, Copy)]
+pub(crate) enum VerifierFamily {
+    Analyze,
+    Research,
+}
+
+impl VerifierFamily {
+    /// The address of one verification slot — the family's only difference.
+    fn slot(self, workspace: &str, suffix: &str, index: usize) -> crate::address::AgentAddress {
+        match self {
+            Self::Analyze => {
+                crate::address::AgentAddress::analyze_verifier(workspace, suffix, index)
+            }
+            Self::Research => {
+                crate::address::AgentAddress::research_verifier(workspace, suffix, index)
+            }
+        }
+    }
+}
+
 /// Dispatch one fresh Analyst per target in parallel, bounded by
-/// [`VERIFY_MAX_ANALYSTS`]. `id_prefix` seeds the agent IDs, `task_extra` is appended to
-/// every task (e.g. the query ledger) and the wait shares the round-wide `deadline`.
+/// [`VERIFY_MAX_ANALYSTS`]. `family` names the round family the analysts belong to — the analyze
+/// round's or the research run's — and renders each slot's id, `task_extra` is appended to every
+/// task (e.g. the query ledger) and the wait shares the round-wide `deadline`.
 ///
 /// `parent_key` names the parent invocation the verifiers group under — the
 /// running-agents view and research-cancel sweep use it, so the caller must supply it,
@@ -1284,7 +1334,7 @@ pub(crate) fn extract_query_telemetry(agent: &Agent) -> (usize, usize, Vec<Strin
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn dispatch_claim_verifiers(
     ws: &Workspace,
-    id_prefix: &str,
+    family: VerifierFamily,
     targets: &[VerificationTarget],
     task_extra: &str,
     deadline: std::time::Instant,
@@ -1302,7 +1352,7 @@ pub(crate) async fn dispatch_claim_verifiers(
         .enumerate()
         .map(|(i, t)| {
             let ws = ws.clone();
-            let agent_id = format!("{id_prefix}_{suffix}_{i}");
+            let agent_id = family.slot(&ws.name, &suffix, i).id();
             dispatched.push(agent_id.clone());
             let mut task = substitute(
                 &task_template,
@@ -1375,8 +1425,7 @@ async fn run_claim_verifier(
         task,
         false,
         Some(round),
-        parent_key,
-        Some(question.to_string()),
+        crate::work_unit::WorkUnit::of_parent(parent_key, Some(question.to_string())),
     )
     .await;
     // The telemetry fields ride every VerificationResult: deep research consumes them
@@ -1458,7 +1507,7 @@ fn verification_units<'a>(
 fn synthesize_verification_target(
     unit: &[&crate::consensus::GroupingGroup],
     table: &crate::consensus::ItemTable<'_>,
-    outcomes: &[AnalystOutcome],
+    outcomes: &[AnalystResult],
 ) -> VerificationTarget {
     let mut claim_parts = Vec::new();
     let mut sources = Vec::new();
@@ -1470,7 +1519,9 @@ fn synthesize_verification_target(
                 group_claims.push(text.to_string());
             }
             if let Some((agent_idx, item_idx)) = table.resolve_index(member.id)
-                && let Some(AnalystOutcome::Findings { findings, .. }) = outcomes.get(agent_idx)
+                && let Some(findings) = outcomes
+                    .get(agent_idx)
+                    .and_then(|outcome| outcome.findings.as_ref())
                 && let Some(claim) = findings.claims.get(item_idx)
             {
                 if !claim.source.is_empty() {
@@ -1532,14 +1583,14 @@ async fn verify_disputed_groups(
     analyze: &str,
     output: &crate::consensus::GroupingOutput,
     table: &crate::consensus::ItemTable<'_>,
-    outcomes: &[AnalystOutcome],
+    outcomes: &[AnalystResult],
     round_key: &str,
     deadline: std::time::Instant,
 ) -> String {
     // This gate is the phase's first statement, so a cancelled round raises no complaint
     // about itself and neither skip warning can fire. Logged at info, like the
     // consolidation gate.
-    if crate::round_cancel::is_cancelled(round_key) {
+    if crate::stop::cancelled(round_key) {
         tracing::info!(
             round = %round_key,
             "Analyze verification skipped — the round was cancelled"
@@ -1575,10 +1626,9 @@ async fn verify_disputed_groups(
         verifiers = units.len(),
         "Analyze verification round dispatching fresh analysts"
     );
-    let prefix = format!("analyze_{}_verify", ws.name);
     let (results, _dispatched) = dispatch_claim_verifiers(
         ws,
-        &prefix,
+        VerifierFamily::Analyze,
         &targets,
         "",
         deadline,
@@ -1594,16 +1644,18 @@ async fn verify_disputed_groups(
 
 /// The raw response of every valid analyst in `### Report from Analyst N` sections; a
 /// no-response analyst renders with its reason.
-fn render_raw_analyst_dump(outcomes: &[AnalystOutcome]) -> String {
+fn render_raw_analyst_dump(outcomes: &[AnalystResult]) -> String {
     let sections: Vec<String> = outcomes
         .iter()
         .enumerate()
         .map(|(i, o)| {
-            let body = match o {
-                AnalystOutcome::Findings { raw, .. } | AnalystOutcome::ParseFailed { raw, .. } => {
-                    escape_fences(raw)
+            let body = if o.raw.is_empty() {
+                match &o.reason {
+                    Some(reason) => format!("no response: {reason}"),
+                    None => "no response".to_string(),
                 }
-                AnalystOutcome::NoResponse(reason) => format!("no response: {reason}"),
+            } else {
+                escape_fences(&o.raw)
             };
             format!("### Report from Analyst {}\n{body}", i + 1)
         })
@@ -1612,21 +1664,18 @@ fn render_raw_analyst_dump(outcomes: &[AnalystOutcome]) -> String {
 }
 
 #[must_use]
-fn render_extraction_failures(outcomes: &[AnalystOutcome]) -> String {
+fn render_extraction_failures(outcomes: &[AnalystResult]) -> String {
     let mut out = String::new();
     for (i, o) in outcomes.iter().enumerate() {
-        match o {
-            AnalystOutcome::ParseFailed { failure, .. } => {
-                let _ = writeln!(
-                    out,
-                    "- Analyst {}: findings extraction failed ({failure})",
-                    i + 1
-                );
-            }
-            AnalystOutcome::NoResponse(reason) => {
-                let _ = writeln!(out, "- Analyst {}: no response ({reason})", i + 1);
-            }
-            AnalystOutcome::Findings { .. } => {}
+        let reason = o.reason.as_deref().unwrap_or("no reason recorded");
+        if o.parse_failed_here() {
+            let _ = writeln!(
+                out,
+                "- Analyst {}: findings extraction failed ({reason})",
+                i + 1
+            );
+        } else if o.findings.is_none() {
+            let _ = writeln!(out, "- Analyst {}: no response ({reason})", i + 1);
         }
     }
     out
@@ -1647,12 +1696,10 @@ mod tests {
             format!("analyze_test_{}", crate::generate_suffix()),
             Role::Analyst,
             ws,
-            None,
+            crate::work_unit::WorkUnit::Turn,
             String::new(),
             String::new(),
             false,
-            None,
-            None,
             None,
         );
         AnalyzeRun::settle(agent, response.map(ToString::to_string))
@@ -1825,7 +1872,7 @@ mod tests {
     /// the section must (not) carry.
     struct RenderGroupsCase {
         name: &'static str,
-        outcomes: Vec<AnalystOutcome>,
+        outcomes: Vec<AnalystResult>,
         output: crate::consensus::GroupingOutput,
         references: Vec<crate::consensus::GroupingReference>,
         contains: &'static [&'static str],
@@ -1850,21 +1897,21 @@ mod tests {
                 // Global flat ids: 0 = a0 "alpha is true", 1 = a0 "beta is true",
                 // 2 = a1 "alpha is true", 3 = a1 "gamma is true".
                 outcomes: vec![
-                    AnalystOutcome::Findings {
-                        raw: "r1".into(),
-                        findings: findings(vec![
+                    AnalystResult::findings(
+                        "r1".into(),
+                        findings(vec![
                             ("alpha is true", "url1", "high"),
                             ("beta is true", "url2", "medium"),
                         ]),
-                    },
-                    AnalystOutcome::Findings {
-                        raw: "r2".into(),
-                        findings: findings(vec![
+                    ),
+                    AnalystResult::findings(
+                        "r2".into(),
+                        findings(vec![
                             ("alpha is true", "url1", "high"),
                             ("gamma is true", "url3", "low"),
                         ]),
-                    },
-                    AnalystOutcome::NoResponse("analyst produced no response".into()),
+                    ),
+                    AnalystResult::no_response("analyst produced no response"),
                 ],
                 output: GroupingOutput {
                     summary: "Two facts, one solo finding.".into(),
@@ -1894,14 +1941,14 @@ mod tests {
             RenderGroupsCase {
                 name: "DISPUTED only on a contradiction",
                 outcomes: vec![
-                    AnalystOutcome::Findings {
-                        raw: "r1".into(),
-                        findings: findings(vec![("alpha is true", "url1", "high")]),
-                    },
-                    AnalystOutcome::Findings {
-                        raw: "r2".into(),
-                        findings: findings(vec![("alpha is false", "url2", "high")]),
-                    },
+                    AnalystResult::findings(
+                        "r1".into(),
+                        findings(vec![("alpha is true", "url1", "high")]),
+                    ),
+                    AnalystResult::findings(
+                        "r2".into(),
+                        findings(vec![("alpha is false", "url2", "high")]),
+                    ),
                 ],
                 output: GroupingOutput {
                     summary: "Agents disagree on alpha.".into(),
@@ -1919,14 +1966,11 @@ mod tests {
             RenderGroupsCase {
                 name: "a member caveat is metadata, not a contradiction",
                 outcomes: vec![
-                    AnalystOutcome::Findings {
-                        raw: "r1".into(),
-                        findings: caveated,
-                    },
-                    AnalystOutcome::Findings {
-                        raw: "r2".into(),
-                        findings: findings(vec![("alpha is true", "url1", "high")]),
-                    },
+                    AnalystResult::findings("r1".into(), caveated),
+                    AnalystResult::findings(
+                        "r2".into(),
+                        findings(vec![("alpha is true", "url1", "high")]),
+                    ),
                 ],
                 output: GroupingOutput {
                     summary: "alpha is agreed.".into(),
@@ -1944,14 +1988,11 @@ mod tests {
             RenderGroupsCase {
                 name: "a disputed remainder renders a code-computed cross-reference",
                 outcomes: vec![
-                    AnalystOutcome::Findings {
-                        raw: "r1".into(),
-                        findings: findings(vec![("safe", "url1", "high")]),
-                    },
-                    AnalystOutcome::Findings {
-                        raw: "r2".into(),
-                        findings: findings(vec![("actually unsafe", "url2", "high")]),
-                    },
+                    AnalystResult::findings("r1".into(), findings(vec![("safe", "url1", "high")])),
+                    AnalystResult::findings(
+                        "r2".into(),
+                        findings(vec![("actually unsafe", "url2", "high")]),
+                    ),
                 ],
                 output: GroupingOutput {
                     summary: "One consensus, one dispute.".into(),
@@ -1988,7 +2029,7 @@ mod tests {
 
     /// Run consolidation over the given outcomes with the provider outcomes scripted.
     async fn consolidate_with_script(
-        outcomes: Vec<AnalystOutcome>,
+        outcomes: Vec<AnalystResult>,
         fake: FakeProvider,
     ) -> anyhow::Result<String> {
         let provider: Arc<dyn crate::Provider> = Arc::new(fake);
@@ -2006,17 +2047,17 @@ mod tests {
     }
 
     /// Two analysts agreeing on one claim, plus a no-response member.
-    fn agreed_outcomes(raw_a: &str, raw_b: &str) -> Vec<AnalystOutcome> {
+    fn agreed_outcomes(raw_a: &str, raw_b: &str) -> Vec<AnalystResult> {
         vec![
-            AnalystOutcome::Findings {
-                raw: raw_a.to_string(),
-                findings: findings(vec![("alpha is true", "url1", "high")]),
-            },
-            AnalystOutcome::Findings {
-                raw: raw_b.to_string(),
-                findings: findings(vec![("alpha is true", "url1", "high")]),
-            },
-            AnalystOutcome::NoResponse("analyst produced no response".into()),
+            AnalystResult::findings(
+                raw_a.to_string(),
+                findings(vec![("alpha is true", "url1", "high")]),
+            ),
+            AnalystResult::findings(
+                raw_b.to_string(),
+                findings(vec![("alpha is true", "url1", "high")]),
+            ),
+            AnalystResult::no_response("analyst produced no response"),
         ]
     }
 
@@ -2033,7 +2074,7 @@ mod tests {
     enum ConsolidationInput {
         /// Runs that still need findings extraction (which may fail).
         Runs(Vec<AnalyzeRun>),
-        Outcomes(Vec<AnalystOutcome>),
+        Outcomes(Vec<AnalystResult>),
     }
 
     #[tokio::test]
@@ -2079,18 +2120,9 @@ mod tests {
             ConsolidationCase {
                 name: "an immediate non-retryable error fails open",
                 input: Outcomes(vec![
-                    AnalystOutcome::Findings {
-                        raw: "alpha".into(),
-                        findings: findings(vec![("a", "u1", "low")]),
-                    },
-                    AnalystOutcome::Findings {
-                        raw: "beta".into(),
-                        findings: findings(vec![("a", "u1", "low")]),
-                    },
-                    AnalystOutcome::Findings {
-                        raw: "gamma".into(),
-                        findings: findings(vec![("a", "u1", "low")]),
-                    },
+                    AnalystResult::findings("alpha".into(), findings(vec![("a", "u1", "low")])),
+                    AnalystResult::findings("beta".into(), findings(vec![("a", "u1", "low")])),
+                    AnalystResult::findings("gamma".into(), findings(vec![("a", "u1", "low")])),
                 ]),
                 fake: FakeProvider::new()
                     .err(FailureClass::InvalidRequest, "insufficient balance"),
@@ -2107,14 +2139,11 @@ mod tests {
             ConsolidationCase {
                 name: "a single parseable source skips the grouping pass",
                 input: Outcomes(vec![
-                    AnalystOutcome::Findings {
-                        raw: "sole report".into(),
-                        findings: findings(vec![("alpha is true", "url1", "high")]),
-                    },
-                    AnalystOutcome::ParseFailed {
-                        raw: "unparseable report".into(),
-                        failure: "parse failed".into(),
-                    },
+                    AnalystResult::findings("sole report".into(), findings(vec![("alpha is true", "url1", "high")])),
+                    AnalystResult::parse_failed(
+                        "unparseable report".to_string(),
+                        "parse failed",
+                    ),
                 ]),
                 // No script — any provider call would fail.
                 fake: FakeProvider::new(),
@@ -2160,18 +2189,12 @@ mod tests {
             ConsolidationCase {
                 name: "partial success delivers the frozen group and the deterministic remainder",
                 input: Outcomes(vec![
-                    AnalystOutcome::Findings {
-                        raw: "r1".into(),
-                        findings: findings(vec![
+                    AnalystResult::findings("r1".into(), findings(vec![
                             ("alpha is true", "url1", "high"),
                             ("beta is true", "url2", "medium"),
-                        ]),
-                    },
-                    AnalystOutcome::Findings {
-                        raw: "r2".into(),
-                        findings: findings(vec![("alpha is true", "url1", "high")]),
-                    },
-                    AnalystOutcome::NoResponse("analyst produced no response".into()),
+                        ])),
+                    AnalystResult::findings("r2".into(), findings(vec![("alpha is true", "url1", "high")])),
+                    AnalystResult::no_response("analyst produced no response"),
                 ]),
                 // ids: 0 = a0 "alpha is true", 1 = a0 "beta is true", 2 = a1 "alpha is
                 // true". Round 2 leaves the id-1 item ungrouped → zero-progress stop.
@@ -2389,7 +2412,7 @@ mod tests {
                     conn,
                     case.job_id,
                     &agent_id,
-                    crate::jobs::RowStatus::Done,
+                    crate::outcome::Outcome::Done,
                     Some(outcome),
                 )
                 .await
@@ -2780,7 +2803,7 @@ mod tests {
         );
         // Register the deep report's consumer exactly as the running service's bootstrap
         // leaves it.
-        let assistant = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let assistant = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let _assistant_rx = crate::agent::message_router::register_agent(&assistant);
 
         // A `place` the `quick` depth refuses: not a directory at all.
@@ -2866,17 +2889,23 @@ mod tests {
 
     /// The agent address of [`CANCEL_SIBLING_USER`]'s Assistant session.
     fn cancel_sibling_caller_id() -> String {
-        crate::session::resolve_agent_id(
+        crate::address::AgentAddress::routed(
             CANCEL_SIBLING_USER,
             Role::Assistant.as_str(),
             CANCEL_SIBLING_WS,
         )
+        .id()
     }
 
     /// [`CANCEL_TEST_USER`]'s Assistant agent address — registered as a consumer, and the
     /// one a round's `jobs` row derives to.
     fn cancel_test_caller_id() -> String {
-        crate::session::resolve_agent_id(CANCEL_TEST_USER, Role::Assistant.as_str(), CANCEL_TEST_WS)
+        crate::address::AgentAddress::routed(
+            CANCEL_TEST_USER,
+            Role::Assistant.as_str(),
+            CANCEL_TEST_WS,
+        )
+        .id()
     }
 
     /// Whether the store holds a row with this `id` in `table` — the cancel
@@ -3065,7 +3094,7 @@ mod tests {
             "the cancelled round must leave no queued result"
         );
         assert!(
-            crate::round_cancel::is_cancelled(&job_id),
+            crate::stop::cancelled(&job_id),
             "the fired signal must be observable while the round unwinds"
         );
         assert!(
@@ -3093,7 +3122,7 @@ mod tests {
         // Let the parked round unwind: nothing may resurrect its rows or reach the caller.
         gate_tx.send(true).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while crate::round_cancel::is_registered(&job_id) {
+        while crate::stop::is_registered(&job_id) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "the cancelled round never unwound after its gate opened"
@@ -3245,8 +3274,8 @@ mod tests {
             "the place's search engine must be registered before the dispatch"
         );
 
-        let _cancel_guard = crate::round_cancel::register(job_id, None);
-        crate::round_cancel::cancel(job_id);
+        let _cancel_guard = crate::stop::register(job_id, None);
+        crate::stop::fire(job_id);
 
         let delivered = crate::tools::SyncDurableCore::Analyze
             .dispatch_durable(
@@ -3310,7 +3339,7 @@ mod tests {
             conn,
             job_id,
             &agent_id,
-            crate::jobs::RowStatus::Done,
+            crate::outcome::Outcome::Done,
             Some("completed analyst response"),
         )
         .await
@@ -3318,8 +3347,8 @@ mod tests {
 
         // The cancel fires while nothing is registered and its row removal has not landed:
         // the boot scan already listed this row, so the resume must observe the cancel.
-        assert!(!crate::round_cancel::is_registered(job_id));
-        crate::round_cancel::cancel(job_id);
+        assert!(!crate::stop::is_registered(job_id));
+        crate::stop::fire(job_id);
         resume_analyze_round(job_id, &ws, None).await;
 
         // Asserted BEFORE the cancel action's own row removal below: an
@@ -3391,7 +3420,7 @@ mod tests {
             &manager_tool,
             &ws,
             "",
-            &crate::session::manager_agent_id(&ws.name),
+            &crate::address::AgentAddress::manager(&ws.name).id(),
             json!({ "action": "cancel", "job_id": manager_job }),
         )
         .await
@@ -3543,7 +3572,7 @@ mod tests {
         let _provider_guard = install_fake_provider(provider.clone() as Arc<dyn crate::Provider>);
         let ws = test_ws("/tmp/test_ws_analyze_cancel_no_further_call");
         let round = "analyze_cancel_no_further_call";
-        let _cancel_guard = crate::round_cancel::register(round, None);
+        let _cancel_guard = crate::stop::register(round, None);
 
         // Part 1 — extraction: both calls are in flight when the cancel lands, so neither
         // may re-ask once the gate opens.
@@ -3561,7 +3590,7 @@ mod tests {
             ),
             async {
                 wait_for_calls(&provider, 2).await;
-                crate::round_cancel::cancel(round);
+                crate::stop::fire(round);
                 // Unblock the parked calls too: a retry loop that ignored the signal would
                 // re-ask and the count below would grow.
                 gate_tx.send(true).unwrap();
@@ -3579,7 +3608,7 @@ mod tests {
         // no repair round may start. A fresh round key is registered (the entry gate would
         // catch the already-fired signal) and the gate re-armed so grouping parks.
         let round2 = "analyze_cancel_no_further_call_consolidate";
-        let _cancel_guard2 = crate::round_cancel::register(round2, None);
+        let _cancel_guard2 = crate::stop::register(round2, None);
         gate_tx.send(false).unwrap();
         let (result, ()) = tokio::join!(
             consolidate_findings(
@@ -3591,7 +3620,7 @@ mod tests {
             ),
             async {
                 wait_for_calls(&provider, 3).await;
-                crate::round_cancel::cancel(round2);
+                crate::stop::fire(round2);
                 // As in Part 1: the phase must stop at the signal, not after the
                 // unblocked call returns.
                 gate_tx.send(true).unwrap();
@@ -3666,7 +3695,7 @@ mod tests {
 
         // The sibling round is untouched: its result still waits and its signal never fired.
         assert!(
-            !crate::round_cancel::is_cancelled(sibling),
+            !crate::stop::cancelled(sibling),
             "cancelling one round must not fire another round's signal"
         );
         assert!(
@@ -3722,7 +3751,7 @@ mod tests {
             "{answer}"
         );
         assert!(
-            !crate::round_cancel::is_cancelled("no_such_cancel_round"),
+            !crate::stop::cancelled("no_such_cancel_round"),
             "a refused cancel must not fire a signal"
         );
 
@@ -3758,7 +3787,7 @@ mod tests {
             "{answer}"
         );
         assert!(
-            !crate::round_cancel::is_cancelled("deep_cancel_round"),
+            !crate::stop::cancelled("deep_cancel_round"),
             "a refused cancel must not fire a signal"
         );
         assert!(
@@ -3797,7 +3826,7 @@ mod tests {
             "{answer}"
         );
         assert!(
-            !crate::round_cancel::is_cancelled("someone_elses_analyze"),
+            !crate::stop::cancelled("someone_elses_analyze"),
             "a refused cancel must not fire a signal"
         );
         assert!(
@@ -3842,7 +3871,7 @@ mod tests {
                 "{answer}"
             );
             assert!(
-                !crate::round_cancel::is_cancelled(job_id),
+                !crate::stop::cancelled(job_id),
                 "a refused cancel must not fire a signal"
             );
             assert!(
@@ -3871,7 +3900,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let mine_round = crate::round_cancel::register("mine_cancel_round", Some(&caller_id));
+        let mine_round = crate::stop::register("mine_cancel_round", Some(&caller_id));
         let answer = run_as_caller(
             &tool,
             &caller,
@@ -3887,7 +3916,7 @@ mod tests {
             "the caller's own cancelled round is deleted"
         );
         assert!(
-            crate::round_cancel::is_cancelled("mine_cancel_round"),
+            crate::stop::cancelled("mine_cancel_round"),
             "the caller's own live round has its signal fired"
         );
         drop(mine_round);
@@ -3924,20 +3953,19 @@ mod tests {
         crate::util::test::init_management_test_stores().await;
         let ws = test_ws("/tmp/test_ws_analyze_cancel_late_register");
         let job_id = "analyze_late_register_round";
-        let round = crate::round_cancel::register(job_id, None);
+        let round = crate::stop::register(job_id, None);
         let analyst = |id: &str| {
             crate::Agent::new(
                 id.to_string(),
                 Role::Analyst,
                 &ws,
-                None,
+                crate::work_unit::WorkUnit::AnalyzeRound {
+                    id: job_id.to_string(),
+                    label: "round question".to_string(),
+                },
                 String::new(),
                 String::new(),
                 false,
-                Some(crate::agent::registry::ParentKey::AnalyzeRound(
-                    job_id.to_string(),
-                )),
-                Some("round question".to_string()),
                 None,
             )
         };
@@ -3946,7 +3974,7 @@ mod tests {
             !analyst("analyze_late_register_first").is_cancelled(),
             "a round's analyst runs while its round is live"
         );
-        crate::round_cancel::cancel(job_id);
+        crate::stop::fire(job_id);
         assert!(
             analyst("analyze_late_register_late").is_cancelled(),
             "an analyst the cancelled round dispatches afterwards must be pre-cancelled"
@@ -4115,7 +4143,7 @@ mod tests {
                 conn,
                 job_id,
                 &analyst_id,
-                crate::jobs::RowStatus::Done,
+                crate::outcome::Outcome::Done,
                 Some(outcome),
             )
             .await
@@ -4284,22 +4312,10 @@ mod tests {
         f3.claims[0].contradictions = vec!["src says beta unknown".into()];
         let f4 = findings(vec![("beta is false", "url4", "medium")]);
         let outcomes = vec![
-            AnalystOutcome::Findings {
-                raw: "r1".into(),
-                findings: f1,
-            },
-            AnalystOutcome::Findings {
-                raw: "r2".into(),
-                findings: f2,
-            },
-            AnalystOutcome::Findings {
-                raw: "r3".into(),
-                findings: f3,
-            },
-            AnalystOutcome::Findings {
-                raw: "r4".into(),
-                findings: f4,
-            },
+            AnalystResult::findings("r1".into(), f1),
+            AnalystResult::findings("r2".into(), f2),
+            AnalystResult::findings("r3".into(), f3),
+            AnalystResult::findings("r4".into(), f4),
         ];
         let items = claims_per_agent(&outcomes);
         let table = crate::consensus::ItemTable::new(&items);

@@ -19,8 +19,9 @@
 //! same holders may ask for the answer as JSON with `extract`, which replaces it
 //! ([`crate::extract`]). No other holder declares either argument.
 //!
-//! Every call that would start a worker or a custom role first refuses a folder another one is
-//! already working in (see [`crate::launch::BusyFolder`]).
+//! Every call that would start a worker or a custom role first refuses a folder any other writer
+//! already holds: every role but the Manager counts, the admin Assistant included, and the refusal
+//! names which (see [`crate::launch::FolderHeld`]).
 
 use crate::prompt::load_prompt;
 use crate::tools::Tool;
@@ -757,10 +758,14 @@ impl Tool for SendTool {
                 // Only the command line reaches this arm: the owner's own assistant is not among
                 // the addressees an agent's holder declares, so an agent naming it is refused
                 // before dispatch.
-                let id =
-                    crate::agent::message_router::deliver_command_line_message(message.to_string())
-                        .await?;
-                Ok(crate::send_outcome::acknowledged(
+                let address =
+                    crate::address::AgentAddress::assistant(crate::agent::tool_user_name());
+                let id = crate::agent::message_router::deliver_command_line_message(
+                    message.to_string(),
+                    &address.id(),
+                )
+                .await?;
+                Ok(crate::jobs::acknowledged(
                     "Message handed to your assistant, which answers on the channels it \
                      normally uses."
                         .to_string(),
@@ -770,7 +775,7 @@ impl Tool for SendTool {
             Addressee::Worker => {
                 if !self.dispatch_mode.is_async() {
                     // The Engineer's sync worker run: the report returns inline.
-                    crate::launch::refuse_busy_folder(ws)?;
+                    crate::launch::refuse_busy_folder(ws).await?;
                     return super::SyncDurableCore::Worker
                         .run_sync_dispatch(ws, message, self.caller_role)
                         .await;
@@ -778,7 +783,7 @@ impl Tool for SendTool {
                 // A worker round writes outside the managed workspaces: only a durable background
                 // round can honour the optional `place`.
                 let place = self.optional_place(&args).await?;
-                crate::launch::refuse_busy_folder(place.as_ref().unwrap_or(ws))?;
+                crate::launch::refuse_busy_folder(place.as_ref().unwrap_or(ws)).await?;
                 let job_id = crate::generate_id();
                 let id = if Self::command_line() {
                     // Answered and gone the moment this returns: the durable rows are written
@@ -809,7 +814,7 @@ impl Tool for SendTool {
                 let folder = place
                     .as_ref()
                     .map_or_else(|| ws.path.clone(), |p| p.path.clone());
-                Ok(crate::send_outcome::acknowledged(
+                Ok(crate::jobs::acknowledged(
                     format!(
                         "Work handed to a worker in {}; its report arrives as a <worker-report> \
                          message.",
@@ -869,10 +874,12 @@ impl Tool for SendTool {
                         ("{{message}}", message),
                     ],
                 );
+                let address = crate::address::AgentAddress::manager(&project.name);
                 let id = crate::agent::message_router::route_agent_message_to_manager(
                     envelope,
                     project.name.clone(),
                     user_name,
+                    &address.id(),
                     asker.map(|launch| crate::agent::message_router::Asker {
                         launch,
                         workspace: ws.name.clone(),
@@ -881,7 +888,7 @@ impl Tool for SendTool {
                     Self::answered_for(),
                 )
                 .await?;
-                Ok(crate::send_outcome::acknowledged(
+                Ok(crate::jobs::acknowledged(
                     format!(
                         "Message delivered to the manager of workspace '{}'.",
                         project.name
@@ -936,9 +943,11 @@ impl Tool for SendTool {
                     &crate::prompt::load_prompt("guest_message.md"),
                     &[("{{message}}", message)],
                 );
+                let address = crate::address::AgentAddress::assistant(name);
                 crate::agent::message_router::route_guest_message(
                     content,
                     name,
+                    &address.id(),
                     Self::answered_for(),
                 )
                 .await?;
@@ -1210,9 +1219,9 @@ mod tests {
                 .to_string();
 
         // The conversations a report can land in, each a registered spy consumer.
-        let assistant = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let assistant = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut assistant_spy = Spy::register(&assistant);
-        let manager_agent = crate::session::manager_agent_id(&project.name);
+        let manager_agent = crate::address::AgentAddress::manager(&project.name).id();
         let mut manager_spy = Spy::register(&manager_agent);
         // The deferred envelopes that already exist: the cleanup at the end
         // removes only the rows this harness creates, because the shared global
@@ -1328,7 +1337,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let role_branch = crate::session::custom_role_agent_id("dispatchable", None);
+        let role_branch = crate::address::AgentAddress::custom_role("dispatchable", None).id();
         let mut role_spy = Spy::register(&role_branch);
         dispatch(
             &send,
@@ -1366,7 +1375,7 @@ mod tests {
         }
 
         let branch = "harness";
-        let branch_agent = crate::session::worker_branch_agent_id(branch);
+        let branch_agent = crate::address::AgentAddress::worker_branch(branch.to_owned()).id();
         let mut branch_spy = Spy::register(&branch_agent);
         let ack = dispatch(
             &send,
@@ -1452,7 +1461,7 @@ mod tests {
 
         // A branch that runs delivers its report into the asking conversation and
         // shows up as one session entry.
-        let reporter = crate::session::worker_branch_agent_id("reporter");
+        let reporter = crate::address::AgentAddress::worker_branch("reporter".to_owned()).id();
         dispatch(
             &send,
             &caller,
@@ -1489,7 +1498,7 @@ mod tests {
         // the agents this harness worked with: only the two worker branches ever ran.
         let owned = [
             assistant.clone(),
-            crate::session::manager_agent_id(&project.name),
+            crate::address::AgentAddress::manager(&project.name).id(),
             role_branch.clone(),
             branch_agent.clone(),
             reporter.clone(),
@@ -1639,11 +1648,9 @@ mod tests {
             Role::Worker.as_str().to_string(),
             None,
             &crate::Workspace::ephemeral_run(&running, dir.path()),
-            tokio_util::sync::CancellationToken::new(),
-            tokio_util::sync::CancellationToken::new(),
+            std::sync::Arc::new(crate::stop::Stop::default()),
             None,
             None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
 
         let jobs_before = job_ids_of_kind("implement", TURN_CHANNEL).await;
@@ -1660,6 +1667,11 @@ mod tests {
         )
         .await
         .expect_err("a worker is already working in that folder");
+        assert!(
+            err.downcast_ref::<crate::launch::FolderHeld>().is_some(),
+            "the refusal is typed, so a caller with no one to refuse (an automation's fire) \
+             waits instead of failing the work"
+        );
         let err = err.to_string();
         for expected in [
             "usage: a worker is already working in",
@@ -1688,6 +1700,7 @@ mod tests {
                 "elsewhere",
                 elsewhere.path()
             ))
+            .await
             .is_ok(),
             "a folder nothing runs in is never refused"
         );
@@ -1703,11 +1716,9 @@ mod tests {
             Role::Custom.as_str().to_string(),
             None,
             &crate::Workspace::ephemeral_run(&own, dir.path()),
-            tokio_util::sync::CancellationToken::new(),
-            tokio_util::sync::CancellationToken::new(),
+            std::sync::Arc::new(crate::stop::Stop::default()),
             None,
             None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         crate::agent::CURRENT_TOOL_AGENT_ID
             .scope(Some(own.clone()), async {
@@ -1715,15 +1726,16 @@ mod tests {
                     "own",
                     dir.path(),
                 ))
+                .await
             })
             .await
             .expect("the caller's own run never blocks its own call");
         crate::agent::registry::AGENT_REGISTRY.deregister(&own, own_generation);
 
         // The very same call to that folder now goes through.
-        let mut spy = Spy::register(&crate::session::assistant_agent_id(
-            crate::users::ADMIN_USER_NAME,
-        ));
+        let mut spy = Spy::register(
+            &crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id(),
+        );
         dispatch(
             &send,
             &caller,
@@ -1801,6 +1813,24 @@ mod tests {
         job_ids_of_kind("implement", crate::cli::CHANNEL).await
     }
 
+    /// The command line's own worker rounds that are still `launched` — the rows a boot would
+    /// resume. A settled round keeps its row as the record its id names, so a terminal row is not
+    /// one of these.
+    async fn launched_command_line_round_ids() -> Vec<String> {
+        crate::session::store()
+            .conn
+            .query(
+                "SELECT id FROM jobs WHERE kind = 'implement' AND channel = ?1 \
+                 AND status = 'launched'",
+                crate::db::params![crate::cli::CHANNEL],
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String>(0).unwrap())
+            .collect()
+    }
+
     /// How many deferred envelopes waiting for `agent_id` carry `content` — the
     /// handover whose durability is being pinned, told apart from a parallel
     /// test's row for the same conversation by the message itself.
@@ -1854,26 +1884,36 @@ mod tests {
             .map(str::to_string)
     }
 
-    /// The record `ack` names is `running`, and names the chain's own length when the handover
+    /// The record `ack` names is `launched`, and names the chain's own length when the handover
     /// started one.
     async fn assert_running_record(ack: &str, chain_steps: Option<usize>) {
         let id =
             ack_job_id(ack).unwrap_or_else(|| panic!("the acknowledgement names its id: {ack}"));
-        let record = crate::send_outcome::lookup(&id)
+        let record = crate::session::store()
+            .conn
+            .query_optional(
+                "SELECT status, chain_steps FROM jobs WHERE id = ?1",
+                crate::db::params![id.as_str()],
+                |row| Ok::<_, anyhow::Error>((row.get::<String>(0)?, row.get::<Option<i64>>(1)?)),
+            )
             .await
-            .expect("read the record")
+            .expect("read the record row")
             .unwrap_or_else(|| panic!("a record stands under {id}"));
-        assert_eq!(record.state, crate::send_outcome::State::Running);
-        assert_eq!(record.chain_steps, chain_steps);
+        assert_eq!(record.0, crate::outcome::Outcome::Running.as_str());
+        assert_eq!(
+            record.1.and_then(|steps| usize::try_from(steps).ok()),
+            chain_steps
+        );
     }
 
     /// The command line is answered and GONE the moment a call returns, so every handover must
     /// be durable BEFORE the acknowledgement. Each durability claim below is checked IMMEDIATELY
     /// after `execute` returns — no `deadline_poll` for the pin. Every provider call the round
     /// makes parks until this test opens the gate, so "immediately" cannot race its progress.
-    /// `send_outcome` serialises it against the boot sweep, which settles every `running` record.
+    /// `handover_records` serialises it against the boot sweep, which settles every `launched`
+    /// record.
     #[tokio::test]
-    #[serial_test::serial(provider, channel_registry, drain, send_outcome)]
+    #[serial_test::serial(provider, channel_registry, drain, handover_records)]
     async fn the_command_lines_handovers_are_durable_before_the_acknowledgement() {
         use std::sync::Arc;
 
@@ -1921,12 +1961,14 @@ mod tests {
         // Every conversation the command line's handovers reach is a registered
         // spy consumer, so nothing is left unconsumed — and the worker round the
         // resume path really runs reports back into the assistant's session.
-        let assistant = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let assistant = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut assistant_spy = Spy::register(&assistant);
-        let manager_agent = crate::session::manager_agent_id(&project.name);
+        let manager_agent = crate::address::AgentAddress::manager(&project.name).id();
         let mut manager_spy = Spy::register(&manager_agent);
-        let _branch_spy = Spy::register(&crate::session::worker_branch_agent_id("cli_branch"));
-        let role_agent = crate::session::custom_role_agent_id("cli_role", None);
+        let _branch_spy = Spy::register(
+            &crate::address::AgentAddress::worker_branch("cli_branch".to_owned()).id(),
+        );
+        let role_agent = crate::address::AgentAddress::custom_role("cli_role", None).id();
         let _role_spy = Spy::register(&role_agent);
 
         // The deferred envelopes that already exist: cleanup removes only the
@@ -2013,13 +2055,16 @@ mod tests {
             "the worker report names the folder the round ran in: {}",
             report.content
         );
-        // The round's record is the answer the round produced, once the answer is final.
-        let record = crate::send_outcome::lookup(&round_id)
+        // The round's row is its work, not a receipt: it is settled when the work ends, so the next
+        // boot cannot run the round a second time.
+        let (status, _) = crate::util::test::record_row(&round_id)
             .await
-            .expect("read the round's record")
-            .expect("the round opened a record");
-        assert_eq!(record.state, crate::send_outcome::State::Done);
-        assert_eq!(record.answer.as_deref(), Some("the work is done"));
+            .expect("the finished round's row stays as the record of its handover");
+        assert_eq!(
+            status,
+            crate::outcome::Outcome::Done.as_str(),
+            "the finished round leaves no launched row behind"
+        );
 
         let before = pending_for_content(&manager_agent, MANAGER_TEXT).await;
         let ack = dispatch_command_line(
@@ -2048,7 +2093,8 @@ mod tests {
             delivered.content
         );
 
-        let branch_agent = crate::session::worker_branch_agent_id("cli_branch");
+        let branch_agent =
+            crate::address::AgentAddress::worker_branch("cli_branch".to_owned()).id();
         let before = pending_for_content(&branch_agent, BRANCH_TEXT).await;
         dispatch_command_line(
             &send,
@@ -2120,7 +2166,7 @@ mod tests {
     /// resolves to a record still `running` — for a chain, one naming the chain's own length. An
     /// agent's own `send` and the one-way `guest` address open no record, so they print no id.
     #[tokio::test]
-    #[serial_test::serial(provider, channel_registry, drain, send_outcome)]
+    #[serial_test::serial(provider, channel_registry, drain, handover_records)]
     async fn every_command_line_acknowledgement_names_its_record() {
         use std::sync::Arc;
 
@@ -2149,13 +2195,15 @@ mod tests {
 
         // Every conversation a handover reaches is a registered consumer, so no envelope is left to
         // spawn a turn of its own.
-        let assistant = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let assistant = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut assistant_spy = Spy::register(&assistant);
-        let manager_agent = crate::session::manager_agent_id(&project.name);
+        let manager_agent = crate::address::AgentAddress::manager(&project.name).id();
         let mut manager_spy = Spy::register(&manager_agent);
-        let branch_agent = crate::session::worker_branch_agent_id("cli_ack_branch");
+        let branch_agent =
+            crate::address::AgentAddress::worker_branch("cli_ack_branch".to_owned()).id();
         let mut branch_spy = Spy::register(&branch_agent);
-        let agent_branch_agent = crate::session::worker_branch_agent_id("cli_ack_agent_branch");
+        let agent_branch_agent =
+            crate::address::AgentAddress::worker_branch("cli_ack_agent_branch".to_owned()).id();
         let mut agent_branch_spy = Spy::register(&agent_branch_agent);
         crate::custom_role::create(
             "cli_ack_role",
@@ -2165,15 +2213,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let role_agent = crate::session::custom_role_agent_id("cli_ack_role", None);
+        let role_agent = crate::address::AgentAddress::custom_role("cli_ack_role", None).id();
         let mut role_spy = Spy::register(&role_agent);
-        let mut chain_spy =
-            Spy::register(&crate::session::worker_branch_agent_id("cli_ack_chain_one"));
+        let mut chain_spy = Spy::register(
+            &crate::address::AgentAddress::worker_branch("cli_ack_chain_one".to_owned()).id(),
+        );
         crate::users::store()
             .add_user("cli_ack_guest")
             .await
             .unwrap();
-        let mut guest_spy = Spy::register(&crate::session::assistant_agent_id("cli_ack_guest"));
+        let mut guest_spy =
+            Spy::register(&crate::address::AgentAddress::assistant("cli_ack_guest").id());
 
         // The deferred envelopes that already exist: cleanup removes only the rows this harness
         // creates, because the shared global store is written by parallel tests too.
@@ -2261,7 +2311,7 @@ mod tests {
         chain_spy.next_job().await;
 
         // An agent's own turn opens no record, so its acknowledgement names none — and the id its
-        // durable envelope carries answers `unknown`.
+        // durable envelope carries names no dispatch row.
         let ack = dispatch(
             &send,
             &caller,
@@ -2280,10 +2330,7 @@ mod tests {
         let routed = agent_branch_spy.next_job().await;
         let pending = routed.pending_job_id.expect("the handover is durable");
         assert!(
-            crate::send_outcome::lookup(&pending)
-                .await
-                .expect("read the record")
-                .is_none(),
+            crate::util::test::record_row(&pending).await.is_none(),
             "an agent's own handover opens no record"
         );
 
@@ -2306,10 +2353,7 @@ mod tests {
         let routed = guest_spy.next_job().await;
         let pending = routed.pending_job_id.expect("the handover is durable");
         assert!(
-            crate::send_outcome::lookup(&pending)
-                .await
-                .expect("read the record")
-                .is_none(),
+            crate::util::test::record_row(&pending).await.is_none(),
             "a one-way handover opens no record"
         );
 
@@ -2360,7 +2404,7 @@ mod tests {
             home.path().to_str().unwrap(),
             &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
         );
-        let assistant = crate::session::assistant_agent_id(crate::users::ADMIN_USER_NAME);
+        let assistant = crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id();
         let mut assistant_spy = Spy::register(&assistant);
         let rounds_before = command_line_round_ids().await;
 
@@ -2395,7 +2439,7 @@ mod tests {
 
         // Terminalized by that report, never left launched for the next boot to
         // retry it.
-        let left = command_line_round_ids().await;
+        let left = launched_command_line_round_ids().await;
         assert!(
             !left.iter().any(|id| mine.contains(id)),
             "the panicked round's row must not stay launched for the next boot: {left:?}"
@@ -2737,7 +2781,7 @@ mod tests {
         // Register the Manager consumer so the routed envelope lands here
         // instead of spawning a live consumer loop (the spy unregisters itself
         // on drop). The deferred rows the dispatch persists are cleaned up below.
-        let target = crate::session::manager_agent_id(&ws.name);
+        let target = crate::address::AgentAddress::manager(&ws.name).id();
         let mut spy = Spy::register(&target);
         let pending_before: std::collections::HashSet<String> =
             crate::jobs::list_pending_jobs(&crate::session::store().conn)
@@ -2839,12 +2883,12 @@ mod tests {
             &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
         );
         let send = SendTool::admin(Role::Assistant);
-        let guest_target = crate::session::assistant_agent_id("guesty");
+        let guest_target = crate::address::AgentAddress::assistant("guesty").id();
         let mut guest_spy = Spy::register(&guest_target);
         // The sender's own conversation: the handover must never reach it.
-        let mut sender_spy = Spy::register(&crate::session::assistant_agent_id(
-            crate::users::ADMIN_USER_NAME,
-        ));
+        let mut sender_spy = Spy::register(
+            &crate::address::AgentAddress::assistant(crate::users::ADMIN_USER_NAME).id(),
+        );
         let pending_before: std::collections::HashSet<String> =
             crate::jobs::list_pending_jobs(&crate::session::store().conn)
                 .await
@@ -3510,7 +3554,7 @@ mod tests {
             "the chain's acknowledgement replaces the per-addressee one: {ack}"
         );
 
-        let branch = crate::session::worker_branch_agent_id("drafting");
+        let branch = crate::address::AgentAddress::worker_branch("drafting".to_owned()).id();
         let row = crate::jobs::list_pending_jobs(conn)
             .await
             .expect("list pending")

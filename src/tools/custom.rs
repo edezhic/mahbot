@@ -504,11 +504,12 @@ pub(crate) async fn notify_grant_change(user_name: &str, tool: &str, granted: bo
     if crate::users::is_admin_name(user_name) {
         return;
     }
-    let agent_id = crate::session::resolve_agent_id(
+    let agent_id = crate::address::AgentAddress::routed(
         user_name,
         crate::Role::Assistant.as_str(),
         &crate::users::personal_workspace_name(user_name),
-    );
+    )
+    .id();
     // An emptied session behaves like a first one — its next turn rebuilds the whole system
     // prompt — so it has nothing to correct either.
     if !crate::session::store().has_content(&agent_id).await {
@@ -1290,11 +1291,12 @@ mod tests {
             },
         ] {
             store.add_user(case.guest).await.unwrap();
-            let agent_id = crate::session::resolve_agent_id(
+            let agent_id = crate::address::AgentAddress::routed(
                 case.guest,
                 crate::Role::Assistant.as_str(),
                 &crate::users::personal_workspace_name(case.guest),
-            );
+            )
+            .id();
             // A registered receiver captures the routed job deterministically — no
             // consumer loop (and no agent run) is spawned.
             let mut rx = crate::agent::message_router::register_agent(&agent_id);
@@ -1358,11 +1360,12 @@ mod tests {
         // not even with a live session. Asserted on the durable rows rather than
         // a registered receiver: registering the production admin id would take
         // over the shared router's entry for it and swallow other tests' jobs.
-        let admin_id = crate::session::resolve_agent_id(
+        let admin_id = crate::address::AgentAddress::routed(
             crate::users::ADMIN_USER_NAME,
             crate::Role::Assistant.as_str(),
             &crate::users::personal_workspace_name(crate::users::ADMIN_USER_NAME),
-        );
+        )
+        .id();
         crate::util::test::seed_session_row(
             &crate::session::store().conn,
             &admin_id,
@@ -1379,11 +1382,12 @@ mod tests {
         // No session yet → nothing to announce: the first one carries the list.
         let fresh = "grant_notice_no_session";
         store.add_user(fresh).await.unwrap();
-        let fresh_id = crate::session::resolve_agent_id(
+        let fresh_id = crate::address::AgentAddress::routed(
             fresh,
             crate::Role::Assistant.as_str(),
             &crate::users::personal_workspace_name(fresh),
-        );
+        )
+        .id();
         notify_grant_change(fresh, ABSENT, true).await;
         assert!(!has_tool_notice(&fresh_id).await, "no session to wake");
     }

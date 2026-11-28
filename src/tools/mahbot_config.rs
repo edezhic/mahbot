@@ -1,9 +1,14 @@
 //! The product's own configuration surface — the admin's Assistant's one way to change it
 //! without a window. It dispatches `mahbot_config`'s actions: the settings themselves
 //! (`get` / `list` / `set`, implemented in [`crate::settings`]), the provider/Telegram/owner
-//! setup, accounts, tool grants and custom roles, plus the two texts it serves whole — the
-//! `reference` and, through `about`, the product's own README. Adding a managed workspace is not
-//! one of its actions — that lives in the `workspace` tool.
+//! setup, accounts, tool grants and custom roles, a managed workspace's profile, plus the two
+//! texts it serves whole — the `reference` and, through `about`, the product's own README. Adding
+//! a managed workspace is not one of its actions — that lives in the `workspace` tool.
+//!
+//! The four profile actions (`profile`, `confirm_profile`, `set_profile`, `reset_profile`) are the
+//! `workspace` tool's own, delegated to ([`crate::tools::workspace::show_profile`] and its three
+//! siblings): the profile has one implementation, and the owner reaches it through whichever of the
+//! two tools they have.
 //!
 //! The standing description is deliberately short and each schema field carries its name and a
 //! short description: the whole text — every action, every field, and what is inert where — is the
@@ -110,6 +115,10 @@ fn build_schema() -> serde_json::Value {
                     "update_custom_role",
                     "list_custom_roles",
                     "delete_custom_role",
+                    "profile",
+                    "confirm_profile",
+                    "set_profile",
+                    "reset_profile",
                 ],
                 "description": "Which action. Its `reference` action gives every action and field in full."
             },
@@ -194,6 +203,28 @@ fn build_schema() -> serde_json::Value {
             "prompt": {
                 "type": "string",
                 "description": "(custom roles) Its whole definition — everything the role is told."
+            },
+            "workspace": {
+                "type": "string",
+                "description": "(profile / confirm_profile / set_profile / reset_profile) The \
+                              managed workspace, spelled as `mahbot workspace list` spells it."
+            },
+            "stage": {
+                "type": "string",
+                "description": super::workspace::STAGE_FIELD
+            },
+            "participants": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": super::workspace::PARTICIPANTS_FIELD
+            },
+            "pass_threshold": {
+                "type": "integer",
+                "description": super::workspace::PASS_THRESHOLD_FIELD
+            },
+            "require_all_checks": {
+                "type": "boolean",
+                "description": super::workspace::REQUIRE_ALL_CHECKS_FIELD
             }
         }),
         &["action"],
@@ -308,6 +339,19 @@ impl MahbotConfigTool {
             "update_custom_role" => Ok(ToolAnswer::done(self.exec_update_custom_role(args).await?)),
             "list_custom_roles" => Ok(ToolAnswer::done(self.exec_list_custom_roles().await?)),
             "delete_custom_role" => Ok(ToolAnswer::done(self.exec_delete_custom_role(args).await?)),
+            "profile" => Ok(ToolAnswer::done(
+                crate::tools::workspace::show_profile(super::get_str(&args, "workspace")?).await?,
+            )),
+            "confirm_profile" => Ok(ToolAnswer::done(
+                crate::tools::workspace::confirm_profile(super::get_str(&args, "workspace")?)
+                    .await?,
+            )),
+            "set_profile" => Ok(ToolAnswer::done(
+                crate::tools::workspace::set_profile(&args).await?,
+            )),
+            "reset_profile" => Ok(ToolAnswer::done(
+                crate::tools::workspace::reset_profile(super::get_str(&args, "workspace")?).await?,
+            )),
             other => Err(err(format!(
                 "unknown action '{other}' — call the `reference` action (`mahbot config \
                  reference`) for every action and field"
