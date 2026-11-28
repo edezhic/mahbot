@@ -567,17 +567,13 @@ pub async fn wait_for_death(pid: i32) {
     panic!("pid {pid} is still alive");
 }
 
-/// 1×1 red PNG as a native data-URI — a payload that survives the media
-/// gate's base64 + bounded raster decode; used wherever tests need a marker
-/// the provider promotes to a vision part.
+/// A 1×1 PNG as a native data-URI — a payload that survives the media gate's base64 + bounded
+/// raster decode; used wherever tests need a marker the provider promotes to a vision part.
 pub(crate) fn tiny_png_data_uri() -> String {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
-    let img = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
-    let mut buf = Vec::new();
-    img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
-        .expect("test PNG must encode");
-    format!("data:image/png;base64,{}", STANDARD.encode(&buf))
+    let png = solid_png(1, 1);
+    format!("data:image/png;base64,{}", STANDARD.encode(&png))
 }
 
 /// The single process-level test temp root: all test-owned global state needing a temp directory
@@ -1451,6 +1447,45 @@ pub fn jpeg_with_exif_orientation(jpeg: &[u8]) -> Vec<u8> {
     ]);
     out.extend_from_slice(&jpeg[2..]);
     out
+}
+
+/// A gzipped tar holding `entries` in order, each a regular 0644 file.
+pub(crate) fn write_tar_gz<S: AsRef<str>, C: AsRef<[u8]>>(path: &Path, entries: &[(S, C)]) {
+    let encoder = flate2::write::GzEncoder::new(
+        std::fs::File::create(path).expect("create archive"),
+        flate2::Compression::default(),
+    );
+    let mut builder = tar::Builder::new(encoder);
+    for (name, contents) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.as_ref().len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        builder
+            .append_data(&mut header, name.as_ref(), contents.as_ref())
+            .expect("append entry");
+    }
+    builder
+        .into_inner()
+        .expect("finish archive")
+        .finish()
+        .expect("finish gzip");
+}
+
+/// A deflated zip holding `entries` in order, as bytes: a caller either hands them to a reader or
+/// writes them to a file.
+pub(crate) fn zip_bytes<S: AsRef<str>, C: AsRef<[u8]>>(entries: &[(S, C)]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, contents) in entries {
+        writer
+            .start_file(name.as_ref(), options)
+            .expect("start entry");
+        writer.write_all(contents.as_ref()).expect("write entry");
+    }
+    writer.finish().expect("finish zip").into_inner()
 }
 
 /// The canonical path as the resolvers hand it on: the platform's

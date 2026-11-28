@@ -811,6 +811,7 @@ fn label_text<'a, Message: 'a>(label: &'a str, text_size: f32) -> Element<'a, Me
 mod tests {
     use super::*;
     use crate::util::DATA_URI_OMITTED_PREFIX;
+    use crate::util::test::solid_png;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use iced::widget::markdown;
     use std::io::Cursor;
@@ -872,14 +873,6 @@ mod tests {
         paragraph_text(items)
     }
 
-    fn tiny_png(width: u32, height: u32) -> Vec<u8> {
-        let img = ::image::RgbaImage::from_pixel(width, height, ::image::Rgba([255, 0, 0, 255]));
-        let mut buf = Vec::new();
-        img.write_to(&mut Cursor::new(&mut buf), ::image::ImageFormat::Png)
-            .expect("test PNG must encode");
-        buf
-    }
-
     fn data_uri(png: &[u8]) -> String {
         format!("data:image/png;base64,{}", STANDARD.encode(png))
     }
@@ -889,8 +882,8 @@ mod tests {
     fn preprocess_table() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        std::fs::write(root.join("photo.png"), tiny_png(2, 1)).unwrap();
-        std::fs::write(root.join("my file.png"), tiny_png(2, 1)).unwrap();
+        std::fs::write(root.join("photo.png"), solid_png(2, 1)).unwrap();
+        std::fs::write(root.join("my file.png"), solid_png(2, 1)).unwrap();
         std::fs::write(root.join("recording.ogg"), b"ogg").unwrap();
         std::fs::create_dir_all(root.join("dir/subdir")).unwrap();
         std::fs::write(root.join("dir/subdir/rec.ogg"), b"ogg").unwrap();
@@ -904,7 +897,7 @@ mod tests {
         let (report_str, readme_str) = (abs("generated/report.pdf"), abs("README"));
         let (gone_str, gone_file_str) = (abs("cleaned_up.png"), abs("generated/gone.pdf"));
         let not_an_image_str = abs("notes.txt");
-        let valid_uri = data_uri(&tiny_png(2, 1));
+        let valid_uri = data_uri(&solid_png(2, 1));
 
         let cases: Vec<(&str, String, &str, Vec<MediaAttachment>)> = vec![
             (
@@ -1141,7 +1134,7 @@ mod tests {
         let img = tmp.path().join("shot.png");
         std::fs::write(&img, b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR").unwrap();
         let img_str = img.to_string_lossy().into_owned();
-        let uri = data_uri(&tiny_png(2, 1));
+        let uri = data_uri(&solid_png(2, 1));
         let marker = picture(Some(&img_str), "🖼️ shot.png");
         let literal = picture(Some("second.png"), "🖼️ second.png");
 
@@ -1275,14 +1268,14 @@ mod tests {
     fn decode_data_uri_image_table() {
         // URIs are built before the table: a success case needs a real encoded
         // PNG, and the two over-cap cases a payload/dimension past their cap.
-        let valid_uri = data_uri(&tiny_png(2, 1));
+        let valid_uri = data_uri(&solid_png(2, 1));
         let invalid_base64 = "data:image/png;base64,%%%not-base64%%%".to_string();
         let non_image = format!("data:text/plain;base64,{}", STANDARD.encode(b"hello world"));
         let huge_payload = format!(
             "data:image/png;base64,{}",
             "A".repeat(media_target::MAX_DATA_URI_ENCODED_BYTES + 1)
         );
-        let oversized = data_uri(&tiny_png(MAX_IMAGE_LONGEST_SIDE_PX + 1, 1));
+        let oversized = data_uri(&solid_png(MAX_IMAGE_LONGEST_SIDE_PX + 1, 1));
         let missing_marker = "data:image/png,AAAA".to_string();
         let mut jbuf = Vec::new();
         ::image::RgbImage::from_pixel(1, 1, ::image::Rgb([255, 0, 0]))
@@ -1303,12 +1296,12 @@ mod tests {
         }
 
         let png = decode_data_uri_image(&valid_uri);
-        let red = vec![255, 0, 0, 255, 255, 0, 0, 255];
-        assert_eq!(png, Some((2, 1, red)), "case decodes a solid-red 2×1 PNG");
+        let solid = vec![40, 90, 160, 255, 40, 90, 160, 255];
+        assert_eq!(png, Some((2, 1, solid)), "case decodes a solid 2×1 PNG");
 
         // A valid but over-display-cap raster is downscaled to the render cap.
         let downscaled = decode_data_uri_image(&oversized);
-        let cap = [255, 0, 0, 255].repeat(MAX_IMAGE_LONGEST_SIDE_PX as usize);
+        let cap = [40, 90, 160, 255].repeat(MAX_IMAGE_LONGEST_SIDE_PX as usize);
         let expected = Some((MAX_IMAGE_LONGEST_SIDE_PX, 1, cap));
         assert_eq!(downscaled, expected, "case downscales to the cap");
     }

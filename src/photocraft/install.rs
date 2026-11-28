@@ -355,31 +355,6 @@ mod tests {
         assert!(root.is_dir(), "{} was not created", root.display());
     }
 
-    /// Build a tar.gz in `dir` holding the given (path, contents) entries, in that order.
-    fn write_tar_gz(dir: &Path, entries: &[(&str, &[u8])]) -> PathBuf {
-        let path = dir.join("photocraft-0.20.1-linux-x86_64.tar.gz");
-        let encoder = flate2::write::GzEncoder::new(
-            fs::File::create(&path).expect("the archive is created"),
-            flate2::Compression::default(),
-        );
-        let mut builder = tar::Builder::new(encoder);
-        for (name, contents) in entries {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o644);
-            header.set_entry_type(tar::EntryType::Regular);
-            builder
-                .append_data(&mut header, name, *contents)
-                .expect("the entry is written");
-        }
-        builder
-            .into_inner()
-            .expect("the archive is finished")
-            .finish()
-            .expect("the gzip stream is finished");
-        path
-    }
-
     #[test]
     fn the_tar_extraction_takes_the_program_and_not_the_completion_script_named_like_it() {
         // The vendor's Linux tree is an FHS layout wrapped in one top-level directory: the CLI at
@@ -390,13 +365,12 @@ mod tests {
         let top = "photocraft-0.20.1-linux-x86_64";
         let decoy = format!("{top}/share/bash-completion/completions/{}", program_file());
         let program = format!("{top}/bin/{}", program_file());
-        let archive = write_tar_gz(
-            dir.path(),
-            &[
-                (&decoy, b"complete -W 'convert run info' photocraft-cli"),
-                (&program, b"the program"),
-            ],
-        );
+        let entries: Vec<(&str, &[u8])> = vec![
+            (&decoy, b"complete -W 'convert run info' photocraft-cli"),
+            (&program, b"the program"),
+        ];
+        let archive = dir.path().join("photocraft-0.20.1-linux-x86_64.tar.gz");
+        crate::util::test::write_tar_gz(&archive, &entries);
         let out = extract(&archive, dir.path()).expect("the program is extracted");
         assert_eq!(out, dir.path().join(program_file()));
         assert_eq!(

@@ -2696,21 +2696,6 @@ pub(crate) async fn upsert_session_pin(
     Ok(())
 }
 
-/// Parse `ticket_{ticket_id}_{role}` — the ticket id is everything before the
-/// final `_{role}` (workspace names allow underscores, so ticket ids like
-/// `my_ws-42` are valid — only the final suffix is stripped).
-#[must_use]
-fn session_pin_ticket_id(agent_id: &str, role: Role) -> Option<String> {
-    agent_id
-        .strip_prefix("ticket_")
-        .and_then(|rest| {
-            rest.strip_suffix(role.as_str())
-                .and_then(|r| r.strip_suffix('_'))
-        })
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-}
-
 /// Terminal deletion of session-pins (S5 — permanently-NULL seats): pins protect the
 /// accumulated engineer/sanitation session across bounce rounds and re-attempts. Once
 /// the ticket reaches a terminal phase (no future bounces/resets), the pin is
@@ -2740,14 +2725,18 @@ pub(crate) async fn purge_terminal_session_pins() -> usize {
         let Ok(kind) = row.get::<String>(1) else {
             continue;
         };
-        let role = match kind.as_str() {
-            "engineer" => Role::Engineer,
-            _ => Role::Sanitation,
-        };
-        let ticket_id = session_pin_ticket_id(&agent_id, role);
-        let Some(ticket_id) = ticket_id else {
+        // The pin's id names the ticket it protects: the address module's split (a ticket id may
+        // carry `_`, only the trailing role is stripped), with that role checked against `kind`.
+        let Some(crate::address::AgentAddress::Ticket {
+            ticket: ticket_id,
+            role,
+        }) = crate::address::AgentAddress::parse(&agent_id)
+        else {
             continue;
         };
+        if role != kind || ticket_id.is_empty() {
+            continue;
+        }
         let terminal = board_ready
             && crate::pipeline::board::store()
                 .get_ticket_phase(&ticket_id)

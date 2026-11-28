@@ -1546,8 +1546,6 @@ fn unreadable(family: Family) -> DocOutcome {
 
 #[cfg(test)]
 pub(crate) mod test_fixtures {
-    use super::*;
-    use std::io::Write;
 
     pub(crate) const DOCX_BODY: &[u8] = br#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>First paragraph</w:t></w:r></w:p><w:p><w:r><w:t>Second paragraph</w:t></w:r></w:p></w:body></w:document>"#;
@@ -1555,14 +1553,7 @@ pub(crate) mod test_fixtures {
     pub(crate) const COLUMN_CHART: &str = r#"<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><c:chart><c:title><c:tx><c:rich><a:p><a:r><a:t>Sales</a:t></a:r></a:p></c:rich></c:tx></c:title><c:plotArea><c:barChart><c:barDir val="col"/><c:ser><c:tx><c:strRef><c:f>Sheet1!$B$1</c:f><c:strCache><c:pt idx="0"><c:v>Revenue</c:v></c:pt></c:strCache></c:strRef></c:tx><c:cat><c:strCache><c:pt idx="0"><c:v>Jan</c:v></c:pt><c:pt idx="1"><c:v>Feb</c:v></c:pt></c:strCache></c:cat><c:val><c:numCache><c:pt idx="0"><c:v>10</c:v></c:pt><c:pt idx="1"><c:v>20</c:v></c:pt></c:numCache></c:val></c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
 
     pub(crate) fn zip_fixture(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        for (path, contents) in entries {
-            writer.start_file(*path, options).expect("start zip entry");
-            writer.write_all(contents).expect("write zip entry");
-        }
-        writer.finish().expect("finish zip").into_inner()
+        crate::util::test::zip_bytes(entries)
     }
 }
 

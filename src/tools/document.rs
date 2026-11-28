@@ -4699,7 +4699,6 @@ mod tests {
     use super::*;
     use crate::util::test::noisy_png;
     use crate::workspace::test_ws_named;
-    use std::io::{Cursor, Write as _};
 
     /// The workspace-confined document tool — what every Assistant but the admin's gets.
     fn confined_document() -> DocumentTool {
@@ -4718,12 +4717,6 @@ mod tests {
         (dir, ws)
     }
 
-    fn add_bytes(zip: &mut zip::ZipWriter<Cursor<Vec<u8>>>, name: &str, body: &[u8]) {
-        zip.start_file(name, zip::write::SimpleFileOptions::default())
-            .expect("start part");
-        zip.write_all(body).expect("write part");
-    }
-
     fn write_fixture(ws: &Workspace, name: &str, bytes: &[u8]) -> PathBuf {
         let path = ws.as_path().join(name);
         std::fs::write(&path, bytes).expect("write fixture");
@@ -4733,9 +4726,7 @@ mod tests {
     /// A package whose only part is `part`: the family verdict reads the container's own entry
     /// names.
     fn package_with(part: &str) -> Vec<u8> {
-        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        add_bytes(&mut zip, part, b"<x/>");
-        zip.finish().expect("finish package").into_inner()
+        crate::util::test::zip_bytes(&[(part, b"<x/>")])
     }
 
     /// A genuinely encrypted package: a CFB container declaring both streams genuine encryption

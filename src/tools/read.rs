@@ -1559,15 +1559,6 @@ mod tests {
         );
     }
 
-    fn tiny_png_bytes(width: u32, height: u32) -> Vec<u8> {
-        use std::io::Cursor;
-        let img = ::image::RgbaImage::from_pixel(width, height, ::image::Rgba([255, 0, 0, 255]));
-        let mut buf = Vec::new();
-        img.write_to(&mut Cursor::new(&mut buf), ::image::ImageFormat::Png)
-            .expect("test PNG must encode");
-        buf
-    }
-
     /// A raster file the read is asked for and what the two halves of the image
     /// path must answer: the annotation `execute` prints and the payload (the
     /// only decoder) that the agent loop injects.
@@ -1585,7 +1576,7 @@ mod tests {
 
     #[tokio::test]
     async fn image_payload_cases() {
-        let png = tiny_png_bytes(4, 4);
+        let png = crate::util::test::solid_png(4, 4);
         let mut unsupported: Vec<u8> = b"GIF89a".to_vec();
         unsupported.extend_from_slice(&[0u8; 20]);
         let cases = vec![
@@ -1702,7 +1693,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let ws_path = dir.path().to_path_buf();
-        let png = tiny_png_bytes(4, 4);
+        let png = crate::util::test::solid_png(4, 4);
         tokio::fs::write(ws_path.join("tiny_image.png"), &png)
             .await
             .unwrap();

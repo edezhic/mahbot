@@ -977,7 +977,7 @@ const SYSTEM_BIN_DIR: &str = "/usr/local/bin";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use crate::util::test::{write_tar_gz, zip_bytes};
     #[test]
     fn safe_entry_path_rejects_anything_outside_the_extraction_root() {
         assert_eq!(
@@ -1157,37 +1157,14 @@ mod tests {
         assert!(!aside_of(&dest).exists(), "aside was moved back");
     }
 
-    /// Build a tar.gz archive in `dir` with the given (path, contents) entries.
-    fn write_test_archive(dir: &std::path::Path, entries: &[(&str, &[u8])]) -> fs::File {
-        let enc = flate2::write::GzEncoder::new(
-            fs::File::create(dir.join("pkg.tar.gz")).expect("create archive"),
-            flate2::Compression::default(),
-        );
-        let mut builder = tar::Builder::new(enc);
-        for (path, contents) in entries {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o644);
-            header.set_entry_type(tar::EntryType::Regular);
-            builder
-                .append_data(&mut header, path, *contents)
-                .expect("append entry");
-        }
-        builder
-            .into_inner()
-            .expect("finish archive")
-            .finish()
-            .expect("finish gzip")
-    }
-
     #[test]
     fn extract_single_file_tar_gz_handles_a_nested_layout() {
         let dir = tempfile::tempdir().expect("tempdir");
         let entry = "pkg/bin/bun";
-        write_test_archive(dir.path(), &[(entry, b"NESTED" as &[u8])]);
+        let archive = dir.path().join("pkg.tar.gz");
+        write_tar_gz(&archive, &[(entry, b"NESTED" as &[u8])]);
 
-        let out = extract_single_file_tar_gz(&dir.path().join("pkg.tar.gz"), dir.path(), "bun")
-            .expect("extract");
+        let out = extract_single_file_tar_gz(&archive, dir.path(), "bun").expect("extract");
         // Matched by file name at any depth, but always written to the dir root.
         assert_eq!(out, dir.path().join("bun"));
         assert_eq!(fs::read(&out).expect("read extracted"), b"NESTED");
@@ -1196,33 +1173,19 @@ mod tests {
     #[test]
     fn extract_single_file_tar_gz_errors_without_the_binary() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_test_archive(dir.path(), &[("readme.txt", b"no bin" as &[u8])]);
+        let archive = dir.path().join("pkg.tar.gz");
+        write_tar_gz(&archive, &[("readme.txt", b"no bin" as &[u8])]);
 
-        assert!(
-            extract_single_file_tar_gz(&dir.path().join("pkg.tar.gz"), dir.path(), "bun").is_err()
-        );
-    }
-
-    /// Build a zip archive in `dir` with the given (path, contents) entries.
-    fn write_test_zip(dir: &std::path::Path, entries: &[(&str, &[u8])]) -> fs::File {
-        let file = fs::File::create(dir.join("pkg.zip")).expect("create archive");
-        let mut writer = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        for (path, contents) in entries {
-            writer.start_file(path, options).expect("start entry");
-            writer.write_all(contents).expect("write entry");
-        }
-        writer.finish().expect("finish zip")
+        assert!(extract_single_file_tar_gz(&archive, dir.path(), "bun").is_err());
     }
 
     #[test]
     fn extract_single_file_zip_lands_at_the_dir_root() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_test_zip(dir.path(), &[("bun", b"BIN" as &[u8])]);
+        let archive = dir.path().join("pkg.zip");
+        fs::write(&archive, zip_bytes(&[("bun", b"BIN")])).expect("write archive");
 
-        let out = extract_single_file_zip(&dir.path().join("pkg.zip"), dir.path(), "bun")
-            .expect("extract");
+        let out = extract_single_file_zip(&archive, dir.path(), "bun").expect("extract");
         assert_eq!(out, dir.path().join("bun"));
         assert_eq!(fs::read(&out).expect("read extracted"), b"BIN");
         #[cfg(unix)]

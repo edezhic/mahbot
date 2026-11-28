@@ -564,6 +564,7 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use crate::ffmpeg::ReleasesHook;
+    use crate::util::test::{write_tar_gz, zip_bytes};
 
     /// The environment lock [`ReleasesHook`] needs, held for the caller's scope: a
     /// `MutexGuard` cannot live across an await point, so it travels inside a struct.
@@ -754,41 +755,6 @@ mod tests {
         ]
     }
 
-    fn write_tar_gz(path: &Path, entries: &[(String, Vec<u8>)]) {
-        let encoder = flate2::write::GzEncoder::new(
-            fs::File::create(path).expect("create archive"),
-            flate2::Compression::default(),
-        );
-        let mut builder = tar::Builder::new(encoder);
-        for (name, contents) in entries {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(contents.len() as u64);
-            header.set_mode(0o644);
-            header.set_entry_type(tar::EntryType::Regular);
-            builder
-                .append_data(&mut header, name.as_str(), contents.as_slice())
-                .expect("append entry");
-        }
-        builder
-            .into_inner()
-            .expect("finish archive")
-            .finish()
-            .expect("finish gzip");
-    }
-
-    fn write_zip(path: &Path, entries: &[(String, Vec<u8>)]) {
-        let mut writer = zip::ZipWriter::new(fs::File::create(path).expect("create archive"));
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
-        for (name, contents) in entries {
-            writer
-                .start_file(name.as_str(), options)
-                .expect("start entry");
-            writer.write_all(contents).expect("write entry");
-        }
-        writer.finish().expect("finish zip");
-    }
-
     /// The staged layout is what the installer reads back: two executable binaries
     /// under `bin/`, the licence material at the root — the notices included, which the
     /// release's archives carry.
@@ -824,7 +790,7 @@ mod tests {
         write_tar_gz(&tarball, &entries);
         assert_staged(&tarball, &dir.path().join("staging-tar"));
         let archive = dir.path().join("pkg.zip");
-        write_zip(&archive, &entries);
+        fs::write(&archive, zip_bytes(&entries)).expect("write archive");
         assert_staged(&archive, &dir.path().join("staging-zip"));
     }
 
